@@ -1,0 +1,1678 @@
+use nu_protocol::{shell_error::generic::GenericError, ShellError};
+use ruff_python_ast as py;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Program {
+    pub statements: Vec<Stmt>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Stmt {
+    Assign {
+        target: AssignTarget,
+        value: Expr,
+    },
+    AugAssign {
+        target: AssignTarget,
+        op: AugOp,
+        value: Expr,
+    },
+    For {
+        targets: Vec<String>,
+        iter: Expr,
+        body: Vec<Stmt>,
+    },
+    While {
+        condition: Expr,
+        body: Vec<Stmt>,
+    },
+    If {
+        condition: Expr,
+        then_branch: Vec<Stmt>,
+        else_branch: Vec<Stmt>,
+    },
+    With {
+        target: Option<String>,
+        context: Expr,
+        body: Vec<Stmt>,
+    },
+    FunctionDef(FunctionDef),
+    Return(Option<Expr>),
+    Break,
+    Continue,
+    Pass,
+    Expr(Expr),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionDef {
+    pub name: String,
+    pub params: Vec<FunctionParam>,
+    pub return_type: StoneType,
+    pub body: Vec<Stmt>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionParam {
+    pub name: String,
+    pub ty: StoneType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoneType {
+    Any,
+    Bool,
+    Float,
+    Int,
+    List,
+    None,
+    Record,
+    Str,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AssignTarget {
+    Name(String),
+    Tuple(Vec<String>),
+    Subscript {
+        value: Box<AssignTarget>,
+        index: Expr,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    None,
+    Bool(bool),
+    Int(String),
+    Float(f64),
+    String(String),
+    FormattedString(Vec<FormattedStringPart>),
+    List(Vec<Expr>),
+    Tuple(Vec<Expr>),
+    ListComprehension {
+        target: String,
+        iter: Box<Expr>,
+        elt: Box<Expr>,
+        filters: Vec<Expr>,
+    },
+    Record(Vec<(String, Expr)>),
+    DictComprehension {
+        target: String,
+        iter: Box<Expr>,
+        key: Box<Expr>,
+        value: Box<Expr>,
+        filters: Vec<Expr>,
+    },
+    Name(String),
+    Subscript {
+        value: Box<Expr>,
+        index: Box<Expr>,
+    },
+    Attribute {
+        value: Box<Expr>,
+        attr: String,
+    },
+    Slice {
+        lower: Option<Box<Expr>>,
+        upper: Option<Box<Expr>>,
+    },
+    Compare {
+        left: Box<Expr>,
+        ops: Vec<CompareOp>,
+        comparators: Vec<Expr>,
+    },
+    BoolOp {
+        op: BoolOp,
+        values: Vec<Expr>,
+    },
+    Not(Box<Expr>),
+    Neg(Box<Expr>),
+    Invert(Box<Expr>),
+    Add {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Sub {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Mul {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Div {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    FloorDiv {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Mod {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    BitAnd {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    BitOr {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    BitXor {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    LShift {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    RShift {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Generator {
+        target: String,
+        iter: Box<Expr>,
+        elt: Box<Expr>,
+    },
+    Lambda {
+        params: Vec<String>,
+        body: Box<Expr>,
+    },
+    MethodCall {
+        receiver: Box<Expr>,
+        method: String,
+        positional: Vec<Expr>,
+    },
+    Call(Call),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FormattedStringPart {
+    Literal(String),
+    Expr(Expr),
+    Formatted { expr: Expr, spec: StoneFormatSpec },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StoneFormatSpec {
+    Fixed { precision: usize },
+    ZeroPadInt { width: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareOp {
+    Eq,
+    NotEq,
+    Lt,
+    LtE,
+    Gt,
+    GtE,
+    In,
+    NotIn,
+    Is,
+    IsNot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AugOp {
+    Add,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoolOp {
+    And,
+    Or,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Call {
+    pub name: String,
+    pub positional: Vec<Expr>,
+    pub named: Vec<(String, Expr)>,
+}
+
+pub fn lower_source(source: &str) -> Result<Program, ShellError> {
+    let parsed = ruff_python_parser::parse_module(source).map_err(|err| {
+        ShellError::Generic(
+            GenericError::new_internal("python parse error", err.to_string())
+                .with_code("stone_parse_error"),
+        )
+    })?;
+
+    lower_module(parsed.into_syntax())
+}
+
+fn lower_module(module: py::ModModule) -> Result<Program, ShellError> {
+    let mut statements = Vec::with_capacity(module.body.len());
+    for statement in module.body {
+        statements.push(lower_stmt(statement)?);
+    }
+
+    Ok(Program { statements })
+}
+
+fn lower_stmt(statement: py::Stmt) -> Result<Stmt, ShellError> {
+    match statement {
+        py::Stmt::Assign(assign) => lower_assign(assign),
+        py::Stmt::AugAssign(assign) => lower_aug_assign(assign),
+        py::Stmt::Break(_) => Ok(Stmt::Break),
+        py::Stmt::Continue(_) => Ok(Stmt::Continue),
+        py::Stmt::For(for_stmt) => lower_for(for_stmt),
+        py::Stmt::FunctionDef(function) => lower_function_def(function),
+        py::Stmt::If(if_stmt) => lower_if(if_stmt),
+        py::Stmt::Pass(_) => Ok(Stmt::Pass),
+        py::Stmt::Return(return_stmt) => lower_return(return_stmt),
+        py::Stmt::While(while_stmt) => lower_while(while_stmt),
+        py::Stmt::With(with_stmt) => lower_with(with_stmt),
+        py::Stmt::Expr(expr) => Ok(Stmt::Expr(lower_expr(*expr.value)?)),
+        unsupported => Err(unsupported_error("statement", &unsupported)),
+    }
+}
+
+fn lower_function_def(function: py::StmtFunctionDef) -> Result<Stmt, ShellError> {
+    if function.is_async {
+        return Err(unsupported_message(
+            "function definition",
+            "async def is not supported",
+        ));
+    }
+    if !function.decorator_list.is_empty() {
+        return Err(unsupported_message(
+            "function definition",
+            "decorators are not supported",
+        ));
+    }
+    if function.type_params.is_some() {
+        return Err(unsupported_message(
+            "function definition",
+            "type parameters are not supported",
+        ));
+    }
+    let parameters = function.parameters;
+    if !parameters.posonlyargs.is_empty()
+        || parameters.vararg.is_some()
+        || !parameters.kwonlyargs.is_empty()
+        || parameters.kwarg.is_some()
+    {
+        return Err(unsupported_message(
+            "function definition",
+            "only simple positional parameters are supported",
+        ));
+    }
+    let mut params = Vec::with_capacity(parameters.args.len());
+    for parameter in parameters.args {
+        if parameter.default.is_some() {
+            return Err(unsupported_message(
+                "function definition",
+                "default parameter values are not supported",
+            ));
+        }
+        params.push(FunctionParam {
+            name: parameter.name().to_string(),
+            ty: match parameter.parameter.annotation.as_deref() {
+                Some(annotation) => lower_type_annotation(annotation)?,
+                None => StoneType::Any,
+            },
+        });
+    }
+    let return_type = match function.returns {
+        Some(return_type) => lower_type_annotation(&return_type)?,
+        None if params.is_empty() => StoneType::None,
+        None => StoneType::Any,
+    };
+    Ok(Stmt::FunctionDef(FunctionDef {
+        name: function.name.to_string(),
+        params,
+        return_type,
+        body: lower_stmt_block(function.body)?,
+    }))
+}
+
+fn lower_return(return_stmt: py::StmtReturn) -> Result<Stmt, ShellError> {
+    Ok(Stmt::Return(
+        return_stmt
+            .value
+            .map(|value| lower_expr(*value))
+            .transpose()?,
+    ))
+}
+
+fn lower_type_annotation(annotation: &py::Expr) -> Result<StoneType, ShellError> {
+    match annotation {
+        py::Expr::Name(name) => match name.id.as_str() {
+            "Any" | "any" => Ok(StoneType::Any),
+            "bool" => Ok(StoneType::Bool),
+            "float" => Ok(StoneType::Float),
+            "int" => Ok(StoneType::Int),
+            "list" => Ok(StoneType::List),
+            "None" => Ok(StoneType::None),
+            "record" | "dict" => Ok(StoneType::Record),
+            "str" => Ok(StoneType::Str),
+            other => Err(unsupported_message(
+                "type annotation",
+                format!("unsupported type `{other}`"),
+            )),
+        },
+        py::Expr::NoneLiteral(_) => Ok(StoneType::None),
+        py::Expr::Subscript(subscript) => match subscript.value.as_ref() {
+            py::Expr::Name(name) if name.id.as_str() == "list" => Ok(StoneType::List),
+            _ => Err(unsupported_message(
+                "type annotation",
+                "only list[T] generic annotations are supported",
+            )),
+        },
+        unsupported => Err(unsupported_error("type annotation", unsupported)),
+    }
+}
+
+fn lower_assign(assign: py::StmtAssign) -> Result<Stmt, ShellError> {
+    let [target] = assign.targets.as_slice() else {
+        return Err(unsupported_message(
+            "assignment",
+            "multiple assignment targets are not supported yet",
+        ));
+    };
+
+    let target = lower_assign_target(target)?;
+
+    Ok(Stmt::Assign {
+        target,
+        value: lower_expr(*assign.value)?,
+    })
+}
+
+fn lower_assign_target(target: &py::Expr) -> Result<AssignTarget, ShellError> {
+    match target {
+        py::Expr::Name(name) => Ok(AssignTarget::Name(name.id.to_string())),
+        py::Expr::Tuple(tuple) => lower_tuple_assign_targets(&tuple.elts),
+        py::Expr::List(list) => lower_tuple_assign_targets(&list.elts),
+        py::Expr::Subscript(subscript) => Ok(AssignTarget::Subscript {
+            value: Box::new(lower_assign_target(subscript.value.as_ref())?),
+            index: lower_expr(*subscript.slice.clone())?,
+        }),
+        _ => Err(unsupported_message(
+            "assignment",
+            "only simple name, fixed tuple/list, and item assignment are supported yet",
+        )),
+    }
+}
+
+fn lower_tuple_assign_targets(elements: &[py::Expr]) -> Result<AssignTarget, ShellError> {
+    let mut targets = Vec::with_capacity(elements.len());
+    for element in elements {
+        let py::Expr::Name(name) = element else {
+            return Err(unsupported_message(
+                "assignment",
+                "tuple/list destructuring only supports simple name targets",
+            ));
+        };
+        targets.push(name.id.to_string());
+    }
+    if targets.is_empty() {
+        return Err(unsupported_message(
+            "assignment",
+            "empty tuple/list destructuring is not supported",
+        ));
+    }
+    Ok(AssignTarget::Tuple(targets))
+}
+
+fn lower_aug_assign(assign: py::StmtAugAssign) -> Result<Stmt, ShellError> {
+    let target = lower_assign_target(&assign.target)?;
+    let op = match assign.op {
+        py::Operator::Add => AugOp::Add,
+        unsupported => {
+            return Err(unsupported_message(
+                "augmented assignment",
+                format!("unsupported augmented assignment operator: {unsupported:?}"),
+            ));
+        }
+    };
+    Ok(Stmt::AugAssign {
+        target,
+        op,
+        value: lower_expr(*assign.value)?,
+    })
+}
+
+fn lower_for(for_stmt: py::StmtFor) -> Result<Stmt, ShellError> {
+    if for_stmt.is_async {
+        return Err(unsupported_message(
+            "for statement",
+            "async for statements are not supported",
+        ));
+    }
+    if !for_stmt.orelse.is_empty() {
+        return Err(unsupported_message(
+            "for statement",
+            "for/else is not supported yet",
+        ));
+    }
+    let targets = lower_loop_targets(*for_stmt.target)?;
+    Ok(Stmt::For {
+        targets,
+        iter: lower_expr(*for_stmt.iter)?,
+        body: lower_stmt_block(for_stmt.body)?,
+    })
+}
+
+fn lower_loop_targets(target: py::Expr) -> Result<Vec<String>, ShellError> {
+    match target {
+        py::Expr::Name(target) => Ok(vec![target.id.to_string()]),
+        py::Expr::Tuple(tuple) => {
+            let mut targets = Vec::with_capacity(tuple.elts.len());
+            for elt in tuple.elts {
+                let py::Expr::Name(name) = elt else {
+                    return Err(unsupported_message(
+                        "for statement",
+                        "only simple name tuple loop targets are supported yet",
+                    ));
+                };
+                targets.push(name.id.to_string());
+            }
+            if targets.is_empty() {
+                return Err(unsupported_message(
+                    "for statement",
+                    "empty tuple loop targets are not supported",
+                ));
+            }
+            Ok(targets)
+        }
+        _ => Err(unsupported_message(
+            "for statement",
+            "only simple name and tuple loop targets are supported yet",
+        )),
+    }
+}
+
+fn lower_if(if_stmt: py::StmtIf) -> Result<Stmt, ShellError> {
+    let mut else_branch = Vec::new();
+    for clause in if_stmt.elif_else_clauses.into_iter().rev() {
+        else_branch = match clause.test {
+            Some(test) => vec![Stmt::If {
+                condition: lower_expr(test)?,
+                then_branch: lower_stmt_block(clause.body)?,
+                else_branch,
+            }],
+            None => {
+                if !else_branch.is_empty() {
+                    return Err(unsupported_message(
+                        "if statement",
+                        "else before elif is not supported",
+                    ));
+                }
+                lower_stmt_block(clause.body)?
+            }
+        }
+    }
+
+    Ok(Stmt::If {
+        condition: lower_expr(*if_stmt.test)?,
+        then_branch: lower_stmt_block(if_stmt.body)?,
+        else_branch,
+    })
+}
+
+fn lower_while(while_stmt: py::StmtWhile) -> Result<Stmt, ShellError> {
+    if !while_stmt.orelse.is_empty() {
+        return Err(unsupported_message(
+            "while statement",
+            "while/else is not supported",
+        ));
+    }
+    Ok(Stmt::While {
+        condition: lower_expr(*while_stmt.test)?,
+        body: lower_stmt_block(while_stmt.body)?,
+    })
+}
+
+fn lower_with(with_stmt: py::StmtWith) -> Result<Stmt, ShellError> {
+    if with_stmt.is_async {
+        return Err(unsupported_message(
+            "with statement",
+            "async with statements are not supported",
+        ));
+    }
+    let [item] = with_stmt.items.as_slice() else {
+        return Err(unsupported_message(
+            "with statement",
+            "only a single with item is supported yet",
+        ));
+    };
+    let target = match &item.optional_vars {
+        Some(var) => {
+            let py::Expr::Name(name) = var.as_ref() else {
+                return Err(unsupported_message(
+                    "with statement",
+                    "only simple name with targets are supported yet",
+                ));
+            };
+            Some(name.id.to_string())
+        }
+        None => None,
+    };
+    Ok(Stmt::With {
+        target,
+        context: lower_expr(item.context_expr.clone())?,
+        body: lower_stmt_block(with_stmt.body)?,
+    })
+}
+
+fn lower_stmt_block(statements: Vec<py::Stmt>) -> Result<Vec<Stmt>, ShellError> {
+    statements
+        .into_iter()
+        .map(lower_stmt)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn lower_expr(expression: py::Expr) -> Result<Expr, ShellError> {
+    match expression {
+        py::Expr::NoneLiteral(_) => Ok(Expr::None),
+        py::Expr::BooleanLiteral(boolean) => Ok(Expr::Bool(boolean.value)),
+        py::Expr::NumberLiteral(number) => lower_number(number.value),
+        py::Expr::StringLiteral(string) => Ok(Expr::String(string.value.to_string())),
+        py::Expr::FString(fstring) => lower_fstring(fstring),
+        py::Expr::Name(name) => Ok(Expr::Name(name.id.to_string())),
+        py::Expr::List(list) => list
+            .elts
+            .into_iter()
+            .map(lower_expr)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Expr::List),
+        py::Expr::Tuple(tuple) => tuple
+            .elts
+            .into_iter()
+            .map(lower_expr)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Expr::Tuple),
+        py::Expr::ListComp(list_comp) => lower_list_comprehension(list_comp),
+        py::Expr::Dict(dict) => lower_dict(dict),
+        py::Expr::DictComp(dict_comp) => lower_dict_comprehension(dict_comp),
+        py::Expr::Call(call) => lower_expr_call(call),
+        py::Expr::BinOp(bin_op) if matches!(bin_op.op, py::Operator::Add) => Ok(Expr::Add {
+            left: Box::new(lower_expr(*bin_op.left)?),
+            right: Box::new(lower_expr(*bin_op.right)?),
+        }),
+        py::Expr::BinOp(bin_op) if matches!(bin_op.op, py::Operator::Sub) => Ok(Expr::Sub {
+            left: Box::new(lower_expr(*bin_op.left)?),
+            right: Box::new(lower_expr(*bin_op.right)?),
+        }),
+        py::Expr::BinOp(bin_op) if matches!(bin_op.op, py::Operator::Mult) => Ok(Expr::Mul {
+            left: Box::new(lower_expr(*bin_op.left)?),
+            right: Box::new(lower_expr(*bin_op.right)?),
+        }),
+        py::Expr::BinOp(bin_op) if matches!(bin_op.op, py::Operator::Div) => Ok(Expr::Div {
+            left: Box::new(lower_expr(*bin_op.left)?),
+            right: Box::new(lower_expr(*bin_op.right)?),
+        }),
+        py::Expr::BinOp(bin_op) if matches!(bin_op.op, py::Operator::FloorDiv) => {
+            Ok(Expr::FloorDiv {
+                left: Box::new(lower_expr(*bin_op.left)?),
+                right: Box::new(lower_expr(*bin_op.right)?),
+            })
+        }
+        py::Expr::BinOp(bin_op) if matches!(bin_op.op, py::Operator::Mod) => Ok(Expr::Mod {
+            left: Box::new(lower_expr(*bin_op.left)?),
+            right: Box::new(lower_expr(*bin_op.right)?),
+        }),
+        py::Expr::BinOp(bin_op) if matches!(bin_op.op, py::Operator::BitAnd) => Ok(Expr::BitAnd {
+            left: Box::new(lower_expr(*bin_op.left)?),
+            right: Box::new(lower_expr(*bin_op.right)?),
+        }),
+        py::Expr::BinOp(bin_op) if matches!(bin_op.op, py::Operator::BitOr) => Ok(Expr::BitOr {
+            left: Box::new(lower_expr(*bin_op.left)?),
+            right: Box::new(lower_expr(*bin_op.right)?),
+        }),
+        py::Expr::BinOp(bin_op) if matches!(bin_op.op, py::Operator::BitXor) => Ok(Expr::BitXor {
+            left: Box::new(lower_expr(*bin_op.left)?),
+            right: Box::new(lower_expr(*bin_op.right)?),
+        }),
+        py::Expr::BinOp(bin_op) if matches!(bin_op.op, py::Operator::LShift) => Ok(Expr::LShift {
+            left: Box::new(lower_expr(*bin_op.left)?),
+            right: Box::new(lower_expr(*bin_op.right)?),
+        }),
+        py::Expr::BinOp(bin_op) if matches!(bin_op.op, py::Operator::RShift) => Ok(Expr::RShift {
+            left: Box::new(lower_expr(*bin_op.left)?),
+            right: Box::new(lower_expr(*bin_op.right)?),
+        }),
+        py::Expr::Compare(compare) => lower_compare(compare),
+        py::Expr::BoolOp(bool_op) => lower_bool_op(bool_op),
+        py::Expr::UnaryOp(unary_op) if matches!(unary_op.op, py::UnaryOp::Not) => {
+            Ok(Expr::Not(Box::new(lower_expr(*unary_op.operand)?)))
+        }
+        py::Expr::UnaryOp(unary_op) if matches!(unary_op.op, py::UnaryOp::USub) => {
+            Ok(Expr::Neg(Box::new(lower_expr(*unary_op.operand)?)))
+        }
+        py::Expr::UnaryOp(unary_op) if matches!(unary_op.op, py::UnaryOp::Invert) => {
+            Ok(Expr::Invert(Box::new(lower_expr(*unary_op.operand)?)))
+        }
+        py::Expr::Lambda(lambda) => lower_lambda(lambda),
+        py::Expr::Generator(generator) => lower_generator(generator),
+        py::Expr::Subscript(subscript) => Ok(Expr::Subscript {
+            value: Box::new(lower_expr(*subscript.value)?),
+            index: Box::new(lower_expr(*subscript.slice)?),
+        }),
+        py::Expr::Attribute(attribute) => Ok(Expr::Attribute {
+            value: Box::new(lower_expr(*attribute.value)?),
+            attr: attribute.attr.to_string(),
+        }),
+        py::Expr::Slice(slice) => lower_slice(slice),
+        unsupported => Err(unsupported_error("expression", &unsupported)),
+    }
+}
+
+fn lower_slice(slice: py::ExprSlice) -> Result<Expr, ShellError> {
+    if slice.step.is_some() {
+        return Err(unsupported_message(
+            "slice",
+            "slice steps are not supported yet",
+        ));
+    }
+    Ok(Expr::Slice {
+        lower: slice
+            .lower
+            .map(|value| lower_expr(*value).map(Box::new))
+            .transpose()?,
+        upper: slice
+            .upper
+            .map(|value| lower_expr(*value).map(Box::new))
+            .transpose()?,
+    })
+}
+
+fn lower_lambda(lambda: py::ExprLambda) -> Result<Expr, ShellError> {
+    let Some(parameters) = lambda.parameters else {
+        return Err(unsupported_message(
+            "lambda",
+            "lambda parameters are required",
+        ));
+    };
+    if parameters.vararg.is_some()
+        || parameters.kwarg.is_some()
+        || !parameters.kwonlyargs.is_empty()
+    {
+        return Err(unsupported_message(
+            "lambda",
+            "lambda supports only positional parameters for now",
+        ));
+    }
+    let mut params = Vec::with_capacity(parameters.posonlyargs.len() + parameters.args.len());
+    for parameter in parameters.posonlyargs.iter().chain(parameters.args.iter()) {
+        if parameter.default.is_some() || parameter.parameter.annotation.is_some() {
+            return Err(unsupported_message(
+                "lambda",
+                "lambda defaults and annotations are not supported yet",
+            ));
+        }
+        let name = parameter.parameter.name.to_string();
+        if params.iter().any(|param| param == &name) {
+            return Err(unsupported_message(
+                "lambda",
+                format!("duplicate lambda parameter `{name}`"),
+            ));
+        }
+        params.push(name);
+    }
+    Ok(Expr::Lambda {
+        params,
+        body: Box::new(lower_expr(*lambda.body)?),
+    })
+}
+
+fn lower_number(number: py::Number) -> Result<Expr, ShellError> {
+    match number {
+        py::Number::Int(value) => Ok(Expr::Int(value.to_string())),
+        py::Number::Float(value) => Ok(Expr::Float(value)),
+        py::Number::Complex { .. } => Err(unsupported_message(
+            "number literal",
+            "complex numbers are not supported yet",
+        )),
+    }
+}
+
+fn lower_compare(compare: py::ExprCompare) -> Result<Expr, ShellError> {
+    let ops = compare
+        .ops
+        .into_vec()
+        .into_iter()
+        .map(lower_compare_op)
+        .collect::<Result<Vec<_>, _>>()?;
+    let comparators = compare
+        .comparators
+        .into_vec()
+        .into_iter()
+        .map(lower_expr)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Expr::Compare {
+        left: Box::new(lower_expr(*compare.left)?),
+        ops,
+        comparators,
+    })
+}
+
+fn lower_compare_op(op: py::CmpOp) -> Result<CompareOp, ShellError> {
+    match op {
+        py::CmpOp::Eq => Ok(CompareOp::Eq),
+        py::CmpOp::NotEq => Ok(CompareOp::NotEq),
+        py::CmpOp::Lt => Ok(CompareOp::Lt),
+        py::CmpOp::LtE => Ok(CompareOp::LtE),
+        py::CmpOp::Gt => Ok(CompareOp::Gt),
+        py::CmpOp::GtE => Ok(CompareOp::GtE),
+        py::CmpOp::In => Ok(CompareOp::In),
+        py::CmpOp::NotIn => Ok(CompareOp::NotIn),
+        py::CmpOp::Is => Ok(CompareOp::Is),
+        py::CmpOp::IsNot => Ok(CompareOp::IsNot),
+    }
+}
+
+fn lower_bool_op(bool_op: py::ExprBoolOp) -> Result<Expr, ShellError> {
+    let op = match bool_op.op {
+        py::BoolOp::And => BoolOp::And,
+        py::BoolOp::Or => BoolOp::Or,
+    };
+    let values = bool_op
+        .values
+        .into_iter()
+        .map(lower_expr)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Expr::BoolOp { op, values })
+}
+
+fn lower_fstring(fstring: py::ExprFString) -> Result<Expr, ShellError> {
+    let mut parts = Vec::new();
+    for element in fstring.value.elements() {
+        match element {
+            py::InterpolatedStringElement::Literal(literal) => {
+                parts.push(FormattedStringPart::Literal(literal.value.to_string()));
+            }
+            py::InterpolatedStringElement::Interpolation(interpolation) => {
+                if interpolation.debug_text.is_some() {
+                    return Err(unsupported_message(
+                        "f-string",
+                        "debug expressions are not supported",
+                    ));
+                }
+                let expr = lower_expr(interpolation.expression.as_ref().clone())?;
+                if let Some(format_spec) = interpolation.format_spec.as_ref() {
+                    parts.push(FormattedStringPart::Formatted {
+                        expr,
+                        spec: lower_fstring_format_spec(format_spec)?,
+                    });
+                } else {
+                    parts.push(FormattedStringPart::Expr(expr));
+                }
+            }
+        }
+    }
+    Ok(Expr::FormattedString(parts))
+}
+
+fn lower_fstring_format_spec(
+    format_spec: &py::InterpolatedStringFormatSpec,
+) -> Result<StoneFormatSpec, ShellError> {
+    let mut spec = String::new();
+    for element in &format_spec.elements {
+        match element {
+            py::InterpolatedStringElement::Literal(literal) => {
+                spec.push_str(&literal.value);
+            }
+            py::InterpolatedStringElement::Interpolation(_) => {
+                return Err(unsupported_message(
+                    "f-string",
+                    "dynamic format specifiers are not supported",
+                ));
+            }
+        }
+    }
+    if let Some(precision) = spec
+        .strip_prefix('.')
+        .and_then(|rest| rest.strip_suffix('f'))
+    {
+        let precision = precision.parse::<usize>().map_err(|err| {
+            unsupported_message(
+                "f-string",
+                format!("invalid fixed precision `{spec}`: {err}"),
+            )
+        })?;
+        return Ok(StoneFormatSpec::Fixed { precision });
+    }
+    if spec.starts_with('0') && spec.ends_with('d') && spec.len() > 2 {
+        let width = spec[1..spec.len() - 1].parse::<usize>().map_err(|err| {
+            unsupported_message("f-string", format!("invalid zero-pad spec `{spec}`: {err}"))
+        })?;
+        return Ok(StoneFormatSpec::ZeroPadInt { width });
+    }
+    Err(unsupported_message(
+        "f-string",
+        format!("unsupported format specifier `{spec}`"),
+    ))
+}
+
+fn lower_generator(generator: py::ExprGenerator) -> Result<Expr, ShellError> {
+    let [comprehension] = generator.generators.as_slice() else {
+        return Err(unsupported_message(
+            "generator expression",
+            "only one generator clause is supported yet",
+        ));
+    };
+    if comprehension.is_async {
+        return Err(unsupported_message(
+            "generator expression",
+            "async generator clauses are not supported",
+        ));
+    }
+    if !comprehension.ifs.is_empty() {
+        return Err(unsupported_message(
+            "generator expression",
+            "if filters are not supported yet",
+        ));
+    }
+    let py::Expr::Name(target) = &comprehension.target else {
+        return Err(unsupported_message(
+            "generator expression",
+            "only simple name generator targets are supported yet",
+        ));
+    };
+
+    Ok(Expr::Generator {
+        target: target.id.to_string(),
+        iter: Box::new(lower_expr(comprehension.iter.clone())?),
+        elt: Box::new(lower_expr(*generator.elt)?),
+    })
+}
+
+fn lower_list_comprehension(list_comp: py::ExprListComp) -> Result<Expr, ShellError> {
+    let [comprehension] = list_comp.generators.as_slice() else {
+        return Err(unsupported_message(
+            "list comprehension",
+            "only one for clause is supported yet",
+        ));
+    };
+    if comprehension.is_async {
+        return Err(unsupported_message(
+            "list comprehension",
+            "async list comprehensions are not supported",
+        ));
+    }
+    let py::Expr::Name(target) = &comprehension.target else {
+        return Err(unsupported_message(
+            "list comprehension",
+            "only simple name targets are supported yet",
+        ));
+    };
+
+    Ok(Expr::ListComprehension {
+        target: target.id.to_string(),
+        iter: Box::new(lower_expr(comprehension.iter.clone())?),
+        elt: Box::new(lower_expr(*list_comp.elt)?),
+        filters: comprehension
+            .ifs
+            .iter()
+            .cloned()
+            .map(lower_expr)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn lower_dict_comprehension(dict_comp: py::ExprDictComp) -> Result<Expr, ShellError> {
+    let [comprehension] = dict_comp.generators.as_slice() else {
+        return Err(unsupported_message(
+            "dict comprehension",
+            "only one for clause is supported",
+        ));
+    };
+    if comprehension.is_async {
+        return Err(unsupported_message(
+            "dict comprehension",
+            "async dict comprehensions are not supported",
+        ));
+    }
+    let py::Expr::Name(target) = &comprehension.target else {
+        return Err(unsupported_message(
+            "dict comprehension",
+            "only simple name targets are supported",
+        ));
+    };
+
+    Ok(Expr::DictComprehension {
+        target: target.id.to_string(),
+        iter: Box::new(lower_expr(comprehension.iter.clone())?),
+        key: Box::new(lower_expr(*dict_comp.key)?),
+        value: Box::new(lower_expr(*dict_comp.value)?),
+        filters: comprehension
+            .ifs
+            .iter()
+            .cloned()
+            .map(lower_expr)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn lower_dict(dict: py::ExprDict) -> Result<Expr, ShellError> {
+    let mut items = Vec::with_capacity(dict.items.len());
+    for item in dict.items {
+        let Some(key) = item.key else {
+            return Err(unsupported_message(
+                "record literal",
+                "dictionary spread is not supported yet",
+            ));
+        };
+
+        let key = match key {
+            py::Expr::StringLiteral(string) => string.value.to_string(),
+            py::Expr::NumberLiteral(number) => record_number_key(number.value)?,
+            py::Expr::BooleanLiteral(boolean) => boolean.value.to_string(),
+            unsupported => {
+                return Err(unsupported_message(
+                    "record literal",
+                    format!("unsupported record key expression: {unsupported:?}"),
+                ));
+            }
+        };
+
+        items.push((key, lower_expr(item.value)?));
+    }
+
+    Ok(Expr::Record(items))
+}
+
+fn record_number_key(number: py::Number) -> Result<String, ShellError> {
+    match number {
+        py::Number::Int(value) => Ok(value.to_string()),
+        py::Number::Float(value) => Ok(value.to_string()),
+        py::Number::Complex { .. } => Err(unsupported_message(
+            "record literal",
+            "complex number keys are not supported yet",
+        )),
+    }
+}
+
+fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
+    let positional = call
+        .arguments
+        .args
+        .into_vec()
+        .into_iter()
+        .map(lower_expr)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    match *call.func {
+        py::Expr::Name(name) => {
+            let named = call
+                .arguments
+                .keywords
+                .into_vec()
+                .into_iter()
+                .map(|keyword| {
+                    let Some(name) = keyword.arg else {
+                        return Err(unsupported_message(
+                            "command call",
+                            "keyword spread is not supported yet",
+                        ));
+                    };
+                    Ok((name.to_string(), lower_expr(keyword.value)?))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Expr::Call(Call {
+                name: name.id.to_string(),
+                positional,
+                named,
+            }))
+        }
+        py::Expr::Attribute(attribute) => {
+            if !call.arguments.keywords.is_empty() {
+                return Err(unsupported_message(
+                    "method call",
+                    "method keyword arguments are not supported yet",
+                ));
+            }
+            let method = attribute.attr.to_string();
+            if !matches!(
+                method.as_str(),
+                "append"
+                    | "add"
+                    | "close"
+                    | "find"
+                    | "get"
+                    | "items"
+                    | "index"
+                    | "join"
+                    | "keys"
+                    | "lower"
+                    | "read"
+                    | "replace"
+                    | "strip"
+                    | "split"
+                    | "splitlines"
+                    | "startswith"
+                    | "endswith"
+                    | "upper"
+                    | "values"
+                    | "write"
+                    | "zfill"
+            ) {
+                return Err(unsupported_message(
+                    "method call",
+                    format!("unsupported method `{method}`"),
+                ));
+            }
+            Ok(Expr::MethodCall {
+                receiver: Box::new(lower_expr(*attribute.value)?),
+                method,
+                positional,
+            })
+        }
+        unsupported => Err(unsupported_message(
+            "command call",
+            format!("unsupported call target: {unsupported:?}"),
+        )),
+    }
+}
+
+fn unsupported_error(kind: &str, value: &impl std::fmt::Debug) -> ShellError {
+    unsupported_message(kind, format!("unsupported {kind}: {value:?}"))
+}
+
+fn unsupported_message(kind: &str, message: impl Into<String>) -> ShellError {
+    ShellError::Generic(
+        GenericError::new_internal(format!("unsupported Stone {kind}"), message.into())
+            .with_code("stone_script_unsupported"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        lower_source, AssignTarget, AugOp, BoolOp, Call, CompareOp, Expr, Program, Stmt, StoneType,
+    };
+
+    #[test]
+    fn lowers_command_call() {
+        let program = lower_source(r#"pwd()"#).expect("lower source");
+        assert_eq!(
+            program,
+            Program {
+                statements: vec![Stmt::Expr(Expr::Call(Call {
+                    name: "pwd".to_string(),
+                    positional: vec![],
+                    named: vec![],
+                }))],
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_assignment_and_bitwise_or() {
+        let program = lower_source("mask = left | right").expect("lower source");
+        assert_eq!(program.statements.len(), 1);
+        let Stmt::Assign { target, value } = &program.statements[0] else {
+            panic!("expected assignment");
+        };
+        assert_eq!(target, &AssignTarget::Name("mask".to_string()));
+        assert!(matches!(value, Expr::BitOr { .. }));
+    }
+
+    #[test]
+    fn lowers_integer_operator_expressions() {
+        for source in [
+            "value = a * b",
+            "value = a // b",
+            "value = a & b",
+            "value = a | b",
+            "value = a ^ b",
+            "value = a << b",
+            "value = a >> b",
+        ] {
+            lower_source(source).expect(source);
+        }
+    }
+
+    #[test]
+    fn lowers_unary_bitwise_invert() {
+        let program = lower_source("value = ~mask").expect("lower source");
+        let Stmt::Assign { value, .. } = &program.statements[0] else {
+            panic!("expected assignment");
+        };
+        assert!(matches!(value, Expr::Invert(_)));
+    }
+
+    #[test]
+    fn accepts_v0_literals_and_collections() {
+        let cases = [
+            ("None", Expr::None),
+            ("True", Expr::Bool(true)),
+            ("False", Expr::Bool(false)),
+            ("42", Expr::Int("42".to_string())),
+            ("1.5", Expr::Float(1.5)),
+            (r#""hello""#, Expr::String("hello".to_string())),
+            (
+                r#"[1, "two", False]"#,
+                Expr::List(vec![
+                    Expr::Int("1".to_string()),
+                    Expr::String("two".to_string()),
+                    Expr::Bool(false),
+                ]),
+            ),
+            (
+                r#"(1, "two", False)"#,
+                Expr::Tuple(vec![
+                    Expr::Int("1".to_string()),
+                    Expr::String("two".to_string()),
+                    Expr::Bool(false),
+                ]),
+            ),
+            (
+                r#"{"name": "demo", "kind": "file"}"#,
+                Expr::Record(vec![
+                    ("name".to_string(), Expr::String("demo".to_string())),
+                    ("kind".to_string(), Expr::String("file".to_string())),
+                ]),
+            ),
+            (
+                r#"{1: "one", 2.5: "two", True: "yes"}"#,
+                Expr::Record(vec![
+                    ("1".to_string(), Expr::String("one".to_string())),
+                    ("2.5".to_string(), Expr::String("two".to_string())),
+                    ("true".to_string(), Expr::String("yes".to_string())),
+                ]),
+            ),
+        ];
+
+        for (source, expected) in cases {
+            let program = lower_source(source).expect(source);
+            assert_eq!(
+                program,
+                Program {
+                    statements: vec![Stmt::Expr(expected)]
+                },
+                "source: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_agent_expression_features() {
+        let cases = [
+            (
+                r#"item["name"]"#,
+                Expr::Subscript {
+                    value: Box::new(Expr::Name("item".to_string())),
+                    index: Box::new(Expr::String("name".to_string())),
+                },
+            ),
+            (
+                "count >= 2",
+                Expr::Compare {
+                    left: Box::new(Expr::Name("count".to_string())),
+                    ops: vec![CompareOp::GtE],
+                    comparators: vec![Expr::Int("2".to_string())],
+                },
+            ),
+            (
+                r#""needle" in text"#,
+                Expr::Compare {
+                    left: Box::new(Expr::String("needle".to_string())),
+                    ops: vec![CompareOp::In],
+                    comparators: vec![Expr::Name("text".to_string())],
+                },
+            ),
+            (
+                "ready and not blocked",
+                Expr::BoolOp {
+                    op: BoolOp::And,
+                    values: vec![
+                        Expr::Name("ready".to_string()),
+                        Expr::Not(Box::new(Expr::Name("blocked".to_string()))),
+                    ],
+                },
+            ),
+        ];
+
+        for (source, expected) in cases {
+            let program = lower_source(source).expect(source);
+            assert_eq!(
+                program,
+                Program {
+                    statements: vec![Stmt::Expr(expected)]
+                },
+                "source: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_slices_and_python_helper_calls() {
+        let program = lower_source(
+            r#"items[1:]
+"a\nb".splitlines()
+",".join(["a", "b"])
+range(3)
+enumerate(items)
+read_json("/app/data.json")
+write_json("/work/out.json", {"ok": True})
+write_jsonl("/work/out.jsonl", [{"ok": True}])
+json_loads("{\"ok\": true}")
+json_dumps({"ok": True})
+"#,
+        )
+        .expect("lower helper calls");
+
+        assert_eq!(program.statements.len(), 10);
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Expr(Expr::Subscript { ref index, .. })
+                if matches!(index.as_ref(), Expr::Slice { .. })
+        ));
+    }
+
+    #[test]
+    fn accepts_simple_list_comprehensions() {
+        let program = lower_source(
+            r#"numbers = [int(text) for text in items if text.strip()]
+trimmed = [item.strip() for item in items]
+"#,
+        )
+        .expect("lower list comprehensions");
+
+        assert_eq!(program.statements.len(), 2);
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Assign {
+                value:
+                    Expr::ListComprehension {
+                        ref target,
+                        ref filters,
+                        ..
+                    },
+                ..
+            } if target == "text" && filters.len() == 1
+        ));
+    }
+
+    #[test]
+    fn accepts_for_augassign_and_method_calls() {
+        let program = lower_source(
+            r#"total = 0
+rows = []
+for line in open("/app/numbers.txt"):
+    total += int(line.strip())
+    rows.append(line.split(","))
+emit({"total": total, "rows": len(rows)})
+"#,
+        )
+        .expect("lower source");
+
+        assert_eq!(program.statements.len(), 4);
+        assert!(matches!(
+            program.statements[2],
+            Stmt::For {
+                ref targets,
+                ref body,
+                ..
+            } if targets == &vec!["line".to_string()]
+                && matches!(body[0], Stmt::AugAssign { op: AugOp::Add, .. })
+                && matches!(body[1], Stmt::Expr(Expr::MethodCall { .. }))
+        ));
+    }
+
+    #[test]
+    fn accepts_local_item_assignment_and_index_method() {
+        let program = lower_source(
+            r#"row = {}
+row["region"] = "west"
+items = ["a", "b"]
+items[1] = "bee"
+idx = items.index("bee")
+pos = "alpha beta".find("beta")
+for i, item in enumerate(items):
+    idx = i + 1
+"#,
+        )
+        .expect("lower source");
+
+        assert_eq!(program.statements.len(), 7);
+        assert!(matches!(
+            program.statements[1],
+            Stmt::Assign {
+                target: AssignTarget::Subscript {
+                    ref value,
+                    ..
+                },
+                ..
+            } if matches!(value.as_ref(), AssignTarget::Name(name) if name == "row")
+        ));
+        assert!(matches!(
+            program.statements[4],
+            Stmt::Assign {
+                value: Expr::MethodCall { ref method, .. },
+                ..
+            } if method == "index"
+        ));
+        assert!(matches!(
+            program.statements[5],
+            Stmt::Assign {
+                value: Expr::MethodCall { ref method, .. },
+                ..
+            } if method == "find"
+        ));
+        assert!(matches!(
+            program.statements[6],
+            Stmt::For {
+                ref targets,
+                ref body,
+                ..
+            } if targets == &vec!["i".to_string(), "item".to_string()]
+                && matches!(
+                    body[0],
+                    Stmt::Assign {
+                        value: Expr::Add { .. },
+                        ..
+                    }
+                )
+        ));
+    }
+
+    #[test]
+    fn accepts_common_python_shaped_ergonomics() {
+        let program = lower_source(
+            r#"a, b = line.split(",")
+message = f"{a}:{b}"
+lookup = {row["name"]: row["score"] for row in rows if row["score"]}
+while a != b:
+    break
+values = sorted([3, 1, 2])
+"#,
+        )
+        .expect("lower common ergonomics");
+
+        assert_eq!(program.statements.len(), 5);
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Assign {
+                target: AssignTarget::Tuple(ref targets),
+                ..
+            } if targets == &vec!["a".to_string(), "b".to_string()]
+        ));
+        assert!(matches!(
+            program.statements[1],
+            Stmt::Assign {
+                value: Expr::FormattedString(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            program.statements[2],
+            Stmt::Assign {
+                value: Expr::DictComprehension { .. },
+                ..
+            }
+        ));
+        assert!(matches!(program.statements[3], Stmt::While { .. }));
+    }
+
+    #[test]
+    fn accepts_nested_item_assignment() {
+        let program = lower_source(
+            r#"stats = {"alice": {"count": 1}}
+stats["alice"]["count"] += 1
+"#,
+        )
+        .expect("lower source");
+
+        assert!(matches!(
+            program.statements[1],
+            Stmt::AugAssign {
+                target: AssignTarget::Subscript {
+                    ref value,
+                    ..
+                },
+                ..
+            } if matches!(value.as_ref(), AssignTarget::Subscript { .. })
+        ));
+    }
+
+    #[test]
+    fn accepts_record_helper_methods() {
+        let program = lower_source(
+            r#"record = {"a": 1}
+value = record.get("a", 0)
+keys = record.keys()
+values = record.values()
+for key, value in record.items():
+    emit(key)
+"#,
+        )
+        .expect("lower source");
+
+        assert_eq!(program.statements.len(), 5);
+        assert!(matches!(
+            program.statements[4],
+            Stmt::For {
+                ref targets,
+                ..
+            } if targets == &vec!["key".to_string(), "value".to_string()]
+        ));
+    }
+
+    #[test]
+    fn accepts_pass_statement() {
+        let program = lower_source(
+            r#"if True:
+    pass
+else:
+    emit("unused")
+"#,
+        )
+        .expect("lower source");
+
+        assert!(matches!(
+            program.statements[0],
+            Stmt::If {
+                ref then_branch,
+                ..
+            } if matches!(then_branch.as_slice(), [Stmt::Pass])
+        ));
+    }
+
+    #[test]
+    fn accepts_typed_function_definition() {
+        let program = lower_source(
+            r#"def normalize(text: str) -> str:
+    parts = text.split("/")
+    return parts[2] + "-" + parts[0] + "-" + parts[1]
+
+value = normalize("01/02/2024")
+"#,
+        )
+        .expect("lower source");
+
+        let Stmt::FunctionDef(function) = &program.statements[0] else {
+            panic!("expected function definition");
+        };
+        assert_eq!(function.name, "normalize");
+        assert_eq!(function.params.len(), 1);
+        assert_eq!(function.params[0].name, "text");
+        assert_eq!(function.params[0].ty, StoneType::Str);
+        assert_eq!(function.return_type, StoneType::Str);
+        assert!(matches!(function.body.last(), Some(Stmt::Return(Some(_)))));
+    }
+
+    #[test]
+    fn accepts_no_arg_procedure_definition_without_annotations() {
+        let program = lower_source(
+            r#"def solve():
+    pass
+
+solve()
+"#,
+        )
+        .expect("lower source");
+
+        let Stmt::FunctionDef(function) = &program.statements[0] else {
+            panic!("expected function definition");
+        };
+        assert_eq!(function.name, "solve");
+        assert!(function.params.is_empty());
+        assert_eq!(function.return_type, StoneType::None);
+    }
+
+    #[test]
+    fn accepts_untyped_function_with_parameters_as_any() {
+        let program = lower_source(
+            r#"def normalize(text):
+    return text
+"#,
+        )
+        .expect("lower source");
+        let Stmt::FunctionDef(function) = &program.statements[0] else {
+            panic!("expected function definition");
+        };
+        assert_eq!(function.params[0].ty, StoneType::Any);
+        assert_eq!(function.return_type, StoneType::Any);
+    }
+
+    #[test]
+    fn accepts_minimal_if_else() {
+        let program = lower_source(
+            r#"if item["ready"]:
+    emit({"status": "ready"})
+else:
+    emit({"status": "blocked"})
+"#,
+        )
+        .expect("lower if");
+
+        assert_eq!(program.statements.len(), 1);
+        let Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } = &program.statements[0]
+        else {
+            panic!("expected if statement");
+        };
+        assert!(matches!(condition, Expr::Subscript { .. }));
+        assert_eq!(then_branch.len(), 1);
+        assert_eq!(else_branch.len(), 1);
+    }
+
+    #[test]
+    fn accepts_elif_break_continue_and_with() {
+        let program = lower_source(
+            r#"with open("/app/input.txt") as f:
+    for line in f:
+        if line == "stop":
+            break
+        elif line == "skip":
+            continue
+        else:
+            emit(line)
+"#,
+        )
+        .expect("lower control flow");
+
+        let [Stmt::With {
+            target,
+            context,
+            body,
+        }] = program.statements.as_slice()
+        else {
+            panic!("expected with statement");
+        };
+        assert_eq!(target.as_deref(), Some("f"));
+        assert!(matches!(context, Expr::Call(call) if call.name == "open"));
+        let Stmt::For { body: for_body, .. } = &body[0] else {
+            panic!("expected for in with body");
+        };
+        let Stmt::If { else_branch, .. } = &for_body[0] else {
+            panic!("expected if in for body");
+        };
+        assert!(matches!(else_branch[0], Stmt::If { .. }));
+    }
+
+    #[test]
+    fn accepts_v0_call_arguments() {
+        let program =
+            lower_source(r#"save(["a"], "/work/out.json", force=True)"#).expect("lower source");
+
+        assert_eq!(
+            program,
+            Program {
+                statements: vec![Stmt::Expr(Expr::Call(Call {
+                    name: "save".to_string(),
+                    positional: vec![
+                        Expr::List(vec![Expr::String("a".to_string())]),
+                        Expr::String("/work/out.json".to_string()),
+                    ],
+                    named: vec![("force".to_string(), Expr::Bool(true))],
+                }))]
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_sum_int_generator_expression() {
+        let program = lower_source(r#"sum(int(line) for line in open("/app/numbers.txt"))"#)
+            .expect("lower source");
+
+        let Stmt::Expr(Expr::Call(call)) = &program.statements[0] else {
+            panic!("expected call");
+        };
+        assert_eq!(call.name, "sum");
+        assert!(matches!(call.positional[0], Expr::Generator { .. }));
+    }
+
+    #[test]
+    fn rejects_unsupported_python_statements() {
+        for source in [
+            "import os",
+            "async def f():\n    pass",
+            "class C:\n    pass",
+            "try:\n    x = 1\nexcept Exception:\n    x = 2",
+        ] {
+            assert_unsupported(source);
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_python_expressions() {
+        for source in [
+            "x if ok else y",
+            "[x for a, b in items]",
+            "(x for x in items if x)",
+            "b'abc'",
+        ] {
+            assert_unsupported(source);
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_stone_shapes() {
+        for source in [
+            "obj.method()",
+            "module.command()",
+            "{name: \"demo\"}",
+            "f(*args)",
+            "f(**kwargs)",
+            "a = b = 1",
+            "obj.items[0] = 1",
+            "for a, (b, c) in items:\n    emit(a)",
+            "for item in items:\n    emit(item)\nelse:\n    emit(None)",
+        ] {
+            assert_unsupported(source);
+        }
+    }
+
+    fn assert_unsupported(source: &str) {
+        let err = lower_source(source).expect_err(source);
+        let debug = format!("{err:?}");
+        assert!(
+            debug.contains("stone_script_unsupported"),
+            "source: {source}\nunexpected error: {debug}"
+        );
+    }
+}

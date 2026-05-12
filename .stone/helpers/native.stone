@@ -1,0 +1,4 @@
+# Dynamic Stone helper registrations for native shared-library diagnostics.
+hook("run.after_failure", family="native", handler="native.after_failure", priority=100)
+hook("run.after_failure", family="python", handler="native.after_failure", priority=40)
+hook("run.after_failure", family="generic", handler="native.after_failure", priority=20)

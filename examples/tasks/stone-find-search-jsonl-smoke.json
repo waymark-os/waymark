@@ -1,0 +1,17 @@
+{
+  "version": 0,
+  "id": "stone-find-search-jsonl-smoke",
+  "description": "Exercise shell-native find/search typed records and JSONL boundary formatting through Stone.",
+  "runtime": {
+    "guest": "waymark",
+    "frontend": "stone"
+  },
+  "script": {
+    "source": "answer = open(\"answer.txt\", \"w\")\nanswer.write(\"alpha\\nneedle here\\n\")\nnotes = open(\"notes.txt\", \"w\")\nnotes.write(\"no match\\n\")\nemit({\"files\": find(\".\", name_contains=\"answer\"), \"matches\": search(\".\", \"needle\")})"
+  },
+  "input": null,
+  "limits": {
+    "timeout_ms": 5000
+  },
+  "artifacts": []
+}

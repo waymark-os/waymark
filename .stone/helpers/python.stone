@@ -1,0 +1,3 @@
+# Dynamic Stone helper registrations for Python and pip command diagnostics.
+hook("run.after_failure", family="python", handler="python.after_failure", priority=100)
+hook("run.after_failure", family="python/pip", handler="python.pip_after_failure", priority=110)

@@ -1,0 +1,21 @@
+[package]
+name = "waymark-runtime"
+edition = "2021"
+license.workspace = true
+
+[lib]
+name = "waymark_runtime"
+
+[dependencies]
+asset-image = { path = "../asset-image" }
+waymark-runtime-support = { path = "../waymark-runtime-support" }
+memchr = "2.8.0"
+nu-engine = { version = "0.112.2", default-features = false }
+nu-parser = "0.112.2"
+nu-protocol = { version = "0.112.2", default-features = false }
+ruff_python_parser = { git = "https://github.com/astral-sh/ruff", tag = "0.15.11", package = "ruff_python_parser" }
+ruff_python_ast = { git = "https://github.com/astral-sh/ruff", tag = "0.15.11", package = "ruff_python_ast" }
+serde_json = "1.0"
+
+[features]
+default = []

@@ -1,0 +1,17 @@
+{
+  "version": 0,
+  "id": "stone-control-expressions-smoke",
+  "description": "Exercise Python-like Stone control expressions over typed internal values.",
+  "runtime": {
+    "guest": "waymark",
+    "frontend": "stone"
+  },
+  "script": {
+    "source": "case = {\"name\": \"sample-17\", \"score\": 87, \"tags\": [\"logic\", \"safe\"], \"blocked\": False}\nif case[\"score\"] >= 80 and not case[\"blocked\"]:\n    emit({\"name\": case[\"name\"], \"bucket\": \"pass\", \"primary_tag\": case[\"tags\"][0], \"tail_tag\": case[\"tags\"][-1]})\nelse:\n    emit({\"name\": case[\"name\"], \"bucket\": \"review\"})"
+  },
+  "input": null,
+  "limits": {
+    "timeout_ms": 5000
+  },
+  "artifacts": []
+}

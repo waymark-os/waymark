@@ -1,0 +1,32 @@
+{
+  "version": 0,
+  "id": "nu-compat-smoke",
+  "description": "Exercise the explicit Nu compatibility frontend through the task contract.",
+  "runtime": {
+    "guest": "waymark",
+    "frontend": "nu"
+  },
+  "script": {
+    "source": "get items | where kind 'file' | sort name | get name"
+  },
+  "input": {
+    "items": [
+      {
+        "name": "b.txt",
+        "kind": "file"
+      },
+      {
+        "name": "tmp",
+        "kind": "dir"
+      },
+      {
+        "name": "a.txt",
+        "kind": "file"
+      }
+    ]
+  },
+  "limits": {
+    "timeout_ms": 5000
+  },
+  "artifacts": []
+}

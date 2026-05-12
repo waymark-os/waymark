@@ -1,0 +1,3 @@
+# Dynamic Stone helper registrations for build and long-running command timeouts.
+hook("run.after_timeout", family="build", handler="build.after_timeout", priority=100)
+hook("run.after_timeout", family="generic", handler="build.after_timeout", priority=20)

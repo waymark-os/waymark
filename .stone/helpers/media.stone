@@ -1,0 +1,3 @@
+# Dynamic Stone helper registrations for media command diagnostics.
+hook("run.after_success", family="generic", argv0=["ffmpeg","ffprobe","yt-dlp","youtube-dl"], argv0_prefix=["ffmpeg-","ffprobe-"], handler="media.after_success", priority=100)
+hook("run.after_failure", family="generic", argv0=["ffmpeg","ffprobe","yt-dlp","youtube-dl"], argv0_prefix=["ffmpeg-","ffprobe-"], handler="media.after_failure", priority=100)

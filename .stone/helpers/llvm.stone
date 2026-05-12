@@ -1,0 +1,3 @@
+# Dynamic Stone helper registrations for LLVM and debug-metadata diagnostics.
+hook("run.after_success", family="llvm", handler="llvm.after_success", priority=100)
+hook("run.after_failure", family="llvm", handler="llvm.after_failure", priority=100)

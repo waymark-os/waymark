@@ -1,0 +1,12 @@
+items = [
+    {"kind": "file", "name": "beta.txt"},
+    {"kind": "dir", "name": "build"},
+    {"kind": "file", "name": "alpha.txt"},
+]
+
+names = []
+for item in sort(items, "name"):
+    if item["kind"] == "file":
+        names.append(item["name"])
+
+emit(names)

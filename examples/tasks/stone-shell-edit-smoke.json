@@ -1,0 +1,17 @@
+{
+  "version": 0,
+  "id": "stone-shell-edit-smoke",
+  "description": "Exercise shell-native file write, edit, read, and structured emit through Stone.",
+  "runtime": {
+    "guest": "waymark",
+    "frontend": "stone"
+  },
+  "script": {
+    "source": "answer = open(\"answer.txt\", \"w\")\nanswer.write(\"hello world\")\nresult = edit(\"answer.txt\", \"hello\", \"goodbye\")\ncontent = cat(\"answer.txt\")\nif result[\"replacements\"] == 1 and content == \"goodbye world\":\n    emit({\"ok\": True, \"content\": content, \"replacements\": result[\"replacements\"]})\nelse:\n    emit({\"ok\": False, \"content\": content})"
+  },
+  "input": null,
+  "limits": {
+    "timeout_ms": 5000
+  },
+  "artifacts": []
+}

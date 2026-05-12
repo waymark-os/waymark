@@ -1,0 +1,17 @@
+{
+  "version": 0,
+  "id": "stone-record-selection-smoke",
+  "description": "Exercise Stone branching and subscript access for a small record-selection task.",
+  "runtime": {
+    "guest": "waymark",
+    "frontend": "stone"
+  },
+  "script": {
+    "source": "items = [{\"name\": \"alpha\", \"score\": 72}, {\"name\": \"beta\", \"score\": 91}, {\"name\": \"gamma\", \"score\": 88}]\nbest = items[1]\nrunner_up = items[-1]\nif best[\"score\"] > runner_up[\"score\"] and best[\"name\"] != runner_up[\"name\"]:\n    emit({\"selected\": best[\"name\"], \"score\": best[\"score\"], \"margin\": \"positive\"})\nelse:\n    emit({\"selected\": runner_up[\"name\"], \"score\": runner_up[\"score\"], \"margin\": \"fallback\"})"
+  },
+  "input": null,
+  "limits": {
+    "timeout_ms": 5000
+  },
+  "artifacts": []
+}

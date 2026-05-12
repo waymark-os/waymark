@@ -1,0 +1,19 @@
+{
+  "version": 0,
+  "id": "agent-model-smoke",
+  "runtime": {
+    "frontend": "agent"
+  },
+  "agent": {
+    "max_turns": 4,
+    "model": "local-model",
+    "task": "Create /work/answer.txt containing Hello, world!"
+  },
+  "artifacts": [
+    {
+      "name": "answer",
+      "guest_path": "/work/answer.txt",
+      "kind": "text"
+    }
+  ]
+}

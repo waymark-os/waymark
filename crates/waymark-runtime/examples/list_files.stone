@@ -1,0 +1,5 @@
+names = []
+for item in ls("."):
+    if item["type"] == "file":
+        names.append(item["name"])
+emit(names)
