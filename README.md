@@ -9,6 +9,11 @@ designed to run as an ordinary POSIX-oriented process on the host, in containers
 and inside agent sandboxes that provide the expected filesystem and process
 interfaces.
 
+Waymark Shell is still a preview implementation. The current runtime deliberately
+reuses selected Nushell components for typed values, command registration, JSON
+conversion, and the compatibility frontend while Stone and the public `waymark`
+surface evolve.
+
 ## Design Philosophy
 
 An operating system exists to make computing resources easy to use. The earliest
@@ -129,10 +134,16 @@ cargo build -p waymark
 cargo build --release -p waymark --target x86_64-unknown-linux-musl
 ```
 
+Use the musl target as the default release artifact for distribution. The normal
+debug build remains useful for local development.
+
 The default build should stay lightweight and run anywhere a normal POSIX-style
 process can run. Container, sandbox, and bridge integrations should remain
 explicit adapter boundaries rather than becoming required for `cargo build -p
 waymark`.
+
+See [docs/BUILD_INSTALL.md](./docs/BUILD_INSTALL.md) for dependencies, release
+builds, and installation notes.
 
 ## Repository Layout
 

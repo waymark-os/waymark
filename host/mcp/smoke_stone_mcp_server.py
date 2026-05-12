@@ -43,8 +43,9 @@ def resolve_waymark_bin(path: Path | None) -> Path:
     if path is not None:
         return path.resolve()
     candidates = [
-        ROOT / "target" / "debug" / "waymark",
+        ROOT / "target" / "x86_64-unknown-linux-musl" / "release" / "waymark",
         ROOT / "target" / "release" / "waymark",
+        ROOT / "target" / "debug" / "waymark",
     ]
     for candidate in candidates:
         if candidate.is_file():
@@ -52,7 +53,10 @@ def resolve_waymark_bin(path: Path | None) -> Path:
     found = shutil.which("waymark")
     if found:
         return Path(found)
-    raise SystemExit("waymark binary not found; build with `cargo build -p waymark`")
+    raise SystemExit(
+        "waymark binary not found; build with "
+        "`cargo build --release -p waymark --target x86_64-unknown-linux-musl`"
+    )
 
 
 def write_message(stream: BinaryIO, message: dict[str, Any]) -> None:

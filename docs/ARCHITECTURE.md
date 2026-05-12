@@ -12,3 +12,9 @@ Waymark Shell is split into three layers:
 `crates/waymark` package provides the CLI boundary, and
 `crates/waymark-runtime-support` contains small startup/process utilities shared
 by the CLI and runtime.
+
+This is a preview implementation. It currently reuses selected Nushell crates
+for typed values, engine state, command registration, JSON conversion, and the
+explicit `--nu` compatibility frontend. Stone and the public `waymark` command
+are the product surface; Nushell reuse is an implementation choice, not a
+separate user-facing shell contract.

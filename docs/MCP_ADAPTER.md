@@ -7,13 +7,13 @@ MCP is one transport.
 ## Build
 
 ```sh
-cargo build -p waymark
+cargo build --release -p waymark --target x86_64-unknown-linux-musl
 ```
 
 ## Run The Adapter
 
 ```sh
-WAYMARK_STONE_BIN="$PWD/target/debug/waymark" \
+WAYMARK_STONE_BIN="$PWD/target/x86_64-unknown-linux-musl/release/waymark" \
 WAYMARK_STONE_CWD="$PWD" \
 WAYMARK_STONE_MCP_TRACE="$PWD/target/stone-mcp.jsonl" \
 python3 host/mcp/stone_mcp_server.py

@@ -8,7 +8,7 @@ to coding agents.
 Run the MCP server over stdio:
 
 ```sh
-WAYMARK_STONE_BIN=/workspace/waymark/target/debug/waymark \
+WAYMARK_STONE_BIN=/workspace/waymark/target/x86_64-unknown-linux-musl/release/waymark \
 WAYMARK_STONE_CWD=/app \
 WAYMARK_STONE_MCP_TRACE=/trace/stone-mcp.jsonl \
 python3 /workspace/waymark/host/mcp/stone_mcp_server.py
@@ -31,7 +31,7 @@ Generate a Codex `config.toml` for an eval container:
 python3 /workspace/waymark/host/mcp/write_codex_stone_mcp_config.py \
   --out /tmp/codex-home/config.toml \
   --server /workspace/waymark/host/mcp/stone_mcp_server.py \
-  --waymark-bin /workspace/waymark/target/debug/waymark \
+  --waymark-bin /workspace/waymark/target/x86_64-unknown-linux-musl/release/waymark \
   --cwd /app \
   --trace /trace/stone-mcp.jsonl
 ```

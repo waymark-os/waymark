@@ -733,6 +733,7 @@ def resolve_waymark_bin() -> str:
         return env_path
     root = repo_root()
     candidates = [
+        root / "target" / "x86_64-unknown-linux-musl" / "release" / "waymark",
         root / "target" / "release" / "waymark",
         root / "target" / "debug" / "waymark",
     ]
