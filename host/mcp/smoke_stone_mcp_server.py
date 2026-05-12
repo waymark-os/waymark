@@ -159,6 +159,36 @@ def run_smoke(args: argparse.Namespace, app_dir: Path, work_dir: Path) -> dict[s
         if eval_result.get("value") != 7:
             raise RuntimeError(f"stone_eval returned unexpected value: {eval_result!r}")
 
+        bind_result = client.call_tool(
+            "stone_eval",
+            {
+                "source": (
+                    "rows = [1, 2, 3]\n"
+                    "def plus_one(value: int) -> int:\n"
+                    "    return value + 1\n"
+                    "print(len(rows))"
+                )
+            },
+        )
+        require_ok("stone_eval session bind", bind_result)
+        if bind_result.get("value") != 3:
+            raise RuntimeError(f"stone_eval session bind returned unexpected value: {bind_result!r}")
+        bound_names = (
+            bind_result.get("diagnostics", {})
+            .get("session", {})
+            .get("bound", [])
+        )
+        if bound_names != ["plus_one", "rows"]:
+            raise RuntimeError(f"stone_eval session bind did not report bound names: {bind_result!r}")
+
+        reuse_result = client.call_tool(
+            "stone_eval",
+            {"source": 'rows.append(4)\nprint({"n": len(rows), "v": plus_one(4)})'},
+        )
+        require_ok("stone_eval session reuse", reuse_result)
+        if reuse_result.get("value") != {"n": 4, "v": 5}:
+            raise RuntimeError(f"stone_eval session reuse returned unexpected value: {reuse_result!r}")
+
         call_result = client.call_tool(
             "stone_call",
             {"name": "read_json", "args": {"path": "package.json"}, "cwd": str(app_dir)},
@@ -193,6 +223,7 @@ def run_smoke(args: argparse.Namespace, app_dir: Path, work_dir: Path) -> dict[s
             "stone_eval": {
                 "value": eval_result.get("value"),
                 "backend": eval_result.get("diagnostics", {}).get("backend"),
+                "session_reuse": reuse_result.get("value"),
             },
             "stone_call": {"value": call_result.get("value"), "effects": call_result.get("effects")},
             "stone_describe": {"kind": describe_result.get("value", {}).get("kind")},

@@ -17,7 +17,15 @@ import write_codex_stone_mcp_config
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_PROMPT = "Use the available Stone MCP tools to inspect the workspace, then summarize what you found."
+DEFAULT_PROMPT = (
+    "Use the available Stone MCP tools to inspect the workspace, then summarize what you found. "
+    "The warm Stone session keeps top-level value and function bindings across stone_eval calls; "
+    "bind intermediate data once and reuse names later instead of rereading files. "
+    "A stone_eval source can be a multi-line script like python -c or bash -c. "
+    "For large values, emit compact len/head/tail summaries; stone_eval returns a peek "
+    "by default and allow_large_output=true forces the full emitted value. "
+    "Open file handles do not persist across calls."
+)
 
 
 def parse_args() -> argparse.Namespace:

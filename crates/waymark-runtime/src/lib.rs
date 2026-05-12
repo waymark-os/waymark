@@ -39,6 +39,7 @@ pub struct StoneGuest {
     stack: Stack,
     work_dir: PathBuf,
     task_scope: TaskScope,
+    stone_session: stone_eval::StoneSession,
 }
 
 const LAST_RESULT_ENV: &str = "WAYMARK_LAST_RESULT_JSON";
@@ -57,6 +58,7 @@ impl StoneGuest {
             stack,
             work_dir: start_dir,
             task_scope: TaskScope::default(),
+            stone_session: stone_eval::StoneSession::default(),
         })
     }
 
@@ -150,11 +152,12 @@ impl StoneGuest {
         input: PipelineData,
     ) -> JsonValue {
         let response = if frontend == FrontendKind::Stone {
-            match stone_frontend::eval_stone_source_with_output(
+            match stone_frontend::eval_stone_source_with_output_and_session(
                 &self.engine_state,
                 &mut self.stack,
                 source,
                 input,
+                &mut self.stone_session,
             ) {
                 Ok(output) => {
                     match json::pipeline_to_json_value(output.pipeline, Span::unknown()) {
@@ -214,6 +217,7 @@ impl StoneGuest {
             self.stack
                 .set_cwd(&self.work_dir)
                 .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+            self.stone_session = stone_eval::StoneSession::default();
             return Ok(());
         }
 
@@ -229,6 +233,7 @@ impl StoneGuest {
             self.stack
                 .set_cwd(&self.work_dir)
                 .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+            self.stone_session = stone_eval::StoneSession::default();
             Ok(())
         }
     }
@@ -404,9 +409,14 @@ impl StoneGuest {
             FrontendKind::Nu => {
                 NuFrontend.eval(&mut self.engine_state, &mut self.stack, source, input)
             }
-            FrontendKind::Stone => {
-                StoneFrontend.eval(&mut self.engine_state, &mut self.stack, source, input)
-            }
+            FrontendKind::Stone => stone_frontend::eval_stone_source_with_output_and_session(
+                &self.engine_state,
+                &mut self.stack,
+                source,
+                input,
+                &mut self.stone_session,
+            )
+            .map(|output| output.pipeline),
             FrontendKind::Python => Err(ShellError::Generic(
                 GenericError::new_internal(
                     "unsupported command frontend",
@@ -627,6 +637,131 @@ emit(names)"#,
             second["value"]["cwd"],
             json!(start_dir.display().to_string())
         );
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn stone_top_level_bindings_persist_across_guest_calls() -> Result<(), ShellError> {
+        let start_dir = test_root("stone-session-bindings");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+        fs::write(start_dir.join("items.csv"), "name,count\na,1\nb,2\n").expect("write csv");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let first = guest.stone_command_response(
+            r#"rows = read_csv("items.csv")
+total = 0
+for row in rows:
+    total += int(row["count"])
+emit({"loaded": len(rows), "total": total})"#,
+        );
+        assert_eq!(first["ok"], json!(true));
+        assert_eq!(first["value"], json!({"loaded": 2, "total": 3}));
+        assert_eq!(
+            first["diagnostics"]["session"]["bound"],
+            json!(["rows", "total"])
+        );
+
+        let second = guest.stone_command_response(
+            r#"rows.append({"name": "c", "count": "4"})
+emit({"names": map(lambda row: row["name"], rows), "total": total})"#,
+        );
+        assert_eq!(second["ok"], json!(true));
+        assert_eq!(second["value"]["names"], json!(["a", "b", "c"]));
+        assert_eq!(second["value"]["total"], json!(3));
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn stone_assignment_only_response_reports_bound_names_without_value() -> Result<(), ShellError>
+    {
+        let start_dir = test_root("stone-session-binding-ack");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+        fs::write(start_dir.join("input.txt"), "large value").expect("write input");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let response = guest.stone_command_response(r#"a = read_text("input.txt")"#);
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["value"], json!(null));
+        assert_eq!(response["output"]["stdout"], json!(""));
+        assert_eq!(response["diagnostics"]["session"]["bound"], json!(["a"]));
+
+        let reuse = guest.stone_command_response(r#"emit(len(a))"#);
+        assert_eq!(reuse["ok"], json!(true));
+        assert_eq!(reuse["value"], json!(11));
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn stone_session_binding_ack_omits_loop_scratch_assignments() -> Result<(), ShellError> {
+        let start_dir = test_root("stone-session-binding-loop-scratch");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let response = guest.stone_command_response(
+            r#"rows = [{"name": "alpha"}, {"name": "beta"}]
+matches = []
+for row in rows:
+    name = row["name"]
+    if name.startswith("a"):
+        matches.append(row)
+emit(len(matches))"#,
+        );
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["value"], json!(1));
+        assert_eq!(
+            response["diagnostics"]["session"]["bound"],
+            json!(["matches", "rows"])
+        );
+
+        let reuse = guest.stone_command_response(r#"emit(name)"#);
+        assert_eq!(reuse["ok"], json!(true));
+        assert_eq!(reuse["value"], json!("beta"));
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn stone_file_handles_do_not_persist_across_guest_calls() -> Result<(), ShellError> {
+        let start_dir = test_root("stone-session-no-files");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+        fs::write(start_dir.join("input.txt"), "hello").expect("write input");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let first = guest.stone_command_response(r#"handle = open("input.txt")"#);
+        assert_eq!(first["ok"], json!(true));
+
+        let second = guest.stone_command_response(r#"emit(handle)"#);
+        assert_eq!(second["ok"], json!(false));
+        assert_eq!(second["error"]["code"], json!("stone_script_error"));
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn stone_functions_persist_across_guest_calls() -> Result<(), ShellError> {
+        let start_dir = test_root("stone-session-functions");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let first = guest.stone_command_response(
+            r#"def double(value: int) -> int:
+    return value * 2
+emit(double(3))"#,
+        );
+        assert_eq!(first["ok"], json!(true));
+        assert_eq!(first["value"], json!(6));
+
+        let second = guest.stone_command_response(r#"emit(double(5))"#);
+        assert_eq!(second["ok"], json!(true));
+        assert_eq!(second["value"], json!(10));
 
         cleanup_dir(&start_dir);
         Ok(())

@@ -23,6 +23,13 @@ The default backend is `warm-stdio`, which keeps one shell process alive and
 reuses it across calls. Set `WAYMARK_STONE_MCP_BACKEND=subprocess` for one-shot
 debugging.
 
+With the warm backend, Stone behaves like a shell session. Top-level value and
+function bindings persist across eval calls, so agents can bind intermediate
+records/lists once and refer to them later. One-shot subprocess mode starts fresh
+for each call. MCP `stone_eval` previews large emitted values by default; bind
+large values and emit `len`/`head`/`tail` summaries, or set
+`allow_large_output` when the full structured value is required.
+
 ## Smoke
 
 ```sh

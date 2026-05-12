@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 import json
+import io
 import os
 from pathlib import Path
 
@@ -26,6 +27,17 @@ class FakeBackend(server.StoneBackend):
 
 
 class StoneMcpServerTests(unittest.TestCase):
+    def test_stone_eval_tool_description_mentions_session_bindings(self) -> None:
+        description = next(
+            tool["description"] for tool in server.TOOLS if tool["name"] == "stone_eval"
+        )
+
+        self.assertIn("long-lived Stone session", description)
+        self.assertIn("bindings persist across stone_eval calls", description)
+        self.assertIn("multi-line script", description)
+        self.assertIn("allow_large_output=true", description)
+        self.assertIn("Open file handles do not persist", description)
+
     def test_normalizes_successful_stone_json_response(self) -> None:
         proc = subprocess.CompletedProcess(
             ["waymark"],
@@ -45,6 +57,19 @@ class StoneMcpServerTests(unittest.TestCase):
                 "diagnostics": {"exit_code": 0, "duration_ms": 7, "backend": "subprocess"},
             },
         )
+
+    def test_normalizes_subprocess_session_diagnostics(self) -> None:
+        proc = subprocess.CompletedProcess(
+            ["waymark"],
+            0,
+            stdout='{"cwd":"/workspace","ok":true,"diagnostics":{"session":{"bound":["rows"]}},"output":{"stderr":"","stdout":""},"value":null}\n',
+            stderr="",
+        )
+
+        result = server.normalize_stone_process_result(proc, 1024, 7)
+
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["diagnostics"]["session"], {"bound": ["rows"]})
 
     def test_normalizes_stone_error_from_stderr(self) -> None:
         proc = subprocess.CompletedProcess(
@@ -69,7 +94,10 @@ class StoneMcpServerTests(unittest.TestCase):
                 "ok": True,
                 "value": 3,
                 "output": {"stdout": "3\n", "stderr": ""},
-                "diagnostics": {"hot_loop": {"jsonl_fused_traces_executed": 1}},
+                "diagnostics": {
+                    "hot_loop": {"jsonl_fused_traces_executed": 1},
+                    "session": {"bound": ["rows"]},
+                },
             },
             "reset": {"ok": True},
         }
@@ -83,6 +111,51 @@ class StoneMcpServerTests(unittest.TestCase):
         self.assertEqual(
             result["diagnostics"]["hot_loop"], {"jsonl_fused_traces_executed": 1}
         )
+        self.assertEqual(result["diagnostics"]["session"], {"bound": ["rows"]})
+
+    def test_large_eval_result_is_replaced_with_peek(self) -> None:
+        backend = FakeBackend({"ok": True, "value": list(range(30)), "diagnostics": {"backend": "fake"}})
+        mcp = server.McpServer(backend, io.BytesIO(), io.BytesIO(), io.StringIO())
+
+        response = mcp.call_tool(
+            {"name": "stone_eval", "arguments": {"source": "emit(rows)"}}
+        )
+        result = response["structuredContent"]
+
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["value"]["type"], "list")
+        self.assertEqual(result["value"]["len"], 30)
+        self.assertEqual(result["value"]["head"], [0, 1, 2, 3, 4])
+        self.assertEqual(result["value"]["tail"], [25, 26, 27, 28, 29])
+        self.assertEqual(result["diagnostics"]["large_output"]["policy"], "preview")
+        self.assertIn("allow_large_output=true", result["diagnostics"]["large_output"]["message"])
+
+    def test_large_eval_result_can_be_forced(self) -> None:
+        values = list(range(30))
+        backend = FakeBackend({"ok": True, "value": values})
+        mcp = server.McpServer(backend, io.BytesIO(), io.BytesIO(), io.StringIO())
+
+        response = mcp.call_tool(
+            {
+                "name": "stone_eval",
+                "arguments": {"source": "emit(rows)", "allow_large_output": True},
+            }
+        )
+
+        self.assertEqual(response["structuredContent"]["value"], values)
+        self.assertNotIn("large_output", response["structuredContent"].get("diagnostics", {}))
+
+    def test_large_stone_call_result_is_replaced_with_peek(self) -> None:
+        backend = FakeBackend({"ok": True, "value": list(range(30))})
+        mcp = server.McpServer(backend, io.BytesIO(), io.BytesIO(), io.StringIO())
+
+        response = mcp.call_tool(
+            {"name": "stone_call", "arguments": {"name": "read_csv", "args": {"path": "x.csv"}}}
+        )
+
+        self.assertEqual(response["structuredContent"]["value"]["type"], "list")
+        self.assertEqual(response["structuredContent"]["value"]["len"], 30)
+        self.assertIn("large_output", response["structuredContent"]["diagnostics"])
 
     def test_read_frame_times_out_without_complete_frame(self) -> None:
         read_fd, write_fd = os.pipe()

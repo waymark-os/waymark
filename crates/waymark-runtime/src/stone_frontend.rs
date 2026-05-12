@@ -4,7 +4,9 @@ use nu_protocol::{
 };
 
 use crate::stone_ast::{lower_source, Program};
-use crate::stone_eval::{eval_program, eval_program_with_output, EvalProgramOutput};
+use crate::stone_eval::{
+    eval_program, eval_program_with_output_and_session, EvalProgramOutput, StoneSession,
+};
 
 pub fn parse_stone_source(source: &str) -> Result<(), ShellError> {
     lower_stone_source(source).map(|_| ())
@@ -24,14 +26,15 @@ pub fn eval_stone_source(
     eval_program(engine_state, stack, &program, input)
 }
 
-pub fn eval_stone_source_with_output(
+pub(crate) fn eval_stone_source_with_output_and_session(
     engine_state: &EngineState,
     stack: &mut Stack,
     source: &str,
     input: PipelineData,
+    session: &mut StoneSession,
 ) -> Result<EvalProgramOutput, ShellError> {
     let program = lower_stone_source(source)?;
-    eval_program_with_output(engine_state, stack, &program, input)
+    eval_program_with_output_and_session(engine_state, stack, &program, input, Some(session))
 }
 
 #[cfg(test)]

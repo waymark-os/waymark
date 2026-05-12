@@ -18,6 +18,11 @@ The default backend is `warm-stdio`, which starts one long-lived
 `waymark --task-server-stream` process and reuses it across `stone_eval`
 calls. Warm evals keep the workspace durable across calls; work-dir reset is an
 explicit guest protocol command, not part of normal task/eval handling.
+Stone top-level value and function bindings also persist across warm eval calls,
+so agents can bind expensive intermediate data once and reuse it in the next
+call. Large emitted values are returned as a compact peek by default; use
+`head`/`tail`/`len` summaries or set `allow_large_output` to force the full
+value. Open file handles remain task-owned and are not carried across calls.
 Set `WAYMARK_STONE_MCP_BACKEND=subprocess` for one-shot debugging.
 Runtime state comes from Stone itself: call `stone_call` with `state` for cwd,
 git, and tool snapshots, or `last_result` to recover the previous Waymark

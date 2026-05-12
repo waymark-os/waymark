@@ -15,6 +15,30 @@ waymark eval --stdin-script < script.stone
 Use `--nu` only for the compatibility frontend. Stone is the default for
 `waymark eval -c`, `.stone` files, and `--stdin-script`.
 
+## Session Semantics
+
+One-shot CLI invocations start with a fresh Stone scope. Long-lived runtime
+processes, such as the task-server stream used by the MCP adapter, behave like a
+shell session: top-level Stone value and function bindings persist across eval
+calls.
+
+```python
+rows = read_csv("data.csv")
+```
+
+A later eval call in the same runtime process can use the binding directly:
+
+```python
+errors = where(rows, "level", "ERROR")
+emit(len(errors))
+```
+
+This is not a JSON result cache. Values are kept in the runtime session when they
+are safe to carry across calls. Open file handles are task-owned and do not
+persist across eval calls. For large values, keep the binding live and emit
+small summaries with `len`, `head`/`first`, or `tail`/`last` unless the caller
+explicitly asks for full output.
+
 ## Core Builtins
 
 - `emit(value)`: return a structured success value.

@@ -675,7 +675,10 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         signature: "emit(value: Any? = pipeline_value) -> Any",
         use_when: "Use to return a structured result from an Stone script or MCP call.",
         examples: &[r#"emit({"ok": True, "path": "/app/out.json"})"#],
-        avoid: &["Do not print final structured results; emit them."],
+        avoid: &[
+            "Do not print final structured results; emit them.",
+            "Do not emit large lists just to inspect them; bind the list and emit len/head/tail summaries.",
+        ],
         aliases: &[],
     },
     StoneHelpEntry {
@@ -925,17 +928,17 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         name: "first",
         signature: "first(values: list, count: int? = None) -> Any | list",
         use_when: "Use to inspect or keep the first item(s) of a list.",
-        examples: &[r#"sample = first(rows, 5)"#],
+        examples: &[r#"sample = first(rows, 5)"#, r#"sample = head(rows, 5)"#],
         avoid: &["Use slicing when it is clearer, such as rows[:5]."],
-        aliases: &[],
+        aliases: &["head"],
     },
     StoneHelpEntry {
         name: "last",
         signature: "last(values: list, count: int? = None) -> Any | list",
         use_when: "Use to inspect or keep the last item(s) of a list.",
-        examples: &[r#"tail = last(rows, 5)"#],
+        examples: &[r#"tail_sample = last(rows, 5)"#, r#"tail_sample = tail(rows, 5)"#],
         avoid: &["Use slicing when it is clearer."],
-        aliases: &[],
+        aliases: &["tail"],
     },
     StoneHelpEntry {
         name: "run",
@@ -1037,10 +1040,25 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
         summary: "Recommended LLM workflow for solving tasks in Stone.",
         bullets: &[
             "Use help() first, then help(\"name\") for a primitive before guessing syntax.",
+            "In long-lived task-server and MCP sessions, top-level value and function bindings persist across eval calls; bind intermediate data once and reuse names later.",
+            "Stone eval source can be a multi-line script like python -c or bash -c; use assignments, loops, helpers, and emit(value) when a structured return is useful.",
+            "For large values, bind them by name and emit compact summaries such as {\"count\": len(rows), \"sample\": head(rows, 5)}; force full output only when necessary.",
             "Use /app paths for task inputs and write exactly the requested output files.",
             "Use stone/data primitives for file, CSV, JSON, JSONL, text, and sorting work.",
             "Use small probes with limit=5 or bounded reads before writing a large final script.",
             "Finish by reading/describing the output file to verify it exists and has the right shape.",
+        ],
+    },
+    StoneHelpTopic {
+        name: "session",
+        summary: "Long-lived eval session behavior for agents.",
+        bullets: &[
+            "One-shot CLI evals are fresh, but task-server stream and MCP warm evals behave like a real shell session.",
+            "Top-level value and function bindings persist across eval calls; this is live name binding, not a JSON result cache.",
+            "Assignment-only evals return null and compact session diagnostics such as bound names instead of echoing large bound values.",
+            "Prefer rows = read_csv(...), inspect rows, then reuse rows in later eval calls instead of rereading the file.",
+            "Avoid emitting entire large lists; use head()/tail()/first()/last() samples unless the caller explicitly requests full output.",
+            "Open file handles do not persist across eval calls; persist paths, text, records, lists, and functions instead.",
         ],
     },
     StoneHelpTopic {
@@ -1090,7 +1108,7 @@ pub(crate) fn stone_help_overview(span: Span) -> Value {
     record.push("language", Value::string("Stone", span));
     record.push(
         "for_llm",
-        Value::string("This help is written for LLM agents generating Stone. Prefer these primitives and examples over guessing Python APIs.", span),
+        Value::string("This help is written for LLM agents generating Stone. Stone eval source can be a multi-line script like python -c or bash -c. In MCP/task-server stream mode, top-level value and function bindings persist across eval calls; reuse named intermediates instead of rereading files. For large values, return len/head/tail summaries unless full output is explicitly required. Prefer these primitives and examples over guessing Python APIs.", span),
     );
     record.push("workflow", topic_bullets("workflow", span));
     record.push(
@@ -1142,6 +1160,8 @@ pub(crate) fn stone_help_topic(name: &str, span: Span) -> Value {
         "write_text" => "write_file",
         "edit_file" => "edit",
         "list_dir" => "ls",
+        "head" => "first",
+        "tail" => "last",
         "from_json" => "json_loads",
         "to_json" => "json_dumps",
         "sorted" => "sort",

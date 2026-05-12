@@ -101,6 +101,14 @@ Use `state()` when an agent needs the current cwd, git summary, or common tool
 availability without ad hoc probes. Use `last_result()` to recover the previous
 Waymark response in a long-lived runtime process.
 
+In long-lived runtime processes, Stone top-level value and function bindings
+persist across eval calls. This lets an agent bind intermediate data once,
+inspect it, and continue in the next call without rereading or JSON-caching it.
+For large values, bind the value and emit compact summaries such as
+`emit({"count": len(rows), "sample": head(rows, 5)})`; MCP `stone_eval`
+previews large emitted values unless `allow_large_output` is set. One-shot CLI
+invocations still start fresh.
+
 ## Helpers
 
 Stone helpers are dynamic extension scripts. The shell loads helper registrations

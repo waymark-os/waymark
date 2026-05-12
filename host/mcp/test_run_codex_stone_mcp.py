@@ -19,6 +19,13 @@ import run_codex_stone_mcp as runner
 
 
 class RunCodexStoneMcpTests(unittest.TestCase):
+    def test_default_prompt_mentions_session_bindings(self) -> None:
+        self.assertIn("bindings across stone_eval calls", runner.DEFAULT_PROMPT)
+        self.assertIn("reuse names later", runner.DEFAULT_PROMPT)
+        self.assertIn("multi-line script", runner.DEFAULT_PROMPT)
+        self.assertIn("allow_large_output=true", runner.DEFAULT_PROMPT)
+        self.assertIn("Open file handles do not persist", runner.DEFAULT_PROMPT)
+
     def test_codex_exec_command_includes_workspace_and_prompt(self) -> None:
         args = argparse.Namespace(
             codex="codex",

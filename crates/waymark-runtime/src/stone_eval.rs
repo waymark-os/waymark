@@ -65,6 +65,7 @@ pub struct EvalState {
     next_file_id: u64,
     next_callable_id: u64,
     stdout: String,
+    session_bound_names: Vec<String>,
     profiler: EvalProfiler,
     hot_loop_diagnostics: EvalHotLoopDiagnostics,
     hot_loop_enabled: bool,
@@ -276,6 +277,34 @@ const EVAL_PROFILE_BUCKET_NAMES: [&str; EVAL_PROFILE_BUCKETS] = [
 struct Scope {
     locals: HashMap<String, RuntimeValue>,
     files: HashMap<u64, RuntimeFile>,
+}
+
+#[derive(Default)]
+pub(crate) struct StoneSession {
+    locals: HashMap<String, RuntimeValue>,
+    functions: HashMap<String, FunctionDef>,
+}
+
+impl StoneSession {
+    fn root_scope(&self) -> Scope {
+        Scope {
+            locals: self.locals.clone(),
+            files: HashMap::new(),
+        }
+    }
+
+    fn update_from_root_scope(&mut self, scope: &Scope) {
+        self.locals = scope
+            .locals
+            .iter()
+            .filter(|(_, value)| value.is_session_persistable())
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+    }
+
+    fn update_functions(&mut self, functions: &HashMap<String, FunctionDef>) {
+        self.functions = functions.clone();
+    }
 }
 
 #[derive(Clone)]
@@ -493,6 +522,16 @@ impl EvalState {
         self.root_scope_mut().locals.insert(name, value);
     }
 
+    fn record_session_binding(&mut self, name: &str) {
+        if !self
+            .session_bound_names
+            .iter()
+            .any(|existing| existing == name)
+        {
+            self.session_bound_names.push(name.to_owned());
+        }
+    }
+
     fn get_local_mut(&mut self, name: &str) -> Option<&mut RuntimeValue> {
         self.scopes
             .iter_mut()
@@ -579,6 +618,22 @@ impl EvalState {
 }
 
 impl RuntimeValue {
+    fn is_session_persistable(&self) -> bool {
+        match self {
+            RuntimeValue::Nu(_) => true,
+            RuntimeValue::TextLines(_) => true,
+            RuntimeValue::JsonlRows(_) => true,
+            RuntimeValue::JsonObjectView(_) => true,
+            RuntimeValue::JsonArrayView(_) => true,
+            RuntimeValue::JsonScalarView(_) => true,
+            RuntimeValue::Callable(callable) => callable
+                .captures
+                .iter()
+                .all(|(_, value)| value.is_session_persistable()),
+            RuntimeValue::File(_) => false,
+        }
+    }
+
     #[allow(dead_code)]
     fn type_tag(&self) -> RuntimeValueTag {
         match self {
@@ -644,6 +699,16 @@ pub fn eval_program_with_output(
     program: &Program,
     input: PipelineData,
 ) -> Result<EvalProgramOutput, ShellError> {
+    eval_program_with_output_and_session(engine_state, stack, program, input, None)
+}
+
+pub(crate) fn eval_program_with_output_and_session(
+    engine_state: &EngineState,
+    stack: &mut Stack,
+    program: &Program,
+    input: PipelineData,
+    session: Option<&mut StoneSession>,
+) -> Result<EvalProgramOutput, ShellError> {
     eval_program_with_options(
         engine_state,
         stack,
@@ -654,14 +719,16 @@ pub fn eval_program_with_output(
             hot_loop_vm_interpreter: env::var_os("WAYMARK_STONE_HOT_LOOP_VM").is_some(),
             hot_loop_validate_snapshot: env::var_os("WAYMARK_STONE_HOT_LOOP_VALIDATE_SNAPSHOT")
                 .is_some(),
+            session,
         },
     )
 }
 
-struct EvalOptions {
+struct EvalOptions<'a> {
     hot_loop_enabled: bool,
     hot_loop_vm_interpreter: bool,
     hot_loop_validate_snapshot: bool,
+    session: Option<&'a mut StoneSession>,
 }
 
 fn eval_program_with_options(
@@ -669,7 +736,7 @@ fn eval_program_with_options(
     stack: &mut Stack,
     program: &Program,
     input: PipelineData,
-    options: EvalOptions,
+    mut options: EvalOptions<'_>,
 ) -> Result<EvalProgramOutput, ShellError> {
     #[cfg(not(target_os = "hermit"))]
     let stone_helper_registry = {
@@ -679,15 +746,25 @@ fn eval_program_with_options(
             .unwrap_or_else(|_| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         stone_helper_registry(&cwd)
     };
+    let root_scope = options
+        .session
+        .as_ref()
+        .map(|session| session.root_scope())
+        .unwrap_or_default();
     let mut evaluator = Evaluator {
         engine_state,
         stack,
         state: EvalState {
-            scopes: vec![Scope::default()],
-            functions: HashMap::new(),
+            scopes: vec![root_scope],
+            functions: options
+                .session
+                .as_ref()
+                .map(|session| session.functions.clone())
+                .unwrap_or_default(),
             next_file_id: 0,
             next_callable_id: 0,
             stdout: String::new(),
+            session_bound_names: Vec::new(),
             profiler: EvalProfiler::default(),
             hot_loop_diagnostics: EvalHotLoopDiagnostics::default(),
             hot_loop_enabled: options.hot_loop_enabled,
@@ -707,11 +784,37 @@ fn eval_program_with_options(
         evaluator.state.hot_loop_enabled,
         evaluator.state.hot_loop_vm_interpreter,
     );
+    if let Some(session) = options.session.as_mut() {
+        if let Some(root_scope) = evaluator.state.scopes.first() {
+            session.update_from_root_scope(root_scope);
+        }
+        session.update_functions(&evaluator.state.functions);
+    }
     let pipeline = pipeline?;
-    let diagnostics = match hot_loop_diagnostics {
+    let mut diagnostics = match hot_loop_diagnostics {
         Some(hot_loop) => json!({ "hot_loop": hot_loop }),
         None => json!({}),
     };
+    if let Some(root_scope) = evaluator.state.scopes.first() {
+        let mut bound = evaluator
+            .state
+            .session_bound_names
+            .iter()
+            .filter(|name| {
+                root_scope
+                    .locals
+                    .get(*name)
+                    .map(|value| value.is_session_persistable())
+                    .unwrap_or_else(|| evaluator.state.functions.contains_key(*name))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        bound.sort();
+        bound.dedup();
+        if !bound.is_empty() {
+            diagnostics["session"] = json!({ "bound": bound });
+        }
+    }
     Ok(EvalProgramOutput {
         pipeline,
         stdout: evaluator.state.stdout,
@@ -738,7 +841,7 @@ impl Evaluator<'_> {
         program: &Program,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        match self.eval_block(&program.statements, input)? {
+        match self.eval_block(&program.statements, input, true)? {
             EvalFlow::Output(output) => Ok(output),
             EvalFlow::Break => Err(stone_error("break", "break outside loop")),
             EvalFlow::Continue => Err(stone_error("continue", "continue outside loop")),
@@ -750,12 +853,13 @@ impl Evaluator<'_> {
         &mut self,
         statements: &[Stmt],
         mut input: PipelineData,
+        record_session_bindings: bool,
     ) -> Result<EvalFlow, ShellError> {
         let started = self.state.profiler.start();
         let mut output = PipelineData::empty();
         let result = (|| {
             for statement in statements {
-                let flow = self.eval_stmt(statement, input)?;
+                let flow = self.eval_stmt(statement, input, record_session_bindings)?;
                 input = PipelineData::empty();
                 match flow {
                     EvalFlow::Output(value) => {
@@ -773,12 +877,17 @@ impl Evaluator<'_> {
         result
     }
 
-    fn eval_stmt(&mut self, statement: &Stmt, input: PipelineData) -> Result<EvalFlow, ShellError> {
+    fn eval_stmt(
+        &mut self,
+        statement: &Stmt,
+        input: PipelineData,
+        record_session_bindings: bool,
+    ) -> Result<EvalFlow, ShellError> {
         let started = self.state.profiler.start();
         let result = match statement {
             Stmt::Assign { target, value } => {
                 let value = self.eval_expr_value(value, input)?;
-                self.assign_value(target, value)?;
+                self.assign_value(target, value, record_session_bindings)?;
                 Ok(EvalFlow::Output(PipelineData::empty()))
             }
             Stmt::AugAssign { target, op, value } => {
@@ -787,11 +896,14 @@ impl Evaluator<'_> {
                     .eval_expr_value(value, input)?
                     .into_nu_value("augmented assignment")?;
                 let value = eval_aug_assign(&left, *op, &right)?;
-                self.assign_value(target, RuntimeValue::Nu(value))?;
+                self.assign_value(target, RuntimeValue::Nu(value), record_session_bindings)?;
                 Ok(EvalFlow::Output(PipelineData::empty()))
             }
             Stmt::Pass => Ok(EvalFlow::Output(PipelineData::empty())),
             Stmt::FunctionDef(function) => {
+                if record_session_bindings {
+                    self.state.record_session_binding(&function.name);
+                }
                 self.state
                     .functions
                     .insert(function.name.clone(), function.clone());
@@ -820,7 +932,7 @@ impl Evaluator<'_> {
                     if !value_truthy(&condition) {
                         return Ok(EvalFlow::Output(output));
                     }
-                    match self.eval_block(body, PipelineData::empty())? {
+                    match self.eval_block(body, PipelineData::empty(), false)? {
                         EvalFlow::Output(value) => output = value,
                         EvalFlow::Break => return Ok(EvalFlow::Output(output)),
                         EvalFlow::Continue => continue,
@@ -850,7 +962,7 @@ impl Evaluator<'_> {
                 } else {
                     else_branch
                 };
-                self.eval_block(branch, PipelineData::empty())
+                self.eval_block(branch, PipelineData::empty(), false)
             }
             Stmt::With {
                 target,
@@ -1748,7 +1860,7 @@ impl Evaluator<'_> {
             let value = jsonl_row_view(&rows, line);
             self.assign_loop_targets(targets, value)?;
             let started = self.state.profiler.start();
-            let flow = self.eval_block(body, PipelineData::empty());
+            let flow = self.eval_block(body, PipelineData::empty(), false);
             self.state
                 .profiler
                 .finish(EvalProfileBucket::ForJsonlBody, started);
@@ -1785,7 +1897,7 @@ impl Evaluator<'_> {
             };
             self.execute_hot_loop_prefix(plan, &view)?;
             let started = self.state.profiler.start();
-            let flow = self.eval_block(remaining_body, PipelineData::empty());
+            let flow = self.eval_block(remaining_body, PipelineData::empty(), false);
             self.state
                 .profiler
                 .finish(EvalProfileBucket::ForJsonlBody, started);
@@ -1812,7 +1924,7 @@ impl Evaluator<'_> {
         for value in values {
             self.assign_loop_targets(targets, value)?;
             let started = self.state.profiler.start();
-            let flow = self.eval_block(body, PipelineData::empty());
+            let flow = self.eval_block(body, PipelineData::empty(), false);
             self.state
                 .profiler
                 .finish(EvalProfileBucket::ForValuesBody, started);
@@ -3544,7 +3656,7 @@ impl Evaluator<'_> {
         if let Some(target) = target {
             self.state.set_local(target.to_owned(), value);
         }
-        let result = self.eval_block(body, PipelineData::empty());
+        let result = self.eval_block(body, PipelineData::empty(), false);
         self.state.pop_scope_merging_nu_locals(target)?;
         result
     }
@@ -3553,14 +3665,23 @@ impl Evaluator<'_> {
         &mut self,
         target: &AssignTarget,
         value: RuntimeValue,
+        record_session_bindings: bool,
     ) -> Result<(), ShellError> {
         let started = self.state.profiler.start();
         let result = match target {
             AssignTarget::Name(name) => {
+                if record_session_bindings {
+                    self.state.record_session_binding(name);
+                }
                 self.state.set_local(name.clone(), value);
                 Ok(())
             }
             AssignTarget::Tuple(targets) => {
+                if record_session_bindings {
+                    for target in targets {
+                        self.state.record_session_binding(target);
+                    }
+                }
                 let value = value.into_nu_value("assignment")?;
                 self.assign_unpack_targets("assignment", targets, value)
             }
@@ -4218,8 +4339,8 @@ impl Evaluator<'_> {
             "cat" => self.eval_cat_call(call),
             "ls" => self.eval_list_dir_call(call),
             "list_dir" => self.eval_list_dir_call(call),
-            "first" => self.eval_first_call(call),
-            "last" => self.eval_last_call(call),
+            "first" | "head" => self.eval_first_call(call),
+            "last" | "tail" => self.eval_last_call(call),
             "read_text" | "read_file" => self.eval_read_text_call(call),
             "stat" => self.eval_stat_call(call),
             "mkdir" => self.eval_mkdir_call(call),
@@ -4308,7 +4429,7 @@ impl Evaluator<'_> {
         for (name, value) in args {
             self.state.set_local(name, RuntimeValue::Nu(value));
         }
-        let flow = self.eval_block(&function.body, PipelineData::empty());
+        let flow = self.eval_block(&function.body, PipelineData::empty(), false);
         self.state.pop_scope()?;
         let value = match flow? {
             EvalFlow::Return(value) => value,
@@ -5073,24 +5194,25 @@ impl Evaluator<'_> {
     }
 
     fn eval_first_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let name = call.name.as_str();
         let ([values] | [values, _]) = call.positional.as_slice() else {
             return Err(stone_error(
-                "first",
-                "first() requires a list and optional count",
+                name,
+                format!("{name}() requires a list and optional count"),
             ));
         };
         if !call.named.is_empty() {
             return Err(stone_error(
-                "first",
-                "first() keyword arguments are not supported",
+                name,
+                format!("{name}() keyword arguments are not supported"),
             ));
         }
         let values = self
             .eval_expr_value(values, PipelineData::empty())?
-            .into_nu_value("first")?;
+            .into_nu_value(name)?;
         let Value::List { vals, .. } = values else {
             return Err(stone_error(
-                "first",
+                name,
                 format!("expected list, got {}", values.get_type()),
             ));
         };
@@ -5098,8 +5220,8 @@ impl Evaluator<'_> {
             Some(count) => {
                 let count = self
                     .eval_expr_value(count, PipelineData::empty())?
-                    .into_nu_value("first")?;
-                Some(value_to_limit(&count, "first")?)
+                    .into_nu_value(name)?;
+                Some(value_to_limit(&count, name)?)
             }
             None => None,
         };
@@ -5113,24 +5235,25 @@ impl Evaluator<'_> {
     }
 
     fn eval_last_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let name = call.name.as_str();
         let ([values] | [values, _]) = call.positional.as_slice() else {
             return Err(stone_error(
-                "last",
-                "last() requires a list and optional count",
+                name,
+                format!("{name}() requires a list and optional count"),
             ));
         };
         if !call.named.is_empty() {
             return Err(stone_error(
-                "last",
-                "last() keyword arguments are not supported",
+                name,
+                format!("{name}() keyword arguments are not supported"),
             ));
         }
         let values = self
             .eval_expr_value(values, PipelineData::empty())?
-            .into_nu_value("last")?;
+            .into_nu_value(name)?;
         let Value::List { vals, .. } = values else {
             return Err(stone_error(
-                "last",
+                name,
                 format!("expected list, got {}", values.get_type()),
             ));
         };
@@ -5138,8 +5261,8 @@ impl Evaluator<'_> {
             Some(count) => {
                 let count = self
                     .eval_expr_value(count, PipelineData::empty())?
-                    .into_nu_value("last")?;
-                Some(value_to_limit(&count, "last")?)
+                    .into_nu_value(name)?;
+                Some(value_to_limit(&count, name)?)
             }
             None => None,
         };
@@ -7173,6 +7296,7 @@ fn is_builtin_call(call: &Call) -> bool {
             | "find"
             | "float"
             | "first"
+            | "head"
             | "from_json"
             | "help"
             | "int"
@@ -7200,6 +7324,7 @@ fn is_builtin_call(call: &Call) -> bool {
             | "run"
             | "resolve_command"
             | "state"
+            | "tail"
             | "last_result"
             | "start_daemon"
             | "daemon_status"
@@ -13324,6 +13449,33 @@ emit(names)
     }
 
     #[test]
+    fn head_and_tail_alias_first_and_last() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("head-tail")?;
+        let program = lower_source(
+            r#"emit({
+    "head": head([1, 2, 3, 4], 2),
+    "tail": tail([1, 2, 3, 4], 2),
+    "single_head": head([1, 2, 3]),
+    "single_tail": tail([1, 2, 3]),
+})"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "head": [1, 2],
+                "tail": [3, 4],
+                "single_head": 1,
+                "single_tail": 3,
+            })
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
     fn evaluates_integer_bitwise_operators() -> Result<(), ShellError> {
         let (engine_state, mut stack, root) = test_engine("bitwise-operators")?;
         let program = lower_source(
@@ -13900,10 +14052,16 @@ emit({
             r#"overview = help()
 write = help("write_file")
 edit = help("edit_file")
+session = help("session")
 missing = help("not_a_builtin")
 emit({
     "language": overview["language"],
     "has_unsupported": len(overview["unsupported"]) > 0,
+    "has_session_topic": "session" in overview["topics"],
+    "for_llm_mentions_bindings": "bindings persist" in overview["for_llm"],
+    "for_llm_mentions_multiline_eval": "multi-line script" in overview["for_llm"],
+    "session_mentions_live_bindings": "live name binding" in session["bullets"][1],
+    "session_mentions_binding_ack": "bound names" in session["bullets"][2],
     "write_signature": write["signature"],
     "write_example": write["examples"][0],
     "edit_signature": edit["signature"],
@@ -13918,6 +14076,11 @@ emit({
             json_value!({
                 "language": "Stone",
                 "has_unsupported": true,
+                "has_session_topic": true,
+                "for_llm_mentions_bindings": true,
+                "for_llm_mentions_multiline_eval": true,
+                "session_mentions_live_bindings": true,
+                "session_mentions_binding_ack": true,
                 "write_signature": "write_file(path: str, text: str, append: bool = False) -> record",
                 "write_example": "write_file(\"/app/report.txt\", \"ok\\n\")",
                 "edit_signature": "edit(path: str, old: str, new: str, all: bool = False) -> record",
@@ -14309,6 +14472,7 @@ emit(seen)
                 hot_loop_enabled: true,
                 hot_loop_vm_interpreter: true,
                 hot_loop_validate_snapshot: false,
+                session: None,
             },
         )?;
 
@@ -14348,6 +14512,7 @@ emit(total)
                 hot_loop_enabled: true,
                 hot_loop_vm_interpreter: true,
                 hot_loop_validate_snapshot: false,
+                session: None,
             },
         )?;
 
@@ -14433,6 +14598,7 @@ emit({"user_totals": user_totals, "tag_counts": tag_counts})
                 hot_loop_enabled: true,
                 hot_loop_vm_interpreter: true,
                 hot_loop_validate_snapshot: false,
+                session: None,
             },
         )?;
         let value = json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())?;
@@ -14502,6 +14668,7 @@ emit({"user_amounts": user_amounts, "user_items": user_items, "tag_counts": tag_
                 hot_loop_enabled: true,
                 hot_loop_vm_interpreter: true,
                 hot_loop_validate_snapshot: false,
+                session: None,
             },
         )?;
         let value = json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())?;
@@ -14571,6 +14738,7 @@ emit({"user_amounts": user_amounts, "user_items": user_items, "tag_counts": tag_
                 hot_loop_enabled: true,
                 hot_loop_vm_interpreter: true,
                 hot_loop_validate_snapshot: false,
+                session: None,
             },
         )?;
         let value = json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())?;
@@ -14651,6 +14819,7 @@ emit(counts)
                 hot_loop_enabled: true,
                 hot_loop_vm_interpreter: true,
                 hot_loop_validate_snapshot: false,
+                session: None,
             },
         )?;
 
@@ -16012,6 +16181,7 @@ emit({
                 hot_loop_enabled: true,
                 hot_loop_vm_interpreter: true,
                 hot_loop_validate_snapshot: false,
+                session: None,
             },
         )
         .map(|output| output.pipeline)

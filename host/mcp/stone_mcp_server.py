@@ -19,6 +19,9 @@ from typing import Any, BinaryIO, TextIO
 
 MAX_OUTPUT_BYTES = 64 * 1024
 MAX_PREVIEW_BYTES = 16 * 1024
+LARGE_RESULT_BYTES = 12 * 1024
+LARGE_RESULT_LIST_ITEMS = 20
+LARGE_RESULT_PEEK_ITEMS = 5
 DEFAULT_TIMEOUT_SECONDS = 180.0
 
 
@@ -47,6 +50,19 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "signature": "find(root: str, name_glob: str = '*') -> list[record]",
         "effects": ["read_dir"],
         "example": 'files = find(".", "*.jsonl")',
+    },
+    "first": {
+        "name": "first",
+        "signature": "first(values: list, count: int? = None) -> Any | list",
+        "effects": [],
+        "example": "sample = first(rows, 5)",
+    },
+    "head": {
+        "name": "head",
+        "signature": "head(values: list, count: int? = None) -> Any | list",
+        "effects": [],
+        "example": "sample = head(rows, 5)",
+        "alias_for": "first",
     },
     "open": {
         "name": "open",
@@ -146,6 +162,12 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "effects": ["read_env"],
         "example": "previous = last_result()",
     },
+    "last": {
+        "name": "last",
+        "signature": "last(values: list, count: int? = None) -> Any | list",
+        "effects": [],
+        "example": "tail_sample = last(rows, 5)",
+    },
     "start_daemon": {
         "name": "start_daemon",
         "signature": "start_daemon(argv: list[str], cwd: str? = None, env: record? = None, stdout: str? = None, stderr: str? = None) -> record",
@@ -176,6 +198,13 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "effects": ["read_file"],
         "example": 'info = stat("results.txt")',
     },
+    "tail": {
+        "name": "tail",
+        "signature": "tail(values: list, count: int? = None) -> Any | list",
+        "effects": [],
+        "example": "tail_sample = tail(rows, 5)",
+        "alias_for": "last",
+    },
     "rm": {
         "name": "rm",
         "signature": "rm(path: str, ...paths: str) -> None",
@@ -189,8 +218,11 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
     "edit": ("path", "old", "new", "all"),
     "edit_file": ("path", "old", "new", "all"),
     "find": ("root", "name_glob"),
+    "first": ("values", "count"),
+    "head": ("values", "count"),
     "json_dumps": ("value",),
     "json_loads": ("text",),
+    "last": ("values", "count"),
     "list": ("path",),
     "list_dir": ("path",),
     "ls": ("path",),
@@ -221,6 +253,7 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
     "wait_port": ("port", "host", "timeout_ms"),
     "search": ("root", "needle"),
     "stat": ("path", "follow_symlinks"),
+    "tail": ("values", "count"),
     "write_file": ("path", "text", "append"),
     "write_json": ("path", "value"),
     "write_jsonl": ("path", "rows"),
@@ -793,12 +826,18 @@ def normalize_stone_process_result(
             result["error"] = normalize_stone_error(payload.get("error"))
             result["stdout"] = bound_text(payload_stdout or stdout, max_output_bytes)
             result["stderr"] = bound_text(payload_stderr or stderr, max_output_bytes)
-        result["diagnostics"] = {
+        diagnostics = {
             "exit_code": proc.returncode,
             "duration_ms": duration_ms,
             "backend": "subprocess",
             "hot_loop": parse_hot_loop_diagnostics(stderr),
         }
+        payload_diagnostics = (
+            payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
+        )
+        if isinstance(payload_diagnostics.get("session"), dict):
+            diagnostics["session"] = payload_diagnostics["session"]
+        result["diagnostics"] = diagnostics
         return sparse(result)
 
     return sparse(
@@ -863,16 +902,19 @@ def normalize_task_frame_result(
         hot_loop = parse_hot_loop_diagnostics(
             output.get("stderr") if isinstance(output, dict) else ""
         )
+    diagnostics = {
+        "duration_ms": duration_ms,
+        "backend": "warm_stdio",
+        "reset": compact_reset(frame.get("reset")),
+        "hot_loop": hot_loop,
+    }
+    if isinstance(payload_diagnostics.get("session"), dict):
+        diagnostics["session"] = payload_diagnostics["session"]
     result: dict[str, Any] = {
         "ok": bool(payload.get("ok")),
         "stdout": bound_text(output.get("stdout") if isinstance(output, dict) else "", max_output_bytes),
         "stderr": bound_text(output.get("stderr") if isinstance(output, dict) else "", max_output_bytes),
-        "diagnostics": {
-            "duration_ms": duration_ms,
-            "backend": "warm_stdio",
-            "reset": compact_reset(frame.get("reset")),
-            "hot_loop": hot_loop,
-        },
+        "diagnostics": diagnostics,
     }
     if payload.get("ok"):
         if "value" in payload and payload.get("value") is not None:
@@ -944,6 +986,106 @@ def bound_text(value: str | bytes | None, max_bytes: int = MAX_OUTPUT_BYTES) -> 
     suffix = f"\n[truncated to {max_bytes} bytes]\n"
     keep = max(0, max_bytes - len(suffix.encode("utf-8")))
     return encoded[:keep].decode("utf-8", errors="replace") + suffix
+
+
+def apply_large_result_policy(
+    result: dict[str, Any], *, allow_large_output: bool = False
+) -> dict[str, Any]:
+    if allow_large_output or not result.get("ok") or "value" not in result:
+        return result
+    preview = large_result_preview(result.get("value"))
+    if preview is None:
+        return result
+
+    policy_result = dict(result)
+    policy_result["value"] = preview
+    diagnostics = dict(policy_result.get("diagnostics") or {})
+    diagnostics["large_output"] = {
+        "policy": "preview",
+        "message": (
+            "Large structured result was replaced with a peek. Bind large values and "
+            "emit len/head/tail summaries, or call stone_eval with allow_large_output=true "
+            "when the full value is required."
+        ),
+        "force": "set allow_large_output=true on stone_eval",
+    }
+    policy_result["diagnostics"] = diagnostics
+    return sparse(policy_result)
+
+
+def large_result_preview(value: Any) -> dict[str, Any] | None:
+    kind = "json"
+    count: int | None = None
+    if isinstance(value, list):
+        kind = "list"
+        count = len(value)
+        if count <= LARGE_RESULT_LIST_ITEMS and json_value_size(value) <= LARGE_RESULT_BYTES:
+            return None
+        preview: dict[str, Any] = {
+            "__waymark_large_output__": True,
+            "type": "list",
+            "len": count,
+            "head": value[:LARGE_RESULT_PEEK_ITEMS],
+        }
+        tail = value[-LARGE_RESULT_PEEK_ITEMS:] if count > LARGE_RESULT_PEEK_ITEMS else []
+        if tail:
+            preview["tail"] = tail
+        preview["hint"] = (
+            "The full value is still live if you bound it in the Stone session. "
+            "Use head(rows, n), tail(rows, n), len(rows), write_json(...), or "
+            "allow_large_output=true to force the full emitted value."
+        )
+        return preview
+
+    if json_value_size(value) <= LARGE_RESULT_BYTES:
+        return None
+    if isinstance(value, dict):
+        kind = "record"
+        count = len(value)
+        return {
+            "__waymark_large_output__": True,
+            "type": kind,
+            "keys": list(value.keys())[:LARGE_RESULT_PEEK_ITEMS],
+            "len": count,
+            "head": preview_record(value),
+            "hint": (
+                "Large record output was replaced with a peek. Emit selected fields "
+                "or use allow_large_output=true to force the full value."
+            ),
+        }
+    return {
+        "__waymark_large_output__": True,
+        "type": kind,
+        "bytes": json_value_size(value),
+        "hint": "Large output was replaced with a peek; use allow_large_output=true to force it.",
+    }
+
+
+def preview_record(value: dict[str, Any]) -> dict[str, Any]:
+    preview: dict[str, Any] = {}
+    for key, item in list(value.items())[:LARGE_RESULT_PEEK_ITEMS]:
+        if isinstance(item, list):
+            preview[key] = {
+                "type": "list",
+                "len": len(item),
+                "head": item[: min(len(item), LARGE_RESULT_PEEK_ITEMS)],
+            }
+        elif isinstance(item, dict):
+            preview[key] = {
+                "type": "record",
+                "len": len(item),
+                "keys": list(item.keys())[:LARGE_RESULT_PEEK_ITEMS],
+            }
+        else:
+            preview[key] = item
+    return preview
+
+
+def json_value_size(value: Any) -> int:
+    try:
+        return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError):
+        return len(str(value).encode("utf-8", errors="replace"))
 
 
 def parse_hot_loop_diagnostics(text: str | bytes | None) -> dict[str, Any] | None:
@@ -1422,12 +1564,24 @@ def classify_escape_gap(reason: str, command: str) -> str:
 TOOLS = [
     {
         "name": "stone_eval",
-        "description": "Run a short Stone source string through waymark --stdin-script.",
+        "description": (
+            "Run Stone source in the long-lived Stone session. In warm-stdio mode, "
+            "top-level value and function bindings persist across stone_eval calls, "
+            "so bind intermediate data once and reuse names later. Source may be a "
+            "multi-line script like python -c or bash -c, not only a single expression. "
+            "Large emitted values are replaced with a head/tail peek by default; bind "
+            "large values and emit len/head/tail summaries, or set allow_large_output=true "
+            "only when the full value is required. Open file handles do not persist."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "source": {"type": "string"},
                 "cwd": {"type": "string"},
+                "allow_large_output": {
+                    "type": "boolean",
+                    "description": "Bypass the MCP large-result peek and return the full emitted value.",
+                },
             },
             "required": ["source"],
             "additionalProperties": False,
@@ -1444,7 +1598,11 @@ TOOLS = [
     },
     {
         "name": "stone_call",
-        "description": "Call a supported Stone builtin with JSON arguments.",
+        "description": (
+            "Call a supported Stone builtin with JSON arguments. Large returned values "
+            "are replaced with a head/tail peek by default; set allow_large_output=true "
+            "only when the full value is required."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1456,6 +1614,10 @@ TOOLS = [
                     ]
                 },
                 "cwd": {"type": "string"},
+                "allow_large_output": {
+                    "type": "boolean",
+                    "description": "Bypass the MCP large-result peek and return the full value.",
+                },
             },
             "required": ["name", "args"],
             "additionalProperties": False,
@@ -1577,10 +1739,16 @@ class McpServer:
         started = time.monotonic()
         if name == "stone_eval":
             result = self.backend.eval(str(args.get("source", "")), args.get("cwd"))
+            result = apply_large_result_policy(
+                result, allow_large_output=bool(args.get("allow_large_output"))
+            )
         elif name == "stone_help":
             result = stone_help(self.backend, args.get("name"))
         elif name == "stone_call":
             result = stone_call(self.backend, str(args.get("name", "")), args.get("args"), args.get("cwd"))
+            result = apply_large_result_policy(
+                result, allow_large_output=bool(args.get("allow_large_output"))
+            )
         elif name == "stone_describe":
             result = stone_describe(str(args.get("path", "")), args.get("cwd"))
         elif name == "escape_linux":
