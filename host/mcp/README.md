@@ -19,6 +19,9 @@ The default backend is `warm-stdio`, which starts one long-lived
 calls. Warm evals keep the workspace durable across calls; work-dir reset is an
 explicit guest protocol command, not part of normal task/eval handling.
 Set `WAYMARK_STONE_MCP_BACKEND=subprocess` for one-shot debugging.
+Runtime state comes from Stone itself: call `stone_call` with `state` for cwd,
+git, and tool snapshots, or `last_result` to recover the previous Waymark
+response in the warm runtime.
 
 ## Codex Config
 

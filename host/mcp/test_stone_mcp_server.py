@@ -661,6 +661,17 @@ class StoneMcpServerTests(unittest.TestCase):
             {"jsonl_fused_traces_executed": 1, "loop_candidates": 2},
         )
 
+    def test_stone_call_supports_runtime_state_builtins(self) -> None:
+        backend = FakeBackend({"ok": True, "value": {"cwd": "/repo"}})
+
+        result = server.stone_call(backend, "state", {})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(backend.calls[0], ("emit(state())\n", None))
+
+        server.stone_call(backend, "last_result", {})
+        self.assertEqual(backend.calls[1], ("emit(last_result())\n", None))
+
 
 if __name__ == "__main__":
     unittest.main()

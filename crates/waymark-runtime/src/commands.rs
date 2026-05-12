@@ -974,6 +974,22 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "state",
+        signature: "state() -> record",
+        use_when: "Use to retrieve cheap agent-facing runtime state such as cwd, git status, and common tool availability.",
+        examples: &[r#"snapshot = state()"#, r#"emit(state().git.modified_files)"#],
+        avoid: &["Do not shell out to git status or which/version probes when this structured snapshot is enough."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "last_result",
+        signature: "last_result() -> record | None",
+        use_when: "Use to recover the previous Waymark command response after the caller's conversation context dropped it.",
+        examples: &[r#"previous = last_result()"#, r#"emit(last_result().value)"#],
+        avoid: &["Do not use as long-term storage; it only tracks the immediately previous command response."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "start_daemon",
         signature: "start_daemon(argv: list[str], cwd: str? = None, env: record? = None, stdout: str? = None, stderr: str? = None) -> record",
         use_when: "Use for servers and background services that must still be running when tests execute.",

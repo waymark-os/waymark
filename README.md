@@ -92,6 +92,10 @@ Save that as `example.stone`, then run:
 target/debug/waymark eval example.stone
 ```
 
+Use `state()` when an agent needs the current cwd, git summary, or common tool
+availability without ad hoc probes. Use `last_result()` to recover the previous
+Waymark response in a long-lived runtime process.
+
 ## Helpers
 
 Stone helpers are dynamic extension scripts. The shell loads helper registrations

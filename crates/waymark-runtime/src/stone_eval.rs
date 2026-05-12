@@ -51,6 +51,7 @@ const STONE_MAX_SEARCH_FILE_BYTES: u64 = 1024 * 1024;
 const STONE_MAX_SEARCH_MATCHES: usize = 1000;
 #[cfg(not(target_os = "hermit"))]
 const STONE_HELPER_OUTPUT_LIMIT: usize = 4000;
+const STONE_LAST_RESULT_ENV: &str = "WAYMARK_LAST_RESULT_JSON";
 
 #[cfg(all(not(target_os = "hermit"), unix))]
 extern "C" {
@@ -4242,6 +4243,8 @@ impl Evaluator<'_> {
             "round" => self.eval_round_call(call),
             "run" => self.eval_run_call(call),
             "resolve_command" => self.eval_resolve_command_call(call),
+            "state" => self.eval_state_call(call),
+            "last_result" => self.eval_last_result_call(call),
             "start_daemon" => self.eval_start_daemon_call(call),
             "daemon_status" => self.eval_daemon_status_call(call),
             "stop_daemon" => self.eval_stop_daemon_call(call),
@@ -6022,6 +6025,41 @@ impl Evaluator<'_> {
         }
     }
 
+    fn eval_state_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.positional.is_empty() || !call.named.is_empty() {
+            return Err(stone_error("state", "state() takes no arguments"));
+        }
+        let cwd = self
+            .engine_state
+            .cwd_as_string(Some(self.stack))
+            .map_err(|err| stone_error("state", err.to_string()))?;
+        Ok(RuntimeValue::Nu(runtime_state_record(Path::new(&cwd))))
+    }
+
+    fn eval_last_result_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.positional.is_empty() || !call.named.is_empty() {
+            return Err(stone_error(
+                "last_result",
+                "last_result() takes no arguments",
+            ));
+        }
+        let span = Span::unknown();
+        let Some(value) = self
+            .stack
+            .get_env_var(self.engine_state, STONE_LAST_RESULT_ENV)
+        else {
+            return Ok(RuntimeValue::Nu(Value::nothing(span)));
+        };
+        let text = value_to_string(&value, "last_result")?;
+        let parsed: JsonValue = serde_json::from_str(&text).map_err(|err| {
+            stone_error(
+                "last_result",
+                format!("stored previous result was not valid JSON: {err}"),
+            )
+        })?;
+        Ok(RuntimeValue::Nu(json_to_nu_value(parsed, span)))
+    }
+
     fn eval_start_daemon_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         #[cfg(target_os = "hermit")]
         {
@@ -7161,6 +7199,8 @@ fn is_builtin_call(call: &Call) -> bool {
             | "rm"
             | "run"
             | "resolve_command"
+            | "state"
+            | "last_result"
             | "start_daemon"
             | "daemon_status"
             | "stop_daemon"
@@ -7847,6 +7887,252 @@ fn string_or_null(value: Option<&JsonValue>, span: Span) -> Value {
         .and_then(JsonValue::as_str)
         .map(|text| Value::string(text.to_owned(), span))
         .unwrap_or_else(|| Value::nothing(span))
+}
+
+fn runtime_state_record(cwd: &Path) -> Value {
+    let span = Span::unknown();
+    let mut record = Record::new();
+    record.push("cwd", Value::string(cwd.display().to_string(), span));
+    record.push("git", git_state_record(cwd, span));
+    record.push("tools", tool_state_record(cwd, span));
+    Value::record(record, span)
+}
+
+#[cfg(target_os = "hermit")]
+fn git_state_record(_cwd: &Path, span: Span) -> Value {
+    let mut record = Record::new();
+    record.push("ok", Value::bool(false, span));
+    record.push("kind", Value::string("unavailable", span));
+    record.push(
+        "message",
+        Value::string("git state is unavailable on Hermit", span),
+    );
+    Value::record(record, span)
+}
+
+#[cfg(not(target_os = "hermit"))]
+fn git_state_record(cwd: &Path, span: Span) -> Value {
+    let cwd_arg = cwd.display().to_string();
+    let Some(status) = bounded_command_stdout(
+        "git",
+        &[
+            "-C",
+            cwd_arg.as_str(),
+            "status",
+            "--porcelain=v1",
+            "--branch",
+        ],
+        cwd,
+        Duration::from_millis(750),
+    ) else {
+        let mut record = Record::new();
+        record.push("ok", Value::bool(false, span));
+        record.push("kind", Value::string("unavailable", span));
+        record.push(
+            "message",
+            Value::string("git status did not complete", span),
+        );
+        return Value::record(record, span);
+    };
+
+    let mut branch = None;
+    let mut upstream = None;
+    let mut ahead = 0_i64;
+    let mut behind = 0_i64;
+    let mut staged = Vec::new();
+    let mut modified = Vec::new();
+    let mut untracked = Vec::new();
+    let mut conflicted = Vec::new();
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("## ") {
+            let (head, tracking) = rest.split_once("...").unwrap_or((rest, ""));
+            branch = Some(head.to_owned());
+            if !tracking.is_empty() {
+                let (name, counts) = tracking.split_once(' ').unwrap_or((tracking, ""));
+                upstream = Some(name.to_owned());
+                ahead = parse_git_count(counts, "ahead").unwrap_or(0);
+                behind = parse_git_count(counts, "behind").unwrap_or(0);
+            }
+            continue;
+        }
+        if line.len() < 3 {
+            continue;
+        }
+        let status = &line[..2];
+        let path = line[3..].to_owned();
+        if status == "??" {
+            untracked.push(path);
+            continue;
+        }
+        if status.contains('U') || matches!(status, "AA" | "DD") {
+            conflicted.push(path.clone());
+        }
+        let mut chars = status.chars();
+        let index = chars.next().unwrap_or(' ');
+        let worktree = chars.next().unwrap_or(' ');
+        if index != ' ' {
+            staged.push(path.clone());
+        }
+        if worktree != ' ' {
+            modified.push(path);
+        }
+    }
+
+    let mut record = Record::new();
+    record.push("ok", Value::bool(true, span));
+    record.push(
+        "branch",
+        branch
+            .map(|value| Value::string(value, span))
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    record.push(
+        "upstream",
+        upstream
+            .map(|value| Value::string(value, span))
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    record.push("ahead", Value::int(ahead, span));
+    record.push("behind", Value::int(behind, span));
+    record.push(
+        "dirty",
+        Value::bool(
+            !staged.is_empty()
+                || !modified.is_empty()
+                || !untracked.is_empty()
+                || !conflicted.is_empty(),
+            span,
+        ),
+    );
+    record.push("staged_files", string_list_value(staged, span));
+    record.push("modified_files", string_list_value(modified, span));
+    record.push("untracked_files", string_list_value(untracked, span));
+    record.push("conflicted_files", string_list_value(conflicted, span));
+    Value::record(record, span)
+}
+
+#[cfg(not(target_os = "hermit"))]
+fn parse_git_count(text: &str, key: &str) -> Option<i64> {
+    let marker = format!("{key} ");
+    let start = text.find(&marker)? + marker.len();
+    let digits = text[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+#[cfg(target_os = "hermit")]
+fn tool_state_record(_cwd: &Path, span: Span) -> Value {
+    let mut record = Record::new();
+    record.push("available", Value::list(Vec::new(), span));
+    record.push("unavailable", Value::list(Vec::new(), span));
+    Value::record(record, span)
+}
+
+#[cfg(not(target_os = "hermit"))]
+fn tool_state_record(cwd: &Path, span: Span) -> Value {
+    let names = [
+        "python3", "python", "pip", "node", "npm", "cargo", "rustc", "go", "java", "javac", "gcc",
+        "clang", "make", "git",
+    ];
+    let mut available = Vec::new();
+    let mut unavailable = Vec::new();
+    for name in names {
+        let resolution = resolve_command(name);
+        if let Some(path) = resolution.matches.first() {
+            let mut record = Record::new();
+            record.push("name", Value::string(name, span));
+            record.push("path", Value::string(path.display().to_string(), span));
+            if let Some(version) = tool_version(name, cwd) {
+                record.push("version", Value::string(version, span));
+            }
+            available.push(Value::record(record, span));
+        } else {
+            unavailable.push(Value::string(name, span));
+        }
+    }
+    let mut record = Record::new();
+    record.push("available", Value::list(available, span));
+    record.push("unavailable", Value::list(unavailable, span));
+    Value::record(record, span)
+}
+
+#[cfg(not(target_os = "hermit"))]
+fn tool_version(name: &str, cwd: &Path) -> Option<String> {
+    let args: &[&str] = match name {
+        "python3" | "python" => &["--version"],
+        "pip" => &["--version"],
+        "node" | "npm" | "cargo" | "rustc" | "go" | "java" | "javac" | "gcc" | "clang" | "make"
+        | "git" => &["--version"],
+        _ => return None,
+    };
+    bounded_command_output(name, args, cwd, Duration::from_millis(750)).map(|text| {
+        text.lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("")
+            .trim()
+            .to_owned()
+    })
+}
+
+#[cfg(not(target_os = "hermit"))]
+fn bounded_command_stdout(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout: Duration,
+) -> Option<String> {
+    bounded_command_output(program, args, cwd, timeout).filter(|text| !text.is_empty())
+}
+
+#[cfg(not(target_os = "hermit"))]
+fn bounded_command_output(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout: Duration,
+) -> Option<String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait().ok()? {
+            Some(_) => break,
+            None if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Some(if stdout.trim().is_empty() {
+        stderr.into_owned()
+    } else {
+        stdout.into_owned()
+    })
+}
+
+fn string_list_value(items: Vec<String>, span: Span) -> Value {
+    Value::list(
+        items
+            .into_iter()
+            .map(|item| Value::string(item, span))
+            .collect(),
+        span,
+    )
 }
 
 #[cfg(not(target_os = "hermit"))]

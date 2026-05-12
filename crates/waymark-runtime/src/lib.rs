@@ -41,6 +41,9 @@ pub struct StoneGuest {
     task_scope: TaskScope,
 }
 
+const LAST_RESULT_ENV: &str = "WAYMARK_LAST_RESULT_JSON";
+const MAX_LAST_RESULT_JSON_BYTES: usize = 1024 * 1024;
+
 impl StoneGuest {
     pub fn new(start_dir: PathBuf) -> Result<Self, ShellError> {
         let mut engine_state = EngineState::new();
@@ -146,8 +149,8 @@ impl StoneGuest {
         source: &str,
         input: PipelineData,
     ) -> JsonValue {
-        if frontend == FrontendKind::Stone {
-            return match stone_frontend::eval_stone_source_with_output(
+        let response = if frontend == FrontendKind::Stone {
+            match stone_frontend::eval_stone_source_with_output(
                 &self.engine_state,
                 &mut self.stack,
                 source,
@@ -176,12 +179,15 @@ impl StoneGuest {
                     }
                 }
                 Err(err) => json::error_response(&err, Some(self.current_cwd())),
-            };
-        }
-        match self.execute_json(frontend, source, input) {
-            Ok(value) => json::success_response(value, self.current_cwd()),
-            Err(err) => json::error_response(&err, Some(self.current_cwd())),
-        }
+            }
+        } else {
+            match self.execute_json(frontend, source, input) {
+                Ok(value) => json::success_response(value, self.current_cwd()),
+                Err(err) => json::error_response(&err, Some(self.current_cwd())),
+            }
+        };
+        self.remember_last_response(&response);
+        response
     }
 
     pub fn reset_work_dir(&mut self) -> io::Result<()> {
@@ -245,6 +251,37 @@ impl StoneGuest {
 
     pub fn debug_clear_task_resources(&mut self) {
         self.task_scope.force_clear();
+    }
+
+    fn remember_last_response(&mut self, response: &JsonValue) {
+        let mut encoded = serde_json::to_string(response).unwrap_or_else(|err| {
+            serde_json::json!({
+                "ok": false,
+                "error": {
+                    "kind": "runtime_error",
+                    "code": "last_result_encode_failed",
+                    "message": err.to_string(),
+                }
+            })
+            .to_string()
+        });
+        if encoded.len() > MAX_LAST_RESULT_JSON_BYTES {
+            encoded = serde_json::json!({
+                "ok": false,
+                "error": {
+                    "kind": "resource_limit",
+                    "code": "last_result_too_large",
+                    "message": "previous result exceeded the last_result storage limit",
+                    "max_bytes": MAX_LAST_RESULT_JSON_BYTES,
+                    "actual_bytes": encoded.len(),
+                }
+            })
+            .to_string();
+        }
+        self.stack.add_env_var(
+            LAST_RESULT_ENV.into(),
+            Value::string(encoded, Span::unknown()),
+        );
     }
 }
 
@@ -549,6 +586,47 @@ emit(names)"#,
         let response = guest.stone_command_response(r#"emit({"status": "ok", "count": 2})"#);
         assert_eq!(response["ok"], json!(true));
         assert_eq!(response["value"], json!({"status": "ok", "count": 2}));
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn state_returns_agent_runtime_snapshot() -> Result<(), ShellError> {
+        let start_dir = test_root("state");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let response = guest.stone_command_response(r#"emit(state())"#);
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(
+            response["value"]["cwd"],
+            json!(start_dir.display().to_string())
+        );
+        assert!(response["value"]["git"].is_object());
+        assert!(response["value"]["tools"]["available"].is_array());
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn last_result_returns_previous_command_response() -> Result<(), ShellError> {
+        let start_dir = test_root("last-result");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let first = guest.stone_command_response(r#"emit({"answer": 42})"#);
+        assert_eq!(first["ok"], json!(true));
+
+        let second = guest.stone_command_response(r#"emit(last_result())"#);
+        assert_eq!(second["ok"], json!(true));
+        assert_eq!(second["value"]["ok"], json!(true));
+        assert_eq!(second["value"]["value"], json!({"answer": 42}));
+        assert_eq!(
+            second["value"]["cwd"],
+            json!(start_dir.display().to_string())
+        );
 
         cleanup_dir(&start_dir);
         Ok(())

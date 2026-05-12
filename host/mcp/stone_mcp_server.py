@@ -134,6 +134,18 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "effects": ["read_env", "read_file"],
         "example": 'info = resolve_command("python3")',
     },
+    "state": {
+        "name": "state",
+        "signature": "state() -> record",
+        "effects": ["read_env", "read_file", "process"],
+        "example": "snapshot = state()",
+    },
+    "last_result": {
+        "name": "last_result",
+        "signature": "last_result() -> record | None",
+        "effects": ["read_env"],
+        "example": "previous = last_result()",
+    },
     "start_daemon": {
         "name": "start_daemon",
         "signature": "start_daemon(argv: list[str], cwd: str? = None, env: record? = None, stdout: str? = None, stderr: str? = None) -> record",
@@ -200,6 +212,8 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
         "max_stderr_bytes",
     ),
     "resolve_command": ("name",),
+    "state": (),
+    "last_result": (),
     "rm": ("path",),
     "start_daemon": ("argv", "cwd", "env", "stdout", "stderr"),
     "daemon_status": ("daemon", "port", "host", "log", "max_log_bytes"),

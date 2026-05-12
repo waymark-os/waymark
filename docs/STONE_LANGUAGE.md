@@ -26,6 +26,10 @@ Use `--nu` only for the compatibility frontend. Stone is the default for
 - `find(root, name_glob="*")`: file discovery.
 - `run(argv, cwd=None, stdin=None, timeout_ms=None, env=None)`: Linux command
   execution with structured stdout, stderr, status, and helper observations.
+- `state()`: typed runtime snapshot with `cwd`, git summary, and common tool
+  availability/version probes.
+- `last_result()`: previous Waymark command response as typed data, or `None`
+  before any previous response in the current runtime process.
 - `help()`, `help("topic")`: builtin help.
 
 ## Result Shape
