@@ -25,6 +25,12 @@ pub(crate) struct LoopIrFunction {
     pub(crate) ops: Vec<GenericVmOp>,
 }
 
+impl LoopIrFunction {
+    pub(crate) fn local_name(&self, local: usize) -> Option<&str> {
+        self.locals.get(local).map(String::as_str)
+    }
+}
+
 pub(crate) type GenericVmFunction = LoopIrFunction;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

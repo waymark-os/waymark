@@ -66,7 +66,7 @@ use crate::stone_vm::{
     GenericLoopIter, GenericLoopOp, GenericLoopPlan, GenericParseNumber, GenericVmConst,
     GenericVmExprBody, GenericVmExprOp, GenericVmFunction, GenericVmOp, HotJsonlAggregationBody,
     HotJsonlBodyOp, HotJsonlNestedUserTotals, HotJsonlSlot, HotJsonlTracePlan, HotLoopIter,
-    HotLoopOp, HotLoopPlan, LoopIrFunction, LoopIrFusedKernel, LoopIrOptimizationDiagnostic,
+    HotLoopOp, HotLoopPlan, LoopIrFusedKernel, LoopIrOptimizationDiagnostic,
     LoopIrOptimizationResult, Reg, SnapshotId, StoneAccumulatorKind, StoneConst,
     StoneFallbackTarget, StoneGuardKind, StoneIrFunction, StoneLoopIrOptimizationResult, StoneOp,
     StoneTerminator,
@@ -454,15 +454,6 @@ enum GenericVmLoopResult {
 enum GenericVmInput<'a> {
     Values(&'a [RuntimeValue]),
     TextLines(&'a TextLines),
-}
-
-impl LoopIrFunction {
-    fn local_name(&self, local: usize) -> Result<&str, ShellError> {
-        self.locals
-            .get(local)
-            .map(String::as_str)
-            .ok_or_else(|| stone_error("hot loop", "generic VM local is out of range"))
-    }
 }
 
 enum StoneVmExecutionResult {
@@ -1306,26 +1297,28 @@ impl Evaluator<'_> {
                 .lowering_miss("unsupported_body_stmt");
             return Ok(GenericVmLoopResult::Unsupported);
         };
+        let local_name = |local| {
+            function
+                .local_name(local)
+                .ok_or_else(|| stone_error("hot loop", "generic VM local is out of range"))
+        };
         match (op, input) {
             (GenericVmOp::AddAssign { local }, GenericVmInput::Values(values)) => {
-                self.execute_generic_vm_add_assign(function.local_name(*local)?, values)
+                self.execute_generic_vm_add_assign(local_name(*local)?, values)
             }
             (GenericVmOp::AddAssignParsed { local, parse }, GenericVmInput::TextLines(lines))
                 if function.iter == GenericLoopIter::OpenSplitlines =>
             {
-                self.execute_generic_vm_text_parse_add_assign(
-                    function.local_name(*local)?,
-                    lines,
-                    *parse,
-                )
+                self.execute_generic_vm_text_parse_add_assign(local_name(*local)?, lines, *parse)
             }
-            (GenericVmOp::MapAddI64Const { map, addend }, GenericVmInput::Values(values)) => self
-                .execute_generic_vm_map_add_i64_const(function.local_name(*map)?, *addend, values),
+            (GenericVmOp::MapAddI64Const { map, addend }, GenericVmInput::Values(values)) => {
+                self.execute_generic_vm_map_add_i64_const(local_name(*map)?, *addend, values)
+            }
             (
                 GenericVmOp::MapAddI64ConstRecordField { map, field, addend },
                 GenericVmInput::Values(values),
             ) => self.execute_generic_vm_map_add_i64_const_record_field(
-                function.local_name(*map)?,
+                local_name(*map)?,
                 field,
                 *addend,
                 values,
@@ -1340,7 +1333,7 @@ impl Evaluator<'_> {
                 },
                 GenericVmInput::Values(values),
             ) => self.execute_generic_vm_map_add_i64_const_record_string_field(
-                function.local_name(*map)?,
+                local_name(*map)?,
                 field,
                 *strip,
                 *lower,
@@ -1348,7 +1341,7 @@ impl Evaluator<'_> {
                 values,
             ),
             (GenericVmOp::ListAppend { list, unique }, GenericVmInput::Values(values)) => {
-                self.execute_generic_vm_list_append(function.local_name(*list)?, values, *unique)
+                self.execute_generic_vm_list_append(local_name(*list)?, values, *unique)
             }
             (GenericVmOp::ExprBody(body), GenericVmInput::Values(values)) => {
                 self.execute_generic_vm_expr_body(function, body, values)
