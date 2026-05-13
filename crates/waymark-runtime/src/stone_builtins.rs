@@ -22,6 +22,17 @@ pub(crate) fn len_builtin(value: &Value) -> Result<Value, ShellError> {
     value_len(value).map(|len| Value::int(len, Span::unknown()))
 }
 
+pub(crate) fn list_builtin(value: &Value) -> Result<Value, ShellError> {
+    match value {
+        Value::List { vals, .. } => Ok(Value::list(vals.clone(), Span::unknown())),
+        Value::Record { .. } => record_method_builtin(value, "keys", &[]),
+        other => Err(stone_error(
+            "list",
+            format!("expected list or record, got {}", other.get_type()),
+        )),
+    }
+}
+
 pub(crate) fn str_builtin(value: &Value) -> Result<Value, ShellError> {
     value_to_display_string(value).map(|text| Value::string(text, Span::unknown()))
 }
@@ -181,6 +192,75 @@ pub(crate) fn value_ordering(left: &Value, right: &Value) -> Result<Ordering, Sh
             "comparison",
             format!("cannot order {} and {}", left.get_type(), right.get_type()),
         )),
+    }
+}
+
+pub(crate) fn record_method_builtin(
+    receiver: &Value,
+    method: &str,
+    args: &[Value],
+) -> Result<Value, ShellError> {
+    let Value::Record { val, .. } = receiver else {
+        return Err(stone_error(
+            method,
+            format!("{} has no {method}()", receiver.get_type()),
+        ));
+    };
+    match method {
+        "get" => {
+            let ([key] | [key, _]) = args else {
+                return Err(stone_error(
+                    "get",
+                    "record get() requires key and optional default",
+                ));
+            };
+            let key = value_to_string(key, "get")?;
+            if let Some(value) = val.get(&key) {
+                return Ok(value.clone());
+            }
+            match args {
+                [_] => Ok(Value::nothing(Span::unknown())),
+                [_, default] => Ok(default.clone()),
+                _ => unreachable!(),
+            }
+        }
+        "keys" => {
+            let [] = args else {
+                return Err(stone_error("keys", "keys() takes no arguments"));
+            };
+            Ok(Value::list(
+                val.iter()
+                    .map(|(key, _)| Value::string(key.clone(), Span::unknown()))
+                    .collect(),
+                Span::unknown(),
+            ))
+        }
+        "values" => {
+            let [] = args else {
+                return Err(stone_error("values", "values() takes no arguments"));
+            };
+            Ok(Value::list(
+                val.iter().map(|(_, value)| value.clone()).collect(),
+                Span::unknown(),
+            ))
+        }
+        "items" => {
+            let [] = args else {
+                return Err(stone_error("items", "items() takes no arguments"));
+            };
+            Ok(Value::list(
+                val.iter()
+                    .map(|(key, value)| {
+                        Value::list(
+                            vec![Value::string(key.clone(), Span::unknown()), value.clone()],
+                            Span::unknown(),
+                        )
+                    })
+                    .collect(),
+                Span::unknown(),
+            ))
+        }
+        _ => unreachable!("record method dispatch is validated by caller"),
     }
 }
 

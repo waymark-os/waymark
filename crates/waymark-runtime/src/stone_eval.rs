@@ -23,9 +23,10 @@ use crate::stone_ast::{
     Stmt, StoneFormatSpec, StoneType,
 };
 use crate::stone_builtins::{
-    float_builtin, int_builtin, len_builtin, str_builtin, value_ordering, value_to_bool,
-    value_to_display_string, value_to_f64, value_to_i64, value_to_int, value_to_limit,
-    value_to_path_string, value_to_string, value_to_u64, value_type_name, values_equal,
+    float_builtin, int_builtin, len_builtin, list_builtin, record_method_builtin, str_builtin,
+    value_ordering, value_to_bool, value_to_display_string, value_to_f64, value_to_i64,
+    value_to_int, value_to_limit, value_to_path_string, value_to_string, value_to_u64,
+    value_type_name, values_equal,
 };
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_file_ops::{
@@ -5823,7 +5824,7 @@ impl Evaluator<'_> {
                     .into_nu_value(&call.name)?,
             );
         }
-        eval_record_method(&record, &call.name, &args).map(RuntimeValue::Nu)
+        record_method_builtin(&record, &call.name, &args).map(RuntimeValue::Nu)
     }
 
     #[cfg(not(target_os = "hermit"))]
@@ -6120,14 +6121,7 @@ impl Evaluator<'_> {
         let value = self
             .eval_expr_value(value, PipelineData::empty())?
             .into_nu_value("list")?;
-        match value {
-            Value::List { vals, .. } => Ok(RuntimeValue::Nu(Value::list(vals, Span::unknown()))),
-            Value::Record { .. } => eval_record_method(&value, "keys", &[]).map(RuntimeValue::Nu),
-            other => Err(stone_error(
-                "list",
-                format!("expected list or record, got {}", other.get_type()),
-            )),
-        }
+        list_builtin(&value).map(RuntimeValue::Nu)
     }
 
     fn eval_type_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -6756,7 +6750,7 @@ impl Evaluator<'_> {
                 })
                 .map(RuntimeValue::Nu),
                 "get" | "items" | "keys" | "values" => {
-                    eval_record_method(&receiver, method, &args).map(RuntimeValue::Nu)
+                    record_method_builtin(&receiver, method, &args).map(RuntimeValue::Nu)
                 }
                 "find" => eval_find_method(&receiver, &args).map(RuntimeValue::Nu),
                 "index" => eval_index_method(&receiver, &args).map(RuntimeValue::Nu),
@@ -7812,7 +7806,7 @@ fn eval_json_object_view_method(
         }
         "items" | "keys" | "values" => {
             let materialized = materialize_json_object_view(view)?;
-            eval_record_method(&materialized, method, args).map(RuntimeValue::Nu)
+            record_method_builtin(&materialized, method, args).map(RuntimeValue::Nu)
         }
         other => Err(stone_error(
             other,
@@ -9135,71 +9129,6 @@ fn eval_string_method(
             method,
             format!("{} has no {method}()", other.get_type()),
         )),
-    }
-}
-
-fn eval_record_method(receiver: &Value, method: &str, args: &[Value]) -> Result<Value, ShellError> {
-    let Value::Record { val, .. } = receiver else {
-        return Err(stone_error(
-            method,
-            format!("{} has no {method}()", receiver.get_type()),
-        ));
-    };
-    match method {
-        "get" => {
-            let ([key] | [key, _]) = args else {
-                return Err(stone_error(
-                    "get",
-                    "record get() requires key and optional default",
-                ));
-            };
-            let key = value_to_string(key, "get")?;
-            if let Some(value) = val.get(&key) {
-                return Ok(value.clone());
-            }
-            match args {
-                [_] => Ok(Value::nothing(Span::unknown())),
-                [_, default] => Ok(default.clone()),
-                _ => unreachable!(),
-            }
-        }
-        "keys" => {
-            let [] = args else {
-                return Err(stone_error("keys", "keys() takes no arguments"));
-            };
-            Ok(Value::list(
-                val.iter()
-                    .map(|(key, _)| Value::string(key.clone(), Span::unknown()))
-                    .collect(),
-                Span::unknown(),
-            ))
-        }
-        "values" => {
-            let [] = args else {
-                return Err(stone_error("values", "values() takes no arguments"));
-            };
-            Ok(Value::list(
-                val.iter().map(|(_, value)| value.clone()).collect(),
-                Span::unknown(),
-            ))
-        }
-        "items" => {
-            let [] = args else {
-                return Err(stone_error("items", "items() takes no arguments"));
-            };
-            Ok(Value::list(
-                val.iter()
-                    .map(|(key, value)| {
-                        Value::list(
-                            vec![Value::string(key.clone(), Span::unknown()), value.clone()],
-                            Span::unknown(),
-                        )
-                    })
-                    .collect(),
-                Span::unknown(),
-            ))
-        }
-        _ => unreachable!("record method dispatch is validated by caller"),
     }
 }
 
