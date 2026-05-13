@@ -24,12 +24,12 @@ use crate::stone_ast::{
 };
 use crate::stone_builtins::{
     first_builtin, float_builtin, format_builtin, int_builtin, join_builtin, last_builtin,
-    len_builtin, list_builtin, min_max_builtin, parse_float_builtin, parse_int_builtin,
-    range_builtin, record_method_builtin, round_builtin, set_builtin, slice_builtin, split_builtin,
-    starts_with_builtin, str_builtin, unique_builtin, value_identity_key, value_ordering,
-    value_to_bool, value_to_display_string, value_to_f64, value_to_i64, value_to_int,
-    value_to_limit, value_to_path_string, value_to_string, value_to_u64, value_type_name,
-    values_equal, where_builtin,
+    len_builtin, list_builtin, map_builtin_value, min_max_builtin, parse_float_builtin,
+    parse_int_builtin, range_builtin, record_method_builtin, round_builtin, set_builtin,
+    slice_builtin, split_builtin, starts_with_builtin, str_builtin, sum_builtin, unique_builtin,
+    value_identity_key, value_ordering, value_to_bool, value_to_display_string, value_to_f64,
+    value_to_i64, value_to_limit, value_to_path_string, value_to_string, value_to_u64,
+    value_type_name, values_equal, where_builtin,
 };
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_file_ops::{
@@ -6717,7 +6717,7 @@ impl Evaluator<'_> {
         }
         let values = self.eval_iterable_expr(iterable)?;
         if let Expr::Name(func_name) = func {
-            if is_map_builtin_name(func_name) {
+            if crate::stone_builtins::is_map_builtin_name(func_name) {
                 return values
                     .into_iter()
                     .map(|value| {
@@ -6776,7 +6776,7 @@ impl Evaluator<'_> {
             ));
         }
 
-        let values: Vec<RuntimeValue> = match arg {
+        let runtime_values: Vec<RuntimeValue> = match arg {
             Expr::Generator { .. } => self
                 .eval_generator_values(arg)?
                 .into_iter()
@@ -6791,34 +6791,11 @@ impl Evaluator<'_> {
             }
         };
 
-        let mut int_total = 0i64;
-        let mut float_total = 0.0f64;
-        let mut has_float = false;
-        for value in values {
-            let value = value.into_nu_value("sum")?;
-            match value_to_sum_number(&value)? {
-                SumNumber::Int(value) if has_float => {
-                    float_total += value as f64;
-                }
-                SumNumber::Int(value) => {
-                    int_total = int_total
-                        .checked_add(value)
-                        .ok_or_else(|| stone_error("sum", "integer sum overflow"))?;
-                }
-                SumNumber::Float(value) if has_float => {
-                    float_total += value;
-                }
-                SumNumber::Float(value) => {
-                    has_float = true;
-                    float_total = int_total as f64 + value;
-                }
-            }
+        let mut values = Vec::with_capacity(runtime_values.len());
+        for value in runtime_values {
+            values.push(value.into_nu_value("sum")?);
         }
-        if has_float {
-            Ok(RuntimeValue::Nu(Value::float(float_total, Span::unknown())))
-        } else {
-            Ok(RuntimeValue::Nu(Value::int(int_total, Span::unknown())))
-        }
+        sum_builtin(values).map(RuntimeValue::Nu)
     }
 
     fn eval_generator_values(&mut self, expression: &Expr) -> Result<Vec<Value>, ShellError> {
@@ -8504,10 +8481,6 @@ fn sort_key_kind(value: &Value) -> Result<SortKeyKind, ShellError> {
     }
 }
 
-fn is_map_builtin_name(func_name: &str) -> bool {
-    matches!(func_name, "int" | "float" | "json_dumps" | "str")
-}
-
 fn runtime_type_name(value: &RuntimeValue) -> &'static str {
     match value {
         RuntimeValue::Nu(value) => value_type_name(value),
@@ -8546,46 +8519,6 @@ fn format_fstring_value(value: &Value, spec: &StoneFormatSpec) -> Result<String,
             let value = value_to_i64(value, "f-string format")?;
             Ok(zfill(&value.to_string(), *width))
         }
-    }
-}
-
-fn map_builtin_value(func_name: &str, value: &Value) -> Result<Value, ShellError> {
-    match func_name {
-        "int" => value_to_int(value),
-        "float" => value_to_f64(value, "float").map(|value| Value::float(value, Span::unknown())),
-        "json_dumps" => serde_json::to_string(&nu_to_json_value(value))
-            .map(|text| Value::string(text, Span::unknown()))
-            .map_err(|err| stone_error("map", err.to_string())),
-        "str" => value_to_display_string(value).map(|text| Value::string(text, Span::unknown())),
-        other => Err(stone_error(
-            "map",
-            format!("map() does not support `{other}` yet"),
-        )),
-    }
-}
-
-enum SumNumber {
-    Int(i64),
-    Float(f64),
-}
-
-fn value_to_sum_number(value: &Value) -> Result<SumNumber, ShellError> {
-    match value {
-        Value::Int { val, .. } => Ok(SumNumber::Int(*val)),
-        Value::Float { val, .. } => Ok(SumNumber::Float(*val)),
-        Value::String { val, .. } | Value::Glob { val, .. } => {
-            let text = val.trim();
-            if let Ok(value) = text.parse::<i64>() {
-                return Ok(SumNumber::Int(value));
-            }
-            text.parse::<f64>()
-                .map(SumNumber::Float)
-                .map_err(|err| stone_error("sum", format!("failed to parse number: {err}")))
-        }
-        other => Err(stone_error(
-            "sum",
-            format!("expected number, got {}", other.get_type()),
-        )),
     }
 }
 

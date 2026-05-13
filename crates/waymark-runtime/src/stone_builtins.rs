@@ -113,8 +113,57 @@ pub(crate) fn list_builtin(value: &Value) -> Result<Value, ShellError> {
     }
 }
 
+pub(crate) fn is_map_builtin_name(func_name: &str) -> bool {
+    matches!(func_name, "int" | "float" | "json_dumps" | "str")
+}
+
+pub(crate) fn map_builtin_value(func_name: &str, value: &Value) -> Result<Value, ShellError> {
+    match func_name {
+        "int" => value_to_int(value),
+        "float" => float_builtin(value),
+        "json_dumps" => serde_json::to_string(&nu_to_json_value(value))
+            .map(|text| Value::string(text, Span::unknown()))
+            .map_err(|err| stone_error("map", err.to_string())),
+        "str" => str_builtin(value),
+        other => Err(stone_error(
+            "map",
+            format!("map() does not support `{other}` yet"),
+        )),
+    }
+}
+
 pub(crate) fn str_builtin(value: &Value) -> Result<Value, ShellError> {
     value_to_display_string(value).map(|text| Value::string(text, Span::unknown()))
+}
+
+pub(crate) fn sum_builtin(values: Vec<Value>) -> Result<Value, ShellError> {
+    let mut int_total = 0i64;
+    let mut float_total = 0.0f64;
+    let mut has_float = false;
+    for value in values {
+        match value_to_sum_number(&value)? {
+            SumNumber::Int(value) if has_float => {
+                float_total += value as f64;
+            }
+            SumNumber::Int(value) => {
+                int_total = int_total
+                    .checked_add(value)
+                    .ok_or_else(|| stone_error("sum", "integer sum overflow"))?;
+            }
+            SumNumber::Float(value) if has_float => {
+                float_total += value;
+            }
+            SumNumber::Float(value) => {
+                has_float = true;
+                float_total = int_total as f64 + value;
+            }
+        }
+    }
+    if has_float {
+        Ok(Value::float(float_total, Span::unknown()))
+    } else {
+        Ok(Value::int(int_total, Span::unknown()))
+    }
 }
 
 pub(crate) fn set_builtin(values: Vec<Value>) -> Result<Value, ShellError> {
@@ -631,6 +680,31 @@ fn unique_values(values: Vec<Value>, context: &str) -> Result<Vec<Value>, ShellE
         }
     }
     Ok(unique_values)
+}
+
+enum SumNumber {
+    Int(i64),
+    Float(f64),
+}
+
+fn value_to_sum_number(value: &Value) -> Result<SumNumber, ShellError> {
+    match value {
+        Value::Int { val, .. } => Ok(SumNumber::Int(*val)),
+        Value::Float { val, .. } => Ok(SumNumber::Float(*val)),
+        Value::String { val, .. } | Value::Glob { val, .. } => {
+            let text = val.trim();
+            if let Ok(value) = text.parse::<i64>() {
+                return Ok(SumNumber::Int(value));
+            }
+            text.parse::<f64>()
+                .map(SumNumber::Float)
+                .map_err(|err| stone_error("sum", format!("failed to parse number: {err}")))
+        }
+        other => Err(stone_error(
+            "sum",
+            format!("expected number, got {}", other.get_type()),
+        )),
+    }
 }
 
 fn stone_error(kind: &str, message: impl Into<String>) -> ShellError {
