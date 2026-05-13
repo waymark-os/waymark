@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Dynamic Stone helper registrations for ML and Triton runtime diagnostics.
 hook("run.after_success", family="python", handler="ml.after_success", priority=50)
 hook("run.after_failure", family="python", handler="ml.after_failure", priority=50)

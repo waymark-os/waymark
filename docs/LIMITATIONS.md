@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
 # Preview Limitations
 
 - The runtime code is still split between `crates/waymark` and

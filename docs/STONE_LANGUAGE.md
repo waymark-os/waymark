@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
 # Stone Language
 
 Stone is the structured shell language used by Waymark Shell. It intentionally looks

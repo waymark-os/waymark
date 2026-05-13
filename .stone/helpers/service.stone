@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Dynamic Stone helper registrations for service and network validation diagnostics.
 hook("run.after_success", family="service", argv0=["python-grpc","grpcurl"], argv0_prefix=["server"], handler="service.after_success", priority=100)
 hook("run.after_failure", family="service", argv0=["python-grpc","grpcurl"], argv0_prefix=["server"], handler="service.after_failure", priority=100)

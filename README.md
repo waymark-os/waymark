@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
 # Waymark Shell
 
 Waymark Shell is a structured shell for coding agents and automation. Stone is the

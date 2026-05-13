@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use nu_protocol::{
     shell_error::{generic::GenericError, io::ErrorKind, ErrorSite},
     PipelineData, Record, ShellError, Span, Value,

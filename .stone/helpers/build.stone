@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Dynamic Stone helper registrations for build and long-running command timeouts.
 hook("run.after_timeout", family="build", argv0=["make","cmake","ninja","cargo","npm","pytest"], handler="build.after_timeout", priority=100)
 hook("run.after_timeout", family="generic", handler="build.after_timeout", priority=20)

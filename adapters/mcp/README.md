@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
 # MCP Adapter
 
 The MCP adapter implementation currently lives in [../../host/mcp](../../host/mcp).

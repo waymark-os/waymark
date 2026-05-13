@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #[cfg(target_os = "hermit")]
 use std::ffi::CString;
 #[cfg(not(target_os = "hermit"))]

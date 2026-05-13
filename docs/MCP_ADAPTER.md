@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
 # MCP Adapter
 
 The MCP server is an adapter that exposes Stone to current coding-agent clients.

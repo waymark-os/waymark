@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
 # Build And Install
 
 Waymark Shell is a Rust project. The public binary is `waymark`.

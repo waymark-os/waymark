@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
 # Stone MCP Adapter
 
 This directory contains the host-side MCP adapter for exposing Waymark Shell/Stone

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Write a Codex config.toml that registers the Stone MCP server."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 names = []
 for item in ls("."):
     if item["type"] == "file":

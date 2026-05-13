@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Dynamic Stone helper registrations for native shared-library diagnostics.
 hook("run.after_failure", family="native", argv0=["file","ldd","readelf","objdump"], handler="native.after_failure", priority=100)
 hook("run.after_failure", family="python", argv0_prefix=["python"], handler="native.after_failure", priority=40)

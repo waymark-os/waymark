@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """Small MCP stdio server for host-side Stone evaluation."""
 
 from __future__ import annotations
