@@ -8724,9 +8724,29 @@ struct StoneHelperHook {
     family: String,
     argv0: Vec<String>,
     argv0_prefix: Vec<String>,
-    handler: String,
+    handler: StoneHelperHandler,
     priority: i64,
     source: PathBuf,
+}
+
+#[cfg(not(target_os = "hermit"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoneHelperHandler {
+    name: String,
+    kind: StoneHelperHandlerKind,
+}
+
+#[cfg(not(target_os = "hermit"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StoneHelperHandlerKind {
+    PythonAfterFailure,
+    NativeAfterFailure,
+    MediaAfterRun,
+    MlAfterRun,
+    LlvmAfterRun,
+    ServiceAfterRun,
+    BuildAfterTimeout,
+    Registered,
 }
 
 #[cfg(not(target_os = "hermit"))]
@@ -8880,7 +8900,7 @@ impl StoneHelperRegistry {
     fn dispatch_run(&self, event: &StoneRunEvent<'_>, span: Span) -> Vec<Value> {
         let mut observations = Vec::new();
         for hook in self.matching_hooks(event) {
-            if let Some(observation) = run_helper_handler(hook, event, span) {
+            if let Some(observation) = hook.handler.invoke(hook, event, span) {
                 observations.push(observation);
             }
         }
@@ -8909,7 +8929,7 @@ impl StoneHelperRegistry {
             right
                 .priority
                 .cmp(&left.priority)
-                .then_with(|| left.handler.cmp(&right.handler))
+                .then_with(|| left.handler.name.cmp(&right.handler.name))
         });
         hooks
     }
@@ -8927,6 +8947,59 @@ impl StoneHelperFamilyMatcher {
 
     fn max_prefix_len(&self) -> usize {
         self.argv0_prefix.iter().map(String::len).max().unwrap_or(0)
+    }
+}
+
+#[cfg(not(target_os = "hermit"))]
+impl StoneHelperHandler {
+    fn resolve(name: String) -> Self {
+        let kind = match name.as_str() {
+            "python.after_failure" | "python.pip_after_failure" => {
+                StoneHelperHandlerKind::PythonAfterFailure
+            }
+            "native.after_failure" => StoneHelperHandlerKind::NativeAfterFailure,
+            "media.after_success" | "media.after_failure" => StoneHelperHandlerKind::MediaAfterRun,
+            "ml.after_success" | "ml.after_failure" => StoneHelperHandlerKind::MlAfterRun,
+            "llvm.after_success" | "llvm.after_failure" => StoneHelperHandlerKind::LlvmAfterRun,
+            "service.after_success" | "service.after_failure" => {
+                StoneHelperHandlerKind::ServiceAfterRun
+            }
+            "build.after_timeout" => StoneHelperHandlerKind::BuildAfterTimeout,
+            _ => StoneHelperHandlerKind::Registered,
+        };
+        Self { name, kind }
+    }
+
+    fn invoke(
+        &self,
+        hook: &StoneHelperHook,
+        event: &StoneRunEvent<'_>,
+        span: Span,
+    ) -> Option<Value> {
+        match self.kind {
+            StoneHelperHandlerKind::PythonAfterFailure => {
+                python_helper_after_failure(hook, event, span)
+            }
+            StoneHelperHandlerKind::NativeAfterFailure => {
+                native_helper_after_failure(hook, event, span)
+            }
+            StoneHelperHandlerKind::MediaAfterRun => media_helper_after_run(hook, event, span),
+            StoneHelperHandlerKind::MlAfterRun => ml_helper_after_run(hook, event, span),
+            StoneHelperHandlerKind::LlvmAfterRun => llvm_helper_after_run(hook, event, span),
+            StoneHelperHandlerKind::ServiceAfterRun => service_helper_after_run(hook, event, span),
+            StoneHelperHandlerKind::BuildAfterTimeout => {
+                build_helper_after_timeout(hook, event, span)
+            }
+            StoneHelperHandlerKind::Registered => Some(helper_observation(
+                hook,
+                event,
+                "helper_registered",
+                format!("Loaded helper `{}` for {}.", self.name, hook.event),
+                Record::new(),
+                Vec::<Vec<String>>::new(),
+                span,
+            )),
+        }
     }
 }
 
@@ -8990,7 +9063,7 @@ fn parse_stone_helper_hooks(source: &str, path: &Path) -> Vec<StoneHelperHook> {
             family,
             argv0: parse_named_string_list_arg(trimmed, "argv0"),
             argv0_prefix: parse_named_string_list_arg(trimmed, "argv0_prefix"),
-            handler,
+            handler: StoneHelperHandler::resolve(handler),
             priority,
             source: path.to_path_buf(),
         });
@@ -9075,36 +9148,6 @@ fn command_argv0(argv: &[String]) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or(first)
         .to_owned()
-}
-
-#[cfg(not(target_os = "hermit"))]
-fn run_helper_handler(
-    hook: &StoneHelperHook,
-    event: &StoneRunEvent<'_>,
-    span: Span,
-) -> Option<Value> {
-    match hook.handler.as_str() {
-        "python.after_failure" | "python.pip_after_failure" => {
-            python_helper_after_failure(hook, event, span)
-        }
-        "native.after_failure" => native_helper_after_failure(hook, event, span),
-        "media.after_success" | "media.after_failure" => media_helper_after_run(hook, event, span),
-        "ml.after_success" | "ml.after_failure" => ml_helper_after_run(hook, event, span),
-        "llvm.after_success" | "llvm.after_failure" => llvm_helper_after_run(hook, event, span),
-        "service.after_success" | "service.after_failure" => {
-            service_helper_after_run(hook, event, span)
-        }
-        "build.after_timeout" => build_helper_after_timeout(hook, event, span),
-        _ => Some(helper_observation(
-            hook,
-            event,
-            "helper_registered",
-            format!("Loaded helper `{}` for {}.", hook.handler, hook.event),
-            Record::new(),
-            Vec::<Vec<String>>::new(),
-            span,
-        )),
-    }
 }
 
 #[cfg(not(target_os = "hermit"))]
@@ -9486,7 +9529,7 @@ fn helper_observation(
     span: Span,
 ) -> Value {
     let mut record = Record::new();
-    record.push("helper", Value::string(hook.handler.clone(), span));
+    record.push("helper", Value::string(hook.handler.name.clone(), span));
     record.push("event", Value::string(event.event.to_owned(), span));
     record.push("family", Value::string(event.family.clone(), span));
     record.push("kind", Value::string(kind.into(), span));
@@ -9544,7 +9587,7 @@ fn attach_service_helper_observation(
         family: "service".to_owned(),
         argv0: Vec::new(),
         argv0_prefix: Vec::new(),
-        handler: handler.to_owned(),
+        handler: StoneHelperHandler::resolve(handler.to_owned()),
         priority: 100,
         source: PathBuf::from("<builtin-service-lifecycle>"),
     };
@@ -15568,8 +15611,8 @@ emit({{
 
         let registry = super::stone_helper_registry(&root);
         assert_eq!(registry.hooks.len(), 2);
-        assert_eq!(registry.hooks[0].handler, "python.after_failure");
-        assert_eq!(registry.hooks[1].handler, "generic.after_failure");
+        assert_eq!(registry.hooks[0].handler.name, "python.after_failure");
+        assert_eq!(registry.hooks[1].handler.name, "generic.after_failure");
 
         cleanup_dir(&root);
         Ok(())
