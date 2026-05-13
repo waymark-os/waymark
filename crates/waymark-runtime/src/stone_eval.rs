@@ -23,10 +23,12 @@ use crate::stone_ast::{
     Stmt, StoneFormatSpec, StoneType,
 };
 use crate::stone_builtins::{
-    float_builtin, int_builtin, len_builtin, list_builtin, record_method_builtin, str_builtin,
-    value_ordering, value_to_bool, value_to_display_string, value_to_f64, value_to_i64,
-    value_to_int, value_to_limit, value_to_path_string, value_to_string, value_to_u64,
-    value_type_name, values_equal,
+    first_builtin, float_builtin, int_builtin, join_builtin, last_builtin, len_builtin,
+    list_builtin, range_builtin, record_method_builtin, set_builtin, slice_builtin, split_builtin,
+    starts_with_builtin, str_builtin, unique_builtin, value_identity_key, value_ordering,
+    value_to_bool, value_to_display_string, value_to_f64, value_to_i64, value_to_int,
+    value_to_limit, value_to_path_string, value_to_string, value_to_u64, value_type_name,
+    values_equal,
 };
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_file_ops::{
@@ -4053,7 +4055,7 @@ impl Evaluator<'_> {
                                     let value = value.into_nu_value("subscript")?;
                                     let lower = self.eval_optional_index(lower.as_deref())?;
                                     let upper = self.eval_optional_index(upper.as_deref())?;
-                                    eval_slice(&value, lower, upper).map(RuntimeValue::Nu)
+                                    slice_builtin(&value, lower, upper).map(RuntimeValue::Nu)
                                 }
                                 index => {
                                     let index = self
@@ -5134,12 +5136,6 @@ impl Evaluator<'_> {
         let values = self
             .eval_expr_value(values, PipelineData::empty())?
             .into_nu_value(name)?;
-        let Value::List { vals, .. } = values else {
-            return Err(stone_error(
-                name,
-                format!("expected list, got {}", values.get_type()),
-            ));
-        };
         let count = match call.positional.get(1) {
             Some(count) => {
                 let count = self
@@ -5149,13 +5145,7 @@ impl Evaluator<'_> {
             }
             None => None,
         };
-        Ok(RuntimeValue::Nu(match count {
-            Some(count) => Value::list(vals.into_iter().take(count).collect(), Span::unknown()),
-            None => vals
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| Value::nothing(Span::unknown())),
-        }))
+        first_builtin(&values, count, name).map(RuntimeValue::Nu)
     }
 
     fn eval_last_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5175,12 +5165,6 @@ impl Evaluator<'_> {
         let values = self
             .eval_expr_value(values, PipelineData::empty())?
             .into_nu_value(name)?;
-        let Value::List { vals, .. } = values else {
-            return Err(stone_error(
-                name,
-                format!("expected list, got {}", values.get_type()),
-            ));
-        };
         let count = match call.positional.get(1) {
             Some(count) => {
                 let count = self
@@ -5190,16 +5174,7 @@ impl Evaluator<'_> {
             }
             None => None,
         };
-        Ok(RuntimeValue::Nu(match count {
-            Some(count) => {
-                let start = vals.len().saturating_sub(count);
-                Value::list(vals.into_iter().skip(start).collect(), Span::unknown())
-            }
-            None => vals
-                .into_iter()
-                .last()
-                .unwrap_or_else(|| Value::nothing(Span::unknown())),
-        }))
+        last_builtin(&values, count, name).map(RuntimeValue::Nu)
     }
 
     fn eval_mkdir_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5639,18 +5614,11 @@ impl Evaluator<'_> {
             [iterable] => self.eval_iterable_expr(iterable)?,
             _ => unreachable!(),
         };
-        let mut seen = HashSet::new();
-        let mut unique_values = Vec::new();
-        for value in values {
-            let value = value.into_nu_value("set")?;
-            if seen.insert(value_identity_key(&value, "set")?) {
-                unique_values.push(value);
-            }
-        }
-        Ok(RuntimeValue::Nu(Value::list(
-            unique_values,
-            Span::unknown(),
-        )))
+        let values = values
+            .into_iter()
+            .map(|value| value.into_nu_value("set"))
+            .collect::<Result<Vec<_>, _>>()?;
+        set_builtin(values).map(RuntimeValue::Nu)
     }
 
     fn eval_unique_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5666,25 +5634,7 @@ impl Evaluator<'_> {
         let values = self
             .eval_expr_value(values, PipelineData::empty())?
             .into_nu_value("unique")?;
-        let Value::List { vals, .. } = values else {
-            return Err(stone_error(
-                "unique",
-                format!("expected list, got {}", values.get_type()),
-            ));
-        };
-
-        let mut seen = HashSet::new();
-        let mut unique_values = Vec::new();
-        for value in vals {
-            let key = value_identity_key(&value, "unique")?;
-            if seen.insert(key) {
-                unique_values.push(value);
-            }
-        }
-        Ok(RuntimeValue::Nu(Value::list(
-            unique_values,
-            Span::unknown(),
-        )))
+        unique_builtin(&values).map(RuntimeValue::Nu)
     }
 
     fn eval_round_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -6205,25 +6155,17 @@ impl Evaluator<'_> {
         let text = self
             .eval_expr_value(text, PipelineData::empty())?
             .into_nu_value("split")?;
-        let text = value_to_string(&text, "split")?;
-        let parts = match call.positional.as_slice() {
-            [_] => text.split_whitespace().collect::<Vec<_>>(),
+        let separator = match call.positional.as_slice() {
+            [_] => None,
             [_, separator] => {
                 let separator = self
                     .eval_expr_value(separator, PipelineData::empty())?
                     .into_nu_value("split")?;
-                let separator = value_to_string(&separator, "split")?;
-                text.split(&separator).collect::<Vec<_>>()
+                Some(separator)
             }
             _ => unreachable!(),
         };
-        Ok(RuntimeValue::Nu(Value::list(
-            parts
-                .into_iter()
-                .map(|part| Value::string(part.to_owned(), Span::unknown()))
-                .collect(),
-            Span::unknown(),
-        )))
+        split_builtin(&text, separator.as_ref()).map(RuntimeValue::Nu)
     }
 
     fn eval_join_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -6242,39 +6184,17 @@ impl Evaluator<'_> {
         let first = self
             .eval_expr_value(items, PipelineData::empty())?
             .into_nu_value("join")?;
-        let (items, separator) = match call.positional.as_slice() {
-            [_] => (first, String::new()),
+        let second = match call.positional.as_slice() {
+            [_] => None,
             [_, second] => {
                 let second = self
                     .eval_expr_value(second, PipelineData::empty())?
                     .into_nu_value("join")?;
-                match (&first, &second) {
-                    (Value::List { .. }, _) => (first, value_to_string(&second, "join")?),
-                    (_, Value::List { .. }) => (second, value_to_string(&first, "join")?),
-                    _ => {
-                        return Err(stone_error(
-                            "join",
-                            "join() requires a list and optional separator",
-                        ));
-                    }
-                }
+                Some(second)
             }
             _ => unreachable!(),
         };
-        let Value::List { vals, .. } = items else {
-            return Err(stone_error(
-                "join",
-                format!("expected list, got {}", items.get_type()),
-            ));
-        };
-        let mut parts = Vec::with_capacity(vals.len());
-        for value in &vals {
-            parts.push(value_to_string(value, "join")?);
-        }
-        Ok(RuntimeValue::Nu(Value::string(
-            parts.join(&separator),
-            Span::unknown(),
-        )))
+        join_builtin(&first, second.as_ref()).map(RuntimeValue::Nu)
     }
 
     fn eval_slice_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -6305,7 +6225,7 @@ impl Evaluator<'_> {
             .map(|expr| self.eval_optional_slice_arg(expr, "slice end"))
             .transpose()?
             .flatten();
-        eval_slice(&value, start, end).map(RuntimeValue::Nu)
+        slice_builtin(&value, start, end).map(RuntimeValue::Nu)
     }
 
     fn eval_optional_slice_arg(
@@ -6342,12 +6262,7 @@ impl Evaluator<'_> {
         let prefix = self
             .eval_expr_value(prefix, PipelineData::empty())?
             .into_nu_value("starts_with")?;
-        let text = value_to_string(&text, "starts_with")?;
-        let prefix = value_to_string(&prefix, "starts_with")?;
-        Ok(RuntimeValue::Nu(Value::bool(
-            text.starts_with(&prefix),
-            Span::unknown(),
-        )))
+        starts_with_builtin(&text, &prefix).map(RuntimeValue::Nu)
     }
 
     fn eval_format_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -6417,36 +6332,7 @@ impl Evaluator<'_> {
                 value_to_i64(&value, "range")
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let (start, stop, step) = match args.as_slice() {
-            [stop] => (0, *stop, 1),
-            [start, stop] => (*start, *stop, 1),
-            [start, stop, step] => (*start, *stop, *step),
-            _ => {
-                return Err(stone_error(
-                    "range",
-                    "range() requires one to three integer arguments",
-                ));
-            }
-        };
-        if step == 0 {
-            return Err(stone_error("range", "range() step must not be zero"));
-        }
-        let mut values = Vec::new();
-        let mut current = start;
-        while if step > 0 {
-            current < stop
-        } else {
-            current > stop
-        } {
-            if values.len() >= 100_000 {
-                return Err(stone_error("range", "range() produced too many values"));
-            }
-            values.push(Value::int(current, Span::unknown()));
-            current = current
-                .checked_add(step)
-                .ok_or_else(|| stone_error("range", "range() integer overflow"))?;
-        }
-        Ok(RuntimeValue::Nu(Value::list(values, Span::unknown())))
+        range_builtin(&args).map(RuntimeValue::Nu)
     }
 
     fn eval_enumerate_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -8709,11 +8595,6 @@ fn runtime_type_name(value: &RuntimeValue) -> &'static str {
     }
 }
 
-fn value_identity_key(value: &Value, context: &str) -> Result<String, ShellError> {
-    serde_json::to_string(&nu_to_json_value(value))
-        .map_err(|err| stone_error(context, err.to_string()))
-}
-
 fn zfill(text: &str, width: usize) -> String {
     let len = text.chars().count();
     if len >= width {
@@ -9244,47 +9125,6 @@ fn eval_subscript(value: &Value, index: &Value) -> Result<Value, ShellError> {
                 index.get_type()
             ),
         )),
-    }
-}
-
-fn eval_slice(value: &Value, lower: Option<i64>, upper: Option<i64>) -> Result<Value, ShellError> {
-    match value {
-        Value::List { vals, .. } => {
-            let (start, end) = normalize_slice_bounds(lower, upper, vals.len())?;
-            Ok(Value::list(vals[start..end].to_vec(), Span::unknown()))
-        }
-        Value::String { val, .. } | Value::Glob { val, .. } => {
-            let chars = val.chars().collect::<Vec<_>>();
-            let (start, end) = normalize_slice_bounds(lower, upper, chars.len())?;
-            Ok(Value::string(
-                chars[start..end].iter().collect::<String>(),
-                Span::unknown(),
-            ))
-        }
-        other => Err(stone_error(
-            "slice",
-            format!("cannot slice {}", other.get_type()),
-        )),
-    }
-}
-
-fn normalize_slice_bounds(
-    lower: Option<i64>,
-    upper: Option<i64>,
-    len: usize,
-) -> Result<(usize, usize), ShellError> {
-    let len_i64 =
-        i64::try_from(len).map_err(|_| stone_error("slice", "collection is too large"))?;
-    let start = lower.unwrap_or(0);
-    let end = upper.unwrap_or(len_i64);
-    let start = if start < 0 { len_i64 + start } else { start }.clamp(0, len_i64);
-    let end = if end < 0 { len_i64 + end } else { end }.clamp(0, len_i64);
-    let start = usize::try_from(start).map_err(|_| stone_error("slice", "start is too large"))?;
-    let end = usize::try_from(end).map_err(|_| stone_error("slice", "end is too large"))?;
-    if start > end {
-        Ok((start, start))
-    } else {
-        Ok((start, end))
     }
 }
 
