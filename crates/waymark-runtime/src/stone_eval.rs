@@ -22,6 +22,11 @@ use crate::stone_ast::{
     AssignTarget, AugOp, BoolOp, Call, CompareOp, Expr, FormattedStringPart, FunctionDef, Program,
     Stmt, StoneFormatSpec, StoneType,
 };
+use crate::stone_builtins::{
+    float_builtin, int_builtin, len_builtin, str_builtin, value_ordering, value_to_bool,
+    value_to_display_string, value_to_f64, value_to_i64, value_to_int, value_to_limit,
+    value_to_path_string, value_to_string, value_to_u64, value_type_name, values_equal,
+};
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_file_ops::{
     cat_text, create_dir_all, diff_record_for_paths, edit_text_file, find_records, io_stone_error,
@@ -4262,7 +4267,7 @@ impl Evaluator<'_> {
                         .map(|value| RuntimeValue::Nu(Value::int(value, Span::unknown())));
                 }
                 let value = value.into_nu_value("int")?;
-                value_to_int(&value).map(RuntimeValue::Nu)
+                int_builtin(&value).map(RuntimeValue::Nu)
             }
             "float" => {
                 let [arg] = call.positional.as_slice() else {
@@ -4283,8 +4288,7 @@ impl Evaluator<'_> {
                         .map(|value| RuntimeValue::Nu(Value::float(value, Span::unknown())));
                 }
                 let value = value.into_nu_value("float")?;
-                value_to_f64(&value, "float")
-                    .map(|value| RuntimeValue::Nu(Value::float(value, Span::unknown())))
+                float_builtin(&value).map(RuntimeValue::Nu)
             }
             "len" => {
                 let [arg] = call.positional.as_slice() else {
@@ -4299,7 +4303,7 @@ impl Evaluator<'_> {
                 let value = self
                     .eval_expr_value(arg, PipelineData::empty())?
                     .into_nu_value("len")?;
-                value_len(&value).map(|len| RuntimeValue::Nu(Value::int(len, Span::unknown())))
+                len_builtin(&value).map(RuntimeValue::Nu)
             }
             "list" => self.eval_list_call(call),
             "str" => {
@@ -4315,10 +4319,7 @@ impl Evaluator<'_> {
                 let value = self
                     .eval_expr_value(arg, PipelineData::empty())?
                     .into_nu_value("str")?;
-                Ok(RuntimeValue::Nu(Value::string(
-                    value_to_display_string(&value)?,
-                    Span::unknown(),
-                )))
+                str_builtin(&value).map(RuntimeValue::Nu)
             }
             "type" => self.eval_type_call(call),
             "enumerate" => self.eval_enumerate_call(call),
@@ -7270,10 +7271,6 @@ impl MinMax {
     }
 }
 
-fn value_to_int(value: &Value) -> Result<Value, ShellError> {
-    value_to_i64(value, "int").map(|value| Value::int(value, Span::unknown()))
-}
-
 fn generic_vm_number_from_runtime(value: &RuntimeValue) -> Option<GenericVmNumber> {
     match value {
         RuntimeValue::Nu(Value::Int { val, .. }) => Some(GenericVmNumber::I64(*val)),
@@ -7323,62 +7320,6 @@ fn generic_vm_number_to_value(value: GenericVmNumber) -> Value {
     }
 }
 
-fn value_to_i64(value: &Value, context: &str) -> Result<i64, ShellError> {
-    match value {
-        Value::Int { val, .. } => Ok(*val),
-        Value::Float { val, .. } => Ok(*val as i64),
-        Value::String { val, .. } | Value::Glob { val, .. } => val
-            .trim()
-            .parse::<i64>()
-            .map_err(|err| stone_error(context, format!("failed to parse integer: {err}"))),
-        other => Err(stone_error(
-            context,
-            format!("expected integer, got {}", other.get_type()),
-        )),
-    }
-}
-
-fn value_to_limit(value: &Value, context: &str) -> Result<usize, ShellError> {
-    let limit = value_to_i64(value, context)?;
-    if limit < 0 {
-        return Err(stone_error(context, "limit must be non-negative"));
-    }
-    usize::try_from(limit).map_err(|_| stone_error(context, "limit is too large"))
-}
-
-fn value_to_u64(value: &Value, context: &str) -> Result<u64, ShellError> {
-    let value = value_to_i64(value, context)?;
-    if value < 0 {
-        return Err(stone_error(context, "value must be non-negative"));
-    }
-    u64::try_from(value).map_err(|_| stone_error(context, "value is too large"))
-}
-
-fn value_to_f64(value: &Value, context: &str) -> Result<f64, ShellError> {
-    match value {
-        Value::Int { val, .. } => Ok(*val as f64),
-        Value::Float { val, .. } => Ok(*val),
-        Value::String { val, .. } | Value::Glob { val, .. } => val
-            .trim()
-            .parse::<f64>()
-            .map_err(|err| stone_error(context, format!("failed to parse float: {err}"))),
-        other => Err(stone_error(
-            context,
-            format!("expected number, got {}", other.get_type()),
-        )),
-    }
-}
-
-fn value_to_bool(value: &Value, context: &str) -> Result<bool, ShellError> {
-    match value {
-        Value::Bool { val, .. } => Ok(*val),
-        other => Err(stone_error(
-            context,
-            format!("expected bool, got {}", other.get_type()),
-        )),
-    }
-}
-
 fn ensure_type(value: &Value, expected: StoneType, context: &str) -> Result<(), ShellError> {
     let ok = match expected {
         StoneType::Any => true,
@@ -7414,34 +7355,6 @@ fn stone_type_name(ty: StoneType) -> &'static str {
         StoneType::None => "None",
         StoneType::Record => "record",
         StoneType::Str => "str",
-    }
-}
-
-fn value_to_string(value: &Value, context: &str) -> Result<String, ShellError> {
-    match value {
-        Value::String { val, .. } | Value::Glob { val, .. } => Ok(val.clone()),
-        other => Err(stone_error(
-            context,
-            format!("expected string, got {}", other.get_type()),
-        )),
-    }
-}
-
-fn value_to_path_string(value: &Value, context: &str) -> Result<String, ShellError> {
-    match value {
-        Value::Record { val, .. } => {
-            let Some(path) = val.get("path") else {
-                return Err(stone_error(
-                    context,
-                    format!(
-                        "record path argument is missing `path`; got {}",
-                        value.get_type()
-                    ),
-                ));
-            };
-            value_to_string(path, context)
-        }
-        _ => value_to_string(value, context),
     }
 }
 
@@ -7640,18 +7553,6 @@ fn string_list_value(items: Vec<String>, span: Span) -> Value {
             .collect(),
         span,
     )
-}
-
-fn value_to_display_string(value: &Value) -> Result<String, ShellError> {
-    match value {
-        Value::Nothing { .. } => Ok(String::new()),
-        Value::Bool { val, .. } => Ok(val.to_string()),
-        Value::Int { val, .. } => Ok(val.to_string()),
-        Value::Float { val, .. } => Ok(val.to_string()),
-        Value::String { val, .. } | Value::Glob { val, .. } => Ok(val.clone()),
-        other => serde_json::to_string(&nu_to_json_value(other))
-            .map_err(|err| stone_error("str", err.to_string())),
-    }
 }
 
 fn jsonl_rows_from_bytes(bytes: Vec<u8>, limit: Option<usize>, source: String) -> JsonlRows {
@@ -8814,20 +8715,6 @@ fn runtime_type_name(value: &RuntimeValue) -> &'static str {
     }
 }
 
-fn value_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Nothing { .. } => "NoneType",
-        Value::Bool { .. } => "bool",
-        Value::Int { .. } => "int",
-        Value::Float { .. } => "float",
-        Value::String { .. } | Value::Glob { .. } => "str",
-        Value::List { .. } => "list",
-        Value::Record { .. } => "dict",
-        Value::Binary { .. } => "bytes",
-        _ => "value",
-    }
-}
-
 fn value_identity_key(value: &Value, context: &str) -> Result<String, ShellError> {
     serde_json::to_string(&nu_to_json_value(value))
         .map_err(|err| stone_error(context, err.to_string()))
@@ -8899,21 +8786,6 @@ fn value_to_sum_number(value: &Value) -> Result<SumNumber, ShellError> {
             format!("expected number, got {}", other.get_type()),
         )),
     }
-}
-
-fn value_len(value: &Value) -> Result<i64, ShellError> {
-    let len = match value {
-        Value::List { vals, .. } => vals.len(),
-        Value::Record { val, .. } => val.len(),
-        Value::String { val, .. } | Value::Glob { val, .. } => val.chars().count(),
-        other => {
-            return Err(stone_error(
-                "len",
-                format!("len() does not support {}", other.get_type()),
-            ));
-        }
-    };
-    i64::try_from(len).map_err(|_| stone_error("len", "value is too large"))
 }
 
 fn assign_subscript(target: &mut Value, index: &Value, value: Value) -> Result<(), ShellError> {
@@ -9600,54 +9472,6 @@ fn value_contains(container: &Value, needle: &Value) -> Result<bool, ShellError>
         other => Err(stone_error(
             "membership",
             format!("cannot test membership in {}", other.get_type()),
-        )),
-    }
-}
-
-fn values_equal(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Nothing { .. }, Value::Nothing { .. }) => true,
-        (Value::Bool { val: left, .. }, Value::Bool { val: right, .. }) => left == right,
-        (Value::Int { val: left, .. }, Value::Int { val: right, .. }) => left == right,
-        (Value::Float { val: left, .. }, Value::Float { val: right, .. }) => left == right,
-        (Value::Int { val: left, .. }, Value::Float { val: right, .. }) => (*left as f64) == *right,
-        (Value::Float { val: left, .. }, Value::Int { val: right, .. }) => *left == (*right as f64),
-        (Value::String { val: left, .. }, Value::String { val: right, .. })
-        | (Value::Glob { val: left, .. }, Value::Glob { val: right, .. })
-        | (Value::String { val: left, .. }, Value::Glob { val: right, .. })
-        | (Value::Glob { val: left, .. }, Value::String { val: right, .. }) => left == right,
-        _ => false,
-    }
-}
-
-fn value_ordering(left: &Value, right: &Value) -> Result<std::cmp::Ordering, ShellError> {
-    match (left, right) {
-        (Value::Int { val: left, .. }, Value::Int { val: right, .. }) => Ok(left.cmp(right)),
-        (Value::Float { val: left, .. }, Value::Float { val: right, .. }) => left
-            .partial_cmp(right)
-            .ok_or_else(|| stone_error("comparison", "cannot compare NaN values")),
-        (Value::Int { val: left, .. }, Value::Float { val: right, .. }) => (*left as f64)
-            .partial_cmp(right)
-            .ok_or_else(|| stone_error("comparison", "cannot compare NaN values")),
-        (Value::Float { val: left, .. }, Value::Int { val: right, .. }) => left
-            .partial_cmp(&(*right as f64))
-            .ok_or_else(|| stone_error("comparison", "cannot compare NaN values")),
-        (Value::String { val: left, .. }, Value::String { val: right, .. })
-        | (Value::Glob { val: left, .. }, Value::Glob { val: right, .. })
-        | (Value::String { val: left, .. }, Value::Glob { val: right, .. })
-        | (Value::Glob { val: left, .. }, Value::String { val: right, .. }) => Ok(left.cmp(right)),
-        (Value::List { vals: left, .. }, Value::List { vals: right, .. }) => {
-            for (left, right) in left.iter().zip(right.iter()) {
-                let ordering = value_ordering(left, right)?;
-                if ordering != std::cmp::Ordering::Equal {
-                    return Ok(ordering);
-                }
-            }
-            Ok(left.len().cmp(&right.len()))
-        }
-        _ => Err(stone_error(
-            "comparison",
-            format!("cannot order {} and {}", left.get_type(), right.get_type()),
         )),
     }
 }

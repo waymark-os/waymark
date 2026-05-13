@@ -20,6 +20,7 @@ mod frontend;
 mod json;
 mod server;
 mod stone_ast;
+mod stone_builtins;
 mod stone_eval;
 #[cfg(not(target_os = "hermit"))]
 mod stone_file_ops;
