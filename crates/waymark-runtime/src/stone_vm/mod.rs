@@ -12,11 +12,14 @@ pub(crate) use crate::stone_ir::{
     HotLoopIter, HotLoopOp, HotLoopPlan,
 };
 pub(crate) use lower::{compile_generic_vm_function, compile_hot_jsonl_loop_ir_function};
+pub(crate) use optimize::{
+    match_hot_jsonl_aggregation_ir_subgraph, optimize_loop_ir, optimize_stone_loop_ir,
+};
 #[cfg(test)]
 pub(crate) use optimize::{
-    match_loop_ir_subgraph, select_hot_jsonl_fused_kernel_from_ir, select_loop_ir_fused_kernel,
+    match_hot_jsonl_ir_subgraph, match_loop_ir_subgraph, select_hot_jsonl_fused_kernel_from_ir,
+    select_loop_ir_fused_kernel,
 };
-pub(crate) use optimize::{optimize_loop_ir, optimize_stone_loop_ir};
 pub(crate) use types::{
     AccId, BlockId, ConstId, GenericLoopIter, GenericParseNumber, GenericVmConst,
     GenericVmExprBody, GenericVmExprOp, GenericVmFunction, GenericVmOp, HotJsonlAggregationBody,

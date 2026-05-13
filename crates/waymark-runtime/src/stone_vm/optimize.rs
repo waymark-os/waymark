@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::{
-    GenericVmOp, LoopIrFunction, LoopIrFusedKernel, LoopIrOptimizationDiagnostic,
-    LoopIrOptimizationResult, LoopIrSubgraphKind, LoopIrTerminator, StoneIrFunction,
-    StoneLoopIrOptimizationResult,
+    AccId, BlockId, ConstId, GenericVmOp, LoopIrFunction, LoopIrFusedKernel,
+    LoopIrOptimizationDiagnostic, LoopIrOptimizationResult, LoopIrSubgraphKind, LoopIrTerminator,
+    Reg, StoneIrFunction, StoneLoopIrOptimizationResult, StoneOp, StoneTerminator,
 };
-
-use crate::stone_ir::match_hot_jsonl_ir_subgraph;
 
 pub(crate) fn optimize_loop_ir(function: &LoopIrFunction) -> LoopIrOptimizationResult {
     let (function, diagnostics) = canonicalize_loop_ir(function);
@@ -49,6 +47,153 @@ pub(crate) fn optimize_stone_loop_ir(function: &StoneIrFunction) -> StoneLoopIrO
         matched_subgraph,
         diagnostics: Vec::new(),
     }
+}
+
+pub(crate) fn match_hot_jsonl_ir_subgraph(
+    function: &StoneIrFunction,
+) -> Option<LoopIrSubgraphKind> {
+    match_hot_jsonl_aggregation_ir_subgraph(function).map(|_| LoopIrSubgraphKind::JsonlAggregation)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct HotJsonlAggregationIrSubgraph {
+    pub(crate) user_has_default: bool,
+    pub(crate) user_amount_has_default: bool,
+    pub(crate) user_amount_default: f64,
+    pub(crate) user_items_has_default: bool,
+    pub(crate) user_items_default: i64,
+    pub(crate) tags_default_empty: bool,
+    pub(crate) users_append: Option<AccId>,
+    pub(crate) tags_append: Option<AccId>,
+}
+
+pub(crate) fn match_hot_jsonl_aggregation_ir_subgraph(
+    function: &StoneIrFunction,
+) -> Option<HotJsonlAggregationIrSubgraph> {
+    let [row_block, tag_block, done_block] = function.blocks.as_slice() else {
+        return None;
+    };
+    let [user_op, amount_op, items_op, tags_op, user_amounts_op, user_items_op] =
+        row_block.ops.as_slice()
+    else {
+        return None;
+    };
+    let (user_reg, user_has_default) = match user_op {
+        StoneOp::JsonGetStrDefault {
+            dst: Reg(1),
+            object: Reg(0),
+            key: ConstId(0),
+            default: ConstId(1),
+        } => (Reg(1), true),
+        StoneOp::JsonGetValue {
+            dst: Reg(1),
+            object: Reg(0),
+            key: ConstId(0),
+        } => (Reg(1), false),
+        _ => return None,
+    };
+    let (user_amount_has_default, user_amount_default) = match amount_op {
+        StoneOp::JsonGetF64Default {
+            dst: Reg(2),
+            object: Reg(0),
+            key: ConstId(2),
+            default,
+        } => (true, *default),
+        StoneOp::JsonGetF64Required {
+            dst: Reg(2),
+            object: Reg(0),
+            key: ConstId(2),
+        } => (false, 0.0),
+        _ => return None,
+    };
+    let (user_items_has_default, user_items_default) = match items_op {
+        StoneOp::JsonGetI64Default {
+            dst: Reg(3),
+            object: Reg(0),
+            key: ConstId(3),
+            default,
+        } => (true, *default),
+        StoneOp::JsonGetI64Required {
+            dst: Reg(3),
+            object: Reg(0),
+            key: ConstId(3),
+        } => (false, 0),
+        _ => return None,
+    };
+    let tags_default_empty = match tags_op {
+        StoneOp::JsonGetArrayDefault {
+            dst: Reg(4),
+            object: Reg(0),
+            key: ConstId(4),
+        } => true,
+        StoneOp::JsonGetArrayRequired {
+            dst: Reg(4),
+            object: Reg(0),
+            key: ConstId(4),
+        } => false,
+        _ => return None,
+    };
+    let StoneOp::MapAddF64 {
+        map: AccId(0),
+        key,
+        value: Reg(2),
+        append: users_append,
+    } = user_amounts_op
+    else {
+        return None;
+    };
+    if *key != user_reg || !matches!(users_append, None | Some(AccId(2))) {
+        return None;
+    }
+    let StoneOp::MapAddI64 {
+        map: AccId(1),
+        key,
+        value: Reg(3),
+        append: None,
+    } = user_items_op
+    else {
+        return None;
+    };
+    if *key != user_reg {
+        return None;
+    }
+    if row_block.terminator
+        != (StoneTerminator::JsonEachStrArray {
+            array: Reg(4),
+            item: Reg(5),
+            body: BlockId(1),
+            done: BlockId(2),
+        })
+    {
+        return None;
+    }
+    let [StoneOp::MapAddI64Const {
+        map: AccId(3),
+        key: Reg(5),
+        value: 1,
+        append: tags_append,
+    }] = tag_block.ops.as_slice()
+    else {
+        return None;
+    };
+    if !matches!(tags_append, None | Some(AccId(4)))
+        || tag_block.terminator != (StoneTerminator::Jump { target: BlockId(0) })
+        || done_block.terminator != StoneTerminator::Return
+        || !done_block.ops.is_empty()
+    {
+        return None;
+    }
+
+    Some(HotJsonlAggregationIrSubgraph {
+        user_has_default,
+        user_amount_has_default,
+        user_amount_default,
+        user_items_has_default,
+        user_items_default,
+        tags_default_empty,
+        users_append: *users_append,
+        tags_append: *tags_append,
+    })
 }
 
 fn canonicalize_loop_ir(

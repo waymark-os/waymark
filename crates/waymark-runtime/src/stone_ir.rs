@@ -2,11 +2,12 @@
 
 use crate::stone_ast::{AssignTarget, AugOp, Call, CompareOp, Expr, Stmt};
 use crate::stone_vm::{
-    AccId, BlockId, ConstId, GenericLoopIter, HotJsonlAggregationBody, HotJsonlBodyOp,
-    HotJsonlNestedUserTotals, HotJsonlSlot, HotJsonlTracePlan, LocalId, LoopIrSubgraphKind, Reg,
-    SnapshotId, StoneAccumulatorKind, StoneAccumulatorSpec, StoneBlock, StoneConst,
-    StoneFallbackTarget, StoneGuard, StoneGuardKind, StoneIrFunction, StoneLocal, StoneOp,
-    StoneSnapshot, StoneSnapshotAccumulator, StoneSnapshotLocal, StoneTerminator,
+    match_hot_jsonl_aggregation_ir_subgraph, AccId, BlockId, ConstId, GenericLoopIter,
+    HotJsonlAggregationBody, HotJsonlBodyOp, HotJsonlNestedUserTotals, HotJsonlSlot,
+    HotJsonlTracePlan, LocalId, Reg, SnapshotId, StoneAccumulatorKind, StoneAccumulatorSpec,
+    StoneBlock, StoneConst, StoneFallbackTarget, StoneGuard, StoneGuardKind, StoneIrFunction,
+    StoneLocal, StoneOp, StoneSnapshot, StoneSnapshotAccumulator, StoneSnapshotLocal,
+    StoneTerminator,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -247,12 +248,6 @@ pub(crate) fn try_lower_generic_loop(
         iter,
         ops: vec![op],
     })
-}
-
-pub(crate) fn match_hot_jsonl_ir_subgraph(
-    function: &StoneIrFunction,
-) -> Option<LoopIrSubgraphKind> {
-    match_hot_jsonl_aggregation_ir_subgraph(function).map(|_| LoopIrSubgraphKind::JsonlAggregation)
 }
 
 pub(crate) fn generic_loop_compile_miss_reason(plan: &GenericLoopPlan) -> &'static str {
@@ -2337,147 +2332,6 @@ struct HotJsonlVmTrace {
     tags_list: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct HotJsonlAggregationIrSubgraph {
-    user_has_default: bool,
-    user_amount_has_default: bool,
-    user_amount_default: f64,
-    user_items_has_default: bool,
-    user_items_default: i64,
-    tags_default_empty: bool,
-    users_append: Option<AccId>,
-    tags_append: Option<AccId>,
-}
-
-fn match_hot_jsonl_aggregation_ir_subgraph(
-    function: &StoneIrFunction,
-) -> Option<HotJsonlAggregationIrSubgraph> {
-    let [row_block, tag_block, done_block] = function.blocks.as_slice() else {
-        return None;
-    };
-    let [user_op, amount_op, items_op, tags_op, user_amounts_op, user_items_op] =
-        row_block.ops.as_slice()
-    else {
-        return None;
-    };
-    let (user_reg, user_has_default) = match user_op {
-        StoneOp::JsonGetStrDefault {
-            dst: Reg(1),
-            object: Reg(0),
-            key: ConstId(0),
-            default: ConstId(1),
-        } => (Reg(1), true),
-        StoneOp::JsonGetValue {
-            dst: Reg(1),
-            object: Reg(0),
-            key: ConstId(0),
-        } => (Reg(1), false),
-        _ => return None,
-    };
-    let (user_amount_has_default, user_amount_default) = match amount_op {
-        StoneOp::JsonGetF64Default {
-            dst: Reg(2),
-            object: Reg(0),
-            key: ConstId(2),
-            default,
-        } => (true, *default),
-        StoneOp::JsonGetF64Required {
-            dst: Reg(2),
-            object: Reg(0),
-            key: ConstId(2),
-        } => (false, 0.0),
-        _ => return None,
-    };
-    let (user_items_has_default, user_items_default) = match items_op {
-        StoneOp::JsonGetI64Default {
-            dst: Reg(3),
-            object: Reg(0),
-            key: ConstId(3),
-            default,
-        } => (true, *default),
-        StoneOp::JsonGetI64Required {
-            dst: Reg(3),
-            object: Reg(0),
-            key: ConstId(3),
-        } => (false, 0),
-        _ => return None,
-    };
-    let tags_default_empty = match tags_op {
-        StoneOp::JsonGetArrayDefault {
-            dst: Reg(4),
-            object: Reg(0),
-            key: ConstId(4),
-        } => true,
-        StoneOp::JsonGetArrayRequired {
-            dst: Reg(4),
-            object: Reg(0),
-            key: ConstId(4),
-        } => false,
-        _ => return None,
-    };
-    let StoneOp::MapAddF64 {
-        map: AccId(0),
-        key,
-        value: Reg(2),
-        append: users_append,
-    } = user_amounts_op
-    else {
-        return None;
-    };
-    if *key != user_reg || !matches!(users_append, None | Some(AccId(2))) {
-        return None;
-    }
-    let StoneOp::MapAddI64 {
-        map: AccId(1),
-        key,
-        value: Reg(3),
-        append: None,
-    } = user_items_op
-    else {
-        return None;
-    };
-    if *key != user_reg {
-        return None;
-    }
-    if row_block.terminator
-        != (StoneTerminator::JsonEachStrArray {
-            array: Reg(4),
-            item: Reg(5),
-            body: BlockId(1),
-            done: BlockId(2),
-        })
-    {
-        return None;
-    }
-    let [StoneOp::MapAddI64Const {
-        map: AccId(3),
-        key: Reg(5),
-        value: 1,
-        append: tags_append,
-    }] = tag_block.ops.as_slice()
-    else {
-        return None;
-    };
-    if !matches!(tags_append, None | Some(AccId(4)))
-        || tag_block.terminator != (StoneTerminator::Jump { target: BlockId(0) })
-        || done_block.terminator != StoneTerminator::Return
-        || !done_block.ops.is_empty()
-    {
-        return None;
-    }
-
-    Some(HotJsonlAggregationIrSubgraph {
-        user_has_default,
-        user_amount_has_default,
-        user_amount_default,
-        user_items_has_default,
-        user_items_default,
-        tags_default_empty,
-        users_append: *users_append,
-        tags_append: *tags_append,
-    })
-}
-
 impl HotJsonlVmTrace {
     fn from_function(function: &StoneIrFunction) -> Option<Self> {
         let [StoneConst::String(user_key), StoneConst::String(user_default), StoneConst::String(amount_key), StoneConst::String(items_key), StoneConst::String(tags_key), StoneConst::EmptyList] =
@@ -2536,11 +2390,13 @@ mod tests {
     use super::*;
     use crate::stone_ast::{lower_source, Stmt};
     use crate::stone_vm::{
-        compile_generic_vm_function, compile_hot_jsonl_loop_ir_function, match_loop_ir_subgraph,
-        optimize_loop_ir, optimize_stone_loop_ir, select_hot_jsonl_fused_kernel_from_ir,
-        select_loop_ir_fused_kernel, GenericParseNumber, GenericVmExprOp, GenericVmOp, LoopIrBlock,
-        LoopIrDiagnostics, LoopIrFusedKernel, LoopIrIteratorAdapter, LoopIrOptimizationDiagnostic,
-        LoopIrOptimizationResult, LoopIrSnapshot, LoopIrSnapshotBoundary, LoopIrTerminator,
+        compile_generic_vm_function, compile_hot_jsonl_loop_ir_function,
+        match_hot_jsonl_ir_subgraph, match_loop_ir_subgraph, optimize_loop_ir,
+        optimize_stone_loop_ir, select_hot_jsonl_fused_kernel_from_ir, select_loop_ir_fused_kernel,
+        GenericParseNumber, GenericVmExprOp, GenericVmOp, LoopIrBlock, LoopIrDiagnostics,
+        LoopIrFusedKernel, LoopIrIteratorAdapter, LoopIrOptimizationDiagnostic,
+        LoopIrOptimizationResult, LoopIrSnapshot, LoopIrSnapshotBoundary, LoopIrSubgraphKind,
+        LoopIrTerminator,
     };
 
     fn required_jsonl_aggregation_vm() -> StoneIrFunction {
