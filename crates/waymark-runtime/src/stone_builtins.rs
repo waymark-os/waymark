@@ -142,6 +142,188 @@ pub(crate) fn compare_values(
     }
 }
 
+pub(crate) fn add_values(left: &Value, right: &Value) -> Result<Value, ShellError> {
+    match (left, right) {
+        (Value::Int { val: left, .. }, Value::Int { val: right, .. }) => left
+            .checked_add(*right)
+            .map(|value| Value::int(value, Span::unknown()))
+            .ok_or_else(|| stone_error("addition", "integer addition overflow")),
+        (Value::Float { val: left, .. }, Value::Float { val: right, .. }) => {
+            Ok(Value::float(left + right, Span::unknown()))
+        }
+        (Value::Int { val: left, .. }, Value::Float { val: right, .. }) => {
+            Ok(Value::float(*left as f64 + right, Span::unknown()))
+        }
+        (Value::Float { val: left, .. }, Value::Int { val: right, .. }) => {
+            Ok(Value::float(left + *right as f64, Span::unknown()))
+        }
+        (Value::String { val: left, .. }, Value::String { val: right, .. })
+        | (Value::Glob { val: left, .. }, Value::Glob { val: right, .. })
+        | (Value::String { val: left, .. }, Value::Glob { val: right, .. })
+        | (Value::Glob { val: left, .. }, Value::String { val: right, .. }) => {
+            Ok(Value::string(format!("{left}{right}"), Span::unknown()))
+        }
+        (Value::List { vals: left, .. }, Value::List { vals: right, .. }) => {
+            let mut values = left.clone();
+            values.extend(right.clone());
+            Ok(Value::list(values, Span::unknown()))
+        }
+        _ => Err(stone_error(
+            "addition",
+            format!("cannot add {} and {}", left.get_type(), right.get_type()),
+        )),
+    }
+}
+
+pub(crate) fn bitwise_int_values(
+    left: &Value,
+    right: &Value,
+    context: &str,
+    op: impl FnOnce(i64, i64) -> i64,
+) -> Result<Value, ShellError> {
+    let left = value_to_i64(left, context)?;
+    let right = value_to_i64(right, context)?;
+    Ok(Value::int(op(left, right), Span::unknown()))
+}
+
+pub(crate) fn div_values(left: &Value, right: &Value) -> Result<Value, ShellError> {
+    let (left, right) = match (left, right) {
+        (Value::Int { val: left, .. }, Value::Int { val: right, .. }) => {
+            (*left as f64, *right as f64)
+        }
+        (Value::Float { val: left, .. }, Value::Float { val: right, .. }) => (*left, *right),
+        (Value::Int { val: left, .. }, Value::Float { val: right, .. }) => (*left as f64, *right),
+        (Value::Float { val: left, .. }, Value::Int { val: right, .. }) => (*left, *right as f64),
+        _ => {
+            return Err(stone_error(
+                "division",
+                format!("cannot divide {} and {}", left.get_type(), right.get_type()),
+            ));
+        }
+    };
+    if right == 0.0 {
+        return Err(stone_error("division", "division by zero"));
+    }
+    Ok(Value::float(left / right, Span::unknown()))
+}
+
+pub(crate) fn floor_div_values(left: &Value, right: &Value) -> Result<Value, ShellError> {
+    match (left, right) {
+        (Value::Int { val: left, .. }, Value::Int { val: right, .. }) => {
+            if *right == 0 {
+                return Err(stone_error("floor division", "division by zero"));
+            }
+            Ok(Value::int(left.div_euclid(*right), Span::unknown()))
+        }
+        _ => {
+            let Value::Float { val, .. } = div_values(left, right)? else {
+                unreachable!("div_values returns a float")
+            };
+            Ok(Value::float(val.floor(), Span::unknown()))
+        }
+    }
+}
+
+pub(crate) fn mod_values(left: &Value, right: &Value) -> Result<Value, ShellError> {
+    match (left, right) {
+        (Value::Int { val: left, .. }, Value::Int { val: right, .. }) => {
+            if *right == 0 {
+                return Err(stone_error("modulo", "modulo by zero"));
+            }
+            Ok(Value::int(left.rem_euclid(*right), Span::unknown()))
+        }
+        _ => {
+            let left = value_to_f64(left, "modulo")?;
+            let right = value_to_f64(right, "modulo")?;
+            if right == 0.0 {
+                return Err(stone_error("modulo", "modulo by zero"));
+            }
+            Ok(Value::float(left.rem_euclid(right), Span::unknown()))
+        }
+    }
+}
+
+pub(crate) fn mul_values(left: &Value, right: &Value) -> Result<Value, ShellError> {
+    match (left, right) {
+        (Value::Int { val: left, .. }, Value::Int { val: right, .. }) => left
+            .checked_mul(*right)
+            .map(|value| Value::int(value, Span::unknown()))
+            .ok_or_else(|| stone_error("multiplication", "integer multiplication overflow")),
+        (Value::Float { val: left, .. }, Value::Float { val: right, .. }) => {
+            Ok(Value::float(left * right, Span::unknown()))
+        }
+        (Value::Int { val: left, .. }, Value::Float { val: right, .. }) => {
+            Ok(Value::float(*left as f64 * right, Span::unknown()))
+        }
+        (Value::Float { val: left, .. }, Value::Int { val: right, .. }) => {
+            Ok(Value::float(left * *right as f64, Span::unknown()))
+        }
+        _ => Err(stone_error(
+            "multiplication",
+            format!(
+                "cannot multiply {} and {}",
+                left.get_type(),
+                right.get_type()
+            ),
+        )),
+    }
+}
+
+pub(crate) fn neg_value(value: &Value) -> Result<Value, ShellError> {
+    match value {
+        Value::Int { val, .. } => val
+            .checked_neg()
+            .map(|value| Value::int(value, Span::unknown()))
+            .ok_or_else(|| stone_error("unary minus", "integer negation overflow")),
+        Value::Float { val, .. } => Ok(Value::float(-val, Span::unknown())),
+        other => Err(stone_error(
+            "unary minus",
+            format!("cannot negate {}", other.get_type()),
+        )),
+    }
+}
+
+pub(crate) fn shift_value(
+    left: &Value,
+    right: &Value,
+    context: &str,
+    op: impl FnOnce(i64, u32) -> Option<i64>,
+) -> Result<Value, ShellError> {
+    let left = value_to_i64(left, context)?;
+    let right = value_to_i64(right, context)?;
+    let shift = u32::try_from(right)
+        .map_err(|_| stone_error(context, "shift count must be non-negative"))?;
+    op(left, shift)
+        .map(|value| Value::int(value, Span::unknown()))
+        .ok_or_else(|| stone_error(context, "shift count is too large"))
+}
+
+pub(crate) fn sub_values(left: &Value, right: &Value) -> Result<Value, ShellError> {
+    match (left, right) {
+        (Value::Int { val: left, .. }, Value::Int { val: right, .. }) => left
+            .checked_sub(*right)
+            .map(|value| Value::int(value, Span::unknown()))
+            .ok_or_else(|| stone_error("subtraction", "integer subtraction overflow")),
+        (Value::Float { val: left, .. }, Value::Float { val: right, .. }) => {
+            Ok(Value::float(left - right, Span::unknown()))
+        }
+        (Value::Int { val: left, .. }, Value::Float { val: right, .. }) => {
+            Ok(Value::float(*left as f64 - right, Span::unknown()))
+        }
+        (Value::Float { val: left, .. }, Value::Int { val: right, .. }) => {
+            Ok(Value::float(left - *right as f64, Span::unknown()))
+        }
+        _ => Err(stone_error(
+            "subtraction",
+            format!(
+                "cannot subtract {} and {}",
+                left.get_type(),
+                right.get_type()
+            ),
+        )),
+    }
+}
+
 pub(crate) fn first_builtin(
     value: &Value,
     count: Option<usize>,

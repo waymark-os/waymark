@@ -23,14 +23,15 @@ use crate::stone_ast::{
     Stmt, StoneFormatSpec, StoneType,
 };
 use crate::stone_builtins::{
-    compare_values, find_method_builtin, first_builtin, float_builtin, format_builtin,
-    index_method_builtin, int_builtin, join_builtin, last_builtin, len_builtin, list_builtin,
-    map_builtin_value, min_max_builtin, normalize_index, parse_float_builtin, parse_int_builtin,
-    range_builtin, record_method_builtin, round_builtin, set_builtin, slice_builtin, split_builtin,
-    starts_with_builtin, str_builtin, subscript_builtin, sum_builtin, unique_builtin,
-    value_identity_key, value_ordering, value_to_bool, value_to_display_string, value_to_f64,
-    value_to_i64, value_to_limit, value_to_path_string, value_to_string, value_to_u64,
-    value_truthy, value_type_name, values_equal, where_builtin,
+    add_values, bitwise_int_values, compare_values, div_values, find_method_builtin, first_builtin,
+    float_builtin, floor_div_values, format_builtin, index_method_builtin, int_builtin,
+    join_builtin, last_builtin, len_builtin, list_builtin, map_builtin_value, min_max_builtin,
+    mod_values, mul_values, neg_value, normalize_index, parse_float_builtin, parse_int_builtin,
+    range_builtin, record_method_builtin, round_builtin, set_builtin, shift_value, slice_builtin,
+    split_builtin, starts_with_builtin, str_builtin, sub_values, subscript_builtin, sum_builtin,
+    unique_builtin, value_identity_key, value_ordering, value_to_bool, value_to_display_string,
+    value_to_f64, value_to_i64, value_to_limit, value_to_path_string, value_to_string,
+    value_to_u64, value_truthy, value_type_name, values_equal, where_builtin,
 };
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_file_ops::{
@@ -902,7 +903,9 @@ impl Evaluator<'_> {
                 let right = self
                     .eval_expr_value(value, input)?
                     .into_nu_value("augmented assignment")?;
-                let value = eval_aug_assign(&left, *op, &right)?;
+                let value = match op {
+                    AugOp::Add => add_values(&left, &right)?,
+                };
                 self.assign_value(target, RuntimeValue::Nu(value), record_session_bindings)?;
                 Ok(EvalFlow::Output(PipelineData::empty()))
             }
@@ -3627,7 +3630,7 @@ impl Evaluator<'_> {
                 .to_mut()
                 .get_mut(key)
                 .ok_or_else(|| stone_error("assignment", format!("record has no key `{key}`")))?;
-            *slot = eval_add(slot, &addend)?;
+            *slot = add_values(slot, &addend)?;
         } else {
             val.to_mut().insert(key.to_owned(), addend);
         }
@@ -4089,7 +4092,7 @@ impl Evaluator<'_> {
                     let value = self
                         .eval_expr_value(value, PipelineData::empty())?
                         .into_nu_value("unary minus")?;
-                    eval_neg(&value).map(RuntimeValue::Nu)
+                    neg_value(&value).map(RuntimeValue::Nu)
                 }
                 Expr::Invert(value) => {
                     let value = self
@@ -4105,7 +4108,7 @@ impl Evaluator<'_> {
                     let right = self
                         .eval_expr_value(right, PipelineData::empty())?
                         .into_nu_value("addition")?;
-                    eval_add(&left, &right).map(RuntimeValue::Nu)
+                    add_values(&left, &right).map(RuntimeValue::Nu)
                 }
                 Expr::Sub { left, right } => {
                     let left = self
@@ -4114,7 +4117,7 @@ impl Evaluator<'_> {
                     let right = self
                         .eval_expr_value(right, PipelineData::empty())?
                         .into_nu_value("subtraction")?;
-                    eval_sub(&left, &right).map(RuntimeValue::Nu)
+                    sub_values(&left, &right).map(RuntimeValue::Nu)
                 }
                 Expr::Mul { left, right } => {
                     let left = self
@@ -4123,7 +4126,7 @@ impl Evaluator<'_> {
                     let right = self
                         .eval_expr_value(right, PipelineData::empty())?
                         .into_nu_value("multiplication")?;
-                    eval_mul(&left, &right).map(RuntimeValue::Nu)
+                    mul_values(&left, &right).map(RuntimeValue::Nu)
                 }
                 Expr::Div { left, right } => {
                     let left = self
@@ -4132,7 +4135,7 @@ impl Evaluator<'_> {
                     let right = self
                         .eval_expr_value(right, PipelineData::empty())?
                         .into_nu_value("division")?;
-                    eval_div(&left, &right).map(RuntimeValue::Nu)
+                    div_values(&left, &right).map(RuntimeValue::Nu)
                 }
                 Expr::FloorDiv { left, right } => {
                     let left = self
@@ -4141,7 +4144,7 @@ impl Evaluator<'_> {
                     let right = self
                         .eval_expr_value(right, PipelineData::empty())?
                         .into_nu_value("floor division")?;
-                    eval_floor_div(&left, &right).map(RuntimeValue::Nu)
+                    floor_div_values(&left, &right).map(RuntimeValue::Nu)
                 }
                 Expr::Mod { left, right } => {
                     let left = self
@@ -4150,7 +4153,7 @@ impl Evaluator<'_> {
                     let right = self
                         .eval_expr_value(right, PipelineData::empty())?
                         .into_nu_value("modulo")?;
-                    eval_mod(&left, &right).map(RuntimeValue::Nu)
+                    mod_values(&left, &right).map(RuntimeValue::Nu)
                 }
                 Expr::BitAnd { left, right } => {
                     let left = self
@@ -4159,7 +4162,7 @@ impl Evaluator<'_> {
                     let right = self
                         .eval_expr_value(right, PipelineData::empty())?
                         .into_nu_value("bitwise and")?;
-                    eval_bitwise_int(&left, &right, "bitwise and", |left, right| left & right)
+                    bitwise_int_values(&left, &right, "bitwise and", |left, right| left & right)
                         .map(RuntimeValue::Nu)
                 }
                 Expr::BitOr { left, right } => {
@@ -4169,7 +4172,7 @@ impl Evaluator<'_> {
                     let right = self
                         .eval_expr_value(right, PipelineData::empty())?
                         .into_nu_value("bitwise or")?;
-                    eval_bitwise_int(&left, &right, "bitwise or", |left, right| left | right)
+                    bitwise_int_values(&left, &right, "bitwise or", |left, right| left | right)
                         .map(RuntimeValue::Nu)
                 }
                 Expr::BitXor { left, right } => {
@@ -4179,7 +4182,7 @@ impl Evaluator<'_> {
                     let right = self
                         .eval_expr_value(right, PipelineData::empty())?
                         .into_nu_value("bitwise xor")?;
-                    eval_bitwise_int(&left, &right, "bitwise xor", |left, right| left ^ right)
+                    bitwise_int_values(&left, &right, "bitwise xor", |left, right| left ^ right)
                         .map(RuntimeValue::Nu)
                 }
                 Expr::LShift { left, right } => {
@@ -4189,7 +4192,7 @@ impl Evaluator<'_> {
                     let right = self
                         .eval_expr_value(right, PipelineData::empty())?
                         .into_nu_value("left shift")?;
-                    eval_shift(&left, &right, "left shift", i64::checked_shl).map(RuntimeValue::Nu)
+                    shift_value(&left, &right, "left shift", i64::checked_shl).map(RuntimeValue::Nu)
                 }
                 Expr::RShift { left, right } => {
                     let left = self
@@ -4198,7 +4201,8 @@ impl Evaluator<'_> {
                     let right = self
                         .eval_expr_value(right, PipelineData::empty())?
                         .into_nu_value("right shift")?;
-                    eval_shift(&left, &right, "right shift", i64::checked_shr).map(RuntimeValue::Nu)
+                    shift_value(&left, &right, "right shift", i64::checked_shr)
+                        .map(RuntimeValue::Nu)
                 }
                 Expr::Generator { .. } => Err(stone_error(
                     "generator expression",
@@ -8668,194 +8672,6 @@ fn value_to_iter_values(value: &RuntimeValue) -> Result<Vec<Value>, ShellError> 
             format!("cannot iterate callable lambda#{}", callable.function_id),
         )),
     }
-}
-
-fn eval_aug_assign(left: &Value, op: AugOp, right: &Value) -> Result<Value, ShellError> {
-    match op {
-        AugOp::Add => eval_add(left, right),
-    }
-}
-
-fn eval_add(left: &Value, right: &Value) -> Result<Value, ShellError> {
-    match (left, right) {
-        (Value::Int { val: left, .. }, Value::Int { val: right, .. }) => left
-            .checked_add(*right)
-            .map(|value| Value::int(value, Span::unknown()))
-            .ok_or_else(|| stone_error("addition", "integer addition overflow")),
-        (Value::Float { val: left, .. }, Value::Float { val: right, .. }) => {
-            Ok(Value::float(left + right, Span::unknown()))
-        }
-        (Value::Int { val: left, .. }, Value::Float { val: right, .. }) => {
-            Ok(Value::float(*left as f64 + right, Span::unknown()))
-        }
-        (Value::Float { val: left, .. }, Value::Int { val: right, .. }) => {
-            Ok(Value::float(left + *right as f64, Span::unknown()))
-        }
-        (Value::String { val: left, .. }, Value::String { val: right, .. })
-        | (Value::Glob { val: left, .. }, Value::Glob { val: right, .. })
-        | (Value::String { val: left, .. }, Value::Glob { val: right, .. })
-        | (Value::Glob { val: left, .. }, Value::String { val: right, .. }) => {
-            Ok(Value::string(format!("{left}{right}"), Span::unknown()))
-        }
-        (Value::List { vals: left, .. }, Value::List { vals: right, .. }) => {
-            let mut values = left.clone();
-            values.extend(right.clone());
-            Ok(Value::list(values, Span::unknown()))
-        }
-        _ => Err(stone_error(
-            "addition",
-            format!("cannot add {} and {}", left.get_type(), right.get_type()),
-        )),
-    }
-}
-
-fn eval_neg(value: &Value) -> Result<Value, ShellError> {
-    match value {
-        Value::Int { val, .. } => val
-            .checked_neg()
-            .map(|value| Value::int(value, Span::unknown()))
-            .ok_or_else(|| stone_error("unary minus", "integer negation overflow")),
-        Value::Float { val, .. } => Ok(Value::float(-val, Span::unknown())),
-        other => Err(stone_error(
-            "unary minus",
-            format!("cannot negate {}", other.get_type()),
-        )),
-    }
-}
-
-fn eval_sub(left: &Value, right: &Value) -> Result<Value, ShellError> {
-    match (left, right) {
-        (Value::Int { val: left, .. }, Value::Int { val: right, .. }) => left
-            .checked_sub(*right)
-            .map(|value| Value::int(value, Span::unknown()))
-            .ok_or_else(|| stone_error("subtraction", "integer subtraction overflow")),
-        (Value::Float { val: left, .. }, Value::Float { val: right, .. }) => {
-            Ok(Value::float(left - right, Span::unknown()))
-        }
-        (Value::Int { val: left, .. }, Value::Float { val: right, .. }) => {
-            Ok(Value::float(*left as f64 - right, Span::unknown()))
-        }
-        (Value::Float { val: left, .. }, Value::Int { val: right, .. }) => {
-            Ok(Value::float(left - *right as f64, Span::unknown()))
-        }
-        _ => Err(stone_error(
-            "subtraction",
-            format!(
-                "cannot subtract {} and {}",
-                left.get_type(),
-                right.get_type()
-            ),
-        )),
-    }
-}
-
-fn eval_mul(left: &Value, right: &Value) -> Result<Value, ShellError> {
-    match (left, right) {
-        (Value::Int { val: left, .. }, Value::Int { val: right, .. }) => left
-            .checked_mul(*right)
-            .map(|value| Value::int(value, Span::unknown()))
-            .ok_or_else(|| stone_error("multiplication", "integer multiplication overflow")),
-        (Value::Float { val: left, .. }, Value::Float { val: right, .. }) => {
-            Ok(Value::float(left * right, Span::unknown()))
-        }
-        (Value::Int { val: left, .. }, Value::Float { val: right, .. }) => {
-            Ok(Value::float(*left as f64 * right, Span::unknown()))
-        }
-        (Value::Float { val: left, .. }, Value::Int { val: right, .. }) => {
-            Ok(Value::float(left * *right as f64, Span::unknown()))
-        }
-        _ => Err(stone_error(
-            "multiplication",
-            format!(
-                "cannot multiply {} and {}",
-                left.get_type(),
-                right.get_type()
-            ),
-        )),
-    }
-}
-
-fn eval_div(left: &Value, right: &Value) -> Result<Value, ShellError> {
-    let (left, right) = match (left, right) {
-        (Value::Int { val: left, .. }, Value::Int { val: right, .. }) => {
-            (*left as f64, *right as f64)
-        }
-        (Value::Float { val: left, .. }, Value::Float { val: right, .. }) => (*left, *right),
-        (Value::Int { val: left, .. }, Value::Float { val: right, .. }) => (*left as f64, *right),
-        (Value::Float { val: left, .. }, Value::Int { val: right, .. }) => (*left, *right as f64),
-        _ => {
-            return Err(stone_error(
-                "division",
-                format!("cannot divide {} and {}", left.get_type(), right.get_type()),
-            ));
-        }
-    };
-    if right == 0.0 {
-        return Err(stone_error("division", "division by zero"));
-    }
-    Ok(Value::float(left / right, Span::unknown()))
-}
-
-fn eval_floor_div(left: &Value, right: &Value) -> Result<Value, ShellError> {
-    match (left, right) {
-        (Value::Int { val: left, .. }, Value::Int { val: right, .. }) => {
-            if *right == 0 {
-                return Err(stone_error("floor division", "division by zero"));
-            }
-            Ok(Value::int(left.div_euclid(*right), Span::unknown()))
-        }
-        _ => {
-            let Value::Float { val, .. } = eval_div(left, right)? else {
-                unreachable!("eval_div returns a float")
-            };
-            Ok(Value::float(val.floor(), Span::unknown()))
-        }
-    }
-}
-
-fn eval_mod(left: &Value, right: &Value) -> Result<Value, ShellError> {
-    match (left, right) {
-        (Value::Int { val: left, .. }, Value::Int { val: right, .. }) => {
-            if *right == 0 {
-                return Err(stone_error("modulo", "modulo by zero"));
-            }
-            Ok(Value::int(left.rem_euclid(*right), Span::unknown()))
-        }
-        _ => {
-            let left = value_to_f64(left, "modulo")?;
-            let right = value_to_f64(right, "modulo")?;
-            if right == 0.0 {
-                return Err(stone_error("modulo", "modulo by zero"));
-            }
-            Ok(Value::float(left.rem_euclid(right), Span::unknown()))
-        }
-    }
-}
-
-fn eval_bitwise_int(
-    left: &Value,
-    right: &Value,
-    context: &str,
-    op: impl FnOnce(i64, i64) -> i64,
-) -> Result<Value, ShellError> {
-    let left = value_to_i64(left, context)?;
-    let right = value_to_i64(right, context)?;
-    Ok(Value::int(op(left, right), Span::unknown()))
-}
-
-fn eval_shift(
-    left: &Value,
-    right: &Value,
-    context: &str,
-    op: impl FnOnce(i64, u32) -> Option<i64>,
-) -> Result<Value, ShellError> {
-    let left = value_to_i64(left, context)?;
-    let right = value_to_i64(right, context)?;
-    let shift = u32::try_from(right)
-        .map_err(|_| stone_error(context, "shift count must be non-negative"))?;
-    op(left, shift)
-        .map(|value| Value::int(value, Span::unknown()))
-        .ok_or_else(|| stone_error(context, "shift count is too large"))
 }
 
 fn eval_string_method(
