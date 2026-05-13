@@ -2085,6 +2085,7 @@ dependencies = [
  "nu-engine",
  "nu-parser",
  "nu-protocol",
+ "regex",
  "ruff_python_ast",
  "ruff_python_parser",
  "serde_json",

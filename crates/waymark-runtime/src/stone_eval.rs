@@ -23,6 +23,7 @@ use nu_protocol::{
     shell_error::generic::GenericError,
     IntoPipelineData, PipelineData, Record, ShellError, Span, Value,
 };
+use regex::bytes::Regex;
 use serde_json::{json, Value as JsonValue};
 
 use crate::commands::{stone_help_overview, stone_help_topic};
@@ -5474,11 +5475,20 @@ impl Evaluator<'_> {
                 "search() requires root and needle arguments",
             ));
         };
-        if !call.named.is_empty() {
-            return Err(stone_error(
-                "search",
-                "search() keyword arguments are not supported",
-            ));
+        let mut regex = false;
+        for (name, argument) in &call.named {
+            let value = self
+                .eval_expr_value(argument, PipelineData::empty())?
+                .into_nu_value("search")?;
+            match name.as_str() {
+                "regex" => regex = value_to_bool(&value, "search regex")?,
+                other => {
+                    return Err(stone_error(
+                        "search",
+                        format!("unsupported keyword `{other}`; expected regex"),
+                    ));
+                }
+            }
         }
         let root = self
             .eval_expr_value(root, PipelineData::empty())?
@@ -5491,6 +5501,7 @@ impl Evaluator<'_> {
         if needle.is_empty() {
             return Err(stone_error("search", "needle must not be empty"));
         }
+        let matcher = StoneSearchMatcher::new(&needle, regex)?;
         let root = self.resolve_script_path(&root)?;
         let mut files_visited = 0usize;
         let mut matches = Vec::new();
@@ -5511,17 +5522,13 @@ impl Evaluator<'_> {
                 continue;
             }
             files_visited += 1;
-            let Ok(content) = fs::read_to_string(&path) else {
+            let Ok(bytes) = fs::read(&path) else {
                 continue;
             };
-            for (line_index, line) in content.lines().enumerate() {
-                if line.contains(&needle) {
-                    matches.push(search_match_record(&path, line_index + 1, line));
-                    if matches.len() >= STONE_MAX_SEARCH_MATCHES {
-                        break;
-                    }
-                }
+            if stone_bytes_look_binary(&bytes) || !matcher.is_match(&bytes) {
+                continue;
             }
+            push_stone_search_line_matches(&mut matches, &path, &bytes, &matcher);
         }
         Ok(RuntimeValue::Nu(Value::list(matches, Span::unknown())))
     }
@@ -13583,6 +13590,66 @@ fn search_match_record(path: &Path, line: usize, text: &str) -> Value {
     Value::record(record, span)
 }
 
+enum StoneSearchMatcher {
+    Literal(Vec<u8>),
+    Regex(Regex),
+}
+
+impl StoneSearchMatcher {
+    fn new(needle: &str, regex: bool) -> Result<Self, ShellError> {
+        if regex {
+            Regex::new(needle)
+                .map(Self::Regex)
+                .map_err(|err| stone_error("search", format!("invalid regex: {err}")))
+        } else {
+            Ok(Self::Literal(needle.as_bytes().to_vec()))
+        }
+    }
+
+    fn is_match(&self, bytes: &[u8]) -> bool {
+        match self {
+            Self::Literal(needle) => memchr::memmem::Finder::new(needle).find(bytes).is_some(),
+            Self::Regex(regex) => regex.is_match(bytes),
+        }
+    }
+}
+
+fn push_stone_search_line_matches(
+    matches: &mut Vec<Value>,
+    path: &Path,
+    content: &[u8],
+    matcher: &StoneSearchMatcher,
+) {
+    let mut line_number = 1usize;
+    let mut start = 0usize;
+    for end in memchr::memchr_iter(b'\n', content).chain(std::iter::once(content.len())) {
+        let line = trim_byte_line_end(&content[start..end]);
+        if matcher.is_match(line) {
+            matches.push(search_match_record(
+                path,
+                line_number,
+                &String::from_utf8_lossy(line),
+            ));
+            if matches.len() >= STONE_MAX_SEARCH_MATCHES {
+                break;
+            }
+        }
+        if end == content.len() {
+            break;
+        }
+        start = end + 1;
+        line_number += 1;
+    }
+}
+
+fn trim_byte_line_end(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+fn stone_bytes_look_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(1024).any(|byte| *byte == 0)
+}
+
 fn file_stat_record(stat: StoneFileStat, span: Span) -> Value {
     let mut record = Record::with_capacity(10);
     record.push("path", Value::string(stat.path.display().to_string(), span));
@@ -13799,6 +13866,7 @@ edited = edit("out/data.txt", "two", "three")
 entries = ls("out")
 found = find(".", "*.txt")
 matches = search(".", "three")
+regex_matches = search(".", "thr.e", regex=True)
 rows = [{"region": "west", "qty": 2}, {"region": "east", "qty": 9}]
 west = where(rows, "region", "west")
 json_text = to_json({"west": west})
@@ -13809,6 +13877,7 @@ emit({
     "entries": len(entries),
     "found": len(found),
     "matches": len(matches),
+    "regex_matches": len(regex_matches),
     "first_region": first(west)["region"],
     "last_qty": last(rows)["qty"],
     "roundtrip_qty": roundtrip["west"][0]["qty"],
@@ -13825,6 +13894,7 @@ emit({
                 "entries": 1,
                 "found": 2,
                 "matches": 1,
+                "regex_matches": 1,
                 "first_region": "west",
                 "last_qty": 9,
                 "roundtrip_qty": 2,

@@ -8,6 +8,7 @@ use std::time::Instant;
 use asset_image::{AssetEntry, AssetImage};
 use memchr::memmem::Finder;
 use nu_protocol::engine::{EngineState, Stack};
+use regex::bytes::Regex;
 use serde_json::{json, Value as JsonValue};
 
 use crate::{FrontendKind, StoneGuest};
@@ -370,6 +371,7 @@ pub struct FindRequest {
 pub struct SearchRequest {
     pub path: String,
     pub needle: String,
+    pub regex: bool,
     pub max_matches: Option<usize>,
 }
 
@@ -1236,7 +1238,10 @@ pub fn search_tool(
     let mut matches = Vec::new();
     let mut queue = VecDeque::from([(path.guest_path().to_owned(), path.host_path().to_owned())]);
     let mut truncated = false;
-    let finder = Finder::new(request.needle.as_bytes());
+    let matcher = match SearchMatcher::new(&request.needle, request.regex, started) {
+        Ok(matcher) => matcher,
+        Err(err) => return err,
+    };
 
     while let Some((guest_path, host_path)) = queue.pop_front() {
         if files_visited >= limits.max_search_files || matches.len() >= max_matches {
@@ -1275,18 +1280,15 @@ pub fn search_tool(
         let Ok(bytes) = fs::read(&host_path) else {
             continue;
         };
-        if finder.find(&bytes).is_none() {
+        if bytes_look_binary(&bytes) || !matcher.is_match(&bytes) {
             continue;
         }
-        let Ok(content) = std::str::from_utf8(&bytes) else {
-            continue;
-        };
-        push_search_line_matches(
+        push_search_line_matches_bytes(
             &mut matches,
             &mut truncated,
             &guest_path,
-            content,
-            &finder,
+            &bytes,
+            &matcher,
             max_matches,
         );
     }
@@ -1524,7 +1526,10 @@ fn search_task_asset_tool(
     let mut files_visited = 0usize;
     let mut matches = Vec::new();
     let mut truncated = false;
-    let finder = Finder::new(request.needle.as_bytes());
+    let matcher = match SearchMatcher::new(&request.needle, request.regex, started) {
+        Ok(matcher) => matcher,
+        Err(err) => return Some(err),
+    };
     for entry in candidates {
         if files_visited >= limits.max_search_files || matches.len() >= max_matches {
             truncated = true;
@@ -1534,18 +1539,15 @@ fn search_task_asset_tool(
             continue;
         }
         files_visited += 1;
-        if finder.find(&entry.content).is_none() {
-            continue;
-        }
-        let Ok(content) = std::str::from_utf8(&entry.content) else {
+        if bytes_look_binary(&entry.content) || !matcher.is_match(&entry.content) {
             continue;
         };
-        push_search_line_matches(
+        push_search_line_matches_bytes(
             &mut matches,
             &mut truncated,
             task_asset_guest_path(entry).as_str(),
-            content,
-            &finder,
+            &entry.content,
+            &matcher,
             max_matches,
         );
     }
@@ -1562,27 +1564,67 @@ fn search_task_asset_tool(
     Some(result)
 }
 
-fn push_search_line_matches(
+enum SearchMatcher {
+    Literal(Vec<u8>),
+    Regex(Regex),
+}
+
+impl SearchMatcher {
+    fn new(needle: &str, regex: bool, started: Instant) -> Result<Self, ToolResult> {
+        if regex {
+            Regex::new(needle).map(Self::Regex).map_err(|err| {
+                elapsed_error("invalid_input", "invalid_regex", err.to_string(), started)
+            })
+        } else {
+            Ok(Self::Literal(needle.as_bytes().to_vec()))
+        }
+    }
+
+    fn is_match(&self, bytes: &[u8]) -> bool {
+        match self {
+            Self::Literal(needle) => Finder::new(needle).find(bytes).is_some(),
+            Self::Regex(regex) => regex.is_match(bytes),
+        }
+    }
+}
+
+fn push_search_line_matches_bytes(
     matches: &mut Vec<JsonValue>,
     truncated: &mut bool,
     path: &str,
-    content: &str,
-    finder: &Finder<'_>,
+    content: &[u8],
+    matcher: &SearchMatcher,
     max_matches: usize,
 ) {
-    for (line_index, line) in content.lines().enumerate() {
-        if finder.find(line.as_bytes()).is_some() {
+    let mut line_number = 1usize;
+    let mut start = 0usize;
+    for end in memchr::memchr_iter(b'\n', content).chain(std::iter::once(content.len())) {
+        let line = trim_line_end(&content[start..end]);
+        if matcher.is_match(line) {
             if matches.len() >= max_matches {
                 *truncated = true;
                 break;
             }
             matches.push(json!({
                 "path": path,
-                "line": line_index + 1,
-                "text": line,
+                "line": line_number,
+                "text": String::from_utf8_lossy(line),
             }));
         }
+        if end == content.len() {
+            break;
+        }
+        start = end + 1;
+        line_number += 1;
     }
+}
+
+fn trim_line_end(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+fn bytes_look_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(1024).any(|byte| *byte == 0)
 }
 
 fn task_assets_for_path<'a>(
@@ -1877,9 +1919,16 @@ fn parse_find_request(input: &JsonValue) -> Result<FindRequest, ToolResult> {
 }
 
 fn parse_search_request(input: &JsonValue) -> Result<SearchRequest, ToolResult> {
+    let regex = optional_bool(input, "regex")?.unwrap_or(false);
+    let regex = match optional_string(input, "mode")?.as_deref() {
+        None | Some("literal") => regex,
+        Some("regex") => true,
+        Some(other) => return Err(invalid_input(format!("unsupported search mode {other:?}"))),
+    };
     Ok(SearchRequest {
         path: required_string(input, "path")?,
         needle: required_string(input, "needle")?,
+        regex,
         max_matches: optional_usize(input, "max_matches")?,
     })
 }
@@ -2633,6 +2682,40 @@ mod tests {
         assert_eq!(search["value"]["matches"][0]["line"], json!(1));
         assert_eq!(search["value"]["truncated"], json!(true));
 
+        let regex_search = dispatch_file_tool_json(
+            &policy,
+            &limits,
+            &json!({
+                "tool": "search",
+                "input": {
+                    "path": "/work",
+                    "needle": "needle\\s+two",
+                    "regex": true
+                }
+            }),
+        )
+        .to_json();
+        assert_eq!(regex_search["ok"], json!(true));
+        assert_eq!(
+            regex_search["value"]["matches"][0]["path"],
+            json!("/work/nested/answer-notes.txt")
+        );
+
+        let invalid_regex = dispatch_file_tool_json(
+            &policy,
+            &limits,
+            &json!({
+                "tool": "search",
+                "input": {
+                    "path": "/work",
+                    "needle": "[",
+                    "mode": "regex"
+                }
+            }),
+        );
+        assert_eq!(invalid_regex.kind, "invalid_input");
+        assert_eq!(invalid_regex.error.unwrap().code, "invalid_regex");
+
         let denied = dispatch_file_tool_json(
             &policy,
             &limits,
@@ -2718,6 +2801,7 @@ mod tests {
             SearchRequest {
                 path: "/task".to_owned(),
                 needle: "hello".to_owned(),
+                regex: false,
                 max_matches: None,
             },
         )

@@ -47,7 +47,11 @@ explicitly asks for full output.
 - `read_json(path)`, `write_json(path, value)`: JSON file I/O.
 - `read_jsonl(path)`, `write_jsonl(path, rows)`: JSONL file I/O.
 - `read_csv(path)`: CSV records.
-- `find(root, name_glob="*")`: file discovery.
+- `find(root, name_glob="*")`: file discovery. Names support simple
+  wildcard globs; regex is not used for file names.
+- `search(root, needle, regex=False)`: content search. Literal search is the
+  default fast path; pass `regex=True` for Rust-regex patterns. Results remain
+  structured records with `path`, `line`, and `text`.
 - `split(text, separator=None)`, `join(items, separator="")`,
   `slice(value, start=None, end=None)`, `starts_with(text, prefix)`, and
   `format(template, ...)`: small text/list helpers for scripts and dynamic
