@@ -751,13 +751,22 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
     },
     StoneHelpEntry {
         name: "find",
-        signature: "find(root: str, name_glob: str = '*') -> list[record]",
-        use_when: "Use to discover task input files by glob before reading them.",
+        signature: "find(root: str, name_glob: str = '*', path_glob: str? = None, type: str? = None) -> list[record]",
+        use_when: "Use to discover task input files by name/path glob and optional type, size, or modified-time filters.",
         examples: &[
             r#"files = find("/app", "*.jsonl")"#,
+            r#"py = find("/app", path_glob="**/*.py", type="file")"#,
             r#"rows = read_jsonl(files[0])"#,
         ],
         avoid: &["Do not import glob/pathlib/os; use find instead."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "diff",
+        signature: "diff(path_a: str, path_b: str) -> record",
+        use_when: "Use to compare two text files and inspect structured hunks with line numbers.",
+        examples: &[r#"changes = diff("expected.txt", "actual.txt")"#],
+        avoid: &["For binary files or very large files, use run([\"diff\", ...]) explicitly."],
         aliases: &[],
     },
     StoneHelpEntry {

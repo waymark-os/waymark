@@ -49,8 +49,13 @@ explicitly asks for full output.
 - `read_json(path)`, `write_json(path, value)`: JSON file I/O.
 - `read_jsonl(path)`, `write_jsonl(path, rows)`: JSONL file I/O.
 - `read_csv(path)`: CSV records.
-- `find(root, name_glob="*")`: file discovery. Names support simple
-  wildcard globs; regex is not used for file names.
+- `find(root, name_glob="*", path_glob=None, type=None, min_size=None,
+  max_size=None, modified_after_ms=None, modified_before_ms=None)`: file
+  discovery. Names support simple wildcard globs, `path_glob` can match
+  recursive patterns such as `**/*.py`, and `type` may be `file`, `dir`,
+  `symlink`, or `any`.
+- `diff(path_a, path_b)`: compare two text files and return structured hunks
+  with line numbers and inserted/deleted lines.
 - `search(root, needle, regex=False)`: content search. Literal search is the
   default fast path; pass `regex=True` for Rust-regex patterns. Results remain
   structured records with `path`, `line`, and `text`.

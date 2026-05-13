@@ -4330,6 +4330,7 @@ impl Evaluator<'_> {
             "emit" => self.eval_emit_call(call, input),
             "fail" => self.eval_fail_call(call),
             "find" => self.eval_find_call(call),
+            "diff" => self.eval_diff_call(call),
             "format" => self.eval_format_call(call),
             "json_dumps" => self.eval_json_dumps_call(call),
             "json_loads" => self.eval_json_loads_call(call),
@@ -4933,6 +4934,12 @@ impl Evaluator<'_> {
             })
             .transpose()?;
         let mut name_contains: Option<String> = None;
+        let mut path_glob: Option<String> = None;
+        let mut kind_filter: Option<String> = None;
+        let mut min_size: Option<u64> = None;
+        let mut max_size: Option<u64> = None;
+        let mut modified_after_ms: Option<i64> = None;
+        let mut modified_before_ms: Option<i64> = None;
         for (name, argument) in &call.named {
             let value = self
                 .eval_expr_value(argument, PipelineData::empty())?
@@ -4942,11 +4949,30 @@ impl Evaluator<'_> {
                 "name_contains" => {
                     name_contains = Some(value_to_string(&value, "find name_contains")?)
                 }
+                "path_glob" => path_glob = Some(value_to_string(&value, "find path_glob")?),
+                "type" => {
+                    let kind = value_to_string(&value, "find type")?;
+                    if !matches!(kind.as_str(), "file" | "dir" | "symlink" | "any") {
+                        return Err(stone_error(
+                            "find",
+                            "type must be one of 'file', 'dir', 'symlink', or 'any'",
+                        ));
+                    }
+                    kind_filter = Some(kind);
+                }
+                "min_size" => min_size = Some(value_to_u64(&value, "find min_size")?),
+                "max_size" => max_size = Some(value_to_u64(&value, "find max_size")?),
+                "modified_after_ms" => {
+                    modified_after_ms = Some(value_to_i64(&value, "find modified_after_ms")?)
+                }
+                "modified_before_ms" => {
+                    modified_before_ms = Some(value_to_i64(&value, "find modified_before_ms")?)
+                }
                 other => {
                     return Err(stone_error(
                         "find",
                         format!(
-                            "unsupported keyword `{other}`; expected name_glob or name_contains"
+                            "unsupported keyword `{other}`; expected name_glob, name_contains, path_glob, type, min_size, max_size, modified_after_ms, or modified_before_ms"
                         ),
                     ));
                 }
@@ -4970,7 +4996,19 @@ impl Evaluator<'_> {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string());
-            if stone_name_matches(&name, name_contains.as_deref(), name_glob.as_deref()) {
+            if stone_find_entry_matches(
+                &path,
+                &name,
+                &stat,
+                name_contains.as_deref(),
+                name_glob.as_deref(),
+                path_glob.as_deref(),
+                kind_filter.as_deref(),
+                min_size,
+                max_size,
+                modified_after_ms,
+                modified_before_ms,
+            ) {
                 entries.push(file_entry_record(
                     StoneFileEntry {
                         name,
@@ -4996,6 +5034,35 @@ impl Evaluator<'_> {
                 )
         });
         Ok(RuntimeValue::Nu(Value::list(entries, Span::unknown())))
+    }
+
+    fn eval_diff_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let [left, right] = call.positional.as_slice() else {
+            return Err(stone_error("diff", "diff() requires two file paths"));
+        };
+        if !call.named.is_empty() {
+            return Err(stone_error(
+                "diff",
+                "diff() keyword arguments are not supported",
+            ));
+        }
+        let left = self
+            .eval_expr_value(left, PipelineData::empty())?
+            .into_nu_value("diff")?;
+        let right = self
+            .eval_expr_value(right, PipelineData::empty())?
+            .into_nu_value("diff")?;
+        let left_path = self.resolve_script_path(&value_to_path_string(&left, "diff")?)?;
+        let right_path = self.resolve_script_path(&value_to_path_string(&right, "diff")?)?;
+        let left_text = stone_file_adapter().read_text(&left_path, 4 * 1024 * 1024)?;
+        let right_text = stone_file_adapter().read_text(&right_path, 4 * 1024 * 1024)?;
+        Ok(RuntimeValue::Nu(stone_diff_record(
+            &left_path,
+            &right_path,
+            &left_text,
+            &right_text,
+            Span::unknown(),
+        )))
     }
 
     fn eval_read_json_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -7582,6 +7649,7 @@ fn is_builtin_call(call: &Call) -> bool {
     matches!(
         call.name.as_str(),
         "cat"
+            | "diff"
             | "edit"
             | "echo"
             | "emit"
@@ -7765,6 +7833,14 @@ fn value_to_limit(value: &Value, context: &str) -> Result<usize, ShellError> {
         return Err(stone_error(context, "limit must be non-negative"));
     }
     usize::try_from(limit).map_err(|_| stone_error(context, "limit is too large"))
+}
+
+fn value_to_u64(value: &Value, context: &str) -> Result<u64, ShellError> {
+    let value = value_to_i64(value, context)?;
+    if value < 0 {
+        return Err(stone_error(context, "value must be non-negative"));
+    }
+    u64::try_from(value).map_err(|_| stone_error(context, "value is too large"))
 }
 
 #[cfg(not(target_os = "hermit"))]
@@ -12819,9 +12895,235 @@ fn values_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
+fn stone_diff_record(
+    left_path: &Path,
+    right_path: &Path,
+    left_text: &str,
+    right_text: &str,
+    span: Span,
+) -> Value {
+    let left_lines = left_text.lines().collect::<Vec<_>>();
+    let right_lines = right_text.lines().collect::<Vec<_>>();
+    let ops = stone_diff_ops(&left_lines, &right_lines);
+    let mut hunks = Vec::new();
+    let mut current = StoneDiffHunk::new(1, 1);
+    let mut old_line = 1usize;
+    let mut new_line = 1usize;
+    let mut changed = false;
+
+    for op in ops {
+        match op {
+            StoneDiffOp::Equal => {
+                if current.has_changes {
+                    hunks.push(current.to_value(span));
+                    current = StoneDiffHunk::new(old_line, new_line);
+                }
+                old_line += 1;
+                new_line += 1;
+                current.old_start = old_line;
+                current.new_start = new_line;
+            }
+            StoneDiffOp::Delete(text) => {
+                changed = true;
+                current.has_changes = true;
+                current.old_lines += 1;
+                current
+                    .lines
+                    .push(stone_diff_line("-", Some(old_line), None, text, span));
+                old_line += 1;
+            }
+            StoneDiffOp::Insert(text) => {
+                changed = true;
+                current.has_changes = true;
+                current.new_lines += 1;
+                current
+                    .lines
+                    .push(stone_diff_line("+", None, Some(new_line), text, span));
+                new_line += 1;
+            }
+        }
+    }
+    if current.has_changes {
+        hunks.push(current.to_value(span));
+    }
+
+    let mut record = Record::new();
+    record.push("changed", Value::bool(changed, span));
+    record.push(
+        "path_a",
+        Value::string(left_path.display().to_string(), span),
+    );
+    record.push(
+        "path_b",
+        Value::string(right_path.display().to_string(), span),
+    );
+    record.push("hunks", Value::list(hunks, span));
+    Value::record(record, span)
+}
+
+#[derive(Debug)]
+enum StoneDiffOp<'a> {
+    Equal,
+    Delete(&'a str),
+    Insert(&'a str),
+}
+
+struct StoneDiffHunk {
+    old_start: usize,
+    new_start: usize,
+    old_lines: usize,
+    new_lines: usize,
+    has_changes: bool,
+    lines: Vec<Value>,
+}
+
+impl StoneDiffHunk {
+    fn new(old_start: usize, new_start: usize) -> Self {
+        Self {
+            old_start,
+            new_start,
+            old_lines: 0,
+            new_lines: 0,
+            has_changes: false,
+            lines: Vec::new(),
+        }
+    }
+
+    fn to_value(self, span: Span) -> Value {
+        let mut record = Record::new();
+        record.push(
+            "old_start",
+            Value::int(i64::try_from(self.old_start).unwrap_or(i64::MAX), span),
+        );
+        record.push(
+            "old_lines",
+            Value::int(i64::try_from(self.old_lines).unwrap_or(i64::MAX), span),
+        );
+        record.push(
+            "new_start",
+            Value::int(i64::try_from(self.new_start).unwrap_or(i64::MAX), span),
+        );
+        record.push(
+            "new_lines",
+            Value::int(i64::try_from(self.new_lines).unwrap_or(i64::MAX), span),
+        );
+        record.push("lines", Value::list(self.lines, span));
+        Value::record(record, span)
+    }
+}
+
+fn stone_diff_line(
+    kind: &str,
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+    text: &str,
+    span: Span,
+) -> Value {
+    let mut record = Record::new();
+    record.push("kind", Value::string(kind, span));
+    record.push(
+        "old_line",
+        old_line
+            .map(|line| Value::int(i64::try_from(line).unwrap_or(i64::MAX), span))
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    record.push(
+        "new_line",
+        new_line
+            .map(|line| Value::int(i64::try_from(line).unwrap_or(i64::MAX), span))
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    record.push("text", Value::string(text.to_owned(), span));
+    Value::record(record, span)
+}
+
+fn stone_diff_ops<'a>(left: &[&'a str], right: &[&'a str]) -> Vec<StoneDiffOp<'a>> {
+    let mut lcs = vec![vec![0usize; right.len() + 1]; left.len() + 1];
+    for i in (0..left.len()).rev() {
+        for j in (0..right.len()).rev() {
+            lcs[i][j] = if left[i] == right[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+
+    let mut ops = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < left.len() && j < right.len() {
+        if left[i] == right[j] {
+            ops.push(StoneDiffOp::Equal);
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            ops.push(StoneDiffOp::Delete(left[i]));
+            i += 1;
+        } else {
+            ops.push(StoneDiffOp::Insert(right[j]));
+            j += 1;
+        }
+    }
+    while i < left.len() {
+        ops.push(StoneDiffOp::Delete(left[i]));
+        i += 1;
+    }
+    while j < right.len() {
+        ops.push(StoneDiffOp::Insert(right[j]));
+        j += 1;
+    }
+    ops
+}
+
 fn stone_name_matches(name: &str, contains: Option<&str>, glob: Option<&str>) -> bool {
     contains.is_none_or(|needle| name.contains(needle))
         && glob.is_none_or(|pattern| stone_wildcard_match(pattern, name))
+}
+
+fn stone_find_entry_matches(
+    path: &Path,
+    name: &str,
+    stat: &StoneFileStat,
+    contains: Option<&str>,
+    name_glob: Option<&str>,
+    path_glob: Option<&str>,
+    kind_filter: Option<&str>,
+    min_size: Option<u64>,
+    max_size: Option<u64>,
+    modified_after_ms: Option<i64>,
+    modified_before_ms: Option<i64>,
+) -> bool {
+    stone_name_matches(name, contains, name_glob)
+        && path_glob.is_none_or(|pattern| stone_path_glob_match(pattern, path))
+        && kind_filter.is_none_or(|kind| match kind {
+            "file" => stat.is_file,
+            "dir" => stat.is_dir,
+            "symlink" => stat.is_symlink,
+            "any" => true,
+            _ => false,
+        })
+        && min_size.is_none_or(|size| stat.size >= size)
+        && max_size.is_none_or(|size| stat.size <= size)
+        && modified_after_ms.is_none_or(|after| stat.modified_ms.is_some_and(|ms| ms > after))
+        && modified_before_ms.is_none_or(|before| stat.modified_ms.is_some_and(|ms| ms < before))
+}
+
+fn stone_path_glob_match(pattern: &str, path: &Path) -> bool {
+    let text = path.to_string_lossy().replace('\\', "/");
+    if let Some(suffix) = pattern.strip_prefix("**/") {
+        return stone_wildcard_match(pattern, &text)
+            || stone_wildcard_match(suffix, &text)
+            || path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| stone_wildcard_match(suffix, name));
+    }
+    if stone_wildcard_match(pattern, &text) {
+        return true;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| stone_wildcard_match(pattern, name))
 }
 
 fn stone_wildcard_match(pattern: &str, text: &str) -> bool {
@@ -16209,6 +16511,80 @@ emit({
                 "file_count": 1,
                 "file_name": "records_1.jsonl",
                 "top": "b",
+            })
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn find_supports_path_type_size_and_mtime_filters() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("find-rich-filters")?;
+        fs::create_dir_all(root.join("pkg/sub")).expect("create nested dirs");
+        fs::write(root.join("pkg/main.py"), "print('main')\n").expect("write main");
+        fs::write(root.join("pkg/sub/test.py"), "print('test')\n").expect("write test");
+        fs::write(root.join("pkg/sub/notes.txt"), "").expect("write notes");
+
+        let program = lower_source(
+            r#"py = find(".", path_glob="**/*.py", type="file", min_size=1)
+small = find(".", path_glob="**/*.txt", type="file", max_size=0)
+old = find(".", type="file", modified_before_ms=1)
+emit({
+    "py_names": sort([file["name"] for file in py]),
+    "small_names": [file["name"] for file in small],
+    "old_count": len(old),
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "py_names": ["main.py", "test.py"],
+                "small_names": ["notes.txt"],
+                "old_count": 0,
+            })
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn diff_returns_structured_hunks() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("diff-builtin")?;
+        fs::write(root.join("before.txt"), "alpha\nbeta\ngamma\n").expect("write before");
+        fs::write(root.join("after.txt"), "alpha\nbravo\ngamma\ndelta\n").expect("write after");
+
+        let program = lower_source(
+            r#"changes = diff("before.txt", "after.txt")
+emit({
+    "changed": changes["changed"],
+    "hunk_count": len(changes["hunks"]),
+    "old_start": changes["hunks"][0]["old_start"],
+    "new_start": changes["hunks"][0]["new_start"],
+    "first_kind": changes["hunks"][0]["lines"][0]["kind"],
+    "first_text": changes["hunks"][0]["lines"][0]["text"],
+    "last_kind": changes["hunks"][1]["lines"][0]["kind"],
+    "last_text": changes["hunks"][1]["lines"][0]["text"],
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "changed": true,
+                "hunk_count": 2,
+                "old_start": 2,
+                "new_start": 2,
+                "first_kind": "-",
+                "first_text": "beta",
+                "last_kind": "+",
+                "last_text": "delta",
             })
         );
 
