@@ -3,8 +3,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,9 +24,10 @@ use crate::stone_ast::{
 };
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_file_ops::{
-    diff_record_for_paths, ensure_parent_dir_for_write, find_records, io_read_stone_error,
-    io_stone_error, list_dir_records, read_csv_file, read_json_file, read_text as stone_read_text,
-    search_records, stat_record, write_json_file, write_jsonl_file, write_text as stone_write_text,
+    cat_text, create_dir_all, diff_record_for_paths, edit_text_file, find_records, io_stone_error,
+    list_dir_records, open_runtime_file, read_bytes_for_jsonl, read_csv_file, read_json_file,
+    read_text as stone_read_text, remove_path, save_value_file, search_records, stat_record,
+    write_json_file, write_jsonl_file, write_text as stone_write_text, RuntimeFile,
     StoneFindOptions,
 };
 #[cfg(not(target_os = "hermit"))]
@@ -361,11 +361,6 @@ struct CallableValue {
 struct FileHandle {
     scope_index: usize,
     file_id: u64,
-}
-
-enum RuntimeFile {
-    Read { text: String, closed: bool },
-    Write { path: PathBuf, file: Option<File> },
 }
 
 #[derive(Clone)]
@@ -4570,49 +4565,7 @@ impl Evaluator<'_> {
             _ => unreachable!(),
         };
 
-        let runtime_file = match mode.as_str() {
-            "r" | "rt" => {
-                let mut file =
-                    File::open(&target).map_err(|err| io_read_stone_error("open", err, &target))?;
-                let mut text = String::new();
-                file.read_to_string(&mut text)
-                    .map_err(|err| io_stone_error("open", err, &target))?;
-                RuntimeFile::Read {
-                    text,
-                    closed: false,
-                }
-            }
-            "w" | "wt" => RuntimeFile::Write {
-                path: target.clone(),
-                file: Some({
-                    ensure_parent_dir_for_write("open", &target)?;
-                    OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(true)
-                        .open(&target)
-                        .map_err(|err| io_stone_error("open", err, &target))?
-                }),
-            },
-            "a" | "at" => RuntimeFile::Write {
-                path: target.clone(),
-                file: Some({
-                    ensure_parent_dir_for_write("open", &target)?;
-                    OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&target)
-                        .map_err(|err| io_stone_error("open", err, &target))?
-                }),
-            },
-            other => {
-                return Err(stone_error(
-                    "open",
-                    format!("unsupported mode `{other}`; expected r, w, or a"),
-                ));
-            }
-        };
-
+        let runtime_file = open_runtime_file(&target, &mode)?;
         let handle = self.state.insert_file(runtime_file);
         Ok(RuntimeValue::File(handle))
     }
@@ -4632,8 +4585,7 @@ impl Evaluator<'_> {
             .into_nu_value("cat")?;
         let path = value_to_path_string(&path, "cat")?;
         let target = self.resolve_script_path(&path)?;
-        let text =
-            fs::read_to_string(&target).map_err(|err| io_read_stone_error("cat", err, &target))?;
+        let text = cat_text(&target)?;
         Ok(RuntimeValue::Nu(Value::string(text, Span::unknown())))
     }
 
@@ -5062,7 +5014,7 @@ impl Evaluator<'_> {
         context: &'static str,
     ) -> Result<JsonlRows, ShellError> {
         let target = self.resolve_script_path(path)?;
-        let bytes = fs::read(&target).map_err(|err| io_read_stone_error(context, err, &target))?;
+        let bytes = read_bytes_for_jsonl(&target, context)?;
         Ok(jsonl_rows_from_bytes(
             bytes,
             limit,
@@ -5264,7 +5216,7 @@ impl Evaluator<'_> {
                 .into_nu_value("mkdir")?;
             let path = value_to_path_string(&path, "mkdir")?;
             let target = self.resolve_script_path(&path)?;
-            fs::create_dir_all(&target).map_err(|err| io_stone_error("mkdir", err, &target))?;
+            create_dir_all(&target)?;
         }
         Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())))
     }
@@ -5285,11 +5237,7 @@ impl Evaluator<'_> {
                 .into_nu_value("rm")?;
             let path = value_to_path_string(&path, "rm")?;
             let target = self.resolve_script_path(&path)?;
-            if target.is_dir() {
-                fs::remove_dir_all(&target).map_err(|err| io_stone_error("rm", err, &target))?;
-            } else {
-                fs::remove_file(&target).map_err(|err| io_stone_error("rm", err, &target))?;
-            }
+            remove_path(&target)?;
         }
         Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())))
     }
@@ -5328,38 +5276,13 @@ impl Evaluator<'_> {
         let path = value_to_path_string(&path, "edit")?;
         let old = value_to_string(&old, "edit old")?;
         let new = value_to_string(&new, "edit new")?;
-        if old.is_empty() {
-            return Err(stone_error("edit", "old text must not be empty"));
-        }
         let target = self.resolve_script_path(&path)?;
-        let text =
-            fs::read_to_string(&target).map_err(|err| io_read_stone_error("edit", err, &target))?;
-        let matches = text.matches(&old).count();
-        if matches == 0 {
-            return Err(stone_error("edit", "old text was not found"));
-        }
-        let replaced = if replace_all {
-            text.replace(&old, &new)
-        } else {
-            text.replacen(&old, &new, 1)
-        };
-        fs::write(&target, replaced.as_bytes())
-            .map_err(|err| io_stone_error("edit", err, &target))?;
-        let mut record = Record::with_capacity(4);
-        record.push(
-            "path",
-            Value::string(target.display().to_string(), Span::unknown()),
-        );
-        record.push(
-            "replacements",
-            Value::int(
-                if replace_all { matches as i64 } else { 1 },
-                Span::unknown(),
-            ),
-        );
-        record.push("matched", Value::int(matches as i64, Span::unknown()));
-        record.push("all", Value::bool(replace_all, Span::unknown()));
-        Ok(RuntimeValue::Nu(Value::record(record, Span::unknown())))
+        Ok(RuntimeValue::Nu(edit_text_file(
+            &target,
+            &old,
+            &new,
+            replace_all,
+        )?))
     }
 
     fn eval_save_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5394,42 +5317,9 @@ impl Evaluator<'_> {
             .into_nu_value("save")?;
         let path = value_to_path_string(&path, "save")?;
         let target = self.resolve_script_path(&path)?;
-        if target.exists() && !append && !force {
-            return Err(stone_error(
-                "save",
-                format!(
-                    "{} already exists; pass force=True to overwrite",
-                    target.display()
-                ),
-            ));
-        }
-        ensure_parent_dir_for_write("save", &target)?;
-        let bytes = value_to_save_bytes(&value)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(append)
-            .truncate(!append)
-            .open(&target)
-            .map_err(|err| io_stone_error("save", err, &target))?;
-        file.write_all(&bytes)
-            .map_err(|err| io_stone_error("save", err, &target))?;
-        file.flush()
-            .map_err(|err| io_stone_error("save", err, &target))?;
-        let mut record = Record::with_capacity(3);
-        record.push(
-            "path",
-            Value::string(target.display().to_string(), Span::unknown()),
-        );
-        record.push(
-            "bytes",
-            Value::int(
-                i64::try_from(bytes.len()).unwrap_or(i64::MAX),
-                Span::unknown(),
-            ),
-        );
-        record.push("append", Value::bool(append, Span::unknown()));
-        Ok(RuntimeValue::Nu(Value::record(record, Span::unknown())))
+        Ok(RuntimeValue::Nu(save_value_file(
+            &target, &value, append, force,
+        )?))
     }
 
     fn eval_search_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -7761,15 +7651,6 @@ fn value_to_display_string(value: &Value) -> Result<String, ShellError> {
         Value::String { val, .. } | Value::Glob { val, .. } => Ok(val.clone()),
         other => serde_json::to_string(&nu_to_json_value(other))
             .map_err(|err| stone_error("str", err.to_string())),
-    }
-}
-
-fn value_to_save_bytes(value: &Value) -> Result<Vec<u8>, ShellError> {
-    match value {
-        Value::Binary { val, .. } => Ok(val.clone()),
-        Value::String { val, .. } | Value::Glob { val, .. } => Ok(val.as_bytes().to_vec()),
-        other => serde_json::to_vec(&nu_to_json_value(other))
-            .map_err(|err| stone_error("save", err.to_string())),
     }
 }
 

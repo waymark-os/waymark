@@ -3,7 +3,7 @@
 #![cfg(not(target_os = "hermit"))]
 
 use std::collections::VecDeque;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -28,6 +28,61 @@ pub(crate) struct StoneFindOptions {
     pub(crate) max_size: Option<u64>,
     pub(crate) modified_after_ms: Option<i64>,
     pub(crate) modified_before_ms: Option<i64>,
+}
+
+pub(crate) enum RuntimeFile {
+    Read { text: String, closed: bool },
+    Write { path: PathBuf, file: Option<File> },
+}
+
+pub(crate) fn open_runtime_file(path: &Path, mode: &str) -> Result<RuntimeFile, ShellError> {
+    match mode {
+        "r" | "rt" => {
+            let mut file =
+                File::open(path).map_err(|err| io_read_stone_error("open", err, path))?;
+            let mut text = String::new();
+            use std::io::Read;
+            file.read_to_string(&mut text)
+                .map_err(|err| io_stone_error("open", err, path))?;
+            Ok(RuntimeFile::Read {
+                text,
+                closed: false,
+            })
+        }
+        "w" | "wt" => {
+            ensure_parent_dir_for_write("open", path)?;
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .map_err(|err| io_stone_error("open", err, path))?;
+            Ok(RuntimeFile::Write {
+                path: path.to_path_buf(),
+                file: Some(file),
+            })
+        }
+        "a" | "at" => {
+            ensure_parent_dir_for_write("open", path)?;
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|err| io_stone_error("open", err, path))?;
+            Ok(RuntimeFile::Write {
+                path: path.to_path_buf(),
+                file: Some(file),
+            })
+        }
+        other => Err(stone_error(
+            "open",
+            format!("unsupported mode `{other}`; expected r, w, or a"),
+        )),
+    }
+}
+
+pub(crate) fn cat_text(path: &Path) -> Result<String, ShellError> {
+    fs::read_to_string(path).map_err(|err| io_read_stone_error("cat", err, path))
 }
 
 pub(crate) fn read_text(path: &Path, max_bytes: usize) -> Result<String, ShellError> {
@@ -176,6 +231,112 @@ pub(crate) fn write_jsonl_file(path: &Path, rows: Vec<Value>) -> Result<Value, S
         i64::try_from(text.len()).unwrap_or(i64::MAX),
         Span::unknown(),
     ))
+}
+
+pub(crate) fn read_bytes_for_jsonl(path: &Path, context: &str) -> Result<Vec<u8>, ShellError> {
+    fs::read(path).map_err(|err| io_read_stone_error(context, err, path))
+}
+
+pub(crate) fn create_dir_all(path: &Path) -> Result<(), ShellError> {
+    fs::create_dir_all(path).map_err(|err| io_stone_error("mkdir", err, path))
+}
+
+pub(crate) fn remove_path(path: &Path) -> Result<(), ShellError> {
+    if path.is_dir() {
+        fs::remove_dir_all(path).map_err(|err| io_stone_error("rm", err, path))
+    } else {
+        fs::remove_file(path).map_err(|err| io_stone_error("rm", err, path))
+    }
+}
+
+pub(crate) fn edit_text_file(
+    path: &Path,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<Value, ShellError> {
+    if old.is_empty() {
+        return Err(stone_error("edit", "old text must not be empty"));
+    }
+    let text = fs::read_to_string(path).map_err(|err| io_read_stone_error("edit", err, path))?;
+    let matches = text.matches(old).count();
+    if matches == 0 {
+        return Err(stone_error("edit", "old text was not found"));
+    }
+    let replaced = if replace_all {
+        text.replace(old, new)
+    } else {
+        text.replacen(old, new, 1)
+    };
+    fs::write(path, replaced.as_bytes()).map_err(|err| io_stone_error("edit", err, path))?;
+    let mut record = Record::with_capacity(4);
+    record.push(
+        "path",
+        Value::string(path.display().to_string(), Span::unknown()),
+    );
+    record.push(
+        "replacements",
+        Value::int(
+            if replace_all { matches as i64 } else { 1 },
+            Span::unknown(),
+        ),
+    );
+    record.push("matched", Value::int(matches as i64, Span::unknown()));
+    record.push("all", Value::bool(replace_all, Span::unknown()));
+    Ok(Value::record(record, Span::unknown()))
+}
+
+pub(crate) fn save_value_file(
+    path: &Path,
+    value: &Value,
+    append: bool,
+    force: bool,
+) -> Result<Value, ShellError> {
+    if path.exists() && !append && !force {
+        return Err(stone_error(
+            "save",
+            format!(
+                "{} already exists; pass force=True to overwrite",
+                path.display()
+            ),
+        ));
+    }
+    ensure_parent_dir_for_write("save", path)?;
+    let bytes = value_to_save_bytes(value)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(path)
+        .map_err(|err| io_stone_error("save", err, path))?;
+    file.write_all(&bytes)
+        .map_err(|err| io_stone_error("save", err, path))?;
+    file.flush()
+        .map_err(|err| io_stone_error("save", err, path))?;
+    let mut record = Record::with_capacity(3);
+    record.push(
+        "path",
+        Value::string(path.display().to_string(), Span::unknown()),
+    );
+    record.push(
+        "bytes",
+        Value::int(
+            i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+            Span::unknown(),
+        ),
+    );
+    record.push("append", Value::bool(append, Span::unknown()));
+    Ok(Value::record(record, Span::unknown()))
+}
+
+fn value_to_save_bytes(value: &Value) -> Result<Vec<u8>, ShellError> {
+    match value {
+        Value::Binary { val, .. } => Ok(val.clone()),
+        Value::String { val, .. } | Value::Glob { val, .. } => Ok(val.as_bytes().to_vec()),
+        other => serde_json::to_vec(&nu_to_json_value(other))
+            .map_err(|err| stone_error("save", err.to_string())),
+    }
 }
 
 pub(crate) fn search_records(
