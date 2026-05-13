@@ -1,5 +1,77 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 # Dynamic Stone helper registrations for Python and pip command diagnostics.
+def python_limit(text):
+    if len(text) <= 1200:
+        return text
+    return slice(text, 0, 1200) + "..."
+
+def python_install_command(event):
+    if len(event["argv"]) == 0:
+        return "python3"
+    command = event["argv"][0]
+    if "python" in command:
+        return command
+    return "python3"
+
+def python_project_markers(cwd):
+    markers = []
+    for name in ["pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile", "poetry.lock", "environment.yml"]:
+        markers.append(cwd + "/" + name)
+    return markers
+
+def python_after_failure(event):
+    kind = event["explanation_kind"]
+    if kind != "python_module_not_found" and kind != "python_module_attribute_missing" and kind != "python_dependency_conflict" and kind != "python_package_resolution_failed":
+        return None
+
+    python = python_install_command(event)
+    explanation = event["explanation"]
+    checks = []
+    summary = "Python failed."
+
+    if kind == "python_module_not_found":
+        module = explanation.get("module", "")
+        package = explanation.get("package", module)
+        if package:
+            checks.append([python, "-m", "pip", "show", package])
+        if module:
+            summary = "Module `" + module + "` is missing from the Python runtime used by this command."
+        else:
+            summary = "Python failed because an import was not available."
+    elif kind == "python_module_attribute_missing":
+        module = explanation.get("module", "")
+        package = explanation.get("package", module)
+        if package:
+            checks.append([python, "-m", "pip", "show", package])
+        summary = "Python imported the module but the requested attribute is absent; this points to an API/version mismatch."
+    elif kind == "python_dependency_conflict":
+        summary = "pip metadata reports an installed dependency conflict in this runtime."
+    elif kind == "python_package_resolution_failed":
+        summary = "pip could not resolve a compatible set of requested package versions."
+
+    checks.append([python, "-m", "pip", "check"])
+
+    return {
+        "helper": "python.after_failure",
+        "event": event["event"],
+        "family": event["family"],
+        "kind": kind,
+        "summary": summary,
+        "exit_code": event["exit_code"],
+        "evidence": {
+            "python": python,
+            "project_markers": python_project_markers(event["cwd"]),
+            "stderr_excerpt": python_limit(event["stderr"]),
+        },
+        "next_checks": checks,
+    }
+
+def python_pip_after_failure(event):
+    observation = python_after_failure(event)
+    if observation != None:
+        observation["helper"] = "python.pip_after_failure"
+    return observation
+
 hook("run.after_failure", family="python", argv0_prefix=["python"], handler="python.after_failure", priority=100)
 hook("run.after_failure", family="python/pip", argv0=["pip"], argv0_prefix=["pip"], handler="python.pip_after_failure", priority=110)

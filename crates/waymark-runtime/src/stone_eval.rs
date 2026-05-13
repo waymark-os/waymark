@@ -52,8 +52,6 @@ const STONE_MAX_FIND_ENTRIES: usize = 4096;
 const STONE_MAX_SEARCH_FILES: usize = 1024;
 const STONE_MAX_SEARCH_FILE_BYTES: u64 = 1024 * 1024;
 const STONE_MAX_SEARCH_MATCHES: usize = 1000;
-#[cfg(not(target_os = "hermit"))]
-const STONE_HELPER_OUTPUT_LIMIT: usize = 4000;
 const STONE_LAST_RESULT_ENV: &str = "WAYMARK_LAST_RESULT_JSON";
 
 #[cfg(all(not(target_os = "hermit"), unix))]
@@ -6175,6 +6173,7 @@ impl Evaluator<'_> {
     fn invoke_stone_helper_function(
         &mut self,
         function: &FunctionDef,
+        functions: &HashMap<String, FunctionDef>,
         event: &StoneRunEvent<'_>,
         span: Span,
     ) -> Result<Vec<Value>, ShellError> {
@@ -6195,25 +6194,33 @@ impl Evaluator<'_> {
             &format!("argument `{}`", function.params[0].name),
         )?;
 
+        let previous_functions = self.state.functions.clone();
+        for (name, function) in functions {
+            self.state.functions.insert(name.clone(), function.clone());
+        }
         self.state.push_scope();
         self.state.set_local(
             function.params[0].name.clone(),
             RuntimeValue::Nu(event_value),
         );
         let flow = self.eval_block(&function.body, PipelineData::empty(), false);
-        self.state.pop_scope()?;
-        let value = match flow? {
-            EvalFlow::Return(value) => value,
-            EvalFlow::Output(_) => Value::nothing(span),
-            EvalFlow::Break => return Err(stone_error("break", "break outside loop")),
-            EvalFlow::Continue => return Err(stone_error("continue", "continue outside loop")),
+        let pop_result = self.state.pop_scope();
+        self.state.functions = previous_functions;
+        pop_result?;
+        let result = match flow? {
+            EvalFlow::Return(value) => {
+                ensure_type(
+                    &value,
+                    function.return_type,
+                    &format!("{}() return value", function.name),
+                )?;
+                stone_helper_observations_from_value(value)
+            }
+            EvalFlow::Output(_) => stone_helper_observations_from_value(Value::nothing(span)),
+            EvalFlow::Break => Err(stone_error("break", "break outside loop")),
+            EvalFlow::Continue => Err(stone_error("continue", "continue outside loop")),
         };
-        ensure_type(
-            &value,
-            function.return_type,
-            &format!("{}() return value", function.name),
-        )?;
-        stone_helper_observations_from_value(value)
+        result
     }
 
     fn eval_resolve_command_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -9031,14 +9038,10 @@ struct StoneHelperHandler {
 #[cfg(not(target_os = "hermit"))]
 #[derive(Clone, Debug, PartialEq)]
 enum StoneHelperHandlerKind {
-    StoneFunction(FunctionDef),
-    PythonAfterFailure,
-    NativeAfterFailure,
-    MediaAfterRun,
-    MlAfterRun,
-    LlvmAfterRun,
-    ServiceAfterRun,
-    BuildAfterTimeout,
+    StoneFunction {
+        function: FunctionDef,
+        functions: HashMap<String, FunctionDef>,
+    },
     Registered,
 }
 
@@ -9074,6 +9077,7 @@ struct StoneRunEvent<'a> {
     timed_out: bool,
     duration_ms: i64,
     explanation_kind: Option<String>,
+    explanation: Option<Value>,
 }
 
 #[cfg(not(target_os = "hermit"))]
@@ -9106,6 +9110,7 @@ fn stone_run_event_from_record<'a>(
         timed_out,
         duration_ms: record_i64(record, "duration_ms").unwrap_or_default(),
         explanation_kind: record_explanation_kind(record),
+        explanation: record.get("explanation").cloned(),
     }
 }
 
@@ -9221,66 +9226,26 @@ impl StoneHelperFamilyMatcher {
 impl StoneHelperHandler {
     fn resolve(name: String, functions: &HashMap<String, FunctionDef>) -> Self {
         let kind = resolve_stone_helper_function(&name, functions)
-            .map(StoneHelperHandlerKind::StoneFunction)
-            .unwrap_or_else(|| match name.as_str() {
-                "python.after_failure" | "python.pip_after_failure" => {
-                    StoneHelperHandlerKind::PythonAfterFailure
-                }
-                "native.after_failure" => StoneHelperHandlerKind::NativeAfterFailure,
-                "media.after_success" | "media.after_failure" => {
-                    StoneHelperHandlerKind::MediaAfterRun
-                }
-                "ml.after_success" | "ml.after_failure" => StoneHelperHandlerKind::MlAfterRun,
-                "llvm.after_success" | "llvm.after_failure" => StoneHelperHandlerKind::LlvmAfterRun,
-                "service.after_success" | "service.after_failure" => {
-                    StoneHelperHandlerKind::ServiceAfterRun
-                }
-                "build.after_timeout" => StoneHelperHandlerKind::BuildAfterTimeout,
-                _ => StoneHelperHandlerKind::Registered,
-            });
+            .map(|function| StoneHelperHandlerKind::StoneFunction {
+                function,
+                functions: functions.clone(),
+            })
+            .unwrap_or(StoneHelperHandlerKind::Registered);
         Self { name, kind }
     }
 
     fn invoke(
         &self,
         evaluator: &mut Evaluator<'_>,
-        hook: &StoneHelperHook,
+        _hook: &StoneHelperHook,
         event: &StoneRunEvent<'_>,
         span: Span,
     ) -> Result<Vec<Value>, ShellError> {
         match &self.kind {
-            StoneHelperHandlerKind::StoneFunction(function) => {
-                evaluator.invoke_stone_helper_function(function, event, span)
-            }
-            StoneHelperHandlerKind::PythonAfterFailure => {
-                Ok(python_helper_after_failure(hook, event, span)
-                    .into_iter()
-                    .collect())
-            }
-            StoneHelperHandlerKind::NativeAfterFailure => {
-                Ok(native_helper_after_failure(hook, event, span)
-                    .into_iter()
-                    .collect())
-            }
-            StoneHelperHandlerKind::MediaAfterRun => Ok(media_helper_after_run(hook, event, span)
-                .into_iter()
-                .collect()),
-            StoneHelperHandlerKind::MlAfterRun => {
-                Ok(ml_helper_after_run(hook, event, span).into_iter().collect())
-            }
-            StoneHelperHandlerKind::LlvmAfterRun => Ok(llvm_helper_after_run(hook, event, span)
-                .into_iter()
-                .collect()),
-            StoneHelperHandlerKind::ServiceAfterRun => {
-                Ok(service_helper_after_run(hook, event, span)
-                    .into_iter()
-                    .collect())
-            }
-            StoneHelperHandlerKind::BuildAfterTimeout => {
-                Ok(build_helper_after_timeout(hook, event, span)
-                    .into_iter()
-                    .collect())
-            }
+            StoneHelperHandlerKind::StoneFunction {
+                function,
+                functions,
+            } => evaluator.invoke_stone_helper_function(function, functions, event, span),
             StoneHelperHandlerKind::Registered => Ok(Vec::new()),
         }
     }
@@ -9465,374 +9430,6 @@ fn command_argv0(argv: &[String]) -> String {
 }
 
 #[cfg(not(target_os = "hermit"))]
-fn python_helper_after_failure(
-    hook: &StoneHelperHook,
-    event: &StoneRunEvent<'_>,
-    span: Span,
-) -> Option<Value> {
-    let explanation_kind = event.explanation_kind.as_deref();
-    if !matches!(
-        explanation_kind,
-        Some("python_module_not_found")
-            | Some("python_module_attribute_missing")
-            | Some("python_dependency_conflict")
-            | Some("python_package_resolution_failed")
-    ) {
-        return None;
-    }
-    let python = python_install_command(event.argv);
-    let mut evidence = Record::new();
-    evidence.push("python", Value::string(python.clone(), span));
-    evidence.push(
-        "project_markers",
-        Value::list(
-            python_project_markers(event.cwd)
-                .into_iter()
-                .map(|path| Value::string(path.display().to_string(), span))
-                .collect(),
-            span,
-        ),
-    );
-    evidence.push(
-        "stderr_excerpt",
-        Value::string(limit_helper_text(&event.stderr), span),
-    );
-    let mut checks = vec![vec![
-        python.clone(),
-        "-m".into(),
-        "pip".into(),
-        "check".into(),
-    ]];
-    let summary = match explanation_kind {
-        Some("python_module_not_found") => {
-            if let Some(module) = missing_python_module(&event.stderr)
-                .or_else(|| missing_python_module(&event.stdout))
-            {
-                let package = python_package_for_module(&module);
-                checks.insert(
-                    0,
-                    vec![
-                        python.clone(),
-                        "-m".into(),
-                        "pip".into(),
-                        "show".into(),
-                        package.clone(),
-                    ],
-                );
-                format!(
-                    "Module `{module}` is missing from the Python runtime used by this command."
-                )
-            } else {
-                "Python failed because an import was not available.".to_owned()
-            }
-        }
-        Some("python_module_attribute_missing") => {
-            if let Some((module, _attribute)) = missing_python_module_attribute(&event.stderr)
-                .or_else(|| missing_python_module_attribute(&event.stdout))
-            {
-                checks.insert(
-                    0,
-                    vec![
-                        python.clone(),
-                        "-m".into(),
-                        "pip".into(),
-                        "show".into(),
-                        python_package_for_module(&module),
-                    ],
-                );
-            }
-            "Python imported the module but the requested attribute is absent; this points to an API/version mismatch.".to_owned()
-        }
-        Some("python_dependency_conflict") => {
-            "pip metadata reports an installed dependency conflict in this runtime.".to_owned()
-        }
-        Some("python_package_resolution_failed") => {
-            "pip could not resolve a compatible set of requested package versions.".to_owned()
-        }
-        _ => return None,
-    };
-    Some(helper_observation(
-        hook,
-        event,
-        explanation_kind.unwrap_or("python_failure"),
-        summary,
-        evidence,
-        checks,
-        span,
-    ))
-}
-
-#[cfg(not(target_os = "hermit"))]
-fn native_helper_after_failure(
-    hook: &StoneHelperHook,
-    event: &StoneRunEvent<'_>,
-    span: Span,
-) -> Option<Value> {
-    let combined = format!("{}\n{}", event.stderr, event.stdout);
-    if !combined.contains("cannot open shared object file")
-        && !combined.contains("error while loading shared libraries")
-        && !combined.contains("=> not found")
-    {
-        return None;
-    }
-    let mut evidence = Record::new();
-    evidence.push(
-        "missing_libraries",
-        Value::list(
-            missing_shared_libraries(&combined)
-                .into_iter()
-                .map(|name| Value::string(name, span))
-                .collect(),
-            span,
-        ),
-    );
-    evidence.push(
-        "ld_library_path",
-        Value::string(
-            env_override_or_current(event.env_overrides, "LD_LIBRARY_PATH"),
-            span,
-        ),
-    );
-    Some(helper_observation(
-        hook,
-        event,
-        "native_shared_library_failure",
-        "A native shared library or one of its transitive dependencies is missing.",
-        evidence,
-        vec![
-            vec!["ldd".into(), "<failing-library-or-binary>".into()],
-            vec!["file".into(), "<failing-library-or-binary>".into()],
-        ],
-        span,
-    ))
-}
-
-#[cfg(not(target_os = "hermit"))]
-fn media_helper_after_run(
-    hook: &StoneHelperHook,
-    event: &StoneRunEvent<'_>,
-    span: Span,
-) -> Option<Value> {
-    let media_paths = media_candidate_paths(event);
-    if media_paths.is_empty() && event.ok {
-        return None;
-    }
-    let mut evidence = Record::new();
-    evidence.push(
-        "candidate_paths",
-        Value::list(
-            media_paths
-                .iter()
-                .map(|path| Value::string(path.display().to_string(), span))
-                .collect(),
-            span,
-        ),
-    );
-    evidence.push(
-        "stdout_excerpt",
-        Value::string(limit_helper_text(&event.stdout), span),
-    );
-    evidence.push(
-        "stderr_excerpt",
-        Value::string(limit_helper_text(&event.stderr), span),
-    );
-    let mut checks = Vec::new();
-    for path in &media_paths {
-        checks.push(vec![
-            "ffprobe".into(),
-            "-v".into(),
-            "error".into(),
-            "-show_format".into(),
-            "-show_streams".into(),
-            "-of".into(),
-            "json".into(),
-            path.display().to_string(),
-        ]);
-    }
-    Some(helper_observation(
-        hook,
-        event,
-        "media_probe_available",
-        "Media command completed; validate duration, streams, codecs, and container metadata before finalizing.",
-        evidence,
-        checks,
-        span,
-    ))
-}
-
-#[cfg(not(target_os = "hermit"))]
-fn ml_helper_after_run(
-    hook: &StoneHelperHook,
-    event: &StoneRunEvent<'_>,
-    span: Span,
-) -> Option<Value> {
-    let combined = format!(
-        "{}\n{}\n{}",
-        event.argv.join(" "),
-        event.stdout,
-        event.stderr
-    );
-    if !combined.contains("triton")
-        && !combined.contains("torch")
-        && !combined.contains("TRITON_INTERPRET")
-        && !combined.contains("numpy")
-    {
-        return None;
-    }
-    let mut evidence = Record::new();
-    evidence.push(
-        "mentions_triton_interpret",
-        Value::bool(
-            combined.contains("TRITON_INTERPRET=1") || combined.contains("TRITON_INTERPRET"),
-            span,
-        ),
-    );
-    evidence.push(
-        "output_excerpt",
-        Value::string(limit_helper_text(&combined), span),
-    );
-    Some(helper_observation(
-        hook,
-        event,
-        "ml_runtime_probe_available",
-        "ML/Triton command evidence is present; small interpreter-mode checks may miss scale-sensitive or timeout-sensitive failures.",
-        evidence,
-        vec![
-            vec!["python3".into(), "-c".into(), "import torch, triton, numpy; print(torch.__version__); print(triton.__version__)".into()],
-        ],
-        span,
-    ))
-}
-
-#[cfg(not(target_os = "hermit"))]
-fn llvm_helper_after_run(
-    hook: &StoneHelperHook,
-    event: &StoneRunEvent<'_>,
-    span: Span,
-) -> Option<Value> {
-    let paths = llvm_candidate_paths(event);
-    if paths.is_empty() && event.ok {
-        return None;
-    }
-    let mut evidence = Record::new();
-    evidence.push(
-        "candidate_paths",
-        Value::list(
-            paths
-                .iter()
-                .map(|path| Value::string(path.display().to_string(), span))
-                .collect(),
-            span,
-        ),
-    );
-    evidence.push(
-        "output_mentions_debug_metadata",
-        Value::bool(
-            event.stdout.contains("!llvm.dbg.cu")
-                || event.stderr.contains("!llvm.dbg.cu")
-                || event.stdout.contains("DICompileUnit")
-                || event.stderr.contains("DICompileUnit"),
-            span,
-        ),
-    );
-    let checks = paths
-        .iter()
-        .flat_map(|path| {
-            [
-                vec!["file".into(), path.display().to_string()],
-                vec![
-                    "llvm-dis".into(),
-                    path.display().to_string(),
-                    "-o".into(),
-                    "-".into(),
-                ],
-            ]
-        })
-        .collect();
-    Some(helper_observation(
-        hook,
-        event,
-        "llvm_ir_probe_available",
-        "LLVM command evidence is present; inspect bitcode/textual IR and debug metadata markers explicitly.",
-        evidence,
-        checks,
-        span,
-    ))
-}
-
-#[cfg(not(target_os = "hermit"))]
-fn service_helper_after_run(
-    hook: &StoneHelperHook,
-    event: &StoneRunEvent<'_>,
-    span: Span,
-) -> Option<Value> {
-    let combined = format!(
-        "{}\n{}\n{}",
-        event.argv.join(" "),
-        event.stdout,
-        event.stderr
-    );
-    if !combined.contains("grpc")
-        && !combined.contains("server")
-        && !combined.contains("daemon")
-        && !combined.contains("port")
-    {
-        return None;
-    }
-    let mut evidence = Record::new();
-    evidence.push(
-        "output_excerpt",
-        Value::string(limit_helper_text(&combined), span),
-    );
-    Some(helper_observation(
-        hook,
-        event,
-        "service_probe_available",
-        "Service evidence is present; validate readiness and protocol behavior from a fresh client process.",
-        evidence,
-        vec![
-            vec!["daemon_status".into(), "<daemon-handle>".into()],
-            vec!["python3".into(), "<fresh-client-probe.py>".into()],
-        ],
-        span,
-    ))
-}
-
-#[cfg(not(target_os = "hermit"))]
-fn build_helper_after_timeout(
-    hook: &StoneHelperHook,
-    event: &StoneRunEvent<'_>,
-    span: Span,
-) -> Option<Value> {
-    if !event.timed_out {
-        return None;
-    }
-    let mut evidence = Record::new();
-    evidence.push("duration_ms", Value::int(event.duration_ms, span));
-    evidence.push(
-        "stdout_tail",
-        Value::string(tail_helper_text(&event.stdout), span),
-    );
-    evidence.push(
-        "stderr_tail",
-        Value::string(tail_helper_text(&event.stderr), span),
-    );
-    Some(helper_observation(
-        hook,
-        event,
-        "build_timeout",
-        "The command timed out; inspect partial output and rerun with a larger timeout or a narrower build target.",
-        evidence,
-        vec![vec![
-            "run".into(),
-            "<same-argv>".into(),
-            "timeout_ms=600000".into(),
-        ]],
-        span,
-    ))
-}
-
-#[cfg(not(target_os = "hermit"))]
 fn helper_observation(
     hook: &StoneHelperHook,
     event: &StoneRunEvent<'_>,
@@ -9951,6 +9548,13 @@ fn stone_run_event_value(event: &StoneRunEvent<'_>, span: Span) -> Value {
             .map(|kind| Value::string(kind.clone(), span))
             .unwrap_or_else(|| Value::nothing(span)),
     );
+    record.push(
+        "explanation",
+        event
+            .explanation
+            .clone()
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
     Value::record(record, span)
 }
 
@@ -10012,6 +9616,7 @@ fn attach_service_helper_observation(
         timed_out: event == "run.after_timeout",
         duration_ms: record_i64(record, "duration_ms").unwrap_or_default(),
         explanation_kind: None,
+        explanation: None,
     };
     let observation = helper_observation(
         &hook,
@@ -10026,112 +9631,6 @@ fn attach_service_helper_observation(
         span,
     );
     record.push("helpers", Value::list(vec![observation], span));
-}
-
-#[cfg(not(target_os = "hermit"))]
-fn media_candidate_paths(event: &StoneRunEvent<'_>) -> Vec<PathBuf> {
-    event
-        .argv
-        .iter()
-        .filter(|arg| {
-            let lower = arg.to_ascii_lowercase();
-            matches!(
-                Path::new(&lower).extension().and_then(|ext| ext.to_str()),
-                Some("mp4" | "mkv" | "webm" | "mov" | "mp3" | "wav" | "flac" | "aac")
-            )
-        })
-        .map(|arg| absolutize_arg_path(event.cwd, arg))
-        .collect()
-}
-
-#[cfg(not(target_os = "hermit"))]
-fn llvm_candidate_paths(event: &StoneRunEvent<'_>) -> Vec<PathBuf> {
-    event
-        .argv
-        .iter()
-        .filter(|arg| {
-            matches!(
-                Path::new(arg).extension().and_then(|ext| ext.to_str()),
-                Some("ll" | "bc" | "o" | "a")
-            )
-        })
-        .map(|arg| absolutize_arg_path(event.cwd, arg))
-        .collect()
-}
-
-#[cfg(not(target_os = "hermit"))]
-fn absolutize_arg_path(cwd: &Path, arg: &str) -> PathBuf {
-    let path = Path::new(arg);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    }
-}
-
-#[cfg(not(target_os = "hermit"))]
-fn missing_shared_libraries(text: &str) -> Vec<String> {
-    let mut libs = Vec::new();
-    for line in text.lines() {
-        if let Some(index) = line.find("=> not found") {
-            let name = line[..index].trim();
-            if !name.is_empty() {
-                libs.push(name.to_owned());
-            }
-        }
-        if line.contains("cannot open shared object file") {
-            let candidate = line
-                .split(':')
-                .find(|part| part.trim().contains(".so"))
-                .map(str::trim);
-            if let Some(name) = candidate {
-                libs.push(name.to_owned());
-            }
-        }
-        if let Some(index) = line.find("error while loading shared libraries:") {
-            let rest = &line[index + "error while loading shared libraries:".len()..];
-            if let Some(name) = rest
-                .split(':')
-                .next()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                libs.push(name.to_owned());
-            }
-        }
-    }
-    libs.sort();
-    libs.dedup();
-    libs
-}
-
-#[cfg(not(target_os = "hermit"))]
-fn env_override_or_current(env_overrides: &[(String, String)], key: &str) -> String {
-    env_overrides
-        .iter()
-        .rev()
-        .find(|(name, _)| name == key)
-        .map(|(_, value)| value.clone())
-        .or_else(|| env::var(key).ok())
-        .unwrap_or_default()
-}
-
-#[cfg(not(target_os = "hermit"))]
-fn limit_helper_text(text: &str) -> String {
-    if text.len() <= STONE_HELPER_OUTPUT_LIMIT {
-        text.to_owned()
-    } else {
-        format!("{}...", &text[..STONE_HELPER_OUTPUT_LIMIT])
-    }
-}
-
-#[cfg(not(target_os = "hermit"))]
-fn tail_helper_text(text: &str) -> String {
-    if text.len() <= STONE_HELPER_OUTPUT_LIMIT {
-        text.to_owned()
-    } else {
-        text[text.len() - STONE_HELPER_OUTPUT_LIMIT..].to_owned()
-    }
 }
 
 #[cfg(not(target_os = "hermit"))]
@@ -15946,8 +15445,7 @@ emit({
         write_helper(
             &root,
             "python.stone",
-            r#"hook("run.after_failure", family="python", argv0_prefix=["python"], handler="python.after_failure", priority=100)
-"#,
+            include_str!("../../../.stone/helpers/python.stone"),
         );
         let program = lower_source(
             r#"result = run(["python3", "-c", "import stone_definitely_missing_module"])
@@ -16258,8 +15756,7 @@ hook("run.after_timeout", family="build", argv0=["make"], handler="build.after_t
         write_helper(
             &root,
             "native.stone",
-            r#"hook("run.after_failure", family="generic", handler="native.after_failure", priority=100)
-"#,
+            include_str!("../../../.stone/helpers/native.stone"),
         );
         let program = lower_source(
             r#"result = run(["sh", "-c", "echo 'libOpenGL.so.0 => not found' >&2; exit 1"])
@@ -16288,8 +15785,7 @@ emit({
         write_helper(
             &root,
             "native.stone",
-            r#"hook("run.after_failure", family="generic", handler="native.after_failure", priority=100)
-"#,
+            include_str!("../../../.stone/helpers/native.stone"),
         );
         let program = lower_source(
             r#"write_file(".stone/helpers/z-late.stone", "hook(\"run.after_failure\", family=\"generic\", handler=\"generic.after_failure\", priority=1000)\n")
@@ -16317,8 +15813,7 @@ emit({
         write_helper(
             &root,
             "media.stone",
-            r#"hook("run.after_success", family="media", argv0=["ffmpeg","ffprobe"], argv0_prefix=["ffmpeg-","ffprobe-"], handler="media.after_success", priority=100)
-"#,
+            include_str!("../../../.stone/helpers/media.stone"),
         );
         let fake_ffmpeg = root.join("ffmpeg-linux-x86_64-v7.0.2");
         fs::write(&fake_ffmpeg, "#!/bin/sh\nexit 0\n").expect("write fake ffmpeg");
@@ -16398,6 +15893,94 @@ emit({
 
     #[cfg(not(target_os = "hermit"))]
     #[test]
+    fn evaluates_checked_in_conda_helper() -> Result<(), ShellError> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (engine_state, mut stack, root) = test_engine("run-conda-helper")?;
+        write_helper(
+            &root,
+            "conda.stone",
+            include_str!("../../../.stone/helpers/conda.stone"),
+        );
+        let fake_conda = root.join("conda");
+        fs::write(
+            &fake_conda,
+            "#!/bin/sh\necho 'LibMambaUnsatisfiableError: package conflicts with python' >&2\nexit 1\n",
+        )
+        .expect("write fake conda");
+        fs::set_permissions(&fake_conda, fs::Permissions::from_mode(0o755))
+            .expect("chmod fake conda");
+        let source = format!(
+            r#"result = run(["{}", "install", "demo"])
+emit({{
+    "helper": result["helpers"][0]["helper"],
+    "kind": result["helpers"][0]["kind"],
+    "conflict": result["helpers"][0]["evidence"]["conflict_excerpt"],
+    "next_check": result["helpers"][0]["next_checks"][0][0],
+}})
+"#,
+            fake_conda.display()
+        );
+        let program = lower_source(&source)?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value["helper"], json_value!("conda.after_failure"));
+        assert_eq!(value["kind"], json_value!("conda_unsatisfiable"));
+        assert!(value["conflict"]
+            .as_str()
+            .expect("conflict excerpt")
+            .contains("conflicts with"));
+        assert_eq!(value["next_check"], json_value!("conda"));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "hermit"))]
+    #[test]
+    fn evaluates_checked_in_latex_helper() -> Result<(), ShellError> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (engine_state, mut stack, root) = test_engine("run-latex-helper")?;
+        write_helper(
+            &root,
+            "latex.stone",
+            include_str!("../../../.stone/helpers/latex.stone"),
+        );
+        let fake_pdflatex = root.join("pdflatex");
+        fs::write(
+            &fake_pdflatex,
+            "#!/bin/sh\necho 'Overfull \\\\hbox (1.0pt too wide) in paragraph at lines 1--2'\nexit 0\n",
+        )
+        .expect("write fake pdflatex");
+        fs::set_permissions(&fake_pdflatex, fs::Permissions::from_mode(0o755))
+            .expect("chmod fake pdflatex");
+        let source = format!(
+            r#"result = run(["{}", "paper.tex"])
+emit({{
+    "helper": result["helpers"][0]["helper"],
+    "kind": result["helpers"][0]["kind"],
+    "overfull": result["helpers"][0]["evidence"]["overfull_lines"],
+    "next_check": result["helpers"][0]["next_checks"][0][0],
+}})
+"#,
+            fake_pdflatex.display()
+        );
+        let program = lower_source(&source)?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value["helper"], json_value!("latex.after_success"));
+        assert_eq!(value["kind"], json_value!("latex_warnings"));
+        assert!(value["overfull"]
+            .as_str()
+            .expect("overfull lines")
+            .contains("Overfull"));
+        assert_eq!(value["next_check"], json_value!("grep"));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "hermit"))]
+    #[test]
     fn suppresses_unimplemented_registered_helper_observation() -> Result<(), ShellError> {
         let (engine_state, mut stack, root) = test_engine("run-unimplemented-helper")?;
         write_helper(
@@ -16461,8 +16044,7 @@ emit({
         write_helper(
             &root,
             "build.stone",
-            r#"hook("run.after_timeout", family="generic", handler="build.after_timeout", priority=100)
-"#,
+            include_str!("../../../.stone/helpers/build.stone"),
         );
         let program = lower_source(
             r#"result = run(["sh", "-c", "printf building; sleep 1"], timeout_ms=20)

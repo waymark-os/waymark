@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Dynamic Stone helper registrations for LaTeX compilation diagnostics.
+def latex_matching_lines(text, needle):
+    lines = []
+    for line in text.splitlines():
+        if needle in line:
+            lines.append(line)
+    return lines
+
+def latex_prefix_lines(text, prefix):
+    lines = []
+    for line in text.splitlines():
+        if line.startswith(prefix):
+            lines.append(line)
+    return lines
+
+def latex_tail_lines(text, count):
+    lines = text.splitlines()
+    return "\n".join(lines[max(0, len(lines) - count):])
+
+def latex_after_success(event):
+    overfull = latex_matching_lines(event["stdout"], "Overfull")
+    underfull = latex_matching_lines(event["stdout"], "Underfull")
+    warnings = latex_matching_lines(event["stdout"], "LaTeX Warning")
+
+    if len(overfull) == 0 and len(underfull) == 0 and len(warnings) == 0:
+        return None
+
+    return {
+        "helper": "latex.after_success",
+        "event": event["event"],
+        "family": event["family"],
+        "kind": "latex_warnings",
+        "summary": "LaTeX compiled with layout or package warnings.",
+        "exit_code": event["exit_code"],
+        "evidence": {
+            "overfull_lines": "\n".join(overfull[0:10]),
+            "underfull_lines": "\n".join(underfull[0:10]),
+            "warning_lines": "\n".join(warnings[0:10]),
+        },
+        "next_checks": [
+            ["grep", "-n", "Overfull\\|Underfull\\|LaTeX Warning", "<latex-log>"],
+            ["latexmk", "-pdf", "-interaction=nonstopmode", "<main.tex>"],
+        ],
+    }
+
+def latex_after_failure(event):
+    combined = event["stderr"] + "\n" + event["stdout"]
+    fatal = latex_prefix_lines(combined, "! ")
+    missing_pkg = []
+    undef = latex_matching_lines(combined, "Undefined control sequence")
+    for line in combined.splitlines():
+        if "File" in line and "not found" in line:
+            missing_pkg.append(line)
+
+    if len(fatal) == 0:
+        return None
+
+    return {
+        "helper": "latex.after_failure",
+        "event": event["event"],
+        "family": event["family"],
+        "kind": "latex_fatal_error",
+        "summary": "LaTeX compilation failed with a fatal error.",
+        "exit_code": event["exit_code"],
+        "evidence": {
+            "error_lines": "\n".join(fatal[0:5]),
+            "missing_packages": "\n".join(missing_pkg[0:5]),
+            "undefined_commands": "\n".join(undef[0:5]),
+            "context": latex_tail_lines(combined, 15),
+        },
+        "next_checks": [
+            ["grep", "-n", "^! ", "<latex-log>"],
+            ["tlmgr", "search", "--global", "--file", "<missing.sty>"],
+            ["latexmk", "-pdf", "-interaction=nonstopmode", "<main.tex>"],
+        ],
+    }
+
+hook("run.after_success", family="latex", argv0=["pdflatex","xelatex","lualatex","latex","latexmk"], handler="latex.after_success", priority=100)
+hook("run.after_failure", family="latex", argv0=["pdflatex","xelatex","lualatex","latex","latexmk"], handler="latex.after_failure", priority=100)

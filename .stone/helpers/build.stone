@@ -1,5 +1,28 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 # Dynamic Stone helper registrations for build and long-running command timeouts.
+def build_tail(text):
+    if len(text) <= 1200:
+        return text
+    return slice(text, len(text) - 1200)
+
+def build_after_timeout(event):
+    if not event["timed_out"]:
+        return None
+    return {
+        "helper": "build.after_timeout",
+        "event": event["event"],
+        "family": event["family"],
+        "kind": "build_timeout",
+        "summary": "The command timed out; inspect partial output and rerun with a larger timeout or a narrower build target.",
+        "exit_code": event["exit_code"],
+        "evidence": {
+            "duration_ms": event["duration_ms"],
+            "stdout_tail": build_tail(event["stdout"]),
+            "stderr_tail": build_tail(event["stderr"]),
+        },
+        "next_checks": [["run", "<same-argv>", "timeout_ms=600000"]],
+    }
+
 hook("run.after_timeout", family="build", argv0=["make","cmake","ninja","cargo","npm","pytest"], handler="build.after_timeout", priority=100)
 hook("run.after_timeout", family="generic", handler="build.after_timeout", priority=20)

@@ -1,6 +1,43 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 # Dynamic Stone helper registrations for native shared-library diagnostics.
+def native_missing_libraries(text):
+    libs = []
+    for line in text.splitlines():
+        if "=> not found" in line:
+            name = split(line, "=> not found")[0].strip()
+            if name and name not in libs:
+                libs.append(name)
+        if "cannot open shared object file" in line:
+            for part in split(line, ":"):
+                name = part.strip()
+                if ".so" in name and name not in libs:
+                    libs.append(name)
+        if "error while loading shared libraries:" in line:
+            rest = split(line, "error while loading shared libraries:")[1]
+            name = split(rest, ":")[0].strip()
+            if name and name not in libs:
+                libs.append(name)
+    return libs
+
+def native_after_failure(event):
+    combined = event["stderr"] + "\n" + event["stdout"]
+    if "cannot open shared object file" not in combined and "error while loading shared libraries" not in combined and "=> not found" not in combined:
+        return None
+    return {
+        "helper": "native.after_failure",
+        "event": event["event"],
+        "family": event["family"],
+        "kind": "native_shared_library_failure",
+        "summary": "A native shared library or one of its transitive dependencies is missing.",
+        "exit_code": event["exit_code"],
+        "evidence": {
+            "missing_libraries": native_missing_libraries(combined),
+            "ld_library_path": event["env"].get("LD_LIBRARY_PATH", ""),
+        },
+        "next_checks": [["ldd", "<failing-library-or-binary>"], ["file", "<failing-library-or-binary>"]],
+    }
+
 hook("run.after_failure", family="native", argv0=["file","ldd","readelf","objdump"], handler="native.after_failure", priority=100)
 hook("run.after_failure", family="python", argv0_prefix=["python"], handler="native.after_failure", priority=40)
 hook("run.after_failure", family="generic", handler="native.after_failure", priority=20)

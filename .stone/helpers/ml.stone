@@ -1,6 +1,41 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 # Dynamic Stone helper registrations for ML and Triton runtime diagnostics.
+def ml_limit(text):
+    if len(text) <= 1200:
+        return text
+    return slice(text, 0, 1200) + "..."
+
+def ml_after_run(event):
+    combined = join(event["argv"], " ") + "\n" + event["stdout"] + "\n" + event["stderr"]
+    if "triton" not in combined and "torch" not in combined and "TRITON_INTERPRET" not in combined and "numpy" not in combined:
+        return None
+    return {
+        "helper": "ml.after_success",
+        "event": event["event"],
+        "family": event["family"],
+        "kind": "ml_runtime_probe_available",
+        "summary": "ML/Triton command evidence is present; small interpreter-mode checks may miss scale-sensitive or timeout-sensitive failures.",
+        "exit_code": event["exit_code"],
+        "evidence": {
+            "mentions_triton_interpret": "TRITON_INTERPRET" in combined,
+            "output_excerpt": ml_limit(combined),
+        },
+        "next_checks": [["python3", "-c", "import torch, triton, numpy; print(torch.__version__); print(triton.__version__)"]],
+    }
+
+def ml_after_success(event):
+    observation = ml_after_run(event)
+    if observation != None:
+        observation["helper"] = "ml.after_success"
+    return observation
+
+def ml_after_failure(event):
+    observation = ml_after_run(event)
+    if observation != None:
+        observation["helper"] = "ml.after_failure"
+    return observation
+
 hook("run.after_success", family="python", handler="ml.after_success", priority=50)
 hook("run.after_failure", family="python", handler="ml.after_failure", priority=50)
 hook("run.after_success", family="python/pip", handler="ml.after_success", priority=50)

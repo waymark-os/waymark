@@ -1,6 +1,38 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 # Dynamic Stone helper registrations for service and network validation diagnostics.
+def service_limit(text):
+    if len(text) <= 1200:
+        return text
+    return slice(text, 0, 1200) + "..."
+
+def service_after_run(event):
+    combined = join(event["argv"], " ") + "\n" + event["stdout"] + "\n" + event["stderr"]
+    if "grpc" not in combined and "server" not in combined and "daemon" not in combined and "port" not in combined:
+        return None
+    return {
+        "helper": "service.after_success",
+        "event": event["event"],
+        "family": event["family"],
+        "kind": "service_probe_available",
+        "summary": "Service evidence is present; validate readiness and protocol behavior from a fresh client process.",
+        "exit_code": event["exit_code"],
+        "evidence": {"output_excerpt": service_limit(combined)},
+        "next_checks": [["daemon_status", "<daemon-handle>"], ["python3", "<fresh-client-probe.py>"]],
+    }
+
+def service_after_success(event):
+    observation = service_after_run(event)
+    if observation != None:
+        observation["helper"] = "service.after_success"
+    return observation
+
+def service_after_failure(event):
+    observation = service_after_run(event)
+    if observation != None:
+        observation["helper"] = "service.after_failure"
+    return observation
+
 hook("run.after_success", family="service", argv0=["python-grpc","grpcurl"], argv0_prefix=["server"], handler="service.after_success", priority=100)
 hook("run.after_failure", family="service", argv0=["python-grpc","grpcurl"], argv0_prefix=["server"], handler="service.after_failure", priority=100)
 hook("run.after_success", family="network", argv0=["curl","wget","nc","netcat","grpcurl"], handler="service.after_success", priority=50)

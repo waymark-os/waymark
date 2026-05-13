@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Dynamic Stone helper registrations for Conda and mamba solver diagnostics.
+def conda_limit_lines(text, count):
+    return "\n".join(text.splitlines()[0:count])
+
+def conda_tail_lines(text, count):
+    lines = text.splitlines()
+    return "\n".join(lines[max(0, len(lines) - count):])
+
+def conda_conflict_excerpt(text):
+    lines = []
+    for line in text.splitlines():
+        if "conflicts with" in line or "is missing on the system" in line or "is not installable" in line:
+            lines.append(line)
+    return "\n".join(lines[0:8])
+
+def conda_observation(event, kind, summary, evidence, checks):
+    return {
+        "helper": "conda.after_failure",
+        "event": event["event"],
+        "family": event["family"],
+        "kind": kind,
+        "summary": summary,
+        "exit_code": event["exit_code"],
+        "evidence": evidence,
+        "next_checks": checks,
+    }
+
+def conda_after_failure(event):
+    combined = event["stderr"] + "\n" + event["stdout"]
+
+    if "UnsatisfiableError" in combined or "LibMambaUnsatisfiableError" in combined:
+        return conda_observation(
+            event,
+            "conda_unsatisfiable",
+            "Conda/mamba cannot resolve a compatible package set. Look for CUDA, Python-version, or pinned-package constraints in the conflict tree.",
+            {
+                "conflict_excerpt": conda_conflict_excerpt(event["stderr"]),
+                "stderr_tail": conda_tail_lines(event["stderr"], 10),
+            },
+            [
+                ["conda", "info"],
+                ["conda", "config", "--show", "channels"],
+                ["conda", "install", "--dry-run", "<same-packages>"],
+            ],
+        )
+
+    if "PackagesNotFoundError" in combined or "ResolvePackageNotFound" in combined:
+        return conda_observation(
+            event,
+            "conda_package_not_found",
+            "One or more requested packages were not found in the configured channels.",
+            {"stderr_excerpt": conda_limit_lines(event["stderr"], 15)},
+            [
+                ["conda", "search", "<package>"],
+                ["conda", "install", "-c", "conda-forge", "<package>"],
+                ["python3", "-m", "pip", "install", "<package>"],
+            ],
+        )
+
+    if "CondaValueError" in combined or "InvalidVersionSpec" in combined:
+        return conda_observation(
+            event,
+            "conda_value_error",
+            "Conda rejected a version specification or configuration value.",
+            {"stderr_excerpt": conda_limit_lines(event["stderr"], 10)},
+            [
+                ["conda", "env", "create", "--dry-run", "-f", "environment.yml"],
+                ["python3", "-c", "import yaml; yaml.safe_load(open('environment.yml'))"],
+            ],
+        )
+
+    return None
+
+hook("run.after_failure", family="conda", argv0=["conda","mamba","micromamba"], handler="conda.after_failure", priority=100)

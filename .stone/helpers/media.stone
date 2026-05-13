@@ -1,5 +1,57 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 # Dynamic Stone helper registrations for media command diagnostics.
+def media_limit(text):
+    if len(text) <= 1200:
+        return text
+    return slice(text, 0, 1200) + "..."
+
+def media_abs_path(cwd, path):
+    if path.startswith("/"):
+        return path
+    return cwd + "/" + path
+
+def media_candidate_paths(event):
+    paths = []
+    for arg in event["argv"]:
+        lower = arg.lower()
+        if lower.endswith(".mp4") or lower.endswith(".mkv") or lower.endswith(".webm") or lower.endswith(".mov") or lower.endswith(".mp3") or lower.endswith(".wav") or lower.endswith(".flac") or lower.endswith(".aac"):
+            paths.append(media_abs_path(event["cwd"], arg))
+    return paths
+
+def media_after_run(event):
+    paths = media_candidate_paths(event)
+    if len(paths) == 0 and event["ok"]:
+        return None
+    checks = []
+    for path in paths:
+        checks.append(["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", path])
+    return {
+        "helper": "media.after_success",
+        "event": event["event"],
+        "family": event["family"],
+        "kind": "media_probe_available",
+        "summary": "Media command completed; validate duration, streams, codecs, and container metadata before finalizing.",
+        "exit_code": event["exit_code"],
+        "evidence": {
+            "candidate_paths": paths,
+            "stdout_excerpt": media_limit(event["stdout"]),
+            "stderr_excerpt": media_limit(event["stderr"]),
+        },
+        "next_checks": checks,
+    }
+
+def media_after_success(event):
+    observation = media_after_run(event)
+    if observation != None:
+        observation["helper"] = "media.after_success"
+    return observation
+
+def media_after_failure(event):
+    observation = media_after_run(event)
+    if observation != None:
+        observation["helper"] = "media.after_failure"
+    return observation
+
 hook("run.after_success", family="media", argv0=["ffmpeg","ffprobe","yt-dlp","youtube-dl"], argv0_prefix=["ffmpeg-","ffprobe-"], handler="media.after_success", priority=100)
 hook("run.after_failure", family="media", argv0=["ffmpeg","ffprobe","yt-dlp","youtube-dl"], argv0_prefix=["ffmpeg-","ffprobe-"], handler="media.after_failure", priority=100)
