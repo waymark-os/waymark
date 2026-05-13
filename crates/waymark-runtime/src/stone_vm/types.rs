@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::stone_ir::GenericLoopIter;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum LoopIrIteratorAdapter {
@@ -28,6 +26,15 @@ pub(crate) struct LoopIrFunction {
 }
 
 pub(crate) type GenericVmFunction = LoopIrFunction;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GenericLoopIter {
+    MaterializedList,
+    OpenSplitlines,
+    Range,
+    ReadJsonl,
+    ReadCsv,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GenericVmOp {

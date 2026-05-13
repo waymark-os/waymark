@@ -2,8 +2,8 @@
 
 use crate::stone_ast::{AssignTarget, AugOp, Call, CompareOp, Expr, Stmt};
 use crate::stone_vm::{
-    AccId, BlockId, ConstId, GenericParseNumber, GenericVmConst, GenericVmExprBody,
-    GenericVmExprOp, GenericVmOp, HotJsonlAggregationBody, HotJsonlBodyOp,
+    AccId, BlockId, ConstId, GenericLoopIter, GenericParseNumber, GenericVmConst,
+    GenericVmExprBody, GenericVmExprOp, GenericVmOp, HotJsonlAggregationBody, HotJsonlBodyOp,
     HotJsonlNestedUserTotals, HotJsonlSlot, HotJsonlTracePlan, LocalId, LoopIrBlock,
     LoopIrDiagnostics, LoopIrFunction, LoopIrFusedKernel, LoopIrIteratorAdapter,
     LoopIrOptimizationDiagnostic, LoopIrOptimizationResult, LoopIrSnapshot, LoopIrSnapshotBoundary,
@@ -32,15 +32,6 @@ pub(crate) struct GenericLoopPlan {
 pub(crate) struct OuterJsonlFileLoopBody {
     pub(crate) row_target: String,
     pub(crate) body: HotJsonlAggregationBody,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum GenericLoopIter {
-    MaterializedList,
-    OpenSplitlines,
-    Range,
-    ReadJsonl,
-    ReadCsv,
 }
 
 #[derive(Debug, Clone, PartialEq)]
