@@ -23,14 +23,14 @@ use crate::stone_ast::{
     Stmt, StoneFormatSpec, StoneType,
 };
 use crate::stone_builtins::{
-    find_method_builtin, first_builtin, float_builtin, format_builtin, index_method_builtin,
-    int_builtin, join_builtin, last_builtin, len_builtin, list_builtin, map_builtin_value,
-    min_max_builtin, normalize_index, parse_float_builtin, parse_int_builtin, range_builtin,
-    record_method_builtin, round_builtin, set_builtin, slice_builtin, split_builtin,
+    compare_values, find_method_builtin, first_builtin, float_builtin, format_builtin,
+    index_method_builtin, int_builtin, join_builtin, last_builtin, len_builtin, list_builtin,
+    map_builtin_value, min_max_builtin, normalize_index, parse_float_builtin, parse_int_builtin,
+    range_builtin, record_method_builtin, round_builtin, set_builtin, slice_builtin, split_builtin,
     starts_with_builtin, str_builtin, subscript_builtin, sum_builtin, unique_builtin,
     value_identity_key, value_ordering, value_to_bool, value_to_display_string, value_to_f64,
     value_to_i64, value_to_limit, value_to_path_string, value_to_string, value_to_u64,
-    value_type_name, values_equal, where_builtin,
+    value_truthy, value_type_name, values_equal, where_builtin,
 };
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_file_ops::{
@@ -8869,60 +8869,6 @@ fn eval_string_method(
         other => Err(stone_error(
             method,
             format!("{} has no {method}()", other.get_type()),
-        )),
-    }
-}
-
-fn value_truthy(value: &Value) -> bool {
-    match value {
-        Value::Bool { val, .. } => *val,
-        Value::Nothing { .. } => false,
-        value => !value.is_empty(),
-    }
-}
-
-fn compare_values(left: &Value, op: CompareOp, right: &Value) -> Result<bool, ShellError> {
-    match op {
-        CompareOp::Eq => Ok(values_equal(left, right)),
-        CompareOp::NotEq => Ok(!values_equal(left, right)),
-        CompareOp::Is => Ok(values_equal(left, right)),
-        CompareOp::IsNot => Ok(!values_equal(left, right)),
-        CompareOp::In => value_contains(right, left),
-        CompareOp::NotIn => value_contains(right, left).map(|value| !value),
-        CompareOp::Lt | CompareOp::LtE | CompareOp::Gt | CompareOp::GtE => {
-            let ordering = value_ordering(left, right)?;
-            Ok(match op {
-                CompareOp::Lt => ordering == std::cmp::Ordering::Less,
-                CompareOp::LtE => ordering != std::cmp::Ordering::Greater,
-                CompareOp::Gt => ordering == std::cmp::Ordering::Greater,
-                CompareOp::GtE => ordering != std::cmp::Ordering::Less,
-                CompareOp::Eq
-                | CompareOp::NotEq
-                | CompareOp::In
-                | CompareOp::NotIn
-                | CompareOp::Is
-                | CompareOp::IsNot => {
-                    unreachable!()
-                }
-            })
-        }
-    }
-}
-
-fn value_contains(container: &Value, needle: &Value) -> Result<bool, ShellError> {
-    match container {
-        Value::String { val, .. } | Value::Glob { val, .. } => {
-            let needle = value_to_string(needle, "membership")?;
-            Ok(val.contains(&needle))
-        }
-        Value::List { vals, .. } => Ok(vals.iter().any(|value| values_equal(value, needle))),
-        Value::Record { val, .. } => {
-            let needle = value_to_string(needle, "membership")?;
-            Ok(val.get(&needle).is_some())
-        }
-        other => Err(stone_error(
-            "membership",
-            format!("cannot test membership in {}", other.get_type()),
         )),
     }
 }

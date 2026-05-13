@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use nu_protocol::{shell_error::generic::GenericError, ShellError, Span, Value};
 
 use crate::json::nu_to_json_value;
+use crate::stone_ast::CompareOp;
 
 pub(crate) fn value_to_int(value: &Value) -> Result<Value, ShellError> {
     value_to_i64(value, "int").map(|value| Value::int(value, Span::unknown()))
@@ -107,6 +108,38 @@ pub(crate) fn format_builtin(template: &Value, args: &[Value]) -> Result<Value, 
         .map(value_to_display_string)
         .collect::<Result<Vec<_>, _>>()?;
     format_template(&template, &args).map(|text| Value::string(text, Span::unknown()))
+}
+
+pub(crate) fn compare_values(
+    left: &Value,
+    op: CompareOp,
+    right: &Value,
+) -> Result<bool, ShellError> {
+    match op {
+        CompareOp::Eq => Ok(values_equal(left, right)),
+        CompareOp::NotEq => Ok(!values_equal(left, right)),
+        CompareOp::Is => Ok(values_equal(left, right)),
+        CompareOp::IsNot => Ok(!values_equal(left, right)),
+        CompareOp::In => value_contains(right, left),
+        CompareOp::NotIn => value_contains(right, left).map(|value| !value),
+        CompareOp::Lt | CompareOp::LtE | CompareOp::Gt | CompareOp::GtE => {
+            let ordering = value_ordering(left, right)?;
+            Ok(match op {
+                CompareOp::Lt => ordering == Ordering::Less,
+                CompareOp::LtE => ordering != Ordering::Greater,
+                CompareOp::Gt => ordering == Ordering::Greater,
+                CompareOp::GtE => ordering != Ordering::Less,
+                CompareOp::Eq
+                | CompareOp::NotEq
+                | CompareOp::In
+                | CompareOp::NotIn
+                | CompareOp::Is
+                | CompareOp::IsNot => {
+                    unreachable!()
+                }
+            })
+        }
+    }
 }
 
 pub(crate) fn first_builtin(
@@ -292,6 +325,14 @@ pub(crate) fn value_identity_key(value: &Value, context: &str) -> Result<String,
         .map_err(|err| stone_error(context, err.to_string()))
 }
 
+pub(crate) fn value_truthy(value: &Value) -> bool {
+    match value {
+        Value::Bool { val, .. } => *val,
+        Value::Nothing { .. } => false,
+        value => !value.is_empty(),
+    }
+}
+
 pub(crate) fn value_to_i64(value: &Value, context: &str) -> Result<i64, ShellError> {
     match value {
         Value::Int { val, .. } => Ok(*val),
@@ -446,6 +487,24 @@ pub(crate) fn value_ordering(left: &Value, right: &Value) -> Result<Ordering, Sh
         _ => Err(stone_error(
             "comparison",
             format!("cannot order {} and {}", left.get_type(), right.get_type()),
+        )),
+    }
+}
+
+fn value_contains(container: &Value, needle: &Value) -> Result<bool, ShellError> {
+    match container {
+        Value::String { val, .. } | Value::Glob { val, .. } => {
+            let needle = value_to_string(needle, "membership")?;
+            Ok(val.contains(&needle))
+        }
+        Value::List { vals, .. } => Ok(vals.iter().any(|value| values_equal(value, needle))),
+        Value::Record { val, .. } => {
+            let needle = value_to_string(needle, "membership")?;
+            Ok(val.get(&needle).is_some())
+        }
+        other => Err(stone_error(
+            "membership",
+            format!("cannot test membership in {}", other.get_type()),
         )),
     }
 }
