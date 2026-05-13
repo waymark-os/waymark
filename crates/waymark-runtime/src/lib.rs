@@ -24,6 +24,7 @@ mod stone_eval;
 mod stone_frontend;
 mod stone_helpers;
 mod stone_ir;
+mod stone_run;
 mod task;
 pub mod tools;
 mod vsock;
