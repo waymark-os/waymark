@@ -33,6 +33,7 @@ use crate::stone_builtins::{
     subscript_builtin, sum_builtin, unique_builtin, value_identity_key, value_to_bool,
     value_to_display_string, value_to_f64, value_to_i64, value_to_limit, value_to_path_string,
     value_to_string, value_to_u64, value_truthy, value_type_name, values_equal, where_builtin,
+    zfill_text,
 };
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_file_ops::{
@@ -8299,21 +8300,6 @@ fn runtime_type_name(value: &RuntimeValue) -> &'static str {
     }
 }
 
-fn zfill(text: &str, width: usize) -> String {
-    let len = text.chars().count();
-    if len >= width {
-        return text.to_owned();
-    }
-    let (sign, digits) = if let Some(rest) = text.strip_prefix('-') {
-        ("-", rest)
-    } else if let Some(rest) = text.strip_prefix('+') {
-        ("+", rest)
-    } else {
-        ("", text)
-    };
-    format!("{sign}{}{}", "0".repeat(width - len), digits)
-}
-
 fn format_fstring_value(value: &Value, spec: &StoneFormatSpec) -> Result<String, ShellError> {
     match spec {
         StoneFormatSpec::Fixed { precision } => {
@@ -8322,7 +8308,7 @@ fn format_fstring_value(value: &Value, spec: &StoneFormatSpec) -> Result<String,
         }
         StoneFormatSpec::ZeroPadInt { width } => {
             let value = value_to_i64(value, "f-string format")?;
-            Ok(zfill(&value.to_string(), *width))
+            Ok(zfill_text(&value.to_string(), *width))
         }
     }
 }

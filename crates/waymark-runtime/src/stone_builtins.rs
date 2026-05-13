@@ -1108,7 +1108,7 @@ pub(crate) fn string_method_builtin(
             }
             let width =
                 usize::try_from(width).map_err(|_| stone_error("zfill", "width is too large"))?;
-            Ok(Value::string(zfill(text, width), Span::unknown()))
+            Ok(Value::string(zfill_text(text, width), Span::unknown()))
         }
         "startswith" => {
             let [prefix] = args else {
@@ -1223,7 +1223,7 @@ fn normalize_string_start(index: i64, len: usize) -> Result<usize, ShellError> {
     usize::try_from(clamped).map_err(|_| stone_error("index", "index is too large"))
 }
 
-fn zfill(text: &str, width: usize) -> String {
+pub(crate) fn zfill_text(text: &str, width: usize) -> String {
     let len = text.chars().count();
     if len >= width {
         return text.to_owned();
