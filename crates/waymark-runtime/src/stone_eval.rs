@@ -24,7 +24,8 @@ use crate::stone_ast::{
 };
 use crate::stone_builtins::{
     first_builtin, float_builtin, int_builtin, join_builtin, last_builtin, len_builtin,
-    list_builtin, range_builtin, record_method_builtin, set_builtin, slice_builtin, split_builtin,
+    list_builtin, min_max_builtin, parse_float_builtin, parse_int_builtin, range_builtin,
+    record_method_builtin, round_builtin, set_builtin, slice_builtin, split_builtin,
     starts_with_builtin, str_builtin, unique_builtin, value_identity_key, value_ordering,
     value_to_bool, value_to_display_string, value_to_f64, value_to_i64, value_to_int,
     value_to_limit, value_to_path_string, value_to_string, value_to_u64, value_type_name,
@@ -5653,7 +5654,6 @@ impl Evaluator<'_> {
         let value = self
             .eval_expr_value(value, PipelineData::empty())?
             .into_nu_value("round")?;
-        let value = value_to_f64(&value, "round")?;
         let digits = match call.positional.as_slice() {
             [_] => 0,
             [_, digits] => {
@@ -5664,17 +5664,7 @@ impl Evaluator<'_> {
             }
             _ => unreachable!(),
         };
-        if !(0..=9).contains(&digits) {
-            return Err(stone_error(
-                "round",
-                "round() digits must be between 0 and 9",
-            ));
-        }
-        let factor = 10_f64.powi(digits as i32);
-        Ok(RuntimeValue::Nu(Value::float(
-            (value * factor).round() / factor,
-            Span::unknown(),
-        )))
+        round_builtin(&value, digits).map(RuntimeValue::Nu)
     }
 
     fn eval_parse_float_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5696,16 +5686,7 @@ impl Evaluator<'_> {
         let default = self
             .eval_expr_value(default, PipelineData::empty())?
             .into_nu_value("parse_float")?;
-        match value_to_f64(&value, "parse_float") {
-            Ok(value) => Ok(RuntimeValue::Nu(Value::float(value, Span::unknown()))),
-            Err(_) => match default {
-                Value::Float { .. } | Value::Int { .. } => Ok(RuntimeValue::Nu(default)),
-                other => Err(stone_error(
-                    "parse_float",
-                    format!("default must be int or float, got {}", other.get_type()),
-                )),
-            },
-        }
+        parse_float_builtin(&value, default).map(RuntimeValue::Nu)
     }
 
     fn eval_parse_int_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5727,16 +5708,7 @@ impl Evaluator<'_> {
         let default = self
             .eval_expr_value(default, PipelineData::empty())?
             .into_nu_value("parse_int")?;
-        match value_to_int(&value) {
-            Ok(value) => Ok(RuntimeValue::Nu(value)),
-            Err(_) => match default {
-                Value::Int { .. } => Ok(RuntimeValue::Nu(default)),
-                other => Err(stone_error(
-                    "parse_int",
-                    format!("default must be int, got {}", other.get_type()),
-                )),
-            },
-        }
+        parse_int_builtin(&value, default).map(RuntimeValue::Nu)
     }
 
     fn eval_record_helper_call(
@@ -6112,31 +6084,14 @@ impl Evaluator<'_> {
             ));
         }
 
-        let mut best: Option<Value> = None;
+        let mut values = Vec::with_capacity(call.positional.len());
         for argument in &call.positional {
-            let value = self
-                .eval_expr_value(argument, PipelineData::empty())?
-                .into_nu_value(operation.name())?;
-            if !matches!(value, Value::Int { .. } | Value::Float { .. }) {
-                return Err(stone_error(
-                    operation.name(),
-                    format!(
-                        "{}() expected numbers, got {}",
-                        operation.name(),
-                        value.get_type()
-                    ),
-                ));
-            }
-            let Some(current) = &best else {
-                best = Some(value);
-                continue;
-            };
-            let ordering = value_ordering(&value, current)?;
-            if operation.should_replace(ordering) {
-                best = Some(value);
-            }
+            values.push(
+                self.eval_expr_value(argument, PipelineData::empty())?
+                    .into_nu_value(operation.name())?,
+            );
         }
-        Ok(RuntimeValue::Nu(best.expect("checked non-empty arguments")))
+        min_max_builtin(values, operation.name()).map(RuntimeValue::Nu)
     }
 
     fn eval_split_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -7140,13 +7095,6 @@ impl MinMax {
         match self {
             Self::Min => "min",
             Self::Max => "max",
-        }
-    }
-
-    fn should_replace(self, ordering: std::cmp::Ordering) -> bool {
-        match self {
-            Self::Min => ordering.is_lt(),
-            Self::Max => ordering.is_gt(),
         }
     }
 }

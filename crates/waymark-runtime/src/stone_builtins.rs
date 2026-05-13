@@ -387,6 +387,78 @@ pub(crate) fn range_builtin(args: &[i64]) -> Result<Value, ShellError> {
     Ok(Value::list(values, Span::unknown()))
 }
 
+pub(crate) fn min_max_builtin(values: Vec<Value>, name: &str) -> Result<Value, ShellError> {
+    let mut best: Option<Value> = None;
+    for value in values {
+        if !matches!(value, Value::Int { .. } | Value::Float { .. }) {
+            return Err(stone_error(
+                name,
+                format!("{name}() expected numbers, got {}", value.get_type()),
+            ));
+        }
+        let Some(current) = &best else {
+            best = Some(value);
+            continue;
+        };
+        let ordering = value_ordering(&value, current)?;
+        let should_replace = match name {
+            "min" => ordering.is_lt(),
+            "max" => ordering.is_gt(),
+            _ => unreachable!("min/max dispatch is validated by caller"),
+        };
+        if should_replace {
+            best = Some(value);
+        }
+    }
+    best.ok_or_else(|| {
+        stone_error(
+            name,
+            format!("{name}() requires at least one numeric argument"),
+        )
+    })
+}
+
+pub(crate) fn parse_float_builtin(value: &Value, default: Value) -> Result<Value, ShellError> {
+    match value_to_f64(value, "parse_float") {
+        Ok(value) => Ok(Value::float(value, Span::unknown())),
+        Err(_) => match default {
+            Value::Float { .. } | Value::Int { .. } => Ok(default),
+            other => Err(stone_error(
+                "parse_float",
+                format!("default must be int or float, got {}", other.get_type()),
+            )),
+        },
+    }
+}
+
+pub(crate) fn parse_int_builtin(value: &Value, default: Value) -> Result<Value, ShellError> {
+    match value_to_int(value) {
+        Ok(value) => Ok(value),
+        Err(_) => match default {
+            Value::Int { .. } => Ok(default),
+            other => Err(stone_error(
+                "parse_int",
+                format!("default must be int, got {}", other.get_type()),
+            )),
+        },
+    }
+}
+
+pub(crate) fn round_builtin(value: &Value, digits: i64) -> Result<Value, ShellError> {
+    let value = value_to_f64(value, "round")?;
+    if !(0..=9).contains(&digits) {
+        return Err(stone_error(
+            "round",
+            "round() digits must be between 0 and 9",
+        ));
+    }
+    let factor = 10_f64.powi(digits as i32);
+    Ok(Value::float(
+        (value * factor).round() / factor,
+        Span::unknown(),
+    ))
+}
+
 pub(crate) fn slice_builtin(
     value: &Value,
     lower: Option<i64>,
