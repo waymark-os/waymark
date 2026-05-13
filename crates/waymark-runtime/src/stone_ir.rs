@@ -2,7 +2,8 @@
 
 use crate::stone_ast::{AssignTarget, AugOp, Call, CompareOp, Expr, Stmt};
 use crate::stone_vm::{
-    AccId, BlockId, ConstId, LocalId, LoopIrBlock, LoopIrDiagnostics, LoopIrFunction,
+    AccId, BlockId, ConstId, GenericParseNumber, GenericVmConst, GenericVmExprBody,
+    GenericVmExprOp, GenericVmOp, LocalId, LoopIrBlock, LoopIrDiagnostics, LoopIrFunction,
     LoopIrFusedKernel, LoopIrIteratorAdapter, LoopIrOptimizationDiagnostic,
     LoopIrOptimizationResult, LoopIrSnapshot, LoopIrSnapshotBoundary, LoopIrSubgraphKind,
     LoopIrTerminator, Reg, SnapshotId, StoneAccumulatorKind, StoneAccumulatorSpec, StoneBlock,
@@ -82,109 +83,6 @@ pub(crate) enum GenericLoopOp {
     ExprBody {
         body: Vec<Stmt>,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum GenericVmOp {
-    AddAssign {
-        local: usize,
-    },
-    AddAssignParsed {
-        local: usize,
-        parse: GenericParseNumber,
-    },
-    MapAddI64Const {
-        map: usize,
-        addend: i64,
-    },
-    MapAddI64ConstRecordField {
-        map: usize,
-        field: String,
-        addend: i64,
-    },
-    MapAddI64ConstRecordStringField {
-        map: usize,
-        field: String,
-        strip: bool,
-        lower: bool,
-        addend: i64,
-    },
-    ListAppend {
-        list: usize,
-        unique: bool,
-    },
-    ExprBody(GenericVmExprBody),
-}
-
-impl GenericVmOp {
-    #[allow(dead_code)]
-    pub(crate) fn opcode_id(&self) -> u16 {
-        match self {
-            GenericVmOp::AddAssign { .. } => 1,
-            GenericVmOp::AddAssignParsed { .. } => 2,
-            GenericVmOp::MapAddI64Const { .. } => 3,
-            GenericVmOp::MapAddI64ConstRecordField { .. } => 4,
-            GenericVmOp::MapAddI64ConstRecordStringField { .. } => 5,
-            GenericVmOp::ListAppend { .. } => 6,
-            GenericVmOp::ExprBody(_) => 7,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GenericParseNumber {
-    Int,
-    Float,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GenericVmExprBody {
-    pub(crate) registers: usize,
-    pub(crate) constants: Vec<GenericVmConst>,
-    pub(crate) ops: Vec<GenericVmExprOp>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum GenericVmConst {
-    I64(i64),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum GenericVmExprOp {
-    LoadLocal { dst: usize, local: usize },
-    StoreLocal { local: usize, src: usize },
-    LoadConst { dst: usize, constant: usize },
-    AddI64 { dst: usize, lhs: usize, rhs: usize },
-    SubI64 { dst: usize, lhs: usize, rhs: usize },
-    MulI64 { dst: usize, lhs: usize, rhs: usize },
-    FloorDivI64 { dst: usize, lhs: usize, rhs: usize },
-    BitAndI64 { dst: usize, lhs: usize, rhs: usize },
-    BitOrI64 { dst: usize, lhs: usize, rhs: usize },
-    BitXorI64 { dst: usize, lhs: usize, rhs: usize },
-    ShlI64 { dst: usize, lhs: usize, rhs: usize },
-    ShrI64 { dst: usize, lhs: usize, rhs: usize },
-    BitNotI64 { dst: usize, src: usize },
-}
-
-impl GenericVmExprOp {
-    #[allow(dead_code)]
-    pub(crate) fn opcode_id(&self) -> u16 {
-        match self {
-            GenericVmExprOp::LoadLocal { .. } => 101,
-            GenericVmExprOp::StoreLocal { .. } => 102,
-            GenericVmExprOp::LoadConst { .. } => 103,
-            GenericVmExprOp::AddI64 { .. } => 104,
-            GenericVmExprOp::SubI64 { .. } => 105,
-            GenericVmExprOp::MulI64 { .. } => 106,
-            GenericVmExprOp::FloorDivI64 { .. } => 107,
-            GenericVmExprOp::BitAndI64 { .. } => 108,
-            GenericVmExprOp::BitOrI64 { .. } => 109,
-            GenericVmExprOp::BitXorI64 { .. } => 110,
-            GenericVmExprOp::ShlI64 { .. } => 111,
-            GenericVmExprOp::ShrI64 { .. } => 112,
-            GenericVmExprOp::BitNotI64 { .. } => 113,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
