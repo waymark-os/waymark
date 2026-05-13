@@ -54,13 +54,10 @@ use crate::stone_ir::{
     compile_hot_jsonl_trace_plan_from_ir, compile_hot_jsonl_vm_function,
     generic_loop_compile_miss_reason, match_hot_jsonl_aggregation_body,
     match_outer_jsonl_file_loop_body, optimize_loop_ir, optimize_stone_loop_ir,
-    try_lower_generic_loop, try_lower_hot_loop, validate_hot_jsonl_native_prefix, AccId, ConstId,
-    GenericLoopIter, GenericLoopOp, GenericLoopPlan, GenericParseNumber, GenericVmConst,
-    GenericVmExprBody, GenericVmExprOp, GenericVmFunction, GenericVmOp, HotJsonlAggregationBody,
-    HotJsonlBodyOp, HotJsonlSlot, HotJsonlTracePlan, HotLoopIter, HotLoopOp, HotLoopPlan,
-    LoopIrFunction, LoopIrFusedKernel, LoopIrOptimizationDiagnostic, LoopIrOptimizationResult, Reg,
-    SnapshotId, StoneAccumulatorKind, StoneConst, StoneFallbackTarget, StoneGuardKind,
-    StoneIrFunction, StoneLoopIrOptimizationResult, StoneOp, StoneTerminator,
+    try_lower_generic_loop, try_lower_hot_loop, validate_hot_jsonl_native_prefix, GenericLoopIter,
+    GenericLoopOp, GenericLoopPlan, GenericParseNumber, GenericVmConst, GenericVmExprBody,
+    GenericVmExprOp, GenericVmOp, HotJsonlAggregationBody, HotJsonlBodyOp, HotJsonlSlot,
+    HotJsonlTracePlan, HotLoopIter, HotLoopOp, HotLoopPlan,
 };
 #[cfg(all(not(target_os = "hermit"), test))]
 use crate::stone_run::cleanup_stale_run_temp_files;
@@ -69,6 +66,12 @@ use crate::stone_run::{
     bounded_command_output, bounded_command_stdout, daemon_status_call_values, resolve_command,
     resolve_command_call_values, run_call_values, start_daemon_call_values,
     stop_daemon_call_values, wait_port_call_values,
+};
+use crate::stone_vm::{
+    AccId, ConstId, GenericVmFunction, LoopIrFunction, LoopIrFusedKernel,
+    LoopIrOptimizationDiagnostic, LoopIrOptimizationResult, Reg, SnapshotId, StoneAccumulatorKind,
+    StoneConst, StoneFallbackTarget, StoneGuardKind, StoneIrFunction,
+    StoneLoopIrOptimizationResult, StoneOp, StoneTerminator,
 };
 
 const STONE_LAST_RESULT_ENV: &str = "WAYMARK_LAST_RESULT_JSON";
@@ -8502,7 +8505,7 @@ mod tests {
         eval_program, eval_program_with_options, eval_program_with_output,
         match_fused_map_update_if, EvalHotLoopDiagnostics, EvalOptions, RuntimeValue, TextLines,
     };
-    use crate::{json, stone_ast::lower_source, stone_ir::LoopIrOptimizationDiagnostic};
+    use crate::{json, stone_ast::lower_source, stone_vm::LoopIrOptimizationDiagnostic};
     use nu_protocol::{
         engine::{EngineState, Stack},
         PipelineData, ShellError, Span, Value,
