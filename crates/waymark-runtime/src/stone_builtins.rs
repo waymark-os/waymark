@@ -945,6 +945,43 @@ pub(crate) fn sort_key_kind(value: &Value) -> Result<SortKeyKind, ShellError> {
     }
 }
 
+pub(crate) fn sort_builtin_values(
+    values: Vec<Value>,
+    reverse: bool,
+    mut key_for_value: impl FnMut(&Value) -> Result<Value, ShellError>,
+) -> Result<Value, ShellError> {
+    let mut keyed = Vec::with_capacity(values.len());
+    let mut key_kind = None;
+    for value in values {
+        let sort_key = key_for_value(&value)?;
+        let next_key_kind = sort_key_kind(&sort_key)?;
+        if let Some(key_kind) = key_kind {
+            if key_kind != next_key_kind {
+                return Err(stone_error(
+                    "sort",
+                    "all sort keys must have compatible types",
+                ));
+            }
+        } else {
+            key_kind = Some(next_key_kind);
+        }
+        keyed.push((sort_key, value));
+    }
+    keyed.sort_by(|(left_key, _), (right_key, _)| {
+        let ordering =
+            value_ordering(left_key, right_key).expect("sort keys are validated before sorting");
+        if reverse {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    });
+    Ok(Value::list(
+        keyed.into_iter().map(|(_, value)| value).collect(),
+        Span::unknown(),
+    ))
+}
+
 pub(crate) fn starts_with_builtin(text: &Value, prefix: &Value) -> Result<Value, ShellError> {
     let text = value_to_string(text, "starts_with")?;
     let prefix = value_to_string(prefix, "starts_with")?;

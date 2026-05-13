@@ -28,11 +28,11 @@ use crate::stone_builtins::{
     join_builtin, last_builtin, len_builtin, list_builtin, map_builtin_value, min_max_builtin,
     mod_values, mul_values, neg_value, normalize_index, parse_float_builtin, parse_int_builtin,
     range_builtin, record_method_builtin, round_builtin, set_builtin, shift_value, slice_builtin,
-    sort_key_for_value, sort_key_kind, split_builtin, starts_with_builtin, str_builtin,
+    sort_builtin_values, sort_key_for_value, split_builtin, starts_with_builtin, str_builtin,
     string_method_builtin, sub_values, subscript_builtin, sum_builtin, unique_builtin,
-    value_identity_key, value_ordering, value_to_bool, value_to_display_string, value_to_f64,
-    value_to_i64, value_to_limit, value_to_path_string, value_to_string, value_to_u64,
-    value_truthy, value_type_name, values_equal, where_builtin,
+    value_identity_key, value_to_bool, value_to_display_string, value_to_f64, value_to_i64,
+    value_to_limit, value_to_path_string, value_to_string, value_to_u64, value_truthy,
+    value_type_name, values_equal, where_builtin,
 };
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_file_ops::{
@@ -5541,42 +5541,14 @@ impl Evaluator<'_> {
             }
         }
 
-        let mut keyed = Vec::with_capacity(vals.len());
-        let mut key_kind = None;
-        for value in vals {
-            let sort_key = match &key {
-                SortKey::Callable(callable) => self
-                    .invoke_callable(callable, vec![RuntimeValue::Nu(value.clone())])?
-                    .into_nu_value("sort key")?,
-                SortKey::Identity => sort_key_for_value(&value, None)?,
-                SortKey::Field(field) => sort_key_for_value(&value, Some(field))?,
-            };
-            let next_key_kind = sort_key_kind(&sort_key)?;
-            if let Some(key_kind) = key_kind {
-                if key_kind != next_key_kind {
-                    return Err(stone_error(
-                        "sort",
-                        "all sort keys must have compatible types",
-                    ));
-                }
-            } else {
-                key_kind = Some(next_key_kind);
-            }
-            keyed.push((sort_key, value));
-        }
-        keyed.sort_by(|(left_key, _), (right_key, _)| {
-            let ordering = value_ordering(left_key, right_key)
-                .expect("sort keys are validated before sorting");
-            if reverse {
-                ordering.reverse()
-            } else {
-                ordering
-            }
-        });
-        Ok(RuntimeValue::Nu(Value::list(
-            keyed.into_iter().map(|(_, value)| value).collect(),
-            Span::unknown(),
-        )))
+        sort_builtin_values(vals, reverse, |value| match &key {
+            SortKey::Callable(callable) => self
+                .invoke_callable(callable, vec![RuntimeValue::Nu(value.clone())])?
+                .into_nu_value("sort key"),
+            SortKey::Identity => sort_key_for_value(value, None),
+            SortKey::Field(field) => sort_key_for_value(value, Some(field)),
+        })
+        .map(RuntimeValue::Nu)
     }
 
     fn eval_sort_key(&mut self, expression: &Expr) -> Result<SortKey, ShellError> {
