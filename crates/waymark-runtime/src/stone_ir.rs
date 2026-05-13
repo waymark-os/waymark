@@ -5,12 +5,11 @@ use crate::stone_vm::{
     AccId, BlockId, ConstId, GenericLoopIter, GenericParseNumber, GenericVmConst,
     GenericVmExprBody, GenericVmExprOp, GenericVmOp, HotJsonlAggregationBody, HotJsonlBodyOp,
     HotJsonlNestedUserTotals, HotJsonlSlot, HotJsonlTracePlan, LocalId, LoopIrBlock,
-    LoopIrDiagnostics, LoopIrFunction, LoopIrFusedKernel, LoopIrIteratorAdapter,
-    LoopIrOptimizationDiagnostic, LoopIrOptimizationResult, LoopIrSnapshot, LoopIrSnapshotBoundary,
-    LoopIrSubgraphKind, LoopIrTerminator, Reg, SnapshotId, StoneAccumulatorKind,
-    StoneAccumulatorSpec, StoneBlock, StoneConst, StoneFallbackTarget, StoneGuard, StoneGuardKind,
-    StoneIrFunction, StoneLocal, StoneLoopIrOptimizationResult, StoneOp, StoneSnapshot,
-    StoneSnapshotAccumulator, StoneSnapshotLocal, StoneTerminator,
+    LoopIrDiagnostics, LoopIrFunction, LoopIrFusedKernel, LoopIrIteratorAdapter, LoopIrSnapshot,
+    LoopIrSnapshotBoundary, LoopIrSubgraphKind, LoopIrTerminator, Reg, SnapshotId,
+    StoneAccumulatorKind, StoneAccumulatorSpec, StoneBlock, StoneConst, StoneFallbackTarget,
+    StoneGuard, StoneGuardKind, StoneIrFunction, StoneLocal, StoneLoopIrOptimizationResult,
+    StoneOp, StoneSnapshot, StoneSnapshotAccumulator, StoneSnapshotLocal, StoneTerminator,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -412,82 +411,6 @@ pub(crate) fn compile_hot_jsonl_loop_ir_function(
     let mut function = compile_hot_jsonl_vm_function(body)?;
     function.adapter = Some(loop_ir_iterator_adapter(plan));
     Some(function)
-}
-
-pub(crate) fn optimize_loop_ir(function: &LoopIrFunction) -> LoopIrOptimizationResult {
-    let (function, diagnostics) = canonicalize_loop_ir(function);
-    let matched_subgraph = match_loop_ir_subgraph(&function);
-    let selected_kernel = matched_subgraph.map(|subgraph| match subgraph {
-        LoopIrSubgraphKind::MapAddI64Const => LoopIrFusedKernel::MapAddI64Const,
-        LoopIrSubgraphKind::ListAppend => LoopIrFusedKernel::ListAppend,
-        LoopIrSubgraphKind::JsonlAggregation => LoopIrFusedKernel::JsonlAggregation,
-    });
-    LoopIrOptimizationResult {
-        function,
-        selected_kernel,
-        matched_subgraph,
-        diagnostics,
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn select_loop_ir_fused_kernel(function: &LoopIrFunction) -> Option<LoopIrFusedKernel> {
-    optimize_loop_ir(function).selected_kernel
-}
-
-fn canonicalize_loop_ir(
-    function: &LoopIrFunction,
-) -> (LoopIrFunction, Vec<LoopIrOptimizationDiagnostic>) {
-    let mut function = function.clone();
-    let mut diagnostics = Vec::new();
-    let Some(canonical_ops) = canonicalize_loop_ir_ops(&function.ops) else {
-        return (function, diagnostics);
-    };
-    if canonical_ops == function.ops {
-        return (function, diagnostics);
-    }
-    let old_ops = std::mem::replace(&mut function.ops, canonical_ops.clone());
-    for block in &mut function.blocks {
-        if block.ops == old_ops {
-            block.ops = canonical_ops.clone();
-        }
-    }
-    diagnostics.push(LoopIrOptimizationDiagnostic::Canonicalized);
-    (function, diagnostics)
-}
-
-fn canonicalize_loop_ir_ops(ops: &[GenericVmOp]) -> Option<Vec<GenericVmOp>> {
-    let [GenericVmOp::MapAddI64ConstRecordStringField {
-        map,
-        field,
-        strip: false,
-        lower: false,
-        addend,
-    }] = ops
-    else {
-        return None;
-    };
-    Some(vec![GenericVmOp::MapAddI64ConstRecordField {
-        map: *map,
-        field: field.clone(),
-        addend: *addend,
-    }])
-}
-
-pub(crate) fn match_loop_ir_subgraph(function: &LoopIrFunction) -> Option<LoopIrSubgraphKind> {
-    let block = function.blocks.get(function.entry)?;
-    if block.terminator != LoopIrTerminator::Return || block.ops != function.ops {
-        return None;
-    }
-    match block.ops.as_slice() {
-        [GenericVmOp::MapAddI64Const { .. }]
-        | [GenericVmOp::MapAddI64ConstRecordField { .. }]
-        | [GenericVmOp::MapAddI64ConstRecordStringField { .. }] => {
-            Some(LoopIrSubgraphKind::MapAddI64Const)
-        }
-        [GenericVmOp::ListAppend { .. }] => Some(LoopIrSubgraphKind::ListAppend),
-        _ => None,
-    }
 }
 
 #[allow(dead_code)]
@@ -2965,6 +2888,10 @@ impl HotJsonlVmTrace {
 mod tests {
     use super::*;
     use crate::stone_ast::{lower_source, Stmt};
+    use crate::stone_vm::{
+        match_loop_ir_subgraph, optimize_loop_ir, select_loop_ir_fused_kernel,
+        LoopIrOptimizationDiagnostic, LoopIrOptimizationResult,
+    };
 
     fn required_jsonl_aggregation_vm() -> StoneIrFunction {
         let body = HotJsonlAggregationBody {
