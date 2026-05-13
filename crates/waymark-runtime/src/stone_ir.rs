@@ -5,11 +5,11 @@ use crate::stone_vm::{
     AccId, BlockId, ConstId, GenericLoopIter, GenericParseNumber, GenericVmConst,
     GenericVmExprBody, GenericVmExprOp, GenericVmOp, HotJsonlAggregationBody, HotJsonlBodyOp,
     HotJsonlNestedUserTotals, HotJsonlSlot, HotJsonlTracePlan, LocalId, LoopIrBlock,
-    LoopIrDiagnostics, LoopIrFunction, LoopIrFusedKernel, LoopIrIteratorAdapter, LoopIrSnapshot,
+    LoopIrDiagnostics, LoopIrFunction, LoopIrIteratorAdapter, LoopIrSnapshot,
     LoopIrSnapshotBoundary, LoopIrSubgraphKind, LoopIrTerminator, Reg, SnapshotId,
     StoneAccumulatorKind, StoneAccumulatorSpec, StoneBlock, StoneConst, StoneFallbackTarget,
-    StoneGuard, StoneGuardKind, StoneIrFunction, StoneLocal, StoneLoopIrOptimizationResult,
-    StoneOp, StoneSnapshot, StoneSnapshotAccumulator, StoneSnapshotLocal, StoneTerminator,
+    StoneGuard, StoneGuardKind, StoneIrFunction, StoneLocal, StoneOp, StoneSnapshot,
+    StoneSnapshotAccumulator, StoneSnapshotLocal, StoneTerminator,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -411,28 +411,6 @@ pub(crate) fn compile_hot_jsonl_loop_ir_function(
     let mut function = compile_hot_jsonl_vm_function(body)?;
     function.adapter = Some(loop_ir_iterator_adapter(plan));
     Some(function)
-}
-
-#[allow(dead_code)]
-pub(crate) fn select_hot_jsonl_fused_kernel_from_ir(
-    function: &StoneIrFunction,
-) -> Option<LoopIrFusedKernel> {
-    optimize_stone_loop_ir(function).selected_kernel
-}
-
-pub(crate) fn optimize_stone_loop_ir(function: &StoneIrFunction) -> StoneLoopIrOptimizationResult {
-    let function = function.clone();
-    let matched_subgraph = match_hot_jsonl_ir_subgraph(&function);
-    let selected_kernel = matched_subgraph.and_then(|subgraph| match subgraph {
-        LoopIrSubgraphKind::JsonlAggregation => Some(LoopIrFusedKernel::JsonlAggregation),
-        LoopIrSubgraphKind::MapAddI64Const | LoopIrSubgraphKind::ListAppend => None,
-    });
-    StoneLoopIrOptimizationResult {
-        function,
-        selected_kernel,
-        matched_subgraph,
-        diagnostics: Vec::new(),
-    }
 }
 
 pub(crate) fn match_hot_jsonl_ir_subgraph(
@@ -2889,7 +2867,8 @@ mod tests {
     use super::*;
     use crate::stone_ast::{lower_source, Stmt};
     use crate::stone_vm::{
-        match_loop_ir_subgraph, optimize_loop_ir, select_loop_ir_fused_kernel,
+        match_loop_ir_subgraph, optimize_loop_ir, optimize_stone_loop_ir,
+        select_hot_jsonl_fused_kernel_from_ir, select_loop_ir_fused_kernel, LoopIrFusedKernel,
         LoopIrOptimizationDiagnostic, LoopIrOptimizationResult,
     };
 
