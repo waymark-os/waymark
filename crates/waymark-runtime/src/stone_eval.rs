@@ -8733,6 +8733,17 @@ struct StoneHelperHook {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct StoneHelperRegistry {
     hooks: Vec<StoneHelperHook>,
+    family_by_argv0: HashMap<String, String>,
+    family_prefix_matchers: Vec<StoneHelperFamilyMatcher>,
+}
+
+#[cfg(not(target_os = "hermit"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoneHelperFamilyMatcher {
+    family: String,
+    argv0: Vec<String>,
+    argv0_prefix: Vec<String>,
+    priority: i64,
 }
 
 #[cfg(not(target_os = "hermit"))]
@@ -8761,7 +8772,7 @@ fn attach_run_helper_observations(
     registry: &StoneHelperRegistry,
     span: Span,
 ) {
-    let event = stone_run_event_from_record(record, argv, cwd, env_overrides);
+    let event = stone_run_event_from_record(record, argv, cwd, env_overrides, registry);
     let helpers = registry.dispatch_run(&event, span);
     if !helpers.is_empty() {
         record.push("helpers", Value::list(helpers, span));
@@ -8774,6 +8785,7 @@ fn stone_run_event_from_record<'a>(
     argv: &'a [String],
     cwd: &'a Path,
     env_overrides: &'a [(String, String)],
+    registry: &StoneHelperRegistry,
 ) -> StoneRunEvent<'a> {
     let ok = record_bool(record, "ok").unwrap_or(false);
     let timed_out = record_bool(record, "timed_out").unwrap_or(false);
@@ -8786,7 +8798,7 @@ fn stone_run_event_from_record<'a>(
     };
     StoneRunEvent {
         event,
-        family: classify_command_family(argv),
+        family: registry.command_family(argv),
         argv,
         cwd,
         env_overrides,
@@ -8802,6 +8814,69 @@ fn stone_run_event_from_record<'a>(
 
 #[cfg(not(target_os = "hermit"))]
 impl StoneHelperRegistry {
+    fn new(hooks: Vec<StoneHelperHook>) -> Self {
+        let mut exact_matchers: Vec<StoneHelperFamilyMatcher> = hooks
+            .iter()
+            .filter(|hook| hook.family != "generic" && !hook.argv0.is_empty())
+            .map(|hook| StoneHelperFamilyMatcher {
+                family: hook.family.clone(),
+                argv0: hook.argv0.clone(),
+                argv0_prefix: Vec::new(),
+                priority: hook.priority,
+            })
+            .collect();
+        exact_matchers.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.family.cmp(&right.family))
+        });
+        let mut family_by_argv0 = HashMap::new();
+        for matcher in exact_matchers {
+            for argv0 in matcher.argv0 {
+                family_by_argv0
+                    .entry(argv0)
+                    .or_insert(matcher.family.clone());
+            }
+        }
+
+        let mut family_prefix_matchers: Vec<StoneHelperFamilyMatcher> = hooks
+            .iter()
+            .filter(|hook| hook.family != "generic" && !hook.argv0_prefix.is_empty())
+            .map(|hook| StoneHelperFamilyMatcher {
+                family: hook.family.clone(),
+                argv0: Vec::new(),
+                argv0_prefix: hook.argv0_prefix.clone(),
+                priority: hook.priority,
+            })
+            .collect();
+        family_prefix_matchers.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| right.max_prefix_len().cmp(&left.max_prefix_len()))
+                .then_with(|| left.family.cmp(&right.family))
+        });
+        family_prefix_matchers.dedup();
+        Self {
+            hooks,
+            family_by_argv0,
+            family_prefix_matchers,
+        }
+    }
+
+    fn command_family(&self, argv: &[String]) -> String {
+        let argv0 = command_argv0(argv);
+        if let Some(family) = self.family_by_argv0.get(&argv0) {
+            return family.clone();
+        }
+        self.family_prefix_matchers
+            .iter()
+            .find(|matcher| matcher.matches_argv0(&argv0))
+            .map(|matcher| matcher.family.clone())
+            .unwrap_or_else(|| "generic".to_owned())
+    }
+
     fn dispatch_run(&self, event: &StoneRunEvent<'_>, span: Span) -> Vec<Value> {
         let mut observations = Vec::new();
         for hook in self.matching_hooks(event) {
@@ -8841,6 +8916,21 @@ impl StoneHelperRegistry {
 }
 
 #[cfg(not(target_os = "hermit"))]
+impl StoneHelperFamilyMatcher {
+    fn matches_argv0(&self, argv0: &str) -> bool {
+        self.argv0.iter().any(|expected| expected == argv0)
+            || self
+                .argv0_prefix
+                .iter()
+                .any(|prefix| argv0.starts_with(prefix))
+    }
+
+    fn max_prefix_len(&self) -> usize {
+        self.argv0_prefix.iter().map(String::len).max().unwrap_or(0)
+    }
+}
+
+#[cfg(not(target_os = "hermit"))]
 fn stone_helper_registry(cwd: &Path) -> StoneHelperRegistry {
     let mut hooks = Vec::new();
     for dir in stone_helper_dirs(cwd) {
@@ -8860,7 +8950,7 @@ fn stone_helper_registry(cwd: &Path) -> StoneHelperRegistry {
             hooks.extend(parse_stone_helper_hooks(&source, &path));
         }
     }
-    StoneHelperRegistry { hooks }
+    StoneHelperRegistry::new(hooks)
 }
 
 #[cfg(not(target_os = "hermit"))]
@@ -8973,57 +9063,6 @@ fn parse_quoted_prefix(rest: &str) -> Option<(String, &str)> {
         stripped[..end].to_owned(),
         &stripped[end + quote.len_utf8()..],
     ))
-}
-
-#[cfg(not(target_os = "hermit"))]
-fn classify_command_family(argv: &[String]) -> String {
-    if argv.is_empty() {
-        return "generic".to_owned();
-    }
-    let argv0 = command_argv0(argv);
-    let argv0 = argv0.as_str();
-    if argv0.starts_with("python") {
-        if argv.get(1).map(String::as_str) == Some("-m")
-            && argv.get(2).map(String::as_str) == Some("pip")
-        {
-            return "python/pip".to_owned();
-        }
-        return "python".to_owned();
-    }
-    if argv0 == "pip" || argv0.starts_with("pip") {
-        return "python/pip".to_owned();
-    }
-    if matches!(
-        argv0,
-        "make" | "cmake" | "ninja" | "cargo" | "npm" | "pytest"
-    ) {
-        return "build".to_owned();
-    }
-    if matches!(
-        argv0,
-        "clang"
-            | "clang++"
-            | "llc"
-            | "llvm-link"
-            | "llvm-dis"
-            | "opt"
-            | "llvm-as"
-            | "llvm-ar"
-            | "extract-bc"
-            | "wllvm"
-    ) {
-        return "llvm".to_owned();
-    }
-    if matches!(argv0, "file" | "ldd" | "readelf" | "objdump") {
-        return "native".to_owned();
-    }
-    if matches!(argv0, "curl" | "wget" | "nc" | "netcat" | "grpcurl") {
-        return "network".to_owned();
-    }
-    if matches!(argv0, "python-grpc" | "grpcurl") || argv0.contains("server") {
-        return "service".to_owned();
-    }
-    "generic".to_owned()
 }
 
 #[cfg(not(target_os = "hermit"))]
@@ -15309,7 +15348,7 @@ emit({
         write_helper(
             &root,
             "python.stone",
-            r#"hook("run.after_failure", family="python", handler="python.after_failure", priority=100)
+            r#"hook("run.after_failure", family="python", argv0_prefix=["python"], handler="python.after_failure", priority=100)
 "#,
         );
         let program = lower_source(
@@ -15522,7 +15561,7 @@ emit({{
         .expect("write helper b");
         fs::write(
             root.join(".stone/helpers/a.stone"),
-            r#"hook("run.after_failure", family="python", handler="python.after_failure", priority=100)
+            r#"hook("run.after_failure", family="python", argv0_prefix=["python"], handler="python.after_failure", priority=100)
 "#,
         )
         .expect("write helper a");
@@ -15543,14 +15582,14 @@ emit({{
         fs::create_dir_all(root.join(".stone/helpers")).expect("create helper dir");
         fs::write(
             root.join(".stone/helpers/media.stone"),
-            r#"hook("run.after_success", family="generic", argv0=["ffmpeg","ffprobe"], argv0_prefix=["ffmpeg-","ffprobe-"], handler="media.after_success", priority=100)
+            r#"hook("run.after_success", family="media", argv0=["ffmpeg","ffprobe"], argv0_prefix=["ffmpeg-","ffprobe-"], handler="media.after_success", priority=100)
 "#,
         )
         .expect("write helper");
 
         let registry = super::stone_helper_registry(&root);
         assert_eq!(registry.hooks.len(), 1);
-        assert_eq!(registry.hooks[0].family, "generic");
+        assert_eq!(registry.hooks[0].family, "media");
         assert_eq!(registry.hooks[0].argv0, vec!["ffmpeg", "ffprobe"]);
         assert_eq!(registry.hooks[0].argv0_prefix, vec!["ffmpeg-", "ffprobe-"]);
 
@@ -15560,31 +15599,58 @@ emit({{
 
     #[cfg(not(target_os = "hermit"))]
     #[test]
-    fn stone_helper_classifies_command_families() {
+    fn stone_helper_registry_classifies_command_families_from_registered_matchers() {
+        let root = test_root("helper-registry-family-lookup");
+        fs::create_dir_all(root.join(".stone/helpers")).expect("create helper dir");
+        fs::write(
+            root.join(".stone/helpers/families.stone"),
+            r#"hook("run.after_failure", family="python", argv0_prefix=["python"], handler="python.after_failure", priority=100)
+hook("run.after_failure", family="python/pip", argv0=["pip"], argv0_prefix=["pip"], handler="python.pip_after_failure", priority=110)
+hook("run.after_failure", family="llvm", argv0=["llvm-dis"], handler="llvm.after_failure", priority=100)
+hook("run.after_failure", family="native", argv0=["file","ldd","readelf","objdump"], handler="native.after_failure", priority=100)
+hook("run.after_success", family="media", argv0=["ffprobe"], argv0_prefix=["ffmpeg-"], handler="media.after_success", priority=100)
+hook("run.after_timeout", family="build", argv0=["make"], handler="build.after_timeout", priority=100)
+"#,
+        )
+        .expect("write helper");
+        let registry = super::stone_helper_registry(&root);
         assert_eq!(
-            super::classify_command_family(&["python3".into(), "-m".into(), "pip".into()]),
-            "python/pip"
-        );
-        assert_eq!(
-            super::classify_command_family(&["/usr/bin/python3.12".into()]),
+            registry.command_family(&["python3".into(), "-m".into(), "pip".into()]),
             "python"
         );
         assert_eq!(
-            super::classify_command_family(&["llvm-dis".into(), "binary.bc".into()]),
+            registry.command_family(&["pip3".into(), "install".into(), "pytest".into()]),
+            "python/pip"
+        );
+        assert_eq!(
+            registry.command_family(&["/usr/bin/python3.12".into()]),
+            "python"
+        );
+        assert_eq!(
+            registry.command_family(&["llvm-dis".into(), "binary.bc".into()]),
             "llvm"
         );
         assert_eq!(
-            super::classify_command_family(&["ffprobe".into(), "out.mp4".into()]),
-            "generic"
+            registry.command_family(&["readelf".into(), "-Ws".into(), "lib.so".into()]),
+            "native"
         );
         assert_eq!(
-            super::classify_command_family(&["/venv/bin/ffmpeg-linux-x86_64-v7.0.2".into()]),
-            "generic"
+            registry.command_family(&["ffprobe".into(), "out.mp4".into()]),
+            "media"
         );
         assert_eq!(
-            super::classify_command_family(&["make".into(), "all".into()]),
+            registry.command_family(&["/venv/bin/ffmpeg-linux-x86_64-v7.0.2".into()]),
+            "media"
+        );
+        assert_eq!(
+            registry.command_family(&["make".into(), "all".into()]),
             "build"
         );
+        assert_eq!(
+            registry.command_family(&["sh".into(), "-c".into(), "true".into()]),
+            "generic"
+        );
+        cleanup_dir(&root);
     }
 
     #[cfg(not(target_os = "hermit"))]
@@ -15653,7 +15719,7 @@ emit({
         write_helper(
             &root,
             "media.stone",
-            r#"hook("run.after_success", family="generic", argv0=["ffmpeg","ffprobe"], argv0_prefix=["ffmpeg-","ffprobe-"], handler="media.after_success", priority=100)
+            r#"hook("run.after_success", family="media", argv0=["ffmpeg","ffprobe"], argv0_prefix=["ffmpeg-","ffprobe-"], handler="media.after_success", priority=100)
 "#,
         );
         let fake_ffmpeg = root.join("ffmpeg-linux-x86_64-v7.0.2");
@@ -15678,7 +15744,7 @@ emit({{
         let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
         assert_eq!(value["ok"], json_value!(true));
         assert_eq!(value["helper"], json_value!("media.after_success"));
-        assert_eq!(value["family"], json_value!("generic"));
+        assert_eq!(value["family"], json_value!("media"));
         assert_eq!(value["kind"], json_value!("media_probe_available"));
         assert_eq!(value["next_check"], json_value!("ffprobe"));
         assert!(value["media_path"]

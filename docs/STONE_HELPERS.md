@@ -18,7 +18,7 @@ Set `WAYMARK_STONE_HELPER_DIRS` to an OS path list to replace that order.
 A helper file registers hooks with `hook(...)` lines:
 
 ```python
-hook("run.after_failure", family="python", handler="python.after_failure", priority=100)
+hook("run.after_failure", family="python", argv0_prefix=["python"], handler="python.after_failure", priority=100)
 ```
 
 Supported fields:
@@ -28,8 +28,10 @@ Supported fields:
 - `family`: helper family name such as `python`, `native`, `media`, `ml`,
   `llvm`, `service`, or `build`.
 - `handler`: internal handler name.
-- `priority`: lower values run first.
-- `argv0`: optional command-name filter.
+- `priority`: higher values run first.
+- `argv0`: optional exact command-name filter. Helper registration builds the
+  command-family lookup table from these filters.
+- `argv0_prefix`: optional command-name prefix filter.
 
 The checked-in examples live under [.stone/helpers](../.stone/helpers).
 
@@ -38,7 +40,7 @@ The checked-in examples live under [.stone/helpers](../.stone/helpers).
 Create `.stone/helpers/example.stone` in a workspace:
 
 ```python
-hook("run.after_failure", family="python", handler="python.after_failure", priority=100)
+hook("run.after_failure", family="python", argv0_prefix=["python"], handler="python.after_failure", priority=100)
 ```
 
 Then run a matching command:
