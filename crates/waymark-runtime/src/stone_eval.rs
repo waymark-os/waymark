@@ -28,10 +28,11 @@ use crate::stone_builtins::{
     join_builtin, last_builtin, len_builtin, list_builtin, map_builtin_value, min_max_builtin,
     mod_values, mul_values, neg_value, normalize_index, parse_float_builtin, parse_int_builtin,
     range_builtin, record_method_builtin, round_builtin, set_builtin, shift_value, slice_builtin,
-    split_builtin, starts_with_builtin, str_builtin, sub_values, subscript_builtin, sum_builtin,
-    unique_builtin, value_identity_key, value_ordering, value_to_bool, value_to_display_string,
-    value_to_f64, value_to_i64, value_to_limit, value_to_path_string, value_to_string,
-    value_to_u64, value_truthy, value_type_name, values_equal, where_builtin,
+    sort_key_for_value, sort_key_kind, split_builtin, starts_with_builtin, str_builtin, sub_values,
+    subscript_builtin, sum_builtin, unique_builtin, value_identity_key, value_ordering,
+    value_to_bool, value_to_display_string, value_to_f64, value_to_i64, value_to_limit,
+    value_to_path_string, value_to_string, value_to_u64, value_truthy, value_type_name,
+    values_equal, where_builtin,
 };
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_file_ops::{
@@ -5547,7 +5548,8 @@ impl Evaluator<'_> {
                 SortKey::Callable(callable) => self
                     .invoke_callable(callable, vec![RuntimeValue::Nu(value.clone())])?
                     .into_nu_value("sort key")?,
-                _ => extract_sort_key(&value, &key)?,
+                SortKey::Identity => sort_key_for_value(&value, None)?,
+                SortKey::Field(field) => sort_key_for_value(&value, Some(field))?,
             };
             let next_key_kind = sort_key_kind(&sort_key)?;
             if let Some(key_kind) = key_kind {
@@ -7043,13 +7045,6 @@ enum SortKey {
     Callable(CallableValue),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SortKeyKind {
-    Number,
-    Text,
-    Composite,
-}
-
 impl MinMax {
     fn name(self) -> &'static str {
         match self {
@@ -8450,40 +8445,6 @@ fn json_scalar_view_error(view: &JsonScalarView, err: serde_json::Error) -> Shel
         "json view",
         format!("{} line {}: {}", view.source, view.line_number, err),
     )
-}
-
-fn extract_sort_key(value: &Value, key: &SortKey) -> Result<Value, ShellError> {
-    match key {
-        SortKey::Identity => Ok(value.clone()),
-        SortKey::Field(field) => match value {
-            Value::Record { val, .. } => val
-                .get(field)
-                .cloned()
-                .ok_or_else(|| stone_error("sort", format!("record has no key `{field}`"))),
-            other => Err(stone_error(
-                "sort",
-                format!("key= requires record rows, got {}", other.get_type()),
-            )),
-        },
-        SortKey::Callable(_) => Err(stone_error(
-            "sort",
-            "internal error: callable sort keys must be invoked by eval_sort_call",
-        )),
-    }
-}
-
-fn sort_key_kind(value: &Value) -> Result<SortKeyKind, ShellError> {
-    match value {
-        Value::Int { .. } => Ok(SortKeyKind::Number),
-        Value::Float { val, .. } if !val.is_nan() => Ok(SortKeyKind::Number),
-        Value::Float { .. } => Err(stone_error("sort", "cannot sort NaN values")),
-        Value::String { .. } | Value::Glob { .. } => Ok(SortKeyKind::Text),
-        Value::List { .. } => Ok(SortKeyKind::Composite),
-        other => Err(stone_error(
-            "sort",
-            format!("cannot sort by {}", other.get_type()),
-        )),
-    }
 }
 
 fn runtime_type_name(value: &RuntimeValue) -> &'static str {

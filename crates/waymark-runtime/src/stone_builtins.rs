@@ -8,6 +8,13 @@ use nu_protocol::{shell_error::generic::GenericError, ShellError, Span, Value};
 use crate::json::nu_to_json_value;
 use crate::stone_ast::CompareOp;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SortKeyKind {
+    Number,
+    Text,
+    Composite,
+}
+
 pub(crate) fn value_to_int(value: &Value) -> Result<Value, ShellError> {
     value_to_i64(value, "int").map(|value| Value::int(value, Span::unknown()))
 }
@@ -906,6 +913,36 @@ pub(crate) fn split_builtin(text: &Value, separator: Option<&Value>) -> Result<V
             .collect(),
         Span::unknown(),
     ))
+}
+
+pub(crate) fn sort_key_for_value(value: &Value, field: Option<&str>) -> Result<Value, ShellError> {
+    match field {
+        None => Ok(value.clone()),
+        Some(field) => match value {
+            Value::Record { val, .. } => val
+                .get(field)
+                .cloned()
+                .ok_or_else(|| stone_error("sort", format!("record has no key `{field}`"))),
+            other => Err(stone_error(
+                "sort",
+                format!("key= requires record rows, got {}", other.get_type()),
+            )),
+        },
+    }
+}
+
+pub(crate) fn sort_key_kind(value: &Value) -> Result<SortKeyKind, ShellError> {
+    match value {
+        Value::Int { .. } => Ok(SortKeyKind::Number),
+        Value::Float { val, .. } if !val.is_nan() => Ok(SortKeyKind::Number),
+        Value::Float { .. } => Err(stone_error("sort", "cannot sort NaN values")),
+        Value::String { .. } | Value::Glob { .. } => Ok(SortKeyKind::Text),
+        Value::List { .. } => Ok(SortKeyKind::Composite),
+        other => Err(stone_error(
+            "sort",
+            format!("cannot sort by {}", other.get_type()),
+        )),
+    }
 }
 
 pub(crate) fn starts_with_builtin(text: &Value, prefix: &Value) -> Result<Value, ShellError> {
