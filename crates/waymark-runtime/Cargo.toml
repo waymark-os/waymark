@@ -9,6 +9,7 @@ name = "waymark_runtime"
 [dependencies]
 asset-image = { path = "../asset-image" }
 waymark-runtime-support = { path = "../waymark-runtime-support" }
+libc = "0.2.186"
 memchr = "2.8.0"
 nu-engine = { version = "0.112.2", default-features = false }
 nu-parser = "0.112.2"

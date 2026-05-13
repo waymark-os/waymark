@@ -4,8 +4,10 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read, Seek, Write};
 use std::ops::Range;
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
 #[cfg(all(not(target_os = "hermit"), unix))]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(all(not(target_os = "hermit"), unix))]
@@ -16,6 +18,8 @@ use std::process::{Command, ExitStatus, Stdio};
 #[cfg(not(target_os = "hermit"))]
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
+#[cfg(not(target_os = "hermit"))]
+use std::sync::Once;
 #[cfg(not(target_os = "hermit"))]
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -8858,6 +8862,83 @@ fn create_command_output_file(context: &str, label: &str, path: &Path) -> Result
 }
 
 #[cfg(not(target_os = "hermit"))]
+struct CommandCaptureFile {
+    file: File,
+    path: Option<PathBuf>,
+}
+
+#[cfg(not(target_os = "hermit"))]
+impl CommandCaptureFile {
+    fn try_clone(&self, context: &str, label: &str) -> Result<File, ShellError> {
+        self.file
+            .try_clone()
+            .map_err(|err| stone_error(context, format!("failed to clone {label} file: {err}")))
+    }
+
+    fn read_bytes(&mut self, context: &str, label: &str) -> Result<Vec<u8>, ShellError> {
+        if let Some(path) = &self.path {
+            fs::read(path).map_err(|err| io_stone_error(context, err, path))
+        } else {
+            self.file
+                .rewind()
+                .map_err(|err| stone_error(context, format!("failed to rewind {label}: {err}")))?;
+            let mut bytes = Vec::new();
+            self.file
+                .read_to_end(&mut bytes)
+                .map_err(|err| stone_error(context, format!("failed to read {label}: {err}")))?;
+            Ok(bytes)
+        }
+    }
+
+    fn cleanup(&self) {
+        if let Some(path) = &self.path {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(not(target_os = "hermit"))]
+fn create_command_capture_file(
+    context: &str,
+    label: &str,
+    temp_prefix: &str,
+    suffix: &str,
+) -> Result<CommandCaptureFile, ShellError> {
+    #[cfg(target_os = "linux")]
+    if let Ok(file) = create_anonymous_command_output_file(&env::temp_dir()) {
+        return Ok(CommandCaptureFile { file, path: None });
+    }
+
+    let path = env::temp_dir().join(format!("{temp_prefix}.{suffix}"));
+    let file = create_command_output_file(context, label, &path)?;
+    Ok(CommandCaptureFile {
+        file,
+        path: Some(path),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn create_anonymous_command_output_file(dir: &Path) -> Result<File, std::io::Error> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))?;
+    let fd = unsafe {
+        libc::open(
+            dir.as_ptr(),
+            libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(not(target_os = "hermit"))]
 fn command_explanation(
     kind: &str,
     summary: String,
@@ -8883,6 +8964,44 @@ fn command_explanation(
 }
 
 #[cfg(not(target_os = "hermit"))]
+fn cleanup_stale_run_temp_files_once() {
+    static CLEANUP: Once = Once::new();
+    CLEANUP.call_once(|| {
+        cleanup_stale_run_temp_files(&env::temp_dir(), Duration::from_secs(6 * 60 * 60));
+    });
+}
+
+#[cfg(not(target_os = "hermit"))]
+fn cleanup_stale_run_temp_files(dir: &Path, stale_after: Duration) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("stone-run-")
+            || !(name.ends_with(".stdout") || name.ends_with(".stderr"))
+        {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let is_stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= stale_after);
+        if is_stale {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(not(target_os = "hermit"))]
 fn run_posix_command(
     argv: &[String],
     cwd: &Path,
@@ -8898,19 +9017,18 @@ fn run_posix_command(
 
     let span = Span::unknown();
     let started = Instant::now();
+    cleanup_stale_run_temp_files_once();
     validate_command_cwd("run", cwd)?;
     let temp_prefix = format!(
         "stone-run-{}-{}",
         std::process::id(),
         RUN_ID.fetch_add(1, AtomicOrdering::Relaxed)
     );
-    let stdout_path = env::temp_dir().join(format!("{temp_prefix}.stdout"));
-    let stderr_path = env::temp_dir().join(format!("{temp_prefix}.stderr"));
-    let stdout_file = (stdout_target == RunOutputTarget::Capture)
-        .then(|| create_command_output_file("run", "stdout", &stdout_path))
+    let mut stdout_file = (stdout_target == RunOutputTarget::Capture)
+        .then(|| create_command_capture_file("run", "stdout", &temp_prefix, "stdout"))
         .transpose()?;
-    let stderr_file = (stderr_target == RunOutputTarget::Capture)
-        .then(|| create_command_output_file("run", "stderr", &stderr_path))
+    let mut stderr_file = (stderr_target == RunOutputTarget::Capture)
+        .then(|| create_command_capture_file("run", "stderr", &temp_prefix, "stderr"))
         .transpose()?;
 
     let mut command = Command::new(&argv[0]);
@@ -8919,8 +9037,7 @@ fn run_posix_command(
             stdout_file
                 .as_ref()
                 .expect("stdout capture file should exist")
-                .try_clone()
-                .map_err(|err| stone_error("run", format!("failed to clone stdout file: {err}")))?,
+                .try_clone("run", "stdout")?,
         ),
         RunOutputTarget::Suppress => Stdio::null(),
         RunOutputTarget::Stdout => unreachable!("stdout cannot target stdout"),
@@ -8930,8 +9047,7 @@ fn run_posix_command(
             stderr_file
                 .as_ref()
                 .expect("stderr capture file should exist")
-                .try_clone()
-                .map_err(|err| stone_error("run", format!("failed to clone stderr file: {err}")))?,
+                .try_clone("run", "stderr")?,
         ),
         RunOutputTarget::Suppress => Stdio::null(),
         RunOutputTarget::Stdout => match stdout_target {
@@ -8939,13 +9055,7 @@ fn run_posix_command(
                 stdout_file
                     .as_ref()
                     .expect("stdout capture file should exist")
-                    .try_clone()
-                    .map_err(|err| {
-                        stone_error(
-                            "run",
-                            format!("failed to clone stdout file for stderr: {err}"),
-                        )
-                    })?,
+                    .try_clone("run", "stdout file for stderr")?,
             ),
             RunOutputTarget::Suppress => Stdio::null(),
             RunOutputTarget::Stdout => unreachable!("stdout cannot target stdout"),
@@ -8964,13 +9074,14 @@ fn run_posix_command(
     }
 
     let mut child = command.spawn().map_err(|err| {
-        let _ = fs::remove_file(&stdout_path);
-        let _ = fs::remove_file(&stderr_path);
+        if let Some(file) = &stdout_file {
+            file.cleanup();
+        }
+        if let Some(file) = &stderr_file {
+            file.cleanup();
+        }
         command_spawn_error("run", &argv[0], &err)
     })?;
-    drop(stdout_file);
-    drop(stderr_file);
-
     if let Some(stdin) = stdin {
         if let Some(mut child_stdin) = child.stdin.take() {
             child_stdin
@@ -8998,18 +9109,22 @@ fn run_posix_command(
     };
 
     let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-    let stdout_bytes = if stdout_target == RunOutputTarget::Capture {
-        fs::read(&stdout_path).map_err(|err| io_stone_error("run", err, &stdout_path))?
-    } else {
-        Vec::new()
-    };
-    let stderr_bytes = if stderr_target == RunOutputTarget::Capture {
-        fs::read(&stderr_path).map_err(|err| io_stone_error("run", err, &stderr_path))?
-    } else {
-        Vec::new()
-    };
-    let _ = fs::remove_file(&stdout_path);
-    let _ = fs::remove_file(&stderr_path);
+    let stdout_bytes = stdout_file
+        .as_mut()
+        .map(|file| file.read_bytes("run", "stdout"))
+        .transpose()?
+        .unwrap_or_default();
+    let stderr_bytes = stderr_file
+        .as_mut()
+        .map(|file| file.read_bytes("run", "stderr"))
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(file) = &stdout_file {
+        file.cleanup();
+    }
+    if let Some(file) = &stderr_file {
+        file.cleanup();
+    }
 
     let (stdout_text, stdout_truncated) = lossy_limited_text(&stdout_bytes, max_stdout_bytes);
     let (stderr_text, stderr_truncated) = lossy_limited_text(&stderr_bytes, max_stderr_bytes);
@@ -13623,6 +13738,8 @@ fn ensure_parent_dir_for_write(kind: &str, path: &Path) -> Result<(), ShellError
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_os = "hermit"))]
+    use super::cleanup_stale_run_temp_files;
     use super::{
         eval_program, eval_program_with_options, eval_program_with_output,
         match_fused_map_update_if, EvalHotLoopDiagnostics, EvalOptions, RuntimeValue, TextLines,
@@ -13636,7 +13753,7 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     #[test]
@@ -15703,6 +15820,26 @@ emit({
         assert_eq!(value["merged_stderr"], json_value!(""));
         assert_eq!(value["merged_flag"], json_value!(true));
         Ok(())
+    }
+
+    #[cfg(not(target_os = "hermit"))]
+    #[test]
+    fn cleanup_stale_run_temp_files_removes_only_waymark_captures() {
+        let root = test_root("run-temp-cleanup");
+        fs::create_dir_all(&root).expect("create temp cleanup root");
+        let stale_stdout = root.join("stone-run-123-0.stdout");
+        let stale_stderr = root.join("stone-run-123-0.stderr");
+        let unrelated = root.join("stone-run-123-0.log");
+        fs::write(&stale_stdout, "out").expect("write stdout temp");
+        fs::write(&stale_stderr, "err").expect("write stderr temp");
+        fs::write(&unrelated, "log").expect("write unrelated temp");
+
+        cleanup_stale_run_temp_files(&root, Duration::ZERO);
+
+        assert!(!stale_stdout.exists());
+        assert!(!stale_stderr.exists());
+        assert!(unrelated.exists());
+        cleanup_dir(&root);
     }
 
     #[cfg(not(target_os = "hermit"))]

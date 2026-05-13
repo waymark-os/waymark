@@ -2081,6 +2081,7 @@ name = "waymark-runtime"
 version = "0.0.0"
 dependencies = [
  "asset-image",
+ "libc",
  "memchr",
  "nu-engine",
  "nu-parser",
