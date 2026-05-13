@@ -9281,15 +9281,7 @@ impl StoneHelperHandler {
                     .into_iter()
                     .collect())
             }
-            StoneHelperHandlerKind::Registered => Ok(vec![helper_observation(
-                hook,
-                event,
-                "helper_registered",
-                format!("Loaded helper `{}` for {}.", self.name, hook.event),
-                Record::new(),
-                Vec::<Vec<String>>::new(),
-                span,
-            )]),
+            StoneHelperHandlerKind::Registered => Ok(Vec::new()),
         }
     }
 }
@@ -9893,6 +9885,10 @@ fn helper_error_observation(
 ) -> Value {
     let mut evidence = Record::new();
     evidence.push("error", Value::string(err.to_string(), span));
+    evidence.push(
+        "source",
+        Value::string(hook.source.display().to_string(), span),
+    );
     helper_observation(
         hook,
         event,
@@ -16396,6 +16392,64 @@ emit({
         assert_eq!(value["family"], json_value!("conda"));
         assert_eq!(value["argv0"], json_value!("sh"));
         assert_eq!(value["next_check"], json_value!("conda"));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "hermit"))]
+    #[test]
+    fn suppresses_unimplemented_registered_helper_observation() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("run-unimplemented-helper")?;
+        write_helper(
+            &root,
+            "typo.stone",
+            r#"hook("run.after_failure", family="generic", handler="typo.after_failure", priority=100)
+"#,
+        );
+        let program = lower_source(
+            r#"result = run(["sh", "-c", "exit 1"])
+emit({
+    "ok": result["ok"],
+    "helper_count": len(result.get("helpers", [])),
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(false));
+        assert_eq!(value["helper_count"], json_value!(0));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "hermit"))]
+    #[test]
+    fn helper_error_observation_includes_source_in_evidence() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("run-helper-error-source")?;
+        write_helper(
+            &root,
+            "broken.stone",
+            r#"def broken_after_failure():
+    return None
+
+hook("run.after_failure", family="generic", handler="broken.after_failure", priority=100)
+"#,
+        );
+        let program = lower_source(
+            r#"result = run(["sh", "-c", "exit 1"])
+emit({
+    "kind": result["helpers"][0]["kind"],
+    "source": result["helpers"][0]["evidence"]["source"],
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value["kind"], json_value!("helper_error"));
+        assert!(value["source"]
+            .as_str()
+            .expect("helper source")
+            .ends_with(".stone/helpers/broken.stone"));
         cleanup_dir(&root);
         Ok(())
     }

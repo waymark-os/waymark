@@ -1384,9 +1384,10 @@ def stone_call_path_arg(name: str, args: Any) -> str | None:
 
 
 def stone_describe(path: str, cwd: str | None = None) -> dict[str, Any]:
-    target = resolve_workspace_path(path, cwd)
+    target = workspace_path(path, cwd)
+    resolved_target = resolve_workspace_path(path, cwd)
     display_path = path
-    if not target.exists():
+    if not target.exists() and not target.is_symlink():
         return {
             "ok": False,
             "error": {
@@ -1399,16 +1400,19 @@ def stone_describe(path: str, cwd: str | None = None) -> dict[str, Any]:
     stat = target.lstat()
     value: dict[str, Any] = {"path": display_path, "size": stat.st_size}
     effects = {"reads": [display_path]}
-    if target.is_dir():
-        entries = sorted(child.name for child in target.iterdir())[:100]
-        value.update({"kind": "directory", "entries": entries})
-        return {"ok": True, "value": value, "effects": effects}
     if target.is_symlink():
         value["symlink_target"] = os.readlink(target)
+        if not resolved_target.exists():
+            value.update({"kind": "symlink", "broken": True})
+            return {"ok": True, "value": value, "effects": effects}
+    if resolved_target.is_dir():
+        entries = sorted(child.name for child in resolved_target.iterdir())[:100]
+        value.update({"kind": "directory", "entries": entries})
+        return {"ok": True, "value": value, "effects": effects}
 
-    data = target.read_bytes()[:MAX_PREVIEW_BYTES]
+    data = resolved_target.read_bytes()[:MAX_PREVIEW_BYTES]
     text = data.decode("utf-8", errors="replace")
-    kind = infer_kind(target, data)
+    kind = infer_kind(resolved_target, data)
     value["kind"] = kind
     if kind != "binary":
         value["preview"] = text
@@ -1421,11 +1425,15 @@ def stone_describe(path: str, cwd: str | None = None) -> dict[str, Any]:
     return sparse({"ok": True, "value": value, "effects": effects})
 
 
-def resolve_workspace_path(path: str, cwd: str | None = None) -> Path:
+def workspace_path(path: str, cwd: str | None = None) -> Path:
     raw = Path(path).expanduser()
     if raw.is_absolute():
-        return raw.resolve()
-    return (resolve_cwd(cwd) / raw).resolve()
+        return raw
+    return resolve_cwd(cwd) / raw
+
+
+def resolve_workspace_path(path: str, cwd: str | None = None) -> Path:
+    return workspace_path(path, cwd).resolve()
 
 
 def infer_kind(path: Path, data: bytes) -> str:
@@ -1458,7 +1466,7 @@ def infer_schema(kind: str, text: str) -> Any:
                 break
             if len(schemas) >= 5:
                 break
-        return schemas[0] if len(schemas) == 1 else schemas or None
+        return schemas or None
     if kind == "csv":
         rows = list(csv.reader(text.splitlines()))
         if not rows:

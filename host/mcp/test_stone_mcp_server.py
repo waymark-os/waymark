@@ -188,6 +188,27 @@ class StoneMcpServerTests(unittest.TestCase):
         self.assertEqual(result["stderr"], "still cloning")
         self.assertEqual(result["diagnostics"]["backend"], "warm_stdio")
 
+    def test_stone_describe_reports_symlink_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "target.txt").write_text("hello\n", encoding="utf-8")
+            os.symlink("target.txt", root / "link.txt")
+
+            result = server.stone_describe("link.txt", cwd=str(root))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["value"]["symlink_target"], "target.txt")
+        self.assertEqual(result["value"]["preview"], "hello\n")
+
+    def test_jsonl_infer_schema_is_always_list_shaped(self) -> None:
+        one_line = server.infer_schema("jsonl", '{"name": "waymark"}\n')
+        two_lines = server.infer_schema(
+            "jsonl", '{"name": "waymark"}\n{"count": 2}\n'
+        )
+
+        self.assertEqual(one_line, [{"name": "str"}])
+        self.assertEqual(two_lines, [{"name": "str"}, {"count": "int"}])
+
     def test_compact_run_explanation_preserves_timeout_fields(self) -> None:
         compact = server.compact_run_explanation(
             {
