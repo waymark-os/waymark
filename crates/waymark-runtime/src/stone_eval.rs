@@ -49,16 +49,6 @@ use crate::stone_helpers::{
     stone_run_event_from_record, stone_run_event_value, StoneHelperHandlerKind, StoneHelperHook,
     StoneHelperRegistry, StoneRunEvent,
 };
-use crate::stone_ir::{
-    compile_generic_vm_function, compile_hot_jsonl_loop_ir_function, compile_hot_jsonl_trace_plan,
-    compile_hot_jsonl_trace_plan_from_ir, compile_hot_jsonl_vm_function,
-    generic_loop_compile_miss_reason, match_hot_jsonl_aggregation_body,
-    match_outer_jsonl_file_loop_body, optimize_loop_ir, optimize_stone_loop_ir,
-    try_lower_generic_loop, try_lower_hot_loop, validate_hot_jsonl_native_prefix, GenericLoopIter,
-    GenericLoopOp, GenericLoopPlan, GenericParseNumber, GenericVmConst, GenericVmExprBody,
-    GenericVmExprOp, GenericVmOp, HotJsonlAggregationBody, HotJsonlBodyOp, HotJsonlSlot,
-    HotJsonlTracePlan, HotLoopIter, HotLoopOp, HotLoopPlan,
-};
 #[cfg(all(not(target_os = "hermit"), test))]
 use crate::stone_run::cleanup_stale_run_temp_files;
 #[cfg(not(target_os = "hermit"))]
@@ -68,10 +58,18 @@ use crate::stone_run::{
     stop_daemon_call_values, wait_port_call_values,
 };
 use crate::stone_vm::{
-    AccId, ConstId, GenericVmFunction, LoopIrFunction, LoopIrFusedKernel,
-    LoopIrOptimizationDiagnostic, LoopIrOptimizationResult, Reg, SnapshotId, StoneAccumulatorKind,
-    StoneConst, StoneFallbackTarget, StoneGuardKind, StoneIrFunction,
-    StoneLoopIrOptimizationResult, StoneOp, StoneTerminator,
+    compile_generic_vm_function, compile_hot_jsonl_loop_ir_function, compile_hot_jsonl_trace_plan,
+    compile_hot_jsonl_trace_plan_from_ir, compile_hot_jsonl_vm_function,
+    generic_loop_compile_miss_reason, match_hot_jsonl_aggregation_body,
+    match_outer_jsonl_file_loop_body, optimize_loop_ir, optimize_stone_loop_ir,
+    try_lower_generic_loop, try_lower_hot_loop, validate_hot_jsonl_native_prefix, AccId, ConstId,
+    GenericLoopIter, GenericLoopOp, GenericLoopPlan, GenericParseNumber, GenericVmConst,
+    GenericVmExprBody, GenericVmExprOp, GenericVmFunction, GenericVmOp, HotJsonlAggregationBody,
+    HotJsonlBodyOp, HotJsonlNestedUserTotals, HotJsonlSlot, HotJsonlTracePlan, HotLoopIter,
+    HotLoopOp, HotLoopPlan, LoopIrFunction, LoopIrFusedKernel, LoopIrOptimizationDiagnostic,
+    LoopIrOptimizationResult, Reg, SnapshotId, StoneAccumulatorKind, StoneConst,
+    StoneFallbackTarget, StoneGuardKind, StoneIrFunction, StoneLoopIrOptimizationResult, StoneOp,
+    StoneTerminator,
 };
 
 const STONE_LAST_RESULT_ENV: &str = "WAYMARK_LAST_RESULT_JSON";
@@ -3449,7 +3447,7 @@ impl Evaluator<'_> {
     fn load_nested_hot_jsonl_native_accumulators(
         &self,
         plan: &HotJsonlTracePlan,
-        nested: &crate::stone_ir::HotJsonlNestedUserTotals,
+        nested: &HotJsonlNestedUserTotals,
     ) -> Result<HotJsonlNativeAccumulators, ShellError> {
         let (users, user_amounts, user_items) = self.load_nested_totals_record_map(nested)?;
         Ok(HotJsonlNativeAccumulators {
@@ -3466,7 +3464,7 @@ impl Evaluator<'_> {
 
     fn load_nested_totals_record_map(
         &self,
-        nested: &crate::stone_ir::HotJsonlNestedUserTotals,
+        nested: &HotJsonlNestedUserTotals,
     ) -> Result<(Vec<String>, HashMap<String, f64>, HashMap<String, i64>), ShellError> {
         let value = self.state.get_local(&nested.map_name).ok_or_else(|| {
             stone_error("hot loop", format!("unknown name `{}`", nested.map_name))
