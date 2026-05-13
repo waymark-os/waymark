@@ -23,13 +23,13 @@ use crate::stone_ast::{
     Stmt, StoneFormatSpec, StoneType,
 };
 use crate::stone_builtins::{
-    first_builtin, float_builtin, int_builtin, join_builtin, last_builtin, len_builtin,
-    list_builtin, min_max_builtin, parse_float_builtin, parse_int_builtin, range_builtin,
-    record_method_builtin, round_builtin, set_builtin, slice_builtin, split_builtin,
+    first_builtin, float_builtin, format_builtin, int_builtin, join_builtin, last_builtin,
+    len_builtin, list_builtin, min_max_builtin, parse_float_builtin, parse_int_builtin,
+    range_builtin, record_method_builtin, round_builtin, set_builtin, slice_builtin, split_builtin,
     starts_with_builtin, str_builtin, unique_builtin, value_identity_key, value_ordering,
     value_to_bool, value_to_display_string, value_to_f64, value_to_i64, value_to_int,
     value_to_limit, value_to_path_string, value_to_string, value_to_u64, value_type_name,
-    values_equal,
+    values_equal, where_builtin,
 };
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_file_ops::{
@@ -5360,25 +5360,7 @@ impl Evaluator<'_> {
         let expected = self
             .eval_expr_value(expected, PipelineData::empty())?
             .into_nu_value("where")?;
-        let key = value_to_string(&key, "where key")?;
-        let Value::List { vals, .. } = values else {
-            return Err(stone_error(
-                "where",
-                format!("expected list, got {}", values.get_type()),
-            ));
-        };
-        let mut selected = Vec::new();
-        for value in vals {
-            if let Value::Record { val, .. } = &value {
-                if val
-                    .get(&key)
-                    .is_some_and(|candidate| values_equal(candidate, &expected))
-                {
-                    selected.push(value);
-                }
-            }
-        }
-        Ok(RuntimeValue::Nu(Value::list(selected, Span::unknown())))
+        where_builtin(&values, &key, &expected).map(RuntimeValue::Nu)
     }
 
     fn eval_from_json_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -6233,18 +6215,14 @@ impl Evaluator<'_> {
         let template = self
             .eval_expr_value(template, PipelineData::empty())?
             .into_nu_value("format")?;
-        let template = value_to_string(&template, "format")?;
         let mut args = Vec::with_capacity(call.positional.len().saturating_sub(1));
         for arg in call.positional.iter().skip(1) {
-            let value = self
-                .eval_expr_value(arg, PipelineData::empty())?
-                .into_nu_value("format")?;
-            args.push(value_to_display_string(&value)?);
+            args.push(
+                self.eval_expr_value(arg, PipelineData::empty())?
+                    .into_nu_value("format")?,
+            );
         }
-        Ok(RuntimeValue::Nu(Value::string(
-            format_template(&template, &args)?,
-            Span::unknown(),
-        )))
+        format_builtin(&template, &args).map(RuntimeValue::Nu)
     }
 
     fn eval_print_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -9094,49 +9072,6 @@ fn normalize_string_start(index: i64, len: usize) -> Result<usize, ShellError> {
     let normalized = if index < 0 { len + index } else { index };
     let clamped = normalized.clamp(0, len);
     usize::try_from(clamped).map_err(|_| stone_error("index", "index is too large"))
-}
-
-fn format_template(template: &str, args: &[String]) -> Result<String, ShellError> {
-    let mut output = String::new();
-    let mut chars = template.chars().peekable();
-    let mut arg_index = 0;
-    while let Some(ch) = chars.next() {
-        match ch {
-            '{' if chars.peek() == Some(&'{') => {
-                chars.next();
-                output.push('{');
-            }
-            '}' if chars.peek() == Some(&'}') => {
-                chars.next();
-                output.push('}');
-            }
-            '{' if chars.peek() == Some(&'}') => {
-                chars.next();
-                let Some(value) = args.get(arg_index) else {
-                    return Err(stone_error(
-                        "format",
-                        "format() has fewer arguments than placeholders",
-                    ));
-                };
-                output.push_str(value);
-                arg_index += 1;
-            }
-            '{' | '}' => {
-                return Err(stone_error(
-                    "format",
-                    "format() supports only `{}` placeholders and escaped `{{` or `}}`",
-                ));
-            }
-            _ => output.push(ch),
-        }
-    }
-    if arg_index != args.len() {
-        return Err(stone_error(
-            "format",
-            "format() received more arguments than placeholders",
-        ));
-    }
-    Ok(output)
 }
 
 fn value_truthy(value: &Value) -> bool {

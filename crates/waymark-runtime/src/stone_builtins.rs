@@ -19,6 +19,15 @@ pub(crate) fn float_builtin(value: &Value) -> Result<Value, ShellError> {
     value_to_f64(value, "float").map(|value| Value::float(value, Span::unknown()))
 }
 
+pub(crate) fn format_builtin(template: &Value, args: &[Value]) -> Result<Value, ShellError> {
+    let template = value_to_string(template, "format")?;
+    let args = args
+        .iter()
+        .map(value_to_display_string)
+        .collect::<Result<Vec<_>, _>>()?;
+    format_template(&template, &args).map(|text| Value::string(text, Span::unknown()))
+}
+
 pub(crate) fn first_builtin(
     value: &Value,
     count: Option<usize>,
@@ -120,6 +129,32 @@ pub(crate) fn unique_builtin(value: &Value) -> Result<Value, ShellError> {
         ));
     };
     unique_values(vals.clone(), "unique").map(|values| Value::list(values, Span::unknown()))
+}
+
+pub(crate) fn where_builtin(
+    values: &Value,
+    key: &Value,
+    expected: &Value,
+) -> Result<Value, ShellError> {
+    let key = value_to_string(key, "where key")?;
+    let Value::List { vals, .. } = values else {
+        return Err(stone_error(
+            "where",
+            format!("expected list, got {}", values.get_type()),
+        ));
+    };
+    let mut selected = Vec::new();
+    for value in vals {
+        if let Value::Record { val, .. } = value {
+            if val
+                .get(&key)
+                .is_some_and(|candidate| values_equal(candidate, expected))
+            {
+                selected.push(value.clone());
+            }
+        }
+    }
+    Ok(Value::list(selected, Span::unknown()))
 }
 
 pub(crate) fn value_identity_key(value: &Value, context: &str) -> Result<String, ShellError> {
@@ -541,6 +576,49 @@ fn normalize_slice_bounds(
     } else {
         Ok((start, end))
     }
+}
+
+fn format_template(template: &str, args: &[String]) -> Result<String, ShellError> {
+    let mut output = String::new();
+    let mut chars = template.chars().peekable();
+    let mut arg_index = 0;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+                output.push('{');
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+                output.push('}');
+            }
+            '{' if chars.peek() == Some(&'}') => {
+                chars.next();
+                let Some(value) = args.get(arg_index) else {
+                    return Err(stone_error(
+                        "format",
+                        "format() has fewer arguments than placeholders",
+                    ));
+                };
+                output.push_str(value);
+                arg_index += 1;
+            }
+            '{' | '}' => {
+                return Err(stone_error(
+                    "format",
+                    "format() supports only `{}` placeholders and escaped `{{` or `}}`",
+                ));
+            }
+            _ => output.push(ch),
+        }
+    }
+    if arg_index != args.len() {
+        return Err(stone_error(
+            "format",
+            "format() received more arguments than placeholders",
+        ));
+    }
+    Ok(output)
 }
 
 fn unique_values(values: Vec<Value>, context: &str) -> Result<Vec<Value>, ShellError> {
