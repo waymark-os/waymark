@@ -951,6 +951,135 @@ pub(crate) fn starts_with_builtin(text: &Value, prefix: &Value) -> Result<Value,
     Ok(Value::bool(text.starts_with(&prefix), Span::unknown()))
 }
 
+pub(crate) fn string_method_builtin(
+    receiver: &Value,
+    method: &str,
+    args: &[Value],
+) -> Result<Value, ShellError> {
+    let (Value::String { val: text, .. } | Value::Glob { val: text, .. }) = receiver else {
+        return Err(stone_error(
+            method,
+            format!("{} has no {method}()", receiver.get_type()),
+        ));
+    };
+    match method {
+        "strip" => {
+            let stripped = match args {
+                [] => text.trim().to_owned(),
+                [chars] => {
+                    let chars = value_to_string(chars, "strip")?;
+                    text.trim_matches(|ch| chars.contains(ch)).to_owned()
+                }
+                _ => return Err(stone_error("strip", "strip() takes at most one argument")),
+            };
+            Ok(Value::string(stripped, Span::unknown()))
+        }
+        "split" => {
+            let parts = match args {
+                [] => text.split_whitespace().collect::<Vec<_>>(),
+                [separator] => {
+                    let separator = value_to_string(separator, "split")?;
+                    text.split(&separator).collect::<Vec<_>>()
+                }
+                _ => return Err(stone_error("split", "split() takes at most one argument")),
+            };
+            Ok(Value::list(
+                parts
+                    .into_iter()
+                    .map(|part| Value::string(part.to_owned(), Span::unknown()))
+                    .collect(),
+                Span::unknown(),
+            ))
+        }
+        "splitlines" => {
+            let [] = args else {
+                return Err(stone_error(
+                    "splitlines",
+                    "splitlines() takes no arguments for now",
+                ));
+            };
+            Ok(Value::list(
+                text.lines()
+                    .map(|part| Value::string(part.to_owned(), Span::unknown()))
+                    .collect(),
+                Span::unknown(),
+            ))
+        }
+        "replace" => {
+            let [old, new] = args else {
+                return Err(stone_error(
+                    "replace",
+                    "replace() requires old and new arguments",
+                ));
+            };
+            let old = value_to_string(old, "replace")?;
+            let new = value_to_string(new, "replace")?;
+            Ok(Value::string(text.replace(&old, &new), Span::unknown()))
+        }
+        "join" => {
+            let [items] = args else {
+                return Err(stone_error("join", "join() requires exactly one iterable"));
+            };
+            let Value::List { vals, .. } = items else {
+                return Err(stone_error(
+                    "join",
+                    format!("expected list, got {}", items.get_type()),
+                ));
+            };
+            let mut parts = Vec::with_capacity(vals.len());
+            for value in vals {
+                parts.push(value_to_string(value, "join")?);
+            }
+            Ok(Value::string(parts.join(text), Span::unknown()))
+        }
+        "lower" => {
+            let [] = args else {
+                return Err(stone_error("lower", "lower() takes no arguments"));
+            };
+            Ok(Value::string(text.to_lowercase(), Span::unknown()))
+        }
+        "upper" => {
+            let [] = args else {
+                return Err(stone_error("upper", "upper() takes no arguments"));
+            };
+            Ok(Value::string(text.to_uppercase(), Span::unknown()))
+        }
+        "zfill" => {
+            let [width] = args else {
+                return Err(stone_error("zfill", "zfill() requires exactly one width"));
+            };
+            let width = value_to_i64(width, "zfill width")?;
+            if width < 0 {
+                return Err(stone_error("zfill", "width must be non-negative"));
+            }
+            let width =
+                usize::try_from(width).map_err(|_| stone_error("zfill", "width is too large"))?;
+            Ok(Value::string(zfill(text, width), Span::unknown()))
+        }
+        "startswith" => {
+            let [prefix] = args else {
+                return Err(stone_error(
+                    "startswith",
+                    "startswith() requires exactly one argument",
+                ));
+            };
+            let prefix = value_to_string(prefix, "startswith")?;
+            Ok(Value::bool(text.starts_with(&prefix), Span::unknown()))
+        }
+        "endswith" => {
+            let [suffix] = args else {
+                return Err(stone_error(
+                    "endswith",
+                    "endswith() requires exactly one argument",
+                ));
+            };
+            let suffix = value_to_string(suffix, "endswith")?;
+            Ok(Value::bool(text.ends_with(&suffix), Span::unknown()))
+        }
+        _ => unreachable!("string method dispatch is validated by caller"),
+    }
+}
+
 pub(crate) fn subscript_builtin(value: &Value, index: &Value) -> Result<Value, ShellError> {
     match (value, index) {
         (Value::Record { val, .. }, Value::String { val: key, .. })
@@ -1038,6 +1167,21 @@ fn normalize_string_start(index: i64, len: usize) -> Result<usize, ShellError> {
     let normalized = if index < 0 { len + index } else { index };
     let clamped = normalized.clamp(0, len);
     usize::try_from(clamped).map_err(|_| stone_error("index", "index is too large"))
+}
+
+fn zfill(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    if len >= width {
+        return text.to_owned();
+    }
+    let (sign, digits) = if let Some(rest) = text.strip_prefix('-') {
+        ("-", rest)
+    } else if let Some(rest) = text.strip_prefix('+') {
+        ("+", rest)
+    } else {
+        ("", text)
+    };
+    format!("{sign}{}{}", "0".repeat(width - len), digits)
 }
 
 fn format_template(template: &str, args: &[String]) -> Result<String, ShellError> {

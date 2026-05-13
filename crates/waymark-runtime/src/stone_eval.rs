@@ -28,11 +28,11 @@ use crate::stone_builtins::{
     join_builtin, last_builtin, len_builtin, list_builtin, map_builtin_value, min_max_builtin,
     mod_values, mul_values, neg_value, normalize_index, parse_float_builtin, parse_int_builtin,
     range_builtin, record_method_builtin, round_builtin, set_builtin, shift_value, slice_builtin,
-    sort_key_for_value, sort_key_kind, split_builtin, starts_with_builtin, str_builtin, sub_values,
-    subscript_builtin, sum_builtin, unique_builtin, value_identity_key, value_ordering,
-    value_to_bool, value_to_display_string, value_to_f64, value_to_i64, value_to_limit,
-    value_to_path_string, value_to_string, value_to_u64, value_truthy, value_type_name,
-    values_equal, where_builtin,
+    sort_key_for_value, sort_key_kind, split_builtin, starts_with_builtin, str_builtin,
+    string_method_builtin, sub_values, subscript_builtin, sum_builtin, unique_builtin,
+    value_identity_key, value_ordering, value_to_bool, value_to_display_string, value_to_f64,
+    value_to_i64, value_to_limit, value_to_path_string, value_to_string, value_to_u64,
+    value_truthy, value_type_name, values_equal, where_builtin,
 };
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_file_ops::{
@@ -6497,138 +6497,15 @@ impl Evaluator<'_> {
 
             let receiver = receiver.into_nu_value("method call")?;
             match method {
-                "strip" => eval_string_method(&receiver, method, &args, |text, args| {
-                    let stripped = match args {
-                        [] => text.trim().to_owned(),
-                        [chars] => {
-                            let chars = value_to_string(chars, "strip")?;
-                            text.trim_matches(|ch| chars.contains(ch)).to_owned()
-                        }
-                        _ => {
-                            return Err(stone_error("strip", "strip() takes at most one argument"));
-                        }
-                    };
-                    Ok(Value::string(stripped, Span::unknown()))
-                })
-                .map(RuntimeValue::Nu),
-                "split" => eval_string_method(&receiver, method, &args, |text, args| {
-                    let parts = match args {
-                        [] => text.split_whitespace().collect::<Vec<_>>(),
-                        [separator] => {
-                            let separator = value_to_string(separator, "split")?;
-                            text.split(&separator).collect::<Vec<_>>()
-                        }
-                        _ => {
-                            return Err(stone_error("split", "split() takes at most one argument"));
-                        }
-                    };
-                    Ok(Value::list(
-                        parts
-                            .into_iter()
-                            .map(|part| Value::string(part.to_owned(), Span::unknown()))
-                            .collect(),
-                        Span::unknown(),
-                    ))
-                })
-                .map(RuntimeValue::Nu),
-                "splitlines" => eval_string_method(&receiver, method, &args, |text, args| {
-                    let [] = args else {
-                        return Err(stone_error(
-                            "splitlines",
-                            "splitlines() takes no arguments for now",
-                        ));
-                    };
-                    Ok(Value::list(
-                        text.lines()
-                            .map(|part| Value::string(part.to_owned(), Span::unknown()))
-                            .collect(),
-                        Span::unknown(),
-                    ))
-                })
-                .map(RuntimeValue::Nu),
-                "replace" => eval_string_method(&receiver, method, &args, |text, args| {
-                    let [old, new] = args else {
-                        return Err(stone_error(
-                            "replace",
-                            "replace() requires old and new arguments",
-                        ));
-                    };
-                    let old = value_to_string(old, "replace")?;
-                    let new = value_to_string(new, "replace")?;
-                    Ok(Value::string(text.replace(&old, &new), Span::unknown()))
-                })
-                .map(RuntimeValue::Nu),
-                "join" => eval_string_method(&receiver, method, &args, |separator, args| {
-                    let [items] = args else {
-                        return Err(stone_error("join", "join() requires exactly one iterable"));
-                    };
-                    let Value::List { vals, .. } = items else {
-                        return Err(stone_error(
-                            "join",
-                            format!("expected list, got {}", items.get_type()),
-                        ));
-                    };
-                    let mut parts = Vec::with_capacity(vals.len());
-                    for value in vals {
-                        parts.push(value_to_string(value, "join")?);
-                    }
-                    Ok(Value::string(parts.join(separator), Span::unknown()))
-                })
-                .map(RuntimeValue::Nu),
+                "strip" | "split" | "splitlines" | "replace" | "join" | "lower" | "upper"
+                | "zfill" | "startswith" | "endswith" => {
+                    string_method_builtin(&receiver, method, &args).map(RuntimeValue::Nu)
+                }
                 "get" | "items" | "keys" | "values" => {
                     record_method_builtin(&receiver, method, &args).map(RuntimeValue::Nu)
                 }
                 "find" => find_method_builtin(&receiver, &args).map(RuntimeValue::Nu),
                 "index" => index_method_builtin(&receiver, &args).map(RuntimeValue::Nu),
-                "lower" => eval_string_method(&receiver, method, &args, |text, args| {
-                    let [] = args else {
-                        return Err(stone_error("lower", "lower() takes no arguments"));
-                    };
-                    Ok(Value::string(text.to_lowercase(), Span::unknown()))
-                })
-                .map(RuntimeValue::Nu),
-                "upper" => eval_string_method(&receiver, method, &args, |text, args| {
-                    let [] = args else {
-                        return Err(stone_error("upper", "upper() takes no arguments"));
-                    };
-                    Ok(Value::string(text.to_uppercase(), Span::unknown()))
-                })
-                .map(RuntimeValue::Nu),
-                "zfill" => eval_string_method(&receiver, method, &args, |text, args| {
-                    let [width] = args else {
-                        return Err(stone_error("zfill", "zfill() requires exactly one width"));
-                    };
-                    let width = value_to_i64(width, "zfill width")?;
-                    if width < 0 {
-                        return Err(stone_error("zfill", "width must be non-negative"));
-                    }
-                    let width = usize::try_from(width)
-                        .map_err(|_| stone_error("zfill", "width is too large"))?;
-                    Ok(Value::string(zfill(text, width), Span::unknown()))
-                })
-                .map(RuntimeValue::Nu),
-                "startswith" => eval_string_method(&receiver, method, &args, |text, args| {
-                    let [prefix] = args else {
-                        return Err(stone_error(
-                            "startswith",
-                            "startswith() requires exactly one argument",
-                        ));
-                    };
-                    let prefix = value_to_string(prefix, "startswith")?;
-                    Ok(Value::bool(text.starts_with(&prefix), Span::unknown()))
-                })
-                .map(RuntimeValue::Nu),
-                "endswith" => eval_string_method(&receiver, method, &args, |text, args| {
-                    let [suffix] = args else {
-                        return Err(stone_error(
-                            "endswith",
-                            "endswith() requires exactly one argument",
-                        ));
-                    };
-                    let suffix = value_to_string(suffix, "endswith")?;
-                    Ok(Value::bool(text.ends_with(&suffix), Span::unknown()))
-                })
-                .map(RuntimeValue::Nu),
                 other => Err(stone_error(
                     "method call",
                     format!("unsupported method `{other}`"),
@@ -8631,21 +8508,6 @@ fn value_to_iter_values(value: &RuntimeValue) -> Result<Vec<Value>, ShellError> 
         RuntimeValue::Callable(callable) => Err(stone_error(
             "iteration",
             format!("cannot iterate callable lambda#{}", callable.function_id),
-        )),
-    }
-}
-
-fn eval_string_method(
-    receiver: &Value,
-    method: &str,
-    args: &[Value],
-    f: impl FnOnce(&str, &[Value]) -> Result<Value, ShellError>,
-) -> Result<Value, ShellError> {
-    match receiver {
-        Value::String { val, .. } | Value::Glob { val, .. } => f(val, args),
-        other => Err(stone_error(
-            method,
-            format!("{} has no {method}()", other.get_type()),
         )),
     }
 }
