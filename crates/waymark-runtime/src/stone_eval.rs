@@ -12823,14 +12823,13 @@ emit({
 emit({
     "ok": result["ok"],
     "kind": result["explanation"]["kind"],
-    "module": result["explanation"]["module"],
-    "package": result["explanation"]["package"],
-    "install_argv": result["explanation"]["install_argv"],
     "runtime_kind": result["runtime"]["kind"],
     "helper_count": len(result["helpers"]),
     "helper": result["helpers"][0]["helper"],
     "helper_kind": result["helpers"][0]["kind"],
     "helper_family": result["helpers"][0]["family"],
+    "module": result["helpers"][0]["evidence"]["module"],
+    "package": result["helpers"][0]["evidence"]["package"],
     "next_check": result["helpers"][0]["next_checks"][0],
 })
 "#,
@@ -12838,7 +12837,7 @@ emit({
         let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
         let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
         assert_eq!(value["ok"], json_value!(false));
-        assert_eq!(value["kind"], json_value!("python_module_not_found"));
+        assert_eq!(value["kind"], json_value!("external_process_exit"));
         assert_eq!(
             value["module"],
             json_value!("stone_definitely_missing_module")
@@ -12846,16 +12845,6 @@ emit({
         assert_eq!(
             value["package"],
             json_value!("stone_definitely_missing_module")
-        );
-        assert_eq!(
-            value["install_argv"],
-            json_value!([
-                "python3",
-                "-m",
-                "pip",
-                "install",
-                "stone_definitely_missing_module"
-            ])
         );
         assert_eq!(value["runtime_kind"], json_value!("python"));
         assert_eq!(value["helper_count"], json_value!(1));
@@ -12879,25 +12868,34 @@ emit({
     #[cfg(not(target_os = "hermit"))]
     #[test]
     fn evaluates_run_builtin_python_missing_attribute_hint() -> Result<(), ShellError> {
-        let (engine_state, mut stack, _root) = test_engine("run-python-missing-attribute")?;
+        let (engine_state, mut stack, root) = test_engine("run-python-missing-attribute")?;
+        write_helper(
+            &root,
+            "python.stone",
+            include_str!("../../../.stone/helpers/python.stone"),
+        );
         let program = lower_source(
             r#"result = run(["python3", "-c", "import math; math.stone_definitely_missing_attribute"])
 emit({
     "ok": result["ok"],
     "kind": result["explanation"]["kind"],
-    "module": result["explanation"]["module"],
-    "attribute": result["explanation"]["attribute"],
-    "package": result["explanation"]["package"],
-    "inspect_argv": result["explanation"]["inspect_argv"],
     "runtime_kind": result["runtime"]["kind"],
+    "helper_count": len(result["helpers"]),
+    "helper_kind": result["helpers"][0]["kind"],
+    "module": result["helpers"][0]["evidence"]["module"],
+    "attribute": result["helpers"][0]["evidence"]["attribute"],
+    "package": result["helpers"][0]["evidence"]["package"],
+    "next_checks": result["helpers"][0]["next_checks"],
 })
 "#,
         )?;
         let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
         let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
         assert_eq!(value["ok"], json_value!(false));
+        assert_eq!(value["kind"], json_value!("external_process_exit"));
+        assert_eq!(value["helper_count"], json_value!(1));
         assert_eq!(
-            value["kind"],
+            value["helper_kind"],
             json_value!("python_module_attribute_missing")
         );
         assert_eq!(value["module"], json_value!("math"));
@@ -12907,7 +12905,7 @@ emit({
         );
         assert_eq!(value["package"], json_value!("math"));
         assert_eq!(
-            value["inspect_argv"],
+            value["next_checks"],
             json_value!([
                 ["python3", "-m", "pip", "show", "math"],
                 ["python3", "-m", "pip", "check"]
@@ -12920,29 +12918,41 @@ emit({
     #[cfg(not(target_os = "hermit"))]
     #[test]
     fn evaluates_run_builtin_pip_check_conflict_hint() -> Result<(), ShellError> {
-        let (engine_state, mut stack, _root) = test_engine("run-pip-check-conflict")?;
+        let (engine_state, mut stack, root) = test_engine("run-pip-check-conflict")?;
+        write_helper(
+            &root,
+            "python.stone",
+            include_str!("../../../.stone/helpers/python.stone"),
+        );
         let program = lower_source(
             r#"script = "import sys; print('demo 1.0 has requirement dep<2, but you have dep 3.0.', file=sys.stderr); sys.exit(1)"
 result = run(["python3", "-c", script])
 emit({
     "ok": result["ok"],
     "kind": result["explanation"]["kind"],
-    "dependent": result["explanation"]["dependent"],
-    "requirement": result["explanation"]["requirement"],
-    "installed": result["explanation"]["installed"],
-    "inspect_argv": result["explanation"]["inspect_argv"],
+    "helper_count": len(result["helpers"]),
+    "helper_kind": result["helpers"][0]["kind"],
+    "dependent": result["helpers"][0]["evidence"]["dependent"],
+    "requirement": result["helpers"][0]["evidence"]["requirement"],
+    "installed": result["helpers"][0]["evidence"]["installed"],
+    "next_checks": result["helpers"][0]["next_checks"],
 })
 "#,
         )?;
         let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
         let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
         assert_eq!(value["ok"], json_value!(false));
-        assert_eq!(value["kind"], json_value!("python_dependency_conflict"));
+        assert_eq!(value["kind"], json_value!("external_process_exit"));
+        assert_eq!(value["helper_count"], json_value!(1));
+        assert_eq!(
+            value["helper_kind"],
+            json_value!("python_dependency_conflict")
+        );
         assert_eq!(value["dependent"], json_value!("demo 1.0"));
         assert_eq!(value["requirement"], json_value!("dep<2"));
         assert_eq!(value["installed"], json_value!("dep 3.0"));
         assert_eq!(
-            value["inspect_argv"],
+            value["next_checks"],
             json_value!([
                 ["python3", "-m", "pip", "check"],
                 ["python3", "-m", "pip", "show", "demo 1.0", "dep"]
@@ -12957,6 +12967,11 @@ emit({
         use std::os::unix::fs::PermissionsExt;
 
         let (engine_state, mut stack, root) = test_engine("run-pip-resolution-failure")?;
+        write_helper(
+            &root,
+            "python.stone",
+            include_str!("../../../.stone/helpers/python.stone"),
+        );
         let pip = root.join("pip");
         fs::write(
             &pip,
@@ -12987,26 +13002,32 @@ emit({
 emit({{
     "ok": result["ok"],
     "kind": result["explanation"]["kind"],
-    "requested": result["explanation"]["requested"],
-    "evidence": result["explanation"]["evidence"],
-    "inspect_argv": result["explanation"]["inspect_argv"],
+    "helper_count": len(result["helpers"]),
+    "helper_kind": result["helpers"][0]["kind"],
+    "helper": result["helpers"][0]["helper"],
+    "requested": result["helpers"][0]["evidence"]["requested"],
+    "evidence": result["helpers"][0]["evidence"]["evidence"],
+    "next_checks": result["helpers"][0]["next_checks"],
 }})
 "#
         ))?;
         let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
         let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
         assert_eq!(value["ok"], json_value!(false));
+        assert_eq!(value["kind"], json_value!("external_process_exit"));
+        assert_eq!(value["helper_count"], json_value!(1));
         assert_eq!(
-            value["kind"],
+            value["helper_kind"],
             json_value!("python_package_resolution_failed")
         );
+        assert_eq!(value["helper"], json_value!("python.pip_after_failure"));
         assert_eq!(value["requested"], json_value!(["alpha==1", "beta==2"]));
         assert!(value["evidence"]
             .as_str()
             .expect("resolver evidence")
             .contains("ResolutionImpossible"));
         assert_eq!(
-            value["inspect_argv"],
+            value["next_checks"],
             json_value!([
                 ["python3", "-m", "pip", "check"],
                 ["python3", "-m", "pip", "debug"]

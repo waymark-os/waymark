@@ -20,38 +20,113 @@ def python_project_markers(cwd):
         markers.append(cwd + "/" + name)
     return markers
 
-def python_after_failure(event):
-    kind = event["explanation_kind"]
-    if kind != "python_module_not_found" and kind != "python_module_attribute_missing" and kind != "python_dependency_conflict" and kind != "python_package_resolution_failed":
-        return None
+def python_combined(event):
+    return event["stderr"] + "\n" + event["stdout"]
 
-    python = python_install_command(event)
-    explanation = event["explanation"]
-    checks = []
-    summary = "Python failed."
+def python_name_prefix(text):
+    rest = text.strip()
+    if rest.startswith("'"):
+        return split(slice(rest, 1), "'")[0]
+    if rest.startswith("\""):
+        return split(slice(rest, 1), "\"")[0]
+    parts = rest.split()
+    if len(parts) == 0:
+        return ""
+    return parts[0].strip(":,;")
 
-    if kind == "python_module_not_found":
-        module = explanation.get("module", "")
-        package = explanation.get("package", module)
-        if package:
-            checks.append([python, "-m", "pip", "show", package])
-        if module:
-            summary = "Module `" + module + "` is missing from the Python runtime used by this command."
-        else:
-            summary = "Python failed because an import was not available."
-    elif kind == "python_module_attribute_missing":
-        module = explanation.get("module", "")
-        package = explanation.get("package", module)
-        if package:
-            checks.append([python, "-m", "pip", "show", package])
-        summary = "Python imported the module but the requested attribute is absent; this points to an API/version mismatch."
-    elif kind == "python_dependency_conflict":
-        summary = "pip metadata reports an installed dependency conflict in this runtime."
-    elif kind == "python_package_resolution_failed":
-        summary = "pip could not resolve a compatible set of requested package versions."
+def python_missing_module(text):
+    markers = ["ModuleNotFoundError: No module named ", "ImportError: No module named "]
+    for marker in markers:
+        if marker in text:
+            candidate = python_name_prefix(split(text, marker)[1])
+            return split(candidate, ".")[0]
+    return ""
 
-    checks.append([python, "-m", "pip", "check"])
+def python_missing_attribute(text):
+    marker = "AttributeError: module "
+    if marker not in text:
+        return {}
+    rest = split(text, marker)[1]
+    module = python_name_prefix(rest)
+    if "has no attribute " not in rest:
+        return {}
+    attribute = python_name_prefix(split(rest, "has no attribute ")[1])
+    if module == "" or attribute == "":
+        return {}
+    return {"module": module, "attribute": attribute}
 
+def python_package_for_module(module):
+    packages = {
+        "PIL": "Pillow",
+        "cv2": "opencv-python",
+        "sklearn": "scikit-learn",
+        "skimage": "scikit-image",
+        "yaml": "PyYAML",
+        "bs4": "beautifulsoup4",
+        "Crypto": "pycryptodome",
+        "lxml": "lxml",
+        "numpy": "numpy",
+        "scipy": "scipy",
+        "pandas": "pandas",
+        "matplotlib": "matplotlib",
+        "seaborn": "seaborn",
+        "statsmodels": "statsmodels",
+        "sympy": "sympy",
+        "requests": "requests",
+        "pytest": "pytest",
+        "pyarrow": "pyarrow",
+        "duckdb": "duckdb",
+        "networkx": "networkx",
+    }
+    return packages.get(module, module)
+
+def python_pip_conflict(text):
+    for line in text.splitlines():
+        if " has requirement " in line and ", but you have " in line:
+            dependent = split(line, " has requirement ")[0].strip()
+            rest = split(line, " has requirement ")[1]
+            requirement = split(rest, ", but you have ")[0].strip()
+            installed = split(rest, ", but you have ")[1].strip().strip(".")
+            if dependent and requirement and installed:
+                return {"dependent": dependent, "requirement": requirement, "installed": installed}
+    return {}
+
+def python_pip_resolution_failed(text):
+    return "ResolutionImpossible" in text or "The conflict is caused by:" in text or "because these package versions have conflicting dependencies" in text or "because these package versions have incompatible dependencies" in text
+
+def python_pip_requested_packages(argv):
+    requested = []
+    pip_index = -1
+    for i, arg in enumerate(argv):
+        if arg == "pip" or arg == "pip3" or arg.endswith("/pip") or arg.endswith("/pip3"):
+            pip_index = i + 1
+        if i + 2 < len(argv) and argv[i + 1] == "-m" and argv[i + 2] == "pip":
+            pip_index = i + 3
+    if pip_index < 0 or pip_index >= len(argv):
+        return requested
+    if argv[pip_index] != "install":
+        return requested
+    skip_next = False
+    for arg in argv[pip_index + 1:]:
+        if skip_next:
+            skip_next = False
+        elif arg == "-r" or arg == "--requirement" or arg == "-c" or arg == "--constraint" or arg == "-i" or arg == "--index-url" or arg == "--extra-index-url" or arg == "-f" or arg == "--find-links":
+            skip_next = True
+        elif not arg.startswith("-"):
+            requested.append(arg)
+    return requested
+
+def python_pip_resolution_evidence(text):
+    lines = []
+    for line in text.splitlines():
+        trimmed = line.strip()
+        if "Cannot install" in trimmed or "ResolutionImpossible" in trimmed or "The conflict is caused by:" in trimmed or trimmed.startswith("ERROR:"):
+            lines.append(trimmed)
+    if len(lines) == 0:
+        return "pip reported a dependency resolution failure."
+    return "\n".join(lines[0:6])
+
+def python_observation(event, kind, summary, evidence, checks):
     return {
         "helper": "python.after_failure",
         "event": event["event"],
@@ -59,13 +134,84 @@ def python_after_failure(event):
         "kind": kind,
         "summary": summary,
         "exit_code": event["exit_code"],
-        "evidence": {
-            "python": python,
-            "project_markers": python_project_markers(event["cwd"]),
-            "stderr_excerpt": python_limit(event["stderr"]),
-        },
+        "evidence": evidence,
         "next_checks": checks,
     }
+
+def python_after_failure(event):
+    combined = python_combined(event)
+    python = python_install_command(event)
+
+    module = python_missing_module(combined)
+    if module:
+        package = python_package_for_module(module)
+        return python_observation(
+            event,
+            "python_module_not_found",
+            "Module `" + module + "` is missing from the Python runtime used by this command.",
+            {
+                "module": module,
+                "package": package,
+                "python": python,
+                "project_markers": python_project_markers(event["cwd"]),
+                "stderr_excerpt": python_limit(event["stderr"]),
+            },
+            [[python, "-m", "pip", "show", package], [python, "-m", "pip", "check"]],
+        )
+
+    attribute = python_missing_attribute(combined)
+    if len(attribute) > 0:
+        module = attribute["module"]
+        package = python_package_for_module(module)
+        return python_observation(
+            event,
+            "python_module_attribute_missing",
+            "Python imported the module but the requested attribute is absent; this points to an API/version mismatch.",
+            {
+                "module": module,
+                "attribute": attribute["attribute"],
+                "package": package,
+                "python": python,
+                "project_markers": python_project_markers(event["cwd"]),
+                "stderr_excerpt": python_limit(event["stderr"]),
+            },
+            [[python, "-m", "pip", "show", package], [python, "-m", "pip", "check"]],
+        )
+
+    conflict = python_pip_conflict(combined)
+    if len(conflict) > 0:
+        installed_package = conflict["installed"].split()[0]
+        return python_observation(
+            event,
+            "python_dependency_conflict",
+            "pip metadata reports an installed dependency conflict in this runtime.",
+            {
+                "dependent": conflict["dependent"],
+                "requirement": conflict["requirement"],
+                "installed": conflict["installed"],
+                "python": python,
+                "project_markers": python_project_markers(event["cwd"]),
+                "stderr_excerpt": python_limit(event["stderr"]),
+            },
+            [[python, "-m", "pip", "check"], [python, "-m", "pip", "show", conflict["dependent"], installed_package]],
+        )
+
+    if python_pip_resolution_failed(combined):
+        return python_observation(
+            event,
+            "python_package_resolution_failed",
+            "pip could not resolve a compatible set of requested package versions.",
+            {
+                "requested": python_pip_requested_packages(event["argv"]),
+                "evidence": python_pip_resolution_evidence(combined),
+                "python": python,
+                "project_markers": python_project_markers(event["cwd"]),
+                "stderr_excerpt": python_limit(event["stderr"]),
+            },
+            [[python, "-m", "pip", "check"], [python, "-m", "pip", "debug"]],
+        )
+
+    return None
 
 def python_pip_after_failure(event):
     observation = python_after_failure(event)
