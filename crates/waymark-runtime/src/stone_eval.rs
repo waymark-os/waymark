@@ -23,16 +23,16 @@ use crate::stone_ast::{
     Stmt, StoneFormatSpec, StoneType,
 };
 use crate::stone_builtins::{
-    add_values, bitwise_int_values, compare_values, div_values, find_method_builtin, first_builtin,
-    float_builtin, floor_div_values, format_builtin, index_method_builtin, int_builtin,
-    join_builtin, last_builtin, len_builtin, list_builtin, map_builtin_value, min_max_builtin,
-    mod_values, mul_values, neg_value, normalize_index, parse_float_builtin, parse_int_builtin,
-    range_builtin, record_method_builtin, round_builtin, set_builtin, shift_value, slice_builtin,
-    sort_builtin_values, sort_key_for_value, split_builtin, starts_with_builtin, str_builtin,
-    string_method_builtin, sub_values, subscript_builtin, sum_builtin, unique_builtin,
-    value_identity_key, value_to_bool, value_to_display_string, value_to_f64, value_to_i64,
-    value_to_limit, value_to_path_string, value_to_string, value_to_u64, value_truthy,
-    value_type_name, values_equal, where_builtin,
+    add_values, bitwise_int_values, compare_values, div_values, enumerate_builtin,
+    find_method_builtin, first_builtin, float_builtin, floor_div_values, format_builtin,
+    index_method_builtin, int_builtin, join_builtin, last_builtin, len_builtin, list_builtin,
+    map_builtin_value, min_max_builtin, mod_values, mul_values, neg_value, normalize_index,
+    parse_float_builtin, parse_int_builtin, range_builtin, record_method_builtin, round_builtin,
+    set_builtin, shift_value, slice_builtin, sort_builtin_values, sort_key_for_value,
+    split_builtin, starts_with_builtin, str_builtin, string_method_builtin, sub_values,
+    subscript_builtin, sum_builtin, unique_builtin, value_identity_key, value_to_bool,
+    value_to_display_string, value_to_f64, value_to_i64, value_to_limit, value_to_path_string,
+    value_to_string, value_to_u64, value_truthy, value_type_name, values_equal, where_builtin,
 };
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_file_ops::{
@@ -6271,21 +6271,11 @@ impl Evaluator<'_> {
             }
             _ => unreachable!(),
         };
-        let mut output = Vec::with_capacity(values.len());
-        for (offset, value) in values.into_iter().enumerate() {
-            let value = value.into_nu_value("enumerate")?;
-            let index = start
-                .checked_add(
-                    i64::try_from(offset)
-                        .map_err(|_| stone_error("enumerate", "index is too large"))?,
-                )
-                .ok_or_else(|| stone_error("enumerate", "index overflow"))?;
-            output.push(Value::list(
-                vec![Value::int(index, Span::unknown()), value],
-                Span::unknown(),
-            ));
-        }
-        Ok(RuntimeValue::Nu(Value::list(output, Span::unknown())))
+        let values = values
+            .into_iter()
+            .map(|value| value.into_nu_value("enumerate"))
+            .collect::<Result<Vec<_>, _>>()?;
+        enumerate_builtin(values, start).map(RuntimeValue::Nu)
     }
 
     fn eval_optional_index(

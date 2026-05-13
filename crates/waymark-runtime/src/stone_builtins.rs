@@ -214,6 +214,23 @@ pub(crate) fn div_values(left: &Value, right: &Value) -> Result<Value, ShellErro
     Ok(Value::float(left / right, Span::unknown()))
 }
 
+pub(crate) fn enumerate_builtin(values: Vec<Value>, start: i64) -> Result<Value, ShellError> {
+    let mut output = Vec::with_capacity(values.len());
+    for (offset, value) in values.into_iter().enumerate() {
+        let index = start
+            .checked_add(
+                i64::try_from(offset)
+                    .map_err(|_| stone_error("enumerate", "index is too large"))?,
+            )
+            .ok_or_else(|| stone_error("enumerate", "index overflow"))?;
+        output.push(Value::list(
+            vec![Value::int(index, Span::unknown()), value],
+            Span::unknown(),
+        ));
+    }
+    Ok(Value::list(output, Span::unknown()))
+}
+
 pub(crate) fn floor_div_values(left: &Value, right: &Value) -> Result<Value, ShellError> {
     match (left, right) {
         (Value::Int { val: left, .. }, Value::Int { val: right, .. }) => {
