@@ -132,6 +132,99 @@ impl GenericVmExprOp {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HotJsonlAggregationBody {
+    pub(crate) ops: Vec<HotJsonlBodyOp>,
+    pub(crate) nested_user_totals: Option<HotJsonlNestedUserTotals>,
+    pub(crate) user_name: String,
+    pub(crate) user_key: String,
+    pub(crate) user_has_default: bool,
+    pub(crate) user_default: String,
+    pub(crate) user_amounts_map: String,
+    pub(crate) user_amount_key: String,
+    pub(crate) user_amount_has_default: bool,
+    pub(crate) user_amount_default: f64,
+    pub(crate) user_items_map: String,
+    pub(crate) user_items_key: String,
+    pub(crate) user_items_has_default: bool,
+    pub(crate) user_items_default: i64,
+    pub(crate) users_list: Option<String>,
+    pub(crate) tags_key: String,
+    pub(crate) tags_default_empty: bool,
+    pub(crate) tag_counts_map: String,
+    pub(crate) tags_list: Option<String>,
+    pub(crate) row_count_local: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HotJsonlNestedUserTotals {
+    pub(crate) map_name: String,
+    pub(crate) amount_field: String,
+    pub(crate) items_field: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HotJsonlTracePlan {
+    pub(crate) user_name: String,
+    pub(crate) user_key: String,
+    pub(crate) user_has_default: bool,
+    pub(crate) user_default: String,
+    pub(crate) user_amounts_map: String,
+    pub(crate) user_amount_key: String,
+    pub(crate) user_amount_has_default: bool,
+    pub(crate) user_amount_default: f64,
+    pub(crate) user_items_map: String,
+    pub(crate) user_items_key: String,
+    pub(crate) user_items_has_default: bool,
+    pub(crate) user_items_default: i64,
+    pub(crate) users_list: Option<String>,
+    pub(crate) tags_key: String,
+    pub(crate) tags_default_empty: bool,
+    pub(crate) tag_counts_map: String,
+    pub(crate) tags_list: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum HotJsonlBodyOp {
+    JsonGetFields {
+        user_key: String,
+        amount_key: String,
+        items_key: String,
+        tags_key: String,
+    },
+    MapAddF64 {
+        map_name: String,
+        key_slot: HotJsonlSlot,
+        value_slot: HotJsonlSlot,
+        append_list: Option<String>,
+    },
+    MapAddI64 {
+        map_name: String,
+        key_slot: HotJsonlSlot,
+        value_slot: HotJsonlSlot,
+    },
+    ForEachJsonString {
+        array_slot: HotJsonlSlot,
+        item_slot: HotJsonlSlot,
+        body: Vec<HotJsonlBodyOp>,
+    },
+    MapAddI64Const {
+        map_name: String,
+        key_slot: HotJsonlSlot,
+        value: i64,
+        append_list: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HotJsonlSlot {
+    User,
+    Amount,
+    Items,
+    Tags,
+    Tag,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LoopIrBlock {
     pub(crate) ops: Vec<GenericVmOp>,
