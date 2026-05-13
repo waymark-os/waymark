@@ -15,6 +15,87 @@ pub(crate) fn int_builtin(value: &Value) -> Result<Value, ShellError> {
     value_to_int(value)
 }
 
+pub(crate) fn index_method_builtin(receiver: &Value, args: &[Value]) -> Result<Value, ShellError> {
+    match receiver {
+        Value::List { vals, .. } => {
+            let [needle] = args else {
+                return Err(stone_error(
+                    "index",
+                    "list index() requires exactly one argument",
+                ));
+            };
+            vals.iter()
+                .position(|value| values_equal(value, needle))
+                .map(|index| Value::int(index as i64, Span::unknown()))
+                .ok_or_else(|| stone_error("index", "value is not in list"))
+        }
+        Value::String { val, .. } | Value::Glob { val, .. } => {
+            let ([needle] | [needle, _]) = args else {
+                return Err(stone_error(
+                    "index",
+                    "string index() requires a substring and optional start",
+                ));
+            };
+            let needle = value_to_string(needle, "index")?;
+            let start = match args {
+                [_] => 0,
+                [_, start] => {
+                    let start = value_to_i64(start, "index")?;
+                    normalize_string_start(start, val.chars().count())?
+                }
+                _ => unreachable!(),
+            };
+            let prefix_len = val
+                .char_indices()
+                .nth(start)
+                .map(|(index, _)| index)
+                .unwrap_or_else(|| val.len());
+            val[prefix_len..]
+                .find(&needle)
+                .map(|index| Value::int((prefix_len + index) as i64, Span::unknown()))
+                .ok_or_else(|| stone_error("index", "substring not found"))
+        }
+        other => Err(stone_error(
+            "index",
+            format!("{} has no index()", other.get_type()),
+        )),
+    }
+}
+
+pub(crate) fn find_method_builtin(receiver: &Value, args: &[Value]) -> Result<Value, ShellError> {
+    let (Value::String { val, .. } | Value::Glob { val, .. }) = receiver else {
+        return Err(stone_error(
+            "find",
+            format!("{} has no find()", receiver.get_type()),
+        ));
+    };
+    let ([needle] | [needle, _]) = args else {
+        return Err(stone_error(
+            "find",
+            "string find() requires a substring and optional start",
+        ));
+    };
+    let needle = value_to_string(needle, "find")?;
+    let start = match args {
+        [_] => 0,
+        [_, start] => {
+            let start = value_to_i64(start, "find")?;
+            normalize_string_start(start, val.chars().count())?
+        }
+        _ => unreachable!(),
+    };
+    let prefix_len = val
+        .char_indices()
+        .nth(start)
+        .map(|(index, _)| index)
+        .unwrap_or_else(|| val.len());
+    let index = val[prefix_len..]
+        .find(&needle)
+        .map(|index| (prefix_len + index) as i64)
+        .unwrap_or(-1);
+    Ok(Value::int(index, Span::unknown()))
+}
+
 pub(crate) fn float_builtin(value: &Value) -> Result<Value, ShellError> {
     value_to_f64(value, "float").map(|value| Value::float(value, Span::unknown()))
 }
@@ -592,6 +673,40 @@ pub(crate) fn starts_with_builtin(text: &Value, prefix: &Value) -> Result<Value,
     Ok(Value::bool(text.starts_with(&prefix), Span::unknown()))
 }
 
+pub(crate) fn subscript_builtin(value: &Value, index: &Value) -> Result<Value, ShellError> {
+    match (value, index) {
+        (Value::Record { val, .. }, Value::String { val: key, .. })
+        | (Value::Record { val, .. }, Value::Glob { val: key, .. }) => val
+            .get(key)
+            .cloned()
+            .ok_or_else(|| stone_error("subscript", format!("record has no key `{key}`"))),
+        (Value::List { vals, .. }, Value::Int { val: index, .. }) => {
+            let index = normalize_index(*index, vals.len())?;
+            vals.get(index).cloned().ok_or_else(|| {
+                stone_error("subscript", format!("list index {index} is out of range"))
+            })
+        }
+        (Value::String { val, .. }, Value::Int { val: index, .. }) => {
+            let chars = val.chars().collect::<Vec<_>>();
+            let index = normalize_index(*index, chars.len())?;
+            chars
+                .get(index)
+                .map(|ch| Value::string(ch.to_string(), Span::unknown()))
+                .ok_or_else(|| {
+                    stone_error("subscript", format!("string index {index} is out of range"))
+                })
+        }
+        (value, index) => Err(stone_error(
+            "subscript",
+            format!(
+                "cannot index {} with {}",
+                value.get_type(),
+                index.get_type()
+            ),
+        )),
+    }
+}
+
 fn value_len(value: &Value) -> Result<i64, ShellError> {
     let len = match value {
         Value::List { vals, .. } => vals.len(),
@@ -625,6 +740,26 @@ fn normalize_slice_bounds(
     } else {
         Ok((start, end))
     }
+}
+
+pub(crate) fn normalize_index(index: i64, len: usize) -> Result<usize, ShellError> {
+    let len =
+        i64::try_from(len).map_err(|_| stone_error("subscript", "collection is too large"))?;
+    let normalized = if index < 0 { len + index } else { index };
+    if normalized < 0 || normalized >= len {
+        return Err(stone_error(
+            "subscript",
+            format!("index {index} is out of range"),
+        ));
+    }
+    usize::try_from(normalized).map_err(|_| stone_error("subscript", "index is too large"))
+}
+
+fn normalize_string_start(index: i64, len: usize) -> Result<usize, ShellError> {
+    let len = i64::try_from(len).map_err(|_| stone_error("index", "string is too large"))?;
+    let normalized = if index < 0 { len + index } else { index };
+    let clamped = normalized.clamp(0, len);
+    usize::try_from(clamped).map_err(|_| stone_error("index", "index is too large"))
 }
 
 fn format_template(template: &str, args: &[String]) -> Result<String, ShellError> {

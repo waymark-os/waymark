@@ -23,10 +23,11 @@ use crate::stone_ast::{
     Stmt, StoneFormatSpec, StoneType,
 };
 use crate::stone_builtins::{
-    first_builtin, float_builtin, format_builtin, int_builtin, join_builtin, last_builtin,
-    len_builtin, list_builtin, map_builtin_value, min_max_builtin, parse_float_builtin,
-    parse_int_builtin, range_builtin, record_method_builtin, round_builtin, set_builtin,
-    slice_builtin, split_builtin, starts_with_builtin, str_builtin, sum_builtin, unique_builtin,
+    find_method_builtin, first_builtin, float_builtin, format_builtin, index_method_builtin,
+    int_builtin, join_builtin, last_builtin, len_builtin, list_builtin, map_builtin_value,
+    min_max_builtin, normalize_index, parse_float_builtin, parse_int_builtin, range_builtin,
+    record_method_builtin, round_builtin, set_builtin, slice_builtin, split_builtin,
+    starts_with_builtin, str_builtin, subscript_builtin, sum_builtin, unique_builtin,
     value_identity_key, value_ordering, value_to_bool, value_to_display_string, value_to_f64,
     value_to_i64, value_to_limit, value_to_path_string, value_to_string, value_to_u64,
     value_type_name, values_equal, where_builtin,
@@ -3731,7 +3732,7 @@ impl Evaluator<'_> {
                 })?;
                 for index in indices {
                     let target = value.into_nu_value("augmented assignment")?;
-                    value = RuntimeValue::Nu(eval_subscript(&target, &index)?);
+                    value = RuntimeValue::Nu(subscript_builtin(&target, &index)?);
                 }
                 value.into_nu_value("augmented assignment")
             }
@@ -6571,8 +6572,8 @@ impl Evaluator<'_> {
                 "get" | "items" | "keys" | "values" => {
                     record_method_builtin(&receiver, method, &args).map(RuntimeValue::Nu)
                 }
-                "find" => eval_find_method(&receiver, &args).map(RuntimeValue::Nu),
-                "index" => eval_index_method(&receiver, &args).map(RuntimeValue::Nu),
+                "find" => find_method_builtin(&receiver, &args).map(RuntimeValue::Nu),
+                "index" => index_method_builtin(&receiver, &args).map(RuntimeValue::Nu),
                 "lower" => eval_string_method(&receiver, method, &args, |text, args| {
                     let [] = args else {
                         return Err(stone_error("lower", "lower() takes no arguments"));
@@ -7547,7 +7548,7 @@ fn eval_runtime_subscript(value: RuntimeValue, index: &Value) -> Result<RuntimeV
         RuntimeValue::JsonArrayView(view) => json_array_view_subscript(&view, index),
         other => {
             let value = other.into_nu_value("subscript")?;
-            eval_subscript(&value, index).map(RuntimeValue::Nu)
+            subscript_builtin(&value, index).map(RuntimeValue::Nu)
         }
     }
 }
@@ -8870,141 +8871,6 @@ fn eval_string_method(
             format!("{} has no {method}()", other.get_type()),
         )),
     }
-}
-
-fn eval_index_method(receiver: &Value, args: &[Value]) -> Result<Value, ShellError> {
-    match receiver {
-        Value::List { vals, .. } => {
-            let [needle] = args else {
-                return Err(stone_error(
-                    "index",
-                    "list index() requires exactly one argument",
-                ));
-            };
-            vals.iter()
-                .position(|value| values_equal(value, needle))
-                .map(|index| Value::int(index as i64, Span::unknown()))
-                .ok_or_else(|| stone_error("index", "value is not in list"))
-        }
-        Value::String { val, .. } | Value::Glob { val, .. } => {
-            let ([needle] | [needle, _]) = args else {
-                return Err(stone_error(
-                    "index",
-                    "string index() requires a substring and optional start",
-                ));
-            };
-            let needle = value_to_string(needle, "index")?;
-            let start = match args {
-                [_] => 0,
-                [_, start] => {
-                    let start = value_to_i64(start, "index")?;
-                    normalize_string_start(start, val.chars().count())?
-                }
-                _ => unreachable!(),
-            };
-            let prefix_len = val
-                .char_indices()
-                .nth(start)
-                .map(|(index, _)| index)
-                .unwrap_or_else(|| val.len());
-            val[prefix_len..]
-                .find(&needle)
-                .map(|index| Value::int((prefix_len + index) as i64, Span::unknown()))
-                .ok_or_else(|| stone_error("index", "substring not found"))
-        }
-        other => Err(stone_error(
-            "index",
-            format!("{} has no index()", other.get_type()),
-        )),
-    }
-}
-
-fn eval_find_method(receiver: &Value, args: &[Value]) -> Result<Value, ShellError> {
-    let (Value::String { val, .. } | Value::Glob { val, .. }) = receiver else {
-        return Err(stone_error(
-            "find",
-            format!("{} has no find()", receiver.get_type()),
-        ));
-    };
-    let ([needle] | [needle, _]) = args else {
-        return Err(stone_error(
-            "find",
-            "string find() requires a substring and optional start",
-        ));
-    };
-    let needle = value_to_string(needle, "find")?;
-    let start = match args {
-        [_] => 0,
-        [_, start] => {
-            let start = value_to_i64(start, "find")?;
-            normalize_string_start(start, val.chars().count())?
-        }
-        _ => unreachable!(),
-    };
-    let prefix_len = val
-        .char_indices()
-        .nth(start)
-        .map(|(index, _)| index)
-        .unwrap_or_else(|| val.len());
-    let index = val[prefix_len..]
-        .find(&needle)
-        .map(|index| (prefix_len + index) as i64)
-        .unwrap_or(-1);
-    Ok(Value::int(index, Span::unknown()))
-}
-
-fn eval_subscript(value: &Value, index: &Value) -> Result<Value, ShellError> {
-    match (value, index) {
-        (Value::Record { val, .. }, Value::String { val: key, .. })
-        | (Value::Record { val, .. }, Value::Glob { val: key, .. }) => val
-            .get(key)
-            .cloned()
-            .ok_or_else(|| stone_error("subscript", format!("record has no key `{key}`"))),
-        (Value::List { vals, .. }, Value::Int { val: index, .. }) => {
-            let index = normalize_index(*index, vals.len())?;
-            vals.get(index).cloned().ok_or_else(|| {
-                stone_error("subscript", format!("list index {index} is out of range"))
-            })
-        }
-        (Value::String { val, .. }, Value::Int { val: index, .. }) => {
-            let chars = val.chars().collect::<Vec<_>>();
-            let index = normalize_index(*index, chars.len())?;
-            chars
-                .get(index)
-                .map(|ch| Value::string(ch.to_string(), Span::unknown()))
-                .ok_or_else(|| {
-                    stone_error("subscript", format!("string index {index} is out of range"))
-                })
-        }
-        (value, index) => Err(stone_error(
-            "subscript",
-            format!(
-                "cannot index {} with {}",
-                value.get_type(),
-                index.get_type()
-            ),
-        )),
-    }
-}
-
-fn normalize_index(index: i64, len: usize) -> Result<usize, ShellError> {
-    let len =
-        i64::try_from(len).map_err(|_| stone_error("subscript", "collection is too large"))?;
-    let normalized = if index < 0 { len + index } else { index };
-    if normalized < 0 || normalized >= len {
-        return Err(stone_error(
-            "subscript",
-            format!("index {index} is out of range"),
-        ));
-    }
-    usize::try_from(normalized).map_err(|_| stone_error("subscript", "index is too large"))
-}
-
-fn normalize_string_start(index: i64, len: usize) -> Result<usize, ShellError> {
-    let len = i64::try_from(len).map_err(|_| stone_error("index", "string is too large"))?;
-    let normalized = if index < 0 { len + index } else { index };
-    let clamped = normalized.clamp(0, len);
-    usize::try_from(clamped).map_err(|_| stone_error("index", "index is too large"))
 }
 
 fn value_truthy(value: &Value) -> bool {
