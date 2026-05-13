@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::{
-    GenericLoopIter, GenericParseNumber, GenericVmConst, GenericVmExprBody, GenericVmExprOp,
-    GenericVmOp, LoopIrBlock, LoopIrDiagnostics, LoopIrFunction, LoopIrIteratorAdapter,
-    LoopIrSnapshot, LoopIrSnapshotBoundary, LoopIrTerminator, StoneIrFunction,
+    AccId, BlockId, ConstId, GenericLoopIter, GenericParseNumber, GenericVmConst,
+    GenericVmExprBody, GenericVmExprOp, GenericVmOp, HotJsonlBodyOp, HotJsonlSlot, LocalId,
+    LoopIrBlock, LoopIrDiagnostics, LoopIrFunction, LoopIrIteratorAdapter, LoopIrSnapshot,
+    LoopIrSnapshotBoundary, LoopIrTerminator, Reg, SnapshotId, StoneAccumulatorKind,
+    StoneAccumulatorSpec, StoneBlock, StoneConst, StoneFallbackTarget, StoneGuard, StoneGuardKind,
+    StoneIrFunction, StoneLocal, StoneOp, StoneSnapshot, StoneSnapshotAccumulator,
+    StoneSnapshotLocal, StoneTerminator,
 };
 
 use crate::stone_ast::{AssignTarget, AugOp, Expr, Stmt};
-use crate::stone_ir::{compile_hot_jsonl_vm_function, GenericLoopOp, GenericLoopPlan};
+use crate::stone_ir::{GenericLoopOp, GenericLoopPlan};
 
 pub(crate) fn compile_generic_vm_function(plan: &GenericLoopPlan) -> Option<LoopIrFunction> {
     let [op] = plan.ops.as_slice() else {
@@ -155,6 +159,280 @@ pub(crate) fn compile_hot_jsonl_loop_ir_function(
     let mut function = compile_hot_jsonl_vm_function(body)?;
     function.adapter = Some(loop_ir_iterator_adapter(plan));
     Some(function)
+}
+
+pub(crate) fn compile_hot_jsonl_vm_function(
+    body_plan: &super::HotJsonlAggregationBody,
+) -> Option<StoneIrFunction> {
+    let [HotJsonlBodyOp::JsonGetFields {
+        user_key,
+        amount_key,
+        items_key,
+        tags_key,
+    }, HotJsonlBodyOp::MapAddF64 {
+        map_name: user_amounts_map,
+        key_slot: HotJsonlSlot::User,
+        value_slot: HotJsonlSlot::Amount,
+        append_list: users_list,
+    }, HotJsonlBodyOp::MapAddI64 {
+        map_name: user_items_map,
+        key_slot: HotJsonlSlot::User,
+        value_slot: HotJsonlSlot::Items,
+    }, HotJsonlBodyOp::ForEachJsonString {
+        array_slot: HotJsonlSlot::Tags,
+        item_slot: HotJsonlSlot::Tag,
+        body,
+    }] = body_plan.ops.as_slice()
+    else {
+        return None;
+    };
+
+    let [HotJsonlBodyOp::MapAddI64Const {
+        map_name: tag_counts_map,
+        key_slot: HotJsonlSlot::Tag,
+        value: 1,
+        append_list: tags_list,
+    }] = body.as_slice()
+    else {
+        return None;
+    };
+
+    if user_key != &body_plan.user_key
+        || amount_key != &body_plan.user_amount_key
+        || items_key != &body_plan.user_items_key
+        || tags_key != &body_plan.tags_key
+        || user_amounts_map != &body_plan.user_amounts_map
+        || user_items_map != &body_plan.user_items_map
+        || users_list.as_deref() != body_plan.users_list.as_deref()
+        || tag_counts_map != &body_plan.tag_counts_map
+        || tags_list.as_deref() != body_plan.tags_list.as_deref()
+    {
+        return None;
+    }
+
+    let row = Reg(0);
+    let user = Reg(1);
+    let amount = Reg(2);
+    let items = Reg(3);
+    let tags = Reg(4);
+    let tag = Reg(5);
+
+    let user_key_const = ConstId(0);
+    let user_default_const = ConstId(1);
+    let amount_key_const = ConstId(2);
+    let items_key_const = ConstId(3);
+    let tags_key_const = ConstId(4);
+    let user_amounts_acc = AccId(0);
+    let user_items_acc = AccId(1);
+    let users_acc = AccId(2);
+    let tag_counts_acc = AccId(3);
+    let tags_acc = AccId(4);
+
+    let row_block = BlockId(0);
+    let tag_block = BlockId(1);
+    let done_block = BlockId(2);
+    let loop_snapshot = SnapshotId(0);
+
+    Some(StoneIrFunction {
+        adapter: None,
+        registers: 6,
+        constants: vec![
+            StoneConst::String(user_key.clone()),
+            StoneConst::String(body_plan.user_default.clone()),
+            StoneConst::String(amount_key.clone()),
+            StoneConst::String(items_key.clone()),
+            StoneConst::String(tags_key.clone()),
+            StoneConst::EmptyList,
+        ],
+        locals: vec![StoneLocal {
+            name: body_plan.user_name.clone(),
+        }],
+        accumulators: vec![
+            StoneAccumulatorSpec {
+                name: user_amounts_map.clone(),
+                kind: StoneAccumulatorKind::F64Map,
+            },
+            StoneAccumulatorSpec {
+                name: user_items_map.clone(),
+                kind: StoneAccumulatorKind::I64Map,
+            },
+            StoneAccumulatorSpec {
+                name: users_list.clone().unwrap_or_default(),
+                kind: StoneAccumulatorKind::StringList,
+            },
+            StoneAccumulatorSpec {
+                name: tag_counts_map.clone(),
+                kind: StoneAccumulatorKind::I64Map,
+            },
+            StoneAccumulatorSpec {
+                name: tags_list.clone().unwrap_or_default(),
+                kind: StoneAccumulatorKind::StringList,
+            },
+        ],
+        guards: vec![
+            StoneGuard {
+                kind: StoneGuardKind::InputIsJsonObject { reg: row },
+                snapshot: loop_snapshot,
+            },
+            StoneGuard {
+                kind: StoneGuardKind::AccumulatorShape {
+                    acc: user_amounts_acc,
+                    kind: StoneAccumulatorKind::F64Map,
+                },
+                snapshot: loop_snapshot,
+            },
+            StoneGuard {
+                kind: StoneGuardKind::AccumulatorShape {
+                    acc: user_items_acc,
+                    kind: StoneAccumulatorKind::I64Map,
+                },
+                snapshot: loop_snapshot,
+            },
+            StoneGuard {
+                kind: StoneGuardKind::AccumulatorShape {
+                    acc: users_acc,
+                    kind: StoneAccumulatorKind::StringList,
+                },
+                snapshot: loop_snapshot,
+            },
+            StoneGuard {
+                kind: StoneGuardKind::AccumulatorShape {
+                    acc: tag_counts_acc,
+                    kind: StoneAccumulatorKind::I64Map,
+                },
+                snapshot: loop_snapshot,
+            },
+            StoneGuard {
+                kind: StoneGuardKind::AccumulatorShape {
+                    acc: tags_acc,
+                    kind: StoneAccumulatorKind::StringList,
+                },
+                snapshot: loop_snapshot,
+            },
+        ],
+        snapshots: vec![StoneSnapshot {
+            locals: vec![StoneSnapshotLocal {
+                local: LocalId(0),
+                reg: user,
+            }],
+            accumulators: vec![
+                StoneSnapshotAccumulator {
+                    local_name: user_amounts_map.clone(),
+                    acc: user_amounts_acc,
+                },
+                StoneSnapshotAccumulator {
+                    local_name: user_items_map.clone(),
+                    acc: user_items_acc,
+                },
+                StoneSnapshotAccumulator {
+                    local_name: users_list.clone().unwrap_or_default(),
+                    acc: users_acc,
+                },
+                StoneSnapshotAccumulator {
+                    local_name: tag_counts_map.clone(),
+                    acc: tag_counts_acc,
+                },
+                StoneSnapshotAccumulator {
+                    local_name: tags_list.clone().unwrap_or_default(),
+                    acc: tags_acc,
+                },
+            ],
+            resume: StoneFallbackTarget::LoopBody,
+        }],
+        blocks: vec![
+            StoneBlock {
+                ops: vec![
+                    if body_plan.user_has_default {
+                        StoneOp::JsonGetStrDefault {
+                            dst: user,
+                            object: row,
+                            key: user_key_const,
+                            default: user_default_const,
+                        }
+                    } else {
+                        StoneOp::JsonGetValue {
+                            dst: user,
+                            object: row,
+                            key: user_key_const,
+                        }
+                    },
+                    if body_plan.user_amount_has_default {
+                        StoneOp::JsonGetF64Default {
+                            dst: amount,
+                            object: row,
+                            key: amount_key_const,
+                            default: body_plan.user_amount_default,
+                        }
+                    } else {
+                        StoneOp::JsonGetF64Required {
+                            dst: amount,
+                            object: row,
+                            key: amount_key_const,
+                        }
+                    },
+                    if body_plan.user_items_has_default {
+                        StoneOp::JsonGetI64Default {
+                            dst: items,
+                            object: row,
+                            key: items_key_const,
+                            default: body_plan.user_items_default,
+                        }
+                    } else {
+                        StoneOp::JsonGetI64Required {
+                            dst: items,
+                            object: row,
+                            key: items_key_const,
+                        }
+                    },
+                    if body_plan.tags_default_empty {
+                        StoneOp::JsonGetArrayDefault {
+                            dst: tags,
+                            object: row,
+                            key: tags_key_const,
+                        }
+                    } else {
+                        StoneOp::JsonGetArrayRequired {
+                            dst: tags,
+                            object: row,
+                            key: tags_key_const,
+                        }
+                    },
+                    StoneOp::MapAddF64 {
+                        map: user_amounts_acc,
+                        key: user,
+                        value: amount,
+                        append: users_list.as_ref().map(|_| users_acc),
+                    },
+                    StoneOp::MapAddI64 {
+                        map: user_items_acc,
+                        key: user,
+                        value: items,
+                        append: None,
+                    },
+                ],
+                terminator: StoneTerminator::JsonEachStrArray {
+                    array: tags,
+                    item: tag,
+                    body: tag_block,
+                    done: done_block,
+                },
+            },
+            StoneBlock {
+                ops: vec![StoneOp::MapAddI64Const {
+                    map: tag_counts_acc,
+                    key: tag,
+                    value: 1,
+                    append: tags_list.as_ref().map(|_| tags_acc),
+                }],
+                terminator: StoneTerminator::Jump { target: row_block },
+            },
+            StoneBlock {
+                ops: Vec::new(),
+                terminator: StoneTerminator::Return,
+            },
+        ],
+        entry: row_block,
+    })
 }
 
 pub(crate) fn loop_ir_iterator_adapter(plan: &GenericLoopPlan) -> LoopIrIteratorAdapter {
