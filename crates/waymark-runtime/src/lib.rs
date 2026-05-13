@@ -22,6 +22,7 @@ mod server;
 mod stone_ast;
 mod stone_eval;
 mod stone_frontend;
+mod stone_helpers;
 mod stone_ir;
 mod task;
 pub mod tools;
