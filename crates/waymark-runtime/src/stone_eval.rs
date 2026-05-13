@@ -1,21 +1,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use nu_protocol::{
     engine::{EngineState, Stack},
     shell_error::generic::GenericError,
     IntoPipelineData, PipelineData, Record, ShellError, Span, Value,
 };
-use regex::bytes::Regex;
 use serde_json::{json, Value as JsonValue};
 
 use crate::commands::{stone_help_overview, stone_help_topic};
@@ -23,6 +22,13 @@ use crate::json::{json_to_nu_value, nu_to_json_value};
 use crate::stone_ast::{
     AssignTarget, AugOp, BoolOp, Call, CompareOp, Expr, FormattedStringPart, FunctionDef, Program,
     Stmt, StoneFormatSpec, StoneType,
+};
+#[cfg(not(target_os = "hermit"))]
+use crate::stone_file_ops::{
+    diff_record_for_paths, ensure_parent_dir_for_write, find_records, io_read_stone_error,
+    io_stone_error, list_dir_records, read_csv_file, read_json_file, read_text as stone_read_text,
+    search_records, stat_record, write_json_file, write_jsonl_file, write_text as stone_write_text,
+    StoneFindOptions,
 };
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_helpers::{
@@ -52,10 +58,6 @@ use crate::stone_run::{
     stop_daemon_call_values, wait_port_call_values,
 };
 
-const STONE_MAX_FIND_ENTRIES: usize = 4096;
-const STONE_MAX_SEARCH_FILES: usize = 1024;
-const STONE_MAX_SEARCH_FILE_BYTES: u64 = 1024 * 1024;
-const STONE_MAX_SEARCH_MATCHES: usize = 1000;
 const STONE_LAST_RESULT_ENV: &str = "WAYMARK_LAST_RESULT_JSON";
 
 #[derive(Default)]
@@ -4675,7 +4677,7 @@ impl Evaluator<'_> {
             .into_nu_value("read_text")?;
         let path = value_to_path_string(&path, "read_text")?;
         let target = self.resolve_script_path(&path)?;
-        let text = stone_file_adapter().read_text(&target, max_bytes)?;
+        let text = stone_read_text(&target, max_bytes)?;
         Ok(RuntimeValue::Nu(Value::string(text, Span::unknown())))
     }
 
@@ -4711,11 +4713,7 @@ impl Evaluator<'_> {
             .eval_expr_value(value, PipelineData::empty())?
             .into_nu_value("write_text")?;
         let text = value_to_string(&value, "write_text")?;
-        let written = stone_file_adapter().write_text(&target, &text, append)?;
-        Ok(RuntimeValue::Nu(file_write_record(
-            written,
-            Span::unknown(),
-        )))
+        Ok(RuntimeValue::Nu(stone_write_text(&target, &text, append)?))
     }
 
     fn eval_stat_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -4745,8 +4743,7 @@ impl Evaluator<'_> {
             .into_nu_value("stat")?;
         let path = value_to_path_string(&path, "stat")?;
         let target = self.resolve_script_path(&path)?;
-        let stat = stone_file_adapter().stat(&target, follow_symlinks)?;
-        Ok(RuntimeValue::Nu(file_stat_record(stat, Span::unknown())))
+        Ok(RuntimeValue::Nu(stat_record(&target, follow_symlinks)?))
     }
 
     fn eval_list_dir_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -4777,20 +4774,7 @@ impl Evaluator<'_> {
                 .map(PathBuf::from)
                 .map_err(|err| stone_error("list_dir", err.to_string()))?,
         };
-        let mut entries = stone_file_adapter()
-            .list_dir(&target)?
-            .into_iter()
-            .map(|entry| file_entry_record(entry, Span::unknown()))
-            .collect::<Vec<_>>();
-        entries.sort_by(|left, right| {
-            left.get_data_by_key("name")
-                .and_then(|value| value.coerce_string().ok())
-                .cmp(
-                    &right
-                        .get_data_by_key("name")
-                        .and_then(|value| value.coerce_string().ok()),
-                )
-        });
+        let entries = list_dir_records(&target)?;
         Ok(RuntimeValue::Nu(Value::list(entries, Span::unknown())))
     }
 
@@ -4924,7 +4908,7 @@ impl Evaluator<'_> {
             ));
         }
 
-        let mut name_glob = rest
+        let name_glob = rest
             .first()
             .map(|expr| {
                 self.eval_expr_value(expr, PipelineData::empty())
@@ -4932,23 +4916,20 @@ impl Evaluator<'_> {
                     .and_then(|value| value_to_string(&value, "find"))
             })
             .transpose()?;
-        let mut name_contains: Option<String> = None;
-        let mut path_glob: Option<String> = None;
-        let mut kind_filter: Option<String> = None;
-        let mut min_size: Option<u64> = None;
-        let mut max_size: Option<u64> = None;
-        let mut modified_after_ms: Option<i64> = None;
-        let mut modified_before_ms: Option<i64> = None;
+        let mut options = StoneFindOptions {
+            name_glob,
+            ..StoneFindOptions::default()
+        };
         for (name, argument) in &call.named {
             let value = self
                 .eval_expr_value(argument, PipelineData::empty())?
                 .into_nu_value("find")?;
             match name.as_str() {
-                "name_glob" => name_glob = Some(value_to_string(&value, "find name_glob")?),
+                "name_glob" => options.name_glob = Some(value_to_string(&value, "find name_glob")?),
                 "name_contains" => {
-                    name_contains = Some(value_to_string(&value, "find name_contains")?)
+                    options.name_contains = Some(value_to_string(&value, "find name_contains")?)
                 }
-                "path_glob" => path_glob = Some(value_to_string(&value, "find path_glob")?),
+                "path_glob" => options.path_glob = Some(value_to_string(&value, "find path_glob")?),
                 "type" => {
                     let kind = value_to_string(&value, "find type")?;
                     if !matches!(kind.as_str(), "file" | "dir" | "symlink" | "any") {
@@ -4957,15 +4938,17 @@ impl Evaluator<'_> {
                             "type must be one of 'file', 'dir', 'symlink', or 'any'",
                         ));
                     }
-                    kind_filter = Some(kind);
+                    options.kind_filter = Some(kind);
                 }
-                "min_size" => min_size = Some(value_to_u64(&value, "find min_size")?),
-                "max_size" => max_size = Some(value_to_u64(&value, "find max_size")?),
+                "min_size" => options.min_size = Some(value_to_u64(&value, "find min_size")?),
+                "max_size" => options.max_size = Some(value_to_u64(&value, "find max_size")?),
                 "modified_after_ms" => {
-                    modified_after_ms = Some(value_to_i64(&value, "find modified_after_ms")?)
+                    options.modified_after_ms =
+                        Some(value_to_i64(&value, "find modified_after_ms")?)
                 }
                 "modified_before_ms" => {
-                    modified_before_ms = Some(value_to_i64(&value, "find modified_before_ms")?)
+                    options.modified_before_ms =
+                        Some(value_to_i64(&value, "find modified_before_ms")?)
                 }
                 other => {
                     return Err(stone_error(
@@ -4983,55 +4966,7 @@ impl Evaluator<'_> {
             .into_nu_value("find")?;
         let root = value_to_path_string(&root, "find")?;
         let root = self.resolve_script_path(&root)?;
-        let mut entries = Vec::new();
-        let mut queue = VecDeque::from([root]);
-
-        while let Some(path) = queue.pop_front() {
-            if entries.len() >= STONE_MAX_FIND_ENTRIES {
-                break;
-            }
-            let stat = stone_file_adapter().stat(&path, false)?;
-            let name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-            if stone_find_entry_matches(
-                &path,
-                &name,
-                &stat,
-                name_contains.as_deref(),
-                name_glob.as_deref(),
-                path_glob.as_deref(),
-                kind_filter.as_deref(),
-                min_size,
-                max_size,
-                modified_after_ms,
-                modified_before_ms,
-            ) {
-                entries.push(file_entry_record(
-                    StoneFileEntry {
-                        name,
-                        stat: stat.clone(),
-                    },
-                    Span::unknown(),
-                ));
-            }
-            if stat.is_dir {
-                for entry in stone_file_adapter().list_dir(&path)? {
-                    queue.push_back(entry.stat.path);
-                }
-            }
-        }
-
-        entries.sort_by(|left, right| {
-            left.get_data_by_key("path")
-                .and_then(|value| value.coerce_string().ok())
-                .cmp(
-                    &right
-                        .get_data_by_key("path")
-                        .and_then(|value| value.coerce_string().ok()),
-                )
-        });
+        let entries = find_records(root, options)?;
         Ok(RuntimeValue::Nu(Value::list(entries, Span::unknown())))
     }
 
@@ -5053,15 +4988,10 @@ impl Evaluator<'_> {
             .into_nu_value("diff")?;
         let left_path = self.resolve_script_path(&value_to_path_string(&left, "diff")?)?;
         let right_path = self.resolve_script_path(&value_to_path_string(&right, "diff")?)?;
-        let left_text = stone_file_adapter().read_text(&left_path, 4 * 1024 * 1024)?;
-        let right_text = stone_file_adapter().read_text(&right_path, 4 * 1024 * 1024)?;
-        Ok(RuntimeValue::Nu(stone_diff_record(
+        Ok(RuntimeValue::Nu(diff_record_for_paths(
             &left_path,
             &right_path,
-            &left_text,
-            &right_text,
-            Span::unknown(),
-        )))
+        )?))
     }
 
     fn eval_read_json_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5082,11 +5012,7 @@ impl Evaluator<'_> {
             .into_nu_value("read_json")?;
         let path = value_to_path_string(&path, "read_json")?;
         let target = self.resolve_script_path(&path)?;
-        let bytes =
-            fs::read(&target).map_err(|err| io_read_stone_error("read_json", err, &target))?;
-        let json = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .map_err(|err| stone_error("read_json", format!("{}: {}", target.display(), err)))?;
-        Ok(RuntimeValue::Nu(json_to_nu_value(json, Span::unknown())))
+        Ok(RuntimeValue::Nu(read_json_file(&target)?))
     }
 
     fn eval_read_csv_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5102,10 +5028,7 @@ impl Evaluator<'_> {
         let path = value_to_path_string(&path, "read_csv")?;
         let target = self.resolve_script_path(&path)?;
         let limit = self.eval_structured_read_limit("read_csv", call)?;
-        let text = fs::read_to_string(&target)
-            .map_err(|err| io_read_stone_error("read_csv", err, &target))?;
-        let rows = parse_csv_records(&text, limit)?;
-        Ok(RuntimeValue::Nu(Value::list(rows, Span::unknown())))
+        Ok(RuntimeValue::Nu(read_csv_file(&target, limit)?))
     }
 
     fn eval_read_jsonl_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5207,17 +5130,7 @@ impl Evaluator<'_> {
         let value = self
             .eval_expr_value(value, PipelineData::empty())?
             .into_nu_value("write_json")?;
-        let json = nu_to_json_value(&value);
-        let text = serde_json::to_string_pretty(&json)
-            .map_err(|err| stone_error("write_json", err.to_string()))?
-            + "\n";
-        ensure_parent_dir_for_write("write_json", &target)?;
-        fs::write(&target, text.as_bytes())
-            .map_err(|err| io_stone_error("write_json", err, &target))?;
-        Ok(RuntimeValue::Nu(Value::int(
-            i64::try_from(text.len()).unwrap_or(i64::MAX),
-            Span::unknown(),
-        )))
+        Ok(RuntimeValue::Nu(write_json_file(&target, &value)?))
     }
 
     fn eval_write_jsonl_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5247,22 +5160,7 @@ impl Evaluator<'_> {
                 format!("expected list, got {}", rows.get_type()),
             ));
         };
-        let mut text = String::new();
-        for value in vals {
-            let json = nu_to_json_value(&value);
-            text.push_str(
-                &serde_json::to_string(&json)
-                    .map_err(|err| stone_error("write_jsonl", err.to_string()))?,
-            );
-            text.push('\n');
-        }
-        ensure_parent_dir_for_write("write_jsonl", &target)?;
-        fs::write(&target, text.as_bytes())
-            .map_err(|err| io_stone_error("write_jsonl", err, &target))?;
-        Ok(RuntimeValue::Nu(Value::int(
-            i64::try_from(text.len()).unwrap_or(i64::MAX),
-            Span::unknown(),
-        )))
+        Ok(RuntimeValue::Nu(write_jsonl_file(&target, vals)?))
     }
 
     fn eval_first_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5567,35 +5465,8 @@ impl Evaluator<'_> {
         if needle.is_empty() {
             return Err(stone_error("search", "needle must not be empty"));
         }
-        let matcher = StoneSearchMatcher::new(&needle, regex)?;
         let root = self.resolve_script_path(&root)?;
-        let mut files_visited = 0usize;
-        let mut matches = Vec::new();
-        let mut queue = VecDeque::from([root]);
-        while let Some(path) = queue.pop_front() {
-            if files_visited >= STONE_MAX_SEARCH_FILES || matches.len() >= STONE_MAX_SEARCH_MATCHES
-            {
-                break;
-            }
-            let stat = stone_file_adapter().stat(&path, false)?;
-            if stat.is_dir {
-                for entry in stone_file_adapter().list_dir(&path)? {
-                    queue.push_back(entry.stat.path);
-                }
-                continue;
-            }
-            if !stat.is_file || stat.size > STONE_MAX_SEARCH_FILE_BYTES {
-                continue;
-            }
-            files_visited += 1;
-            let Ok(bytes) = fs::read(&path) else {
-                continue;
-            };
-            if stone_bytes_look_binary(&bytes) || !matcher.is_match(&bytes) {
-                continue;
-            }
-            push_stone_search_line_matches(&mut matches, &path, &bytes, &matcher);
-        }
+        let matches = search_records(root, &needle, regex)?;
         Ok(RuntimeValue::Nu(Value::list(matches, Span::unknown())))
     }
 
@@ -7902,73 +7773,6 @@ fn value_to_save_bytes(value: &Value) -> Result<Vec<u8>, ShellError> {
     }
 }
 
-fn parse_csv_records(text: &str, limit: Option<usize>) -> Result<Vec<Value>, ShellError> {
-    let mut lines = text.lines();
-    let Some(header_line) = lines.next() else {
-        return Ok(Vec::new());
-    };
-    let headers = parse_csv_line(header_line)?;
-    let mut rows = Vec::new();
-    for (line_index, line) in lines.enumerate() {
-        if limit.is_some_and(|limit| rows.len() >= limit) {
-            break;
-        }
-        if line.is_empty() {
-            continue;
-        }
-        let fields = parse_csv_line(line).map_err(|err| {
-            stone_error(
-                "read_csv",
-                format!("line {}: {}", line_index + 2, shell_error_message(&err)),
-            )
-        })?;
-        if fields.len() != headers.len() {
-            return Err(stone_error(
-                "read_csv",
-                format!(
-                    "line {} has {} field(s), expected {}",
-                    line_index + 2,
-                    fields.len(),
-                    headers.len()
-                ),
-            ));
-        }
-        let mut record = Record::with_capacity(headers.len());
-        for (header, field) in headers.iter().zip(fields) {
-            record.push(header.clone(), Value::string(field, Span::unknown()));
-        }
-        rows.push(Value::record(record, Span::unknown()));
-    }
-    Ok(rows)
-}
-
-fn parse_csv_line(line: &str) -> Result<Vec<String>, ShellError> {
-    let mut fields = Vec::new();
-    let mut field = String::new();
-    let mut chars = line.chars().peekable();
-    let mut in_quotes = false;
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' if in_quotes && chars.peek() == Some(&'"') => {
-                chars.next();
-                field.push('"');
-            }
-            '"' => {
-                in_quotes = !in_quotes;
-            }
-            ',' if !in_quotes => {
-                fields.push(std::mem::take(&mut field));
-            }
-            _ => field.push(ch),
-        }
-    }
-    if in_quotes {
-        return Err(stone_error("read_csv", "unterminated quoted field"));
-    }
-    fields.push(field);
-    Ok(fields)
-}
-
 fn jsonl_rows_from_bytes(bytes: Vec<u8>, limit: Option<usize>, source: String) -> JsonlRows {
     let bytes: Arc<[u8]> = Arc::from(bytes);
     let mut lines = Vec::new();
@@ -9112,13 +8916,6 @@ fn sort_key_kind(value: &Value) -> Result<SortKeyKind, ShellError> {
     }
 }
 
-fn shell_error_message(error: &ShellError) -> String {
-    match error {
-        ShellError::Generic(error) => error.msg.to_string(),
-        other => other.to_string(),
-    }
-}
-
 fn is_map_builtin_name(func_name: &str) -> bool {
     matches!(func_name, "int" | "float" | "json_dumps" | "str")
 }
@@ -9942,270 +9739,6 @@ fn values_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
-fn stone_diff_record(
-    left_path: &Path,
-    right_path: &Path,
-    left_text: &str,
-    right_text: &str,
-    span: Span,
-) -> Value {
-    let left_lines = left_text.lines().collect::<Vec<_>>();
-    let right_lines = right_text.lines().collect::<Vec<_>>();
-    let ops = stone_diff_ops(&left_lines, &right_lines);
-    let mut hunks = Vec::new();
-    let mut current = StoneDiffHunk::new(1, 1);
-    let mut old_line = 1usize;
-    let mut new_line = 1usize;
-    let mut changed = false;
-
-    for op in ops {
-        match op {
-            StoneDiffOp::Equal => {
-                if current.has_changes {
-                    hunks.push(current.to_value(span));
-                    current = StoneDiffHunk::new(old_line, new_line);
-                }
-                old_line += 1;
-                new_line += 1;
-                current.old_start = old_line;
-                current.new_start = new_line;
-            }
-            StoneDiffOp::Delete(text) => {
-                changed = true;
-                current.has_changes = true;
-                current.old_lines += 1;
-                current
-                    .lines
-                    .push(stone_diff_line("-", Some(old_line), None, text, span));
-                old_line += 1;
-            }
-            StoneDiffOp::Insert(text) => {
-                changed = true;
-                current.has_changes = true;
-                current.new_lines += 1;
-                current
-                    .lines
-                    .push(stone_diff_line("+", None, Some(new_line), text, span));
-                new_line += 1;
-            }
-        }
-    }
-    if current.has_changes {
-        hunks.push(current.to_value(span));
-    }
-
-    let mut record = Record::new();
-    record.push("changed", Value::bool(changed, span));
-    record.push(
-        "path_a",
-        Value::string(left_path.display().to_string(), span),
-    );
-    record.push(
-        "path_b",
-        Value::string(right_path.display().to_string(), span),
-    );
-    record.push("hunks", Value::list(hunks, span));
-    Value::record(record, span)
-}
-
-#[derive(Debug)]
-enum StoneDiffOp<'a> {
-    Equal,
-    Delete(&'a str),
-    Insert(&'a str),
-}
-
-struct StoneDiffHunk {
-    old_start: usize,
-    new_start: usize,
-    old_lines: usize,
-    new_lines: usize,
-    has_changes: bool,
-    lines: Vec<Value>,
-}
-
-impl StoneDiffHunk {
-    fn new(old_start: usize, new_start: usize) -> Self {
-        Self {
-            old_start,
-            new_start,
-            old_lines: 0,
-            new_lines: 0,
-            has_changes: false,
-            lines: Vec::new(),
-        }
-    }
-
-    fn to_value(self, span: Span) -> Value {
-        let mut record = Record::new();
-        record.push(
-            "old_start",
-            Value::int(i64::try_from(self.old_start).unwrap_or(i64::MAX), span),
-        );
-        record.push(
-            "old_lines",
-            Value::int(i64::try_from(self.old_lines).unwrap_or(i64::MAX), span),
-        );
-        record.push(
-            "new_start",
-            Value::int(i64::try_from(self.new_start).unwrap_or(i64::MAX), span),
-        );
-        record.push(
-            "new_lines",
-            Value::int(i64::try_from(self.new_lines).unwrap_or(i64::MAX), span),
-        );
-        record.push("lines", Value::list(self.lines, span));
-        Value::record(record, span)
-    }
-}
-
-fn stone_diff_line(
-    kind: &str,
-    old_line: Option<usize>,
-    new_line: Option<usize>,
-    text: &str,
-    span: Span,
-) -> Value {
-    let mut record = Record::new();
-    record.push("kind", Value::string(kind, span));
-    record.push(
-        "old_line",
-        old_line
-            .map(|line| Value::int(i64::try_from(line).unwrap_or(i64::MAX), span))
-            .unwrap_or_else(|| Value::nothing(span)),
-    );
-    record.push(
-        "new_line",
-        new_line
-            .map(|line| Value::int(i64::try_from(line).unwrap_or(i64::MAX), span))
-            .unwrap_or_else(|| Value::nothing(span)),
-    );
-    record.push("text", Value::string(text.to_owned(), span));
-    Value::record(record, span)
-}
-
-fn stone_diff_ops<'a>(left: &[&'a str], right: &[&'a str]) -> Vec<StoneDiffOp<'a>> {
-    let mut lcs = vec![vec![0usize; right.len() + 1]; left.len() + 1];
-    for i in (0..left.len()).rev() {
-        for j in (0..right.len()).rev() {
-            lcs[i][j] = if left[i] == right[j] {
-                lcs[i + 1][j + 1] + 1
-            } else {
-                lcs[i + 1][j].max(lcs[i][j + 1])
-            };
-        }
-    }
-
-    let mut ops = Vec::new();
-    let (mut i, mut j) = (0usize, 0usize);
-    while i < left.len() && j < right.len() {
-        if left[i] == right[j] {
-            ops.push(StoneDiffOp::Equal);
-            i += 1;
-            j += 1;
-        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
-            ops.push(StoneDiffOp::Delete(left[i]));
-            i += 1;
-        } else {
-            ops.push(StoneDiffOp::Insert(right[j]));
-            j += 1;
-        }
-    }
-    while i < left.len() {
-        ops.push(StoneDiffOp::Delete(left[i]));
-        i += 1;
-    }
-    while j < right.len() {
-        ops.push(StoneDiffOp::Insert(right[j]));
-        j += 1;
-    }
-    ops
-}
-
-fn stone_name_matches(name: &str, contains: Option<&str>, glob: Option<&str>) -> bool {
-    contains.is_none_or(|needle| name.contains(needle))
-        && glob.is_none_or(|pattern| stone_wildcard_match(pattern, name))
-}
-
-fn stone_find_entry_matches(
-    path: &Path,
-    name: &str,
-    stat: &StoneFileStat,
-    contains: Option<&str>,
-    name_glob: Option<&str>,
-    path_glob: Option<&str>,
-    kind_filter: Option<&str>,
-    min_size: Option<u64>,
-    max_size: Option<u64>,
-    modified_after_ms: Option<i64>,
-    modified_before_ms: Option<i64>,
-) -> bool {
-    stone_name_matches(name, contains, name_glob)
-        && path_glob.is_none_or(|pattern| stone_path_glob_match(pattern, path))
-        && kind_filter.is_none_or(|kind| match kind {
-            "file" => stat.is_file,
-            "dir" => stat.is_dir,
-            "symlink" => stat.is_symlink,
-            "any" => true,
-            _ => false,
-        })
-        && min_size.is_none_or(|size| stat.size >= size)
-        && max_size.is_none_or(|size| stat.size <= size)
-        && modified_after_ms.is_none_or(|after| stat.modified_ms.is_some_and(|ms| ms > after))
-        && modified_before_ms.is_none_or(|before| stat.modified_ms.is_some_and(|ms| ms < before))
-}
-
-fn stone_path_glob_match(pattern: &str, path: &Path) -> bool {
-    let text = path.to_string_lossy().replace('\\', "/");
-    if let Some(suffix) = pattern.strip_prefix("**/") {
-        return stone_wildcard_match(pattern, &text)
-            || stone_wildcard_match(suffix, &text)
-            || path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| stone_wildcard_match(suffix, name));
-    }
-    if stone_wildcard_match(pattern, &text) {
-        return true;
-    }
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| stone_wildcard_match(pattern, name))
-}
-
-fn stone_wildcard_match(pattern: &str, text: &str) -> bool {
-    let pattern = pattern.as_bytes();
-    let text = text.as_bytes();
-    let (mut pattern_index, mut text_index) = (0usize, 0usize);
-    let mut star_index = None;
-    let mut star_text_index = 0usize;
-
-    while text_index < text.len() {
-        if pattern_index < pattern.len()
-            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == text[text_index])
-        {
-            pattern_index += 1;
-            text_index += 1;
-        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
-            star_index = Some(pattern_index);
-            pattern_index += 1;
-            star_text_index = text_index;
-        } else if let Some(star) = star_index {
-            pattern_index = star + 1;
-            star_text_index += 1;
-            text_index = star_text_index;
-        } else {
-            return false;
-        }
-    }
-
-    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
-        pattern_index += 1;
-    }
-
-    pattern_index == pattern.len()
-}
-
 fn value_ordering(left: &Value, right: &Value) -> Result<std::cmp::Ordering, ShellError> {
     match (left, right) {
         (Value::Int { val: left, .. }, Value::Int { val: right, .. }) => Ok(left.cmp(right)),
@@ -10270,402 +9803,6 @@ fn file_method_error(method: &str) -> ShellError {
         None => format!("file object has no {method}()"),
     };
     stone_error("file method", message)
-}
-
-trait StoneFileAdapter {
-    fn read_text(&self, path: &Path, max_bytes: usize) -> Result<String, ShellError>;
-    fn write_text(
-        &self,
-        path: &Path,
-        text: &str,
-        append: bool,
-    ) -> Result<StoneFileWrite, ShellError>;
-    fn stat(&self, path: &Path, follow_symlinks: bool) -> Result<StoneFileStat, ShellError>;
-    fn list_dir(&self, path: &Path) -> Result<Vec<StoneFileEntry>, ShellError>;
-}
-
-#[derive(Clone, Debug)]
-struct StoneFileEntry {
-    name: String,
-    stat: StoneFileStat,
-}
-
-#[derive(Clone, Debug)]
-struct StoneFileStat {
-    path: PathBuf,
-    kind: &'static str,
-    is_file: bool,
-    is_dir: bool,
-    is_symlink: bool,
-    readonly: bool,
-    size: u64,
-    modified_ms: Option<i64>,
-    accessed_ms: Option<i64>,
-    created_ms: Option<i64>,
-}
-
-#[derive(Clone, Debug)]
-struct StoneFileWrite {
-    path: PathBuf,
-    bytes: usize,
-    append: bool,
-}
-
-struct StdStoneFileAdapter;
-
-static STD_STONE_FILE_ADAPTER: StdStoneFileAdapter = StdStoneFileAdapter;
-
-fn stone_file_adapter() -> &'static dyn StoneFileAdapter {
-    &STD_STONE_FILE_ADAPTER
-}
-
-impl StoneFileAdapter for StdStoneFileAdapter {
-    fn read_text(&self, path: &Path, max_bytes: usize) -> Result<String, ShellError> {
-        let mut bytes =
-            fs::read(path).map_err(|err| io_read_stone_error("read_text", err, path))?;
-        if bytes.len() > max_bytes {
-            bytes.truncate(max_bytes);
-            while std::str::from_utf8(&bytes).is_err() && !bytes.is_empty() {
-                bytes.pop();
-            }
-        }
-        String::from_utf8(bytes).map_err(|err| {
-            stone_error(
-                "read_text",
-                format!("{}: invalid UTF-8: {err}", path.display()),
-            )
-        })
-    }
-
-    fn write_text(
-        &self,
-        path: &Path,
-        text: &str,
-        append: bool,
-    ) -> Result<StoneFileWrite, ShellError> {
-        ensure_parent_dir_for_write("write_text", path)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(append)
-            .truncate(!append)
-            .open(path)
-            .map_err(|err| io_stone_error("write_text", err, path))?;
-        file.write_all(text.as_bytes())
-            .map_err(|err| io_stone_error("write_text", err, path))?;
-        file.flush()
-            .map_err(|err| io_stone_error("write_text", err, path))?;
-        Ok(StoneFileWrite {
-            path: path.to_path_buf(),
-            bytes: text.len(),
-            append,
-        })
-    }
-
-    fn stat(&self, path: &Path, follow_symlinks: bool) -> Result<StoneFileStat, ShellError> {
-        let metadata = if follow_symlinks {
-            fs::metadata(path)
-        } else {
-            fs::symlink_metadata(path)
-        }
-        .map_err(|err| io_read_stone_error("stat", err, path))?;
-        Ok(file_stat_from_metadata(path.to_path_buf(), &metadata))
-    }
-
-    fn list_dir(&self, path: &Path) -> Result<Vec<StoneFileEntry>, ShellError> {
-        let mut entries = fs::read_dir(path)
-            .map_err(|err| io_read_stone_error("list_dir", err, path))?
-            .map(|entry| {
-                let entry = entry.map_err(|err| io_stone_error("list_dir", err, path))?;
-                let path = entry.path();
-                let metadata = fs::symlink_metadata(&path)
-                    .map_err(|err| io_stone_error("list_dir", err, &path))?;
-                Ok(StoneFileEntry {
-                    name: entry.file_name().to_string_lossy().into_owned(),
-                    stat: file_stat_from_metadata(path, &metadata),
-                })
-            })
-            .collect::<Result<Vec<_>, ShellError>>()?;
-        entries.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(entries)
-    }
-}
-
-fn file_stat_from_metadata(path: PathBuf, metadata: &fs::Metadata) -> StoneFileStat {
-    StoneFileStat {
-        path,
-        kind: file_type_name(metadata),
-        is_file: metadata.is_file(),
-        is_dir: metadata.is_dir(),
-        is_symlink: metadata.file_type().is_symlink(),
-        readonly: metadata.permissions().readonly(),
-        size: metadata.len(),
-        modified_ms: system_time_ms(metadata.modified().ok()),
-        accessed_ms: system_time_ms(metadata.accessed().ok()),
-        created_ms: system_time_ms(metadata.created().ok()),
-    }
-}
-
-fn file_entry_record(entry: StoneFileEntry, span: Span) -> Value {
-    let mut record = Record::with_capacity(7);
-    record.push("name", Value::string(entry.name, span));
-    record.push(
-        "path",
-        Value::string(entry.stat.path.display().to_string(), span),
-    );
-    record.push("type", Value::string(entry.stat.kind, span));
-    record.push("is_file", Value::bool(entry.stat.is_file, span));
-    record.push("is_dir", Value::bool(entry.stat.is_dir, span));
-    record.push("is_symlink", Value::bool(entry.stat.is_symlink, span));
-    record.push(
-        "size",
-        Value::int(i64::try_from(entry.stat.size).unwrap_or(i64::MAX), span),
-    );
-    Value::record(record, span)
-}
-
-fn search_match_record(path: &Path, line: usize, text: &str) -> Value {
-    let span = Span::unknown();
-    let mut record = Record::with_capacity(3);
-    record.push("path", Value::string(path.display().to_string(), span));
-    record.push(
-        "line",
-        Value::int(i64::try_from(line).unwrap_or(i64::MAX), span),
-    );
-    record.push("text", Value::string(text.to_string(), span));
-    Value::record(record, span)
-}
-
-enum StoneSearchMatcher {
-    Literal(Vec<u8>),
-    Regex(Regex),
-}
-
-impl StoneSearchMatcher {
-    fn new(needle: &str, regex: bool) -> Result<Self, ShellError> {
-        if regex {
-            Regex::new(needle)
-                .map(Self::Regex)
-                .map_err(|err| stone_error("search", format!("invalid regex: {err}")))
-        } else {
-            Ok(Self::Literal(needle.as_bytes().to_vec()))
-        }
-    }
-
-    fn is_match(&self, bytes: &[u8]) -> bool {
-        match self {
-            Self::Literal(needle) => memchr::memmem::Finder::new(needle).find(bytes).is_some(),
-            Self::Regex(regex) => regex.is_match(bytes),
-        }
-    }
-}
-
-fn push_stone_search_line_matches(
-    matches: &mut Vec<Value>,
-    path: &Path,
-    content: &[u8],
-    matcher: &StoneSearchMatcher,
-) {
-    let mut line_number = 1usize;
-    let mut start = 0usize;
-    for end in memchr::memchr_iter(b'\n', content).chain(std::iter::once(content.len())) {
-        let line = trim_byte_line_end(&content[start..end]);
-        if matcher.is_match(line) {
-            matches.push(search_match_record(
-                path,
-                line_number,
-                &String::from_utf8_lossy(line),
-            ));
-            if matches.len() >= STONE_MAX_SEARCH_MATCHES {
-                break;
-            }
-        }
-        if end == content.len() {
-            break;
-        }
-        start = end + 1;
-        line_number += 1;
-    }
-}
-
-fn trim_byte_line_end(line: &[u8]) -> &[u8] {
-    line.strip_suffix(b"\r").unwrap_or(line)
-}
-
-fn stone_bytes_look_binary(bytes: &[u8]) -> bool {
-    bytes.iter().take(1024).any(|byte| *byte == 0)
-}
-
-fn file_stat_record(stat: StoneFileStat, span: Span) -> Value {
-    let mut record = Record::with_capacity(10);
-    record.push("path", Value::string(stat.path.display().to_string(), span));
-    record.push("type", Value::string(stat.kind, span));
-    record.push("is_file", Value::bool(stat.is_file, span));
-    record.push("is_dir", Value::bool(stat.is_dir, span));
-    record.push("is_symlink", Value::bool(stat.is_symlink, span));
-    record.push("readonly", Value::bool(stat.readonly, span));
-    record.push(
-        "size",
-        Value::int(i64::try_from(stat.size).unwrap_or(i64::MAX), span),
-    );
-    record.push("modified_ms", optional_i64_value(stat.modified_ms, span));
-    record.push("accessed_ms", optional_i64_value(stat.accessed_ms, span));
-    record.push("created_ms", optional_i64_value(stat.created_ms, span));
-    Value::record(record, span)
-}
-
-fn file_write_record(write: StoneFileWrite, span: Span) -> Value {
-    let mut record = Record::with_capacity(3);
-    record.push(
-        "path",
-        Value::string(write.path.display().to_string(), span),
-    );
-    record.push(
-        "bytes",
-        Value::int(i64::try_from(write.bytes).unwrap_or(i64::MAX), span),
-    );
-    record.push("append", Value::bool(write.append, span));
-    Value::record(record, span)
-}
-
-fn file_type_name(metadata: &fs::Metadata) -> &'static str {
-    let file_type = metadata.file_type();
-    if file_type.is_dir() {
-        "dir"
-    } else if file_type.is_symlink() {
-        "symlink"
-    } else if file_type.is_file() {
-        "file"
-    } else {
-        "other"
-    }
-}
-
-fn system_time_ms(time: Option<std::time::SystemTime>) -> Option<i64> {
-    let Some(time) = time else {
-        return None;
-    };
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => Some(i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)),
-        Err(_) => None,
-    }
-}
-
-fn optional_i64_value(value: Option<i64>, span: Span) -> Value {
-    match value {
-        Some(value) => Value::int(value, span),
-        None => Value::nothing(span),
-    }
-}
-
-fn io_stone_error(kind: &str, err: std::io::Error, path: &Path) -> ShellError {
-    let path = path.to_path_buf();
-    ShellError::Io(
-        nu_protocol::shell_error::io::IoError::new_internal_with_path(
-            err,
-            format!("Stone {kind} I/O error at {}", path.display()),
-            path,
-        ),
-    )
-}
-
-fn io_read_stone_error(kind: &str, err: std::io::Error, path: &Path) -> ShellError {
-    if err.kind() != ErrorKind::NotFound {
-        return io_stone_error(kind, err, path);
-    }
-    let suggestions = nearby_read_path_suggestions(path, 5);
-    if suggestions.is_empty() {
-        return io_stone_error(kind, err, path);
-    }
-    ShellError::Generic(
-        GenericError::new_internal(
-            format!("Stone {kind} I/O error"),
-            format!(
-                "{}: {}. Did you mean {}?",
-                path.display(),
-                err,
-                suggestions.join(" or ")
-            ),
-        )
-        .with_code("io_error"),
-    )
-}
-
-fn nearby_read_path_suggestions(path: &Path, limit: usize) -> Vec<String> {
-    let Some(root) = nearest_existing_search_root(path) else {
-        return Vec::new();
-    };
-    if root == Path::new("/") {
-        return Vec::new();
-    }
-    let mut candidates = Vec::new();
-    if let Some(expected_name) = path.file_name().and_then(|name| name.to_str()) {
-        collect_read_path_suggestions(&root, limit, &mut candidates, &mut |candidate| {
-            candidate
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name == expected_name)
-        });
-    }
-    if candidates.len() < limit {
-        if let Some(expected_suffix) = path.extension().and_then(|suffix| suffix.to_str()) {
-            collect_read_path_suggestions(&root, limit, &mut candidates, &mut |candidate| {
-                candidate
-                    .extension()
-                    .and_then(|suffix| suffix.to_str())
-                    .is_some_and(|suffix| suffix == expected_suffix)
-            });
-        }
-    }
-    candidates.sort();
-    candidates.dedup();
-    candidates.truncate(limit);
-    candidates
-}
-
-fn nearest_existing_search_root(path: &Path) -> Option<PathBuf> {
-    let parent = path.parent()?;
-    if parent.as_os_str().is_empty() || !parent.is_dir() {
-        return None;
-    }
-    Some(parent.to_path_buf())
-}
-
-fn collect_read_path_suggestions(
-    current: &Path,
-    limit: usize,
-    candidates: &mut Vec<String>,
-    matches: &mut dyn FnMut(&Path) -> bool,
-) {
-    if candidates.len() >= limit {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(current) else {
-        return;
-    };
-    let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.path());
-    for entry in entries {
-        if candidates.len() >= limit {
-            return;
-        }
-        let path = entry.path();
-        if path.is_dir() {
-            collect_read_path_suggestions(&path, limit, candidates, matches);
-        } else if path.is_file() && matches(&path) {
-            candidates.push(path.display().to_string());
-        }
-    }
-}
-
-fn ensure_parent_dir_for_write(kind: &str, path: &Path) -> Result<(), ShellError> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    if parent.as_os_str().is_empty() || parent.exists() {
-        return Ok(());
-    }
-    fs::create_dir_all(parent).map_err(|err| io_stone_error(kind, err, parent))
 }
 
 #[cfg(test)]

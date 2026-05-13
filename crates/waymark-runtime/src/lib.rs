@@ -21,6 +21,8 @@ mod json;
 mod server;
 mod stone_ast;
 mod stone_eval;
+#[cfg(not(target_os = "hermit"))]
+mod stone_file_ops;
 mod stone_frontend;
 mod stone_helpers;
 mod stone_ir;
