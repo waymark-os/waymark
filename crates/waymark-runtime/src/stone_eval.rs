@@ -4329,6 +4329,7 @@ impl Evaluator<'_> {
             "emit" => self.eval_emit_call(call, input),
             "fail" => self.eval_fail_call(call),
             "find" => self.eval_find_call(call),
+            "format" => self.eval_format_call(call),
             "json_dumps" => self.eval_json_dumps_call(call),
             "json_loads" => self.eval_json_loads_call(call),
             "help" => self.eval_help_call(call),
@@ -4358,6 +4359,8 @@ impl Evaluator<'_> {
             "parse_int" => self.eval_parse_int_call(call),
             "print" => self.eval_print_call(call),
             "range" => self.eval_range_call(call),
+            "slice" => self.eval_slice_call(call),
+            "split" => self.eval_split_call(call),
             "read_csv" => self.eval_read_csv_call(call),
             "read_json" => self.eval_read_json_call(call),
             "read_jsonl" => self.eval_read_jsonl_call(call),
@@ -4367,6 +4370,7 @@ impl Evaluator<'_> {
             "state" => self.eval_state_call(call),
             "last_result" => self.eval_last_result_call(call),
             "start_daemon" => self.eval_start_daemon_call(call),
+            "starts_with" | "startswith" => self.eval_starts_with_call(call),
             "daemon_status" => self.eval_daemon_status_call(call),
             "stop_daemon" => self.eval_stop_daemon_call(call),
             "wait_port" => self.eval_wait_port_call(call),
@@ -4378,6 +4382,7 @@ impl Evaluator<'_> {
             "filter" => self.eval_filter_call(call),
             "map" => self.eval_map_call(call),
             "sum" => self.eval_sum_call(call),
+            "join" => self.eval_join_call(call),
             _ => Err(stone_error(
                 "builtin",
                 format!("unknown builtin `{}`", call.name),
@@ -6595,6 +6600,194 @@ impl Evaluator<'_> {
         Ok(RuntimeValue::Nu(best.expect("checked non-empty arguments")))
     }
 
+    fn eval_split_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.named.is_empty() {
+            return Err(stone_error(
+                "split",
+                "split() keyword arguments are not supported",
+            ));
+        }
+        let ([text] | [text, _]) = call.positional.as_slice() else {
+            return Err(stone_error(
+                "split",
+                "split() requires text and optional separator",
+            ));
+        };
+        let text = self
+            .eval_expr_value(text, PipelineData::empty())?
+            .into_nu_value("split")?;
+        let text = value_to_string(&text, "split")?;
+        let parts = match call.positional.as_slice() {
+            [_] => text.split_whitespace().collect::<Vec<_>>(),
+            [_, separator] => {
+                let separator = self
+                    .eval_expr_value(separator, PipelineData::empty())?
+                    .into_nu_value("split")?;
+                let separator = value_to_string(&separator, "split")?;
+                text.split(&separator).collect::<Vec<_>>()
+            }
+            _ => unreachable!(),
+        };
+        Ok(RuntimeValue::Nu(Value::list(
+            parts
+                .into_iter()
+                .map(|part| Value::string(part.to_owned(), Span::unknown()))
+                .collect(),
+            Span::unknown(),
+        )))
+    }
+
+    fn eval_join_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.named.is_empty() {
+            return Err(stone_error(
+                "join",
+                "join() keyword arguments are not supported",
+            ));
+        }
+        let ([items] | [items, _]) = call.positional.as_slice() else {
+            return Err(stone_error(
+                "join",
+                "join() requires items and optional separator",
+            ));
+        };
+        let first = self
+            .eval_expr_value(items, PipelineData::empty())?
+            .into_nu_value("join")?;
+        let (items, separator) = match call.positional.as_slice() {
+            [_] => (first, String::new()),
+            [_, second] => {
+                let second = self
+                    .eval_expr_value(second, PipelineData::empty())?
+                    .into_nu_value("join")?;
+                match (&first, &second) {
+                    (Value::List { .. }, _) => (first, value_to_string(&second, "join")?),
+                    (_, Value::List { .. }) => (second, value_to_string(&first, "join")?),
+                    _ => {
+                        return Err(stone_error(
+                            "join",
+                            "join() requires a list and optional separator",
+                        ));
+                    }
+                }
+            }
+            _ => unreachable!(),
+        };
+        let Value::List { vals, .. } = items else {
+            return Err(stone_error(
+                "join",
+                format!("expected list, got {}", items.get_type()),
+            ));
+        };
+        let mut parts = Vec::with_capacity(vals.len());
+        for value in &vals {
+            parts.push(value_to_string(value, "join")?);
+        }
+        Ok(RuntimeValue::Nu(Value::string(
+            parts.join(&separator),
+            Span::unknown(),
+        )))
+    }
+
+    fn eval_slice_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.named.is_empty() {
+            return Err(stone_error(
+                "slice",
+                "slice() keyword arguments are not supported",
+            ));
+        }
+        let ([value] | [value, _] | [value, _, _]) = call.positional.as_slice() else {
+            return Err(stone_error(
+                "slice",
+                "slice() requires value, optional start, and optional end",
+            ));
+        };
+        let value = self
+            .eval_expr_value(value, PipelineData::empty())?
+            .into_nu_value("slice")?;
+        let start = call
+            .positional
+            .get(1)
+            .map(|expr| self.eval_optional_slice_arg(expr, "slice start"))
+            .transpose()?
+            .flatten();
+        let end = call
+            .positional
+            .get(2)
+            .map(|expr| self.eval_optional_slice_arg(expr, "slice end"))
+            .transpose()?
+            .flatten();
+        eval_slice(&value, start, end).map(RuntimeValue::Nu)
+    }
+
+    fn eval_optional_slice_arg(
+        &mut self,
+        expression: &Expr,
+        context: &str,
+    ) -> Result<Option<i64>, ShellError> {
+        let value = self
+            .eval_expr_value(expression, PipelineData::empty())?
+            .into_nu_value(context)?;
+        if matches!(value, Value::Nothing { .. }) {
+            Ok(None)
+        } else {
+            value_to_i64(&value, context).map(Some)
+        }
+    }
+
+    fn eval_starts_with_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.named.is_empty() {
+            return Err(stone_error(
+                "starts_with",
+                "starts_with() keyword arguments are not supported",
+            ));
+        }
+        let [text, prefix] = call.positional.as_slice() else {
+            return Err(stone_error(
+                "starts_with",
+                "starts_with() requires text and prefix",
+            ));
+        };
+        let text = self
+            .eval_expr_value(text, PipelineData::empty())?
+            .into_nu_value("starts_with")?;
+        let prefix = self
+            .eval_expr_value(prefix, PipelineData::empty())?
+            .into_nu_value("starts_with")?;
+        let text = value_to_string(&text, "starts_with")?;
+        let prefix = value_to_string(&prefix, "starts_with")?;
+        Ok(RuntimeValue::Nu(Value::bool(
+            text.starts_with(&prefix),
+            Span::unknown(),
+        )))
+    }
+
+    fn eval_format_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.named.is_empty() {
+            return Err(stone_error(
+                "format",
+                "format() keyword arguments are not supported",
+            ));
+        }
+        let Some(template) = call.positional.first() else {
+            return Err(stone_error("format", "format() requires a template string"));
+        };
+        let template = self
+            .eval_expr_value(template, PipelineData::empty())?
+            .into_nu_value("format")?;
+        let template = value_to_string(&template, "format")?;
+        let mut args = Vec::with_capacity(call.positional.len().saturating_sub(1));
+        for arg in call.positional.iter().skip(1) {
+            let value = self
+                .eval_expr_value(arg, PipelineData::empty())?
+                .into_nu_value("format")?;
+            args.push(value_to_display_string(&value)?);
+        }
+        Ok(RuntimeValue::Nu(Value::string(
+            format_template(&template, &args)?,
+            Span::unknown(),
+        )))
+    }
+
     fn eval_print_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let [arg] = call.positional.as_slice() else {
             return Err(stone_error(
@@ -7381,6 +7574,7 @@ fn is_builtin_call(call: &Call) -> bool {
             | "enumerate"
             | "find"
             | "float"
+            | "format"
             | "first"
             | "head"
             | "from_json"
@@ -7391,6 +7585,7 @@ fn is_builtin_call(call: &Call) -> bool {
             | "ls"
             | "list_dir"
             | "list"
+            | "join"
             | "map"
             | "max"
             | "min"
@@ -7408,8 +7603,12 @@ fn is_builtin_call(call: &Call) -> bool {
             | "round"
             | "rm"
             | "run"
+            | "slice"
+            | "split"
             | "resolve_command"
             | "state"
+            | "starts_with"
+            | "startswith"
             | "tail"
             | "last_result"
             | "start_daemon"
@@ -13003,6 +13202,49 @@ fn normalize_string_start(index: i64, len: usize) -> Result<usize, ShellError> {
     usize::try_from(clamped).map_err(|_| stone_error("index", "index is too large"))
 }
 
+fn format_template(template: &str, args: &[String]) -> Result<String, ShellError> {
+    let mut output = String::new();
+    let mut chars = template.chars().peekable();
+    let mut arg_index = 0;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+                output.push('{');
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+                output.push('}');
+            }
+            '{' if chars.peek() == Some(&'}') => {
+                chars.next();
+                let Some(value) = args.get(arg_index) else {
+                    return Err(stone_error(
+                        "format",
+                        "format() has fewer arguments than placeholders",
+                    ));
+                };
+                output.push_str(value);
+                arg_index += 1;
+            }
+            '{' | '}' => {
+                return Err(stone_error(
+                    "format",
+                    "format() supports only `{}` placeholders and escaped `{{` or `}}`",
+                ));
+            }
+            _ => output.push(ch),
+        }
+    }
+    if arg_index != args.len() {
+        return Err(stone_error(
+            "format",
+            "format() received more arguments than placeholders",
+        ));
+    }
+    Ok(output)
+}
+
 fn value_truthy(value: &Value) -> bool {
     match value {
         Value::Bool { val, .. } => *val,
@@ -14608,6 +14850,47 @@ emit({
                 "lines": ["alpha", "beta"],
                 "replace": "alpha-beta",
                 "join": "a,b,c",
+            })
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn evaluates_top_level_text_list_helper_builtins() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("top-level-text-list-helpers")?;
+        let program = lower_source(
+            r#"items = split("alpha,beta,gamma", ",")
+emit({
+    "split": items,
+    "join": join(items, "|"),
+    "join_reversed_args": join("/", ["tmp", "waymark"]),
+    "slice": slice(items, 1, 3),
+    "tail": slice(items, 1),
+    "prefix": slice("abcdef", None, 3),
+    "starts_with": starts_with("abcdef", "abc"),
+    "startswith": startswith("abcdef", "def"),
+    "format": format("{}:{} {{ok}}", "port", 8080),
+    "max": max(1, 7, 3),
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "split": ["alpha", "beta", "gamma"],
+                "join": "alpha|beta|gamma",
+                "join_reversed_args": "tmp/waymark",
+                "slice": ["beta", "gamma"],
+                "tail": ["beta", "gamma"],
+                "prefix": "abc",
+                "starts_with": true,
+                "startswith": false,
+                "format": "port:8080 {ok}",
+                "max": 7,
             })
         );
 

@@ -48,6 +48,11 @@ explicitly asks for full output.
 - `read_jsonl(path)`, `write_jsonl(path, rows)`: JSONL file I/O.
 - `read_csv(path)`: CSV records.
 - `find(root, name_glob="*")`: file discovery.
+- `split(text, separator=None)`, `join(items, separator="")`,
+  `slice(value, start=None, end=None)`, `starts_with(text, prefix)`, and
+  `format(template, ...)`: small text/list helpers for scripts and dynamic
+  helper callbacks. String method forms such as `"a,b".split(",")` and
+  `",".join(items)` are also supported.
 - `run(argv, cwd=None, stdin=None, timeout_ms=None, env=None)`: Linux command
   execution with structured stdout, stderr, status, and helper observations.
 - `state()`: typed runtime snapshot with `cwd`, git summary, and common tool
