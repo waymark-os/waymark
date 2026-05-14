@@ -14,6 +14,18 @@ use super::{
 use crate::stone_ast::{AssignTarget, AugOp, Call, CompareOp, Expr, Stmt};
 use crate::stone_vm::match_hot_jsonl_aggregation_ir_subgraph;
 
+pub(crate) struct FusedMapUpdateIf {
+    pub(crate) key_name: String,
+    pub(crate) contains_map: String,
+    pub(crate) updates: Vec<FusedMapUpdate>,
+    pub(crate) append_list: Option<String>,
+}
+
+pub(crate) struct FusedMapUpdate {
+    pub(crate) map_name: String,
+    pub(crate) addend: Expr,
+}
+
 pub(crate) fn try_lower_hot_loop(
     targets: &[String],
     iter: &Expr,
@@ -1021,4 +1033,162 @@ pub(crate) fn match_row_subscript(row_target: &str, value: &Expr) -> Option<Stri
         }
         _ => None,
     }
+}
+
+pub(crate) fn match_fused_map_update_if(
+    condition: &Expr,
+    then_branch: &[Stmt],
+    else_branch: &[Stmt],
+) -> Option<FusedMapUpdateIf> {
+    let (key_name, contains_map) = match_key_in_map(condition)?;
+    if then_branch.is_empty() || else_branch.len() < then_branch.len() {
+        return None;
+    }
+    let mut updates = Vec::with_capacity(then_branch.len());
+    for (then_stmt, else_stmt) in then_branch.iter().zip(else_branch.iter()) {
+        let (map_name, then_key, addend) = match_increment_assignment(then_stmt)?;
+        if then_key != key_name {
+            return None;
+        }
+        let (else_map, else_key, else_value) = match_insert_assignment(else_stmt)?;
+        if else_map != map_name || else_key != key_name || else_value != addend {
+            return None;
+        }
+        updates.push(FusedMapUpdate { map_name, addend });
+    }
+    let append_tail = &else_branch[then_branch.len()..];
+    let append_list = match append_tail {
+        [] => None,
+        [stmt] => Some(match_append_key(stmt, &key_name)?),
+        _ => return None,
+    };
+    Some(FusedMapUpdateIf {
+        key_name,
+        contains_map,
+        updates,
+        append_list,
+    })
+}
+
+pub(crate) fn match_key_not_in_map(condition: &Expr) -> Option<(String, String)> {
+    if let Expr::Not(condition) = condition {
+        return match_key_in_map(condition);
+    }
+    let Expr::Compare {
+        left,
+        ops,
+        comparators,
+    } = condition
+    else {
+        return None;
+    };
+    let ([CompareOp::NotIn], [Expr::Name(map_name)]) = (ops.as_slice(), comparators.as_slice())
+    else {
+        return None;
+    };
+    let Expr::Name(key_name) = left.as_ref() else {
+        return None;
+    };
+    Some((key_name.clone(), map_name.clone()))
+}
+
+fn match_key_in_map(condition: &Expr) -> Option<(String, String)> {
+    let Expr::Compare {
+        left,
+        ops,
+        comparators,
+    } = condition
+    else {
+        return None;
+    };
+    let ([CompareOp::In], [Expr::Name(map_name)]) = (ops.as_slice(), comparators.as_slice()) else {
+        return None;
+    };
+    let Expr::Name(key_name) = left.as_ref() else {
+        return None;
+    };
+    Some((key_name.clone(), map_name.clone()))
+}
+
+fn match_increment_assignment(stmt: &Stmt) -> Option<(String, String, Expr)> {
+    match stmt {
+        Stmt::Assign { target, value } => {
+            let (target_map, target_key) = match_map_key_target(target)?;
+            let Expr::Add { left, right } = value else {
+                return None;
+            };
+            let (left_map, left_key) = match_map_key_expr(left)?;
+            if left_map != target_map || left_key != target_key {
+                return None;
+            }
+            Some((target_map, target_key, right.as_ref().clone()))
+        }
+        Stmt::AugAssign {
+            target,
+            op: AugOp::Add,
+            value,
+        } => {
+            let (target_map, target_key) = match_map_key_target(target)?;
+            Some((target_map, target_key, value.clone()))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn match_insert_assignment(stmt: &Stmt) -> Option<(String, String, Expr)> {
+    let Stmt::Assign { target, value } = stmt else {
+        return None;
+    };
+    let (map_name, key_name) = match_map_key_target(target)?;
+    Some((map_name, key_name, value.clone()))
+}
+
+pub(crate) fn match_map_key_target(target: &AssignTarget) -> Option<(String, String)> {
+    let AssignTarget::Subscript { value, index } = target else {
+        return None;
+    };
+    let AssignTarget::Name(map_name) = value.as_ref() else {
+        return None;
+    };
+    let Expr::Name(key_name) = index else {
+        return None;
+    };
+    Some((map_name.clone(), key_name.clone()))
+}
+
+fn match_map_key_expr(value: &Expr) -> Option<(String, String)> {
+    let Expr::Subscript { value, index } = value else {
+        return None;
+    };
+    let Expr::Name(map_name) = value.as_ref() else {
+        return None;
+    };
+    let Expr::Name(key_name) = index.as_ref() else {
+        return None;
+    };
+    Some((map_name.clone(), key_name.clone()))
+}
+
+fn match_append_key(stmt: &Stmt, key_name: &str) -> Option<String> {
+    let Stmt::Expr(Expr::MethodCall {
+        receiver,
+        method,
+        positional,
+    }) = stmt
+    else {
+        return None;
+    };
+    if method != "append" {
+        return None;
+    }
+    let Expr::Name(list_name) = receiver.as_ref() else {
+        return None;
+    };
+    let [Expr::Name(arg_name)] = positional.as_slice() else {
+        return None;
+    };
+    if arg_name != key_name {
+        return None;
+    }
+    Some(list_name.clone())
 }
