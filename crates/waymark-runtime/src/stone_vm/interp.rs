@@ -27,6 +27,11 @@ pub(super) struct GenericVmExprBodyResult {
     pub(super) last_value: Option<RuntimeValue>,
 }
 
+pub(super) struct GenericVmAssignResult {
+    pub(super) value: RuntimeValue,
+    pub(super) last_value: Option<RuntimeValue>,
+}
+
 pub(super) fn generic_vm_number_from_runtime(value: &RuntimeValue) -> Option<GenericVmNumber> {
     match value {
         RuntimeValue::Nu(Value::Int { val, .. }) => Some(GenericVmNumber::I64(*val)),
@@ -74,6 +79,34 @@ pub(super) fn generic_vm_number_to_value(value: GenericVmNumber) -> Value {
         GenericVmNumber::I64(value) => Value::int(value, Span::unknown()),
         GenericVmNumber::F64(value) => Value::float(value, Span::unknown()),
     }
+}
+
+pub(super) fn execute_generic_vm_add_assign(
+    local_value: RuntimeValue,
+    values: &[RuntimeValue],
+    mut lowering_miss: impl FnMut(&'static str),
+) -> Result<Option<GenericVmAssignResult>, ShellError> {
+    let mut accumulator = match generic_vm_number_from_runtime(&local_value) {
+        Some(value) => value,
+        None => {
+            lowering_miss("unsupported_expr");
+            return Ok(None);
+        }
+    };
+    let mut last_value = None;
+    for value in values {
+        let Some(number) = generic_vm_number_from_runtime(value) else {
+            lowering_miss("unsupported_expr");
+            return Ok(None);
+        };
+        accumulator = generic_vm_add_number(accumulator, number)?;
+        last_value = Some(value.clone());
+    }
+
+    Ok(Some(GenericVmAssignResult {
+        value: RuntimeValue::Nu(generic_vm_number_to_value(accumulator)),
+        last_value,
+    }))
 }
 
 pub(super) fn generic_vm_register_i64(
