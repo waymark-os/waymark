@@ -30,7 +30,7 @@ use crate::stone_builtins::{
     split_builtin, starts_with_builtin, str_builtin, string_method_builtin, sub_values,
     subscript_builtin, sum_builtin, unique_builtin, value_identity_key, value_to_bool,
     value_to_display_string, value_to_f64, value_to_i64, value_to_limit, value_to_path_string,
-    value_to_string, value_to_u64, value_truthy, value_type_name, values_equal, where_builtin,
+    value_to_string, value_to_u64, value_truthy, value_type_name, where_builtin,
     where_compare_builtin, zfill_text,
 };
 #[cfg(not(target_os = "hermit"))]
@@ -60,8 +60,7 @@ use crate::stone_vm::{
     generic_loop_compile_miss_reason, match_hot_jsonl_aggregation_body,
     match_outer_jsonl_file_loop_body, optimize_loop_ir, optimize_stone_loop_ir,
     try_lower_generic_loop, try_lower_hot_loop, validate_hot_jsonl_native_prefix, AccId, ConstId,
-    GenericLoopIter, GenericLoopOp, GenericLoopPlan, GenericParseNumber, GenericVmExprBody,
-    GenericVmFunction, GenericVmOp, HotJsonlAggregationBody, HotJsonlBodyOp,
+    GenericLoopIter, GenericLoopOp, GenericLoopPlan, HotJsonlAggregationBody, HotJsonlBodyOp,
     HotJsonlNestedUserTotals, HotJsonlSlot, HotJsonlTracePlan, HotLoopIter, HotLoopOp, HotLoopPlan,
     LoopIrFusedKernel, LoopIrOptimizationDiagnostic, LoopIrOptimizationResult, Reg, SnapshotId,
     StoneAccumulatorKind, StoneConst, StoneFallbackTarget, StoneGuardKind, StoneIrFunction,
@@ -78,6 +77,8 @@ mod stone_runtime_value;
 mod stone_state;
 #[path = "stone_vm/interp.rs"]
 mod stone_vm_interp;
+#[path = "stone_vm/runtime.rs"]
+mod stone_vm_runtime;
 use stone_functions::CallableValue;
 pub(crate) use stone_functions::StoneSession;
 use stone_json_view::{
@@ -93,16 +94,7 @@ use stone_json_view::{
 };
 use stone_runtime_value::{FileHandle, RuntimeValue, TextLines};
 use stone_state::runtime_state_record;
-use stone_vm_interp::{
-    execute_generic_vm_add_assign as execute_generic_vm_add_assign_loop,
-    execute_generic_vm_expr_body as execute_generic_vm_expr_body_loop,
-    execute_generic_vm_list_append as execute_generic_vm_list_append_loop,
-    execute_generic_vm_map_add_i64_const as execute_generic_vm_map_add_i64_const_loop,
-    execute_generic_vm_map_add_i64_const_record_field as execute_generic_vm_map_add_i64_const_record_field_loop,
-    execute_generic_vm_map_add_i64_const_record_string_field as execute_generic_vm_map_add_i64_const_record_string_field_loop,
-    execute_generic_vm_text_parse_add_assign as execute_generic_vm_text_parse_add_assign_loop,
-    GenericVmInput, GenericVmLoopResult,
-};
+use stone_vm_interp::{GenericVmInput, GenericVmLoopResult};
 
 const STONE_LAST_RESULT_ENV: &str = "WAYMARK_LAST_RESULT_JSON";
 
@@ -1116,275 +1108,6 @@ impl Evaluator<'_> {
             .hot_loop_diagnostics
             .fused_kernel_selected(kernel);
         Ok(())
-    }
-
-    fn execute_generic_vm_function(
-        &mut self,
-        function: &GenericVmFunction,
-        input: GenericVmInput<'_>,
-    ) -> Result<GenericVmLoopResult, ShellError> {
-        let [op] = function.ops.as_slice() else {
-            self.state
-                .hot_loop_diagnostics
-                .lowering_miss("unsupported_body_stmt");
-            return Ok(GenericVmLoopResult::Unsupported);
-        };
-        let local_name = |local| {
-            function
-                .local_name(local)
-                .ok_or_else(|| stone_error("hot loop", "generic VM local is out of range"))
-        };
-        match (op, input) {
-            (GenericVmOp::AddAssign { local }, GenericVmInput::Values(values)) => {
-                self.execute_generic_vm_add_assign(local_name(*local)?, values)
-            }
-            (GenericVmOp::AddAssignParsed { local, parse }, GenericVmInput::TextLines(lines))
-                if function.iter == GenericLoopIter::OpenSplitlines =>
-            {
-                self.execute_generic_vm_text_parse_add_assign(local_name(*local)?, lines, *parse)
-            }
-            (GenericVmOp::MapAddI64Const { map, addend }, GenericVmInput::Values(values)) => {
-                self.execute_generic_vm_map_add_i64_const(local_name(*map)?, *addend, values)
-            }
-            (
-                GenericVmOp::MapAddI64ConstRecordField { map, field, addend },
-                GenericVmInput::Values(values),
-            ) => self.execute_generic_vm_map_add_i64_const_record_field(
-                local_name(*map)?,
-                field,
-                *addend,
-                values,
-            ),
-            (
-                GenericVmOp::MapAddI64ConstRecordStringField {
-                    map,
-                    field,
-                    strip,
-                    lower,
-                    addend,
-                },
-                GenericVmInput::Values(values),
-            ) => self.execute_generic_vm_map_add_i64_const_record_string_field(
-                local_name(*map)?,
-                field,
-                *strip,
-                *lower,
-                *addend,
-                values,
-            ),
-            (GenericVmOp::ListAppend { list, unique }, GenericVmInput::Values(values)) => {
-                self.execute_generic_vm_list_append(local_name(*list)?, values, *unique)
-            }
-            (GenericVmOp::ExprBody(body), GenericVmInput::Values(values)) => {
-                self.execute_generic_vm_expr_body(function, body, values)
-            }
-            _ => {
-                self.state
-                    .hot_loop_diagnostics
-                    .lowering_miss("unsupported_iterator");
-                Ok(GenericVmLoopResult::Unsupported)
-            }
-        }
-    }
-
-    fn finish_generic_vm_loop(&mut self, targets: &[String], last_value: Option<RuntimeValue>) {
-        if let Some(value) = last_value {
-            if let Some(target) = targets.first() {
-                self.state.set_local(target.clone(), value);
-            }
-        }
-        self.state.hot_loop_diagnostics.loop_vm_executed();
-    }
-
-    fn execute_generic_vm_add_assign(
-        &mut self,
-        local: &str,
-        values: &[RuntimeValue],
-    ) -> Result<GenericVmLoopResult, ShellError> {
-        let Some(local_value) = self.state.get_local(local) else {
-            self.state
-                .hot_loop_diagnostics
-                .lowering_miss("unsupported_expr");
-            return Ok(GenericVmLoopResult::Unsupported);
-        };
-        let Some(result) = execute_generic_vm_add_assign_loop(local_value, values, |reason| {
-            self.state.hot_loop_diagnostics.lowering_miss(reason);
-        })?
-        else {
-            return Ok(GenericVmLoopResult::Unsupported);
-        };
-        self.state.set_local(local.to_owned(), result.value);
-        Ok(GenericVmLoopResult::Executed {
-            last_value: result.last_value,
-        })
-    }
-
-    fn execute_generic_vm_text_parse_add_assign(
-        &mut self,
-        local: &str,
-        lines: &TextLines,
-        parse: GenericParseNumber,
-    ) -> Result<GenericVmLoopResult, ShellError> {
-        let Some(local_value) = self.state.get_local(local) else {
-            self.state
-                .hot_loop_diagnostics
-                .lowering_miss("unsupported_expr");
-            return Ok(GenericVmLoopResult::Unsupported);
-        };
-        let Some(result) =
-            execute_generic_vm_text_parse_add_assign_loop(local_value, lines, parse, |reason| {
-                self.state.hot_loop_diagnostics.lowering_miss(reason);
-            })?
-        else {
-            return Ok(GenericVmLoopResult::Unsupported);
-        };
-        self.state.set_local(local.to_owned(), result.value);
-        Ok(GenericVmLoopResult::Executed {
-            last_value: result.last_value,
-        })
-    }
-
-    fn execute_generic_vm_map_add_i64_const(
-        &mut self,
-        map: &str,
-        addend: i64,
-        values: &[RuntimeValue],
-    ) -> Result<GenericVmLoopResult, ShellError> {
-        let counts = self.load_i64_record_map(map)?;
-        let Some(result) = execute_generic_vm_map_add_i64_const_loop(
-            counts,
-            addend,
-            values,
-            |value| value_to_string(value, "hot loop"),
-            |reason| self.state.hot_loop_diagnostics.lowering_miss(reason),
-        )?
-        else {
-            return Ok(GenericVmLoopResult::Unsupported);
-        };
-        self.store_i64_record_map(map, &result.counts);
-        Ok(GenericVmLoopResult::Executed {
-            last_value: result.last_value,
-        })
-    }
-
-    fn execute_generic_vm_map_add_i64_const_record_field(
-        &mut self,
-        map: &str,
-        field: &str,
-        addend: i64,
-        values: &[RuntimeValue],
-    ) -> Result<GenericVmLoopResult, ShellError> {
-        let counts = self.load_i64_record_map(map)?;
-        let Some(result) = execute_generic_vm_map_add_i64_const_record_field_loop(
-            counts,
-            field,
-            addend,
-            values,
-            |value| runtime_value_to_string_key(value, "hot loop"),
-            |reason| self.state.hot_loop_diagnostics.lowering_miss(reason),
-        )?
-        else {
-            return Ok(GenericVmLoopResult::Unsupported);
-        };
-        self.store_i64_record_map(map, &result.counts);
-        Ok(GenericVmLoopResult::Executed {
-            last_value: result.last_value,
-        })
-    }
-
-    fn execute_generic_vm_map_add_i64_const_record_string_field(
-        &mut self,
-        map: &str,
-        field: &str,
-        strip: bool,
-        lower: bool,
-        addend: i64,
-        values: &[RuntimeValue],
-    ) -> Result<GenericVmLoopResult, ShellError> {
-        let counts = self.load_i64_record_map(map)?;
-        let Some(result) = execute_generic_vm_map_add_i64_const_record_string_field_loop(
-            counts,
-            field,
-            strip,
-            lower,
-            addend,
-            values,
-            |value| runtime_value_to_string_key(value, "hot loop"),
-            |reason| self.state.hot_loop_diagnostics.lowering_miss(reason),
-        )?
-        else {
-            return Ok(GenericVmLoopResult::Unsupported);
-        };
-        self.store_i64_record_map(map, &result.counts);
-        Ok(GenericVmLoopResult::Executed {
-            last_value: result.last_value,
-        })
-    }
-
-    fn execute_generic_vm_list_append(
-        &mut self,
-        list: &str,
-        values: &[RuntimeValue],
-        unique: bool,
-    ) -> Result<GenericVmLoopResult, ShellError> {
-        let current = self
-            .state
-            .get_local(list)
-            .ok_or_else(|| stone_error("hot loop", format!("unknown name `{list}`")))?;
-        let Some(result) =
-            execute_generic_vm_list_append_loop(current, values, unique, values_equal, |reason| {
-                self.state.hot_loop_diagnostics.lowering_miss(reason)
-            })?
-        else {
-            return Ok(GenericVmLoopResult::Unsupported);
-        };
-        self.state.set_local(
-            list.to_owned(),
-            RuntimeValue::Nu(Value::list(result.items, Span::unknown())),
-        );
-        Ok(GenericVmLoopResult::Executed {
-            last_value: result.last_value,
-        })
-    }
-
-    fn execute_generic_vm_expr_body(
-        &mut self,
-        function: &GenericVmFunction,
-        body: &GenericVmExprBody,
-        values: &[RuntimeValue],
-    ) -> Result<GenericVmLoopResult, ShellError> {
-        let mut locals = Vec::with_capacity(function.locals.len());
-        for local in &function.locals {
-            let value = self
-                .state
-                .get_local(local)
-                .and_then(|value| value.into_nu_value("hot loop").ok())
-                .and_then(|value| match value {
-                    Value::Int { val, .. } => Some(val),
-                    _ => None,
-                });
-            locals.push(value);
-        }
-
-        let Some(result) = execute_generic_vm_expr_body_loop(body, locals, values, |reason| {
-            self.state.hot_loop_diagnostics.lowering_miss(reason);
-        })?
-        else {
-            return Ok(GenericVmLoopResult::Unsupported);
-        };
-
-        for (name, value) in function.locals.iter().zip(result.locals.into_iter()) {
-            if let Some(value) = value {
-                self.state.set_local(
-                    name.clone(),
-                    RuntimeValue::Nu(Value::int(value, Span::unknown())),
-                );
-            }
-        }
-
-        Ok(GenericVmLoopResult::Executed {
-            last_value: result.last_value,
-        })
     }
 
     fn eval_for_jsonl_rows(
