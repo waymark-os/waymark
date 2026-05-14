@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use nu_protocol::{ShellError, Span, Value};
+use std::time::Instant;
 
-use super::stone_json_view::runtime_value_to_string_key;
+use nu_protocol::{PipelineData, ShellError, Span, Value};
+
+use super::stone_json_view::{jsonl_row_views, runtime_value_to_string_key, JsonlRows};
 use super::stone_runtime_value::{RuntimeValue, TextLines};
 use super::stone_vm_interp::{
     execute_generic_vm_add_assign as execute_generic_vm_add_assign_loop,
@@ -14,13 +16,180 @@ use super::stone_vm_interp::{
     execute_generic_vm_text_parse_add_assign as execute_generic_vm_text_parse_add_assign_loop,
     GenericVmInput, GenericVmLoopResult,
 };
-use super::{stone_error, value_to_string, Evaluator};
+use super::{stone_error, value_to_string, EvalFlow, Evaluator};
 use crate::stone_builtins::values_equal;
 use crate::stone_vm::{
-    GenericLoopIter, GenericParseNumber, GenericVmExprBody, GenericVmFunction, GenericVmOp,
+    compile_generic_vm_function, generic_loop_compile_miss_reason, optimize_loop_ir,
+    GenericLoopIter, GenericLoopOp, GenericLoopPlan, GenericParseNumber, GenericVmExprBody,
+    GenericVmFunction, GenericVmOp, LoopIrFusedKernel, LoopIrOptimizationResult,
 };
 
 impl Evaluator<'_> {
+    pub(super) fn try_eval_for_values_generic_vm(
+        &mut self,
+        targets: &[String],
+        values: &[RuntimeValue],
+        plan: &GenericLoopPlan,
+    ) -> Result<Option<EvalFlow>, ShellError> {
+        let Some(function) = compile_generic_vm_function(plan) else {
+            self.state
+                .hot_loop_diagnostics
+                .lowering_miss(generic_loop_compile_miss_reason(plan));
+            return Ok(None);
+        };
+        let optimization = optimize_loop_ir(&function);
+        let fused_kernel = self.record_loop_ir_function_selection(&optimization);
+        let execution_started = Instant::now();
+        let result = self
+            .execute_generic_vm_function(&optimization.function, GenericVmInput::Values(values))?;
+        let execution_duration = execution_started.elapsed();
+        let GenericVmLoopResult::Executed { last_value } = result else {
+            self.state.hot_loop_diagnostics.loop_fallback();
+            return Ok(None);
+        };
+        self.state
+            .hot_loop_diagnostics
+            .loop_vm_time(execution_duration);
+        self.finish_generic_vm_loop(targets, last_value);
+        if let Some(kernel) = fused_kernel {
+            self.state
+                .hot_loop_diagnostics
+                .fused_kernel_executed(kernel);
+            self.state
+                .hot_loop_diagnostics
+                .fused_kernel_time(execution_duration);
+        }
+        Ok(Some(EvalFlow::Output(PipelineData::empty())))
+    }
+
+    pub(super) fn try_eval_for_text_lines_generic_vm(
+        &mut self,
+        targets: &[String],
+        lines: &TextLines,
+        plan: &GenericLoopPlan,
+    ) -> Result<Option<EvalFlow>, ShellError> {
+        if !matches!(
+            plan.iter,
+            GenericLoopIter::OpenSplitlines | GenericLoopIter::MaterializedList
+        ) {
+            return Ok(None);
+        }
+        if let [GenericLoopOp::JsonlAggregation { .. }] = plan.ops.as_slice() {
+            self.eval_for_text_lines_jsonl_generic_native_body(targets, lines, plan)?;
+            return Ok(Some(EvalFlow::Output(PipelineData::empty())));
+        }
+        let Some(function) = compile_generic_vm_function(plan) else {
+            self.state
+                .hot_loop_diagnostics
+                .lowering_miss(generic_loop_compile_miss_reason(plan));
+            return Ok(None);
+        };
+        let optimization = optimize_loop_ir(&function);
+        let fused_kernel = self.record_loop_ir_function_selection(&optimization);
+        let execution_started = Instant::now();
+        let result = self.execute_generic_vm_function(
+            &optimization.function,
+            GenericVmInput::TextLines(lines),
+        )?;
+        let execution_duration = execution_started.elapsed();
+        let GenericVmLoopResult::Executed { last_value } = result else {
+            self.state.hot_loop_diagnostics.loop_fallback();
+            return Ok(None);
+        };
+        self.state
+            .hot_loop_diagnostics
+            .loop_vm_time(execution_duration);
+        self.finish_generic_vm_loop(targets, last_value);
+        if let Some(kernel) = fused_kernel {
+            self.state
+                .hot_loop_diagnostics
+                .fused_kernel_executed(kernel);
+            self.state
+                .hot_loop_diagnostics
+                .fused_kernel_time(execution_duration);
+        }
+        Ok(Some(EvalFlow::Output(PipelineData::empty())))
+    }
+
+    pub(super) fn try_eval_for_jsonl_rows_generic_vm(
+        &mut self,
+        targets: &[String],
+        rows: &JsonlRows,
+        plan: &GenericLoopPlan,
+    ) -> Result<Option<EvalFlow>, ShellError> {
+        if !matches!(
+            plan.iter,
+            GenericLoopIter::ReadJsonl
+                | GenericLoopIter::ReadCsv
+                | GenericLoopIter::MaterializedList
+        ) {
+            return Ok(None);
+        }
+        let [op] = plan.ops.as_slice() else {
+            self.state
+                .hot_loop_diagnostics
+                .lowering_miss(generic_loop_compile_miss_reason(plan));
+            return Ok(None);
+        };
+        let GenericLoopOp::JsonlAggregation { .. } = op else {
+            let Some(function) = compile_generic_vm_function(plan) else {
+                self.state
+                    .hot_loop_diagnostics
+                    .lowering_miss(generic_loop_compile_miss_reason(plan));
+                return Ok(None);
+            };
+            let optimization = optimize_loop_ir(&function);
+            let fused_kernel = self.record_loop_ir_function_selection(&optimization);
+            let values = jsonl_row_views(rows);
+            let execution_started = Instant::now();
+            let result = self.execute_generic_vm_function(
+                &optimization.function,
+                GenericVmInput::Values(&values),
+            )?;
+            let execution_duration = execution_started.elapsed();
+            let GenericVmLoopResult::Executed { last_value } = result else {
+                self.state.hot_loop_diagnostics.loop_fallback();
+                return Ok(None);
+            };
+            self.state
+                .hot_loop_diagnostics
+                .loop_vm_time(execution_duration);
+            self.finish_generic_vm_loop(targets, last_value);
+            if let Some(kernel) = fused_kernel {
+                self.state
+                    .hot_loop_diagnostics
+                    .fused_kernel_executed(kernel);
+                self.state
+                    .hot_loop_diagnostics
+                    .fused_kernel_time(execution_duration);
+            }
+            return Ok(Some(EvalFlow::Output(PipelineData::empty())));
+        };
+        self.eval_for_jsonl_rows_generic_native_body(targets, rows, plan)?;
+        Ok(Some(EvalFlow::Output(PipelineData::empty())))
+    }
+
+    fn record_loop_ir_function_selection(
+        &mut self,
+        optimization: &LoopIrOptimizationResult,
+    ) -> Option<LoopIrFusedKernel> {
+        self.state.hot_loop_diagnostics.loop_ir_lowered();
+        self.state
+            .hot_loop_diagnostics
+            .loop_ir_optimized(&optimization.diagnostics);
+        if let Some(kernel) = optimization.selected_kernel {
+            self.state
+                .hot_loop_diagnostics
+                .fused_kernel_selected(kernel);
+            Some(kernel)
+        } else {
+            self.state
+                .hot_loop_diagnostics
+                .fusion_miss("no_fused_kernel");
+            None
+        }
+    }
+
     pub(super) fn execute_generic_vm_function(
         &mut self,
         function: &GenericVmFunction,

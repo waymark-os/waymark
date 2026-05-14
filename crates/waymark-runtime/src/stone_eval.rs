@@ -55,15 +55,14 @@ use crate::stone_run::{
     start_daemon_call_values, stop_daemon_call_values, wait_port_call_values,
 };
 use crate::stone_vm::{
-    compile_generic_vm_function, compile_hot_jsonl_loop_ir_function, compile_hot_jsonl_trace_plan,
+    compile_hot_jsonl_loop_ir_function, compile_hot_jsonl_trace_plan,
     compile_hot_jsonl_trace_plan_from_ir, compile_hot_jsonl_vm_function,
-    generic_loop_compile_miss_reason, match_hot_jsonl_aggregation_body,
-    match_outer_jsonl_file_loop_body, optimize_loop_ir, optimize_stone_loop_ir,
+    match_hot_jsonl_aggregation_body, match_outer_jsonl_file_loop_body, optimize_stone_loop_ir,
     try_lower_generic_loop, try_lower_hot_loop, validate_hot_jsonl_native_prefix, AccId, ConstId,
     GenericLoopIter, GenericLoopOp, GenericLoopPlan, HotJsonlAggregationBody, HotJsonlBodyOp,
     HotJsonlNestedUserTotals, HotJsonlSlot, HotJsonlTracePlan, HotLoopIter, HotLoopOp, HotLoopPlan,
-    LoopIrFusedKernel, LoopIrOptimizationDiagnostic, LoopIrOptimizationResult, Reg, SnapshotId,
-    StoneAccumulatorKind, StoneConst, StoneFallbackTarget, StoneGuardKind, StoneIrFunction,
+    LoopIrFusedKernel, LoopIrOptimizationDiagnostic, Reg, SnapshotId, StoneAccumulatorKind,
+    StoneConst, StoneFallbackTarget, StoneGuardKind, StoneIrFunction,
     StoneLoopIrOptimizationResult, StoneOp, StoneTerminator,
 };
 
@@ -94,7 +93,6 @@ use stone_json_view::{
 };
 use stone_runtime_value::{FileHandle, RuntimeValue, TextLines};
 use stone_state::runtime_state_record;
-use stone_vm_interp::{GenericVmInput, GenericVmLoopResult};
 
 const STONE_LAST_RESULT_ENV: &str = "WAYMARK_LAST_RESULT_JSON";
 
@@ -920,171 +918,6 @@ impl Evaluator<'_> {
             )?;
         }
         Ok(Some(EvalFlow::Output(PipelineData::empty())))
-    }
-
-    fn try_eval_for_values_generic_vm(
-        &mut self,
-        targets: &[String],
-        values: &[RuntimeValue],
-        plan: &GenericLoopPlan,
-    ) -> Result<Option<EvalFlow>, ShellError> {
-        let Some(function) = compile_generic_vm_function(plan) else {
-            self.state
-                .hot_loop_diagnostics
-                .lowering_miss(generic_loop_compile_miss_reason(plan));
-            return Ok(None);
-        };
-        let optimization = optimize_loop_ir(&function);
-        let fused_kernel = self.record_loop_ir_function_selection(&optimization);
-        let execution_started = Instant::now();
-        let result = self
-            .execute_generic_vm_function(&optimization.function, GenericVmInput::Values(values))?;
-        let execution_duration = execution_started.elapsed();
-        let GenericVmLoopResult::Executed { last_value } = result else {
-            self.state.hot_loop_diagnostics.loop_fallback();
-            return Ok(None);
-        };
-        self.state
-            .hot_loop_diagnostics
-            .loop_vm_time(execution_duration);
-        self.finish_generic_vm_loop(targets, last_value);
-        if let Some(kernel) = fused_kernel {
-            self.state
-                .hot_loop_diagnostics
-                .fused_kernel_executed(kernel);
-            self.state
-                .hot_loop_diagnostics
-                .fused_kernel_time(execution_duration);
-        }
-        Ok(Some(EvalFlow::Output(PipelineData::empty())))
-    }
-
-    fn try_eval_for_text_lines_generic_vm(
-        &mut self,
-        targets: &[String],
-        lines: &TextLines,
-        plan: &GenericLoopPlan,
-    ) -> Result<Option<EvalFlow>, ShellError> {
-        if !matches!(
-            plan.iter,
-            GenericLoopIter::OpenSplitlines | GenericLoopIter::MaterializedList
-        ) {
-            return Ok(None);
-        }
-        if let [GenericLoopOp::JsonlAggregation { .. }] = plan.ops.as_slice() {
-            self.eval_for_text_lines_jsonl_generic_native_body(targets, lines, plan)?;
-            return Ok(Some(EvalFlow::Output(PipelineData::empty())));
-        }
-        let Some(function) = compile_generic_vm_function(plan) else {
-            self.state
-                .hot_loop_diagnostics
-                .lowering_miss(generic_loop_compile_miss_reason(plan));
-            return Ok(None);
-        };
-        let optimization = optimize_loop_ir(&function);
-        let fused_kernel = self.record_loop_ir_function_selection(&optimization);
-        let execution_started = Instant::now();
-        let result = self.execute_generic_vm_function(
-            &optimization.function,
-            GenericVmInput::TextLines(lines),
-        )?;
-        let execution_duration = execution_started.elapsed();
-        let GenericVmLoopResult::Executed { last_value } = result else {
-            self.state.hot_loop_diagnostics.loop_fallback();
-            return Ok(None);
-        };
-        self.state
-            .hot_loop_diagnostics
-            .loop_vm_time(execution_duration);
-        self.finish_generic_vm_loop(targets, last_value);
-        if let Some(kernel) = fused_kernel {
-            self.state
-                .hot_loop_diagnostics
-                .fused_kernel_executed(kernel);
-            self.state
-                .hot_loop_diagnostics
-                .fused_kernel_time(execution_duration);
-        }
-        Ok(Some(EvalFlow::Output(PipelineData::empty())))
-    }
-
-    fn try_eval_for_jsonl_rows_generic_vm(
-        &mut self,
-        targets: &[String],
-        rows: &JsonlRows,
-        plan: &GenericLoopPlan,
-    ) -> Result<Option<EvalFlow>, ShellError> {
-        if !matches!(
-            plan.iter,
-            GenericLoopIter::ReadJsonl
-                | GenericLoopIter::ReadCsv
-                | GenericLoopIter::MaterializedList
-        ) {
-            return Ok(None);
-        }
-        let [op] = plan.ops.as_slice() else {
-            self.state
-                .hot_loop_diagnostics
-                .lowering_miss(generic_loop_compile_miss_reason(plan));
-            return Ok(None);
-        };
-        let GenericLoopOp::JsonlAggregation { .. } = op else {
-            let Some(function) = compile_generic_vm_function(plan) else {
-                self.state
-                    .hot_loop_diagnostics
-                    .lowering_miss(generic_loop_compile_miss_reason(plan));
-                return Ok(None);
-            };
-            let optimization = optimize_loop_ir(&function);
-            let fused_kernel = self.record_loop_ir_function_selection(&optimization);
-            let values = jsonl_row_views(rows);
-            let execution_started = Instant::now();
-            let result = self.execute_generic_vm_function(
-                &optimization.function,
-                GenericVmInput::Values(&values),
-            )?;
-            let execution_duration = execution_started.elapsed();
-            let GenericVmLoopResult::Executed { last_value } = result else {
-                self.state.hot_loop_diagnostics.loop_fallback();
-                return Ok(None);
-            };
-            self.state
-                .hot_loop_diagnostics
-                .loop_vm_time(execution_duration);
-            self.finish_generic_vm_loop(targets, last_value);
-            if let Some(kernel) = fused_kernel {
-                self.state
-                    .hot_loop_diagnostics
-                    .fused_kernel_executed(kernel);
-                self.state
-                    .hot_loop_diagnostics
-                    .fused_kernel_time(execution_duration);
-            }
-            return Ok(Some(EvalFlow::Output(PipelineData::empty())));
-        };
-        self.eval_for_jsonl_rows_generic_native_body(targets, rows, plan)?;
-        Ok(Some(EvalFlow::Output(PipelineData::empty())))
-    }
-
-    fn record_loop_ir_function_selection(
-        &mut self,
-        optimization: &LoopIrOptimizationResult,
-    ) -> Option<LoopIrFusedKernel> {
-        self.state.hot_loop_diagnostics.loop_ir_lowered();
-        self.state
-            .hot_loop_diagnostics
-            .loop_ir_optimized(&optimization.diagnostics);
-        if let Some(kernel) = optimization.selected_kernel {
-            self.state
-                .hot_loop_diagnostics
-                .fused_kernel_selected(kernel);
-            Some(kernel)
-        } else {
-            self.state
-                .hot_loop_diagnostics
-                .fusion_miss("no_fused_kernel");
-            None
-        }
     }
 
     fn record_hot_jsonl_ir_fused_selection(
