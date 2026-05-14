@@ -22,6 +22,11 @@ pub(super) enum GenericVmInput<'a> {
     TextLines(&'a TextLines),
 }
 
+pub(super) struct GenericVmExprBodyResult {
+    pub(super) locals: Vec<Option<i64>>,
+    pub(super) last_value: Option<RuntimeValue>,
+}
+
 pub(super) fn generic_vm_number_from_runtime(value: &RuntimeValue) -> Option<GenericVmNumber> {
     match value {
         RuntimeValue::Nu(Value::Int { val, .. }) => Some(GenericVmNumber::I64(*val)),
@@ -218,4 +223,36 @@ pub(super) fn execute_generic_vm_expr_ops(
         }
     }
     Ok(true)
+}
+
+pub(super) fn execute_generic_vm_expr_body(
+    body: &GenericVmExprBody,
+    mut locals: Vec<Option<i64>>,
+    values: &[RuntimeValue],
+    mut lowering_miss: impl FnMut(&'static str),
+) -> Result<Option<GenericVmExprBodyResult>, ShellError> {
+    let mut last_value = None;
+    let mut registers = vec![None; body.registers];
+    for value in values {
+        let RuntimeValue::Nu(value) = value else {
+            lowering_miss("unsupported_value_type");
+            return Ok(None);
+        };
+        let Value::Int { val, .. } = value else {
+            lowering_miss("unsupported_value_type");
+            return Ok(None);
+        };
+        if locals.is_empty() {
+            lowering_miss("unsupported_body_stmt");
+            return Ok(None);
+        }
+        locals[0] = Some(*val);
+        registers.fill(None);
+        if !execute_generic_vm_expr_ops(body, &mut locals, &mut registers, &mut lowering_miss)? {
+            return Ok(None);
+        }
+        last_value = Some(RuntimeValue::Nu(value.clone()));
+    }
+
+    Ok(Some(GenericVmExprBodyResult { locals, last_value }))
 }

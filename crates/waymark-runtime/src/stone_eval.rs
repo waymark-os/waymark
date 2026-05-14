@@ -94,9 +94,9 @@ use stone_json_view::{
 use stone_runtime_value::{FileHandle, RuntimeValue, TextLines};
 use stone_state::runtime_state_record;
 use stone_vm_interp::{
-    execute_generic_vm_expr_ops, generic_vm_add_number, generic_vm_number_from_runtime,
-    generic_vm_number_to_value, generic_vm_record_field_value, GenericVmInput, GenericVmLoopResult,
-    GenericVmNumber,
+    execute_generic_vm_expr_body as execute_generic_vm_expr_body_loop, generic_vm_add_number,
+    generic_vm_number_from_runtime, generic_vm_number_to_value, generic_vm_record_field_value,
+    GenericVmInput, GenericVmLoopResult, GenericVmNumber,
 };
 
 const STONE_LAST_RESULT_ENV: &str = "WAYMARK_LAST_RESULT_JSON";
@@ -1464,38 +1464,14 @@ impl Evaluator<'_> {
             locals.push(value);
         }
 
-        let mut last_value = None;
-        let mut registers = vec![None; body.registers];
-        for value in values {
-            let RuntimeValue::Nu(value) = value else {
-                self.state
-                    .hot_loop_diagnostics
-                    .lowering_miss("unsupported_value_type");
-                return Ok(GenericVmLoopResult::Unsupported);
-            };
-            let Value::Int { val, .. } = value else {
-                self.state
-                    .hot_loop_diagnostics
-                    .lowering_miss("unsupported_value_type");
-                return Ok(GenericVmLoopResult::Unsupported);
-            };
-            if locals.is_empty() {
-                self.state
-                    .hot_loop_diagnostics
-                    .lowering_miss("unsupported_body_stmt");
-                return Ok(GenericVmLoopResult::Unsupported);
-            }
-            locals[0] = Some(*val);
-            registers.fill(None);
-            if !execute_generic_vm_expr_ops(body, &mut locals, &mut registers, |reason| {
-                self.state.hot_loop_diagnostics.lowering_miss(reason);
-            })? {
-                return Ok(GenericVmLoopResult::Unsupported);
-            }
-            last_value = Some(RuntimeValue::Nu(value.clone()));
-        }
+        let Some(result) = execute_generic_vm_expr_body_loop(body, locals, values, |reason| {
+            self.state.hot_loop_diagnostics.lowering_miss(reason);
+        })?
+        else {
+            return Ok(GenericVmLoopResult::Unsupported);
+        };
 
-        for (name, value) in function.locals.iter().zip(locals.into_iter()) {
+        for (name, value) in function.locals.iter().zip(result.locals.into_iter()) {
             if let Some(value) = value {
                 self.state.set_local(
                     name.clone(),
@@ -1504,7 +1480,9 @@ impl Evaluator<'_> {
             }
         }
 
-        Ok(GenericVmLoopResult::Executed { last_value })
+        Ok(GenericVmLoopResult::Executed {
+            last_value: result.last_value,
+        })
     }
 
     fn eval_for_jsonl_rows(
