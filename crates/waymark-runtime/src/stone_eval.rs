@@ -95,9 +95,9 @@ use stone_runtime_value::{FileHandle, RuntimeValue, TextLines};
 use stone_state::runtime_state_record;
 use stone_vm_interp::{
     execute_generic_vm_add_assign as execute_generic_vm_add_assign_loop,
-    execute_generic_vm_expr_body as execute_generic_vm_expr_body_loop, generic_vm_add_number,
-    generic_vm_number_from_runtime, generic_vm_number_to_value, generic_vm_record_field_value,
-    GenericVmInput, GenericVmLoopResult, GenericVmNumber,
+    execute_generic_vm_expr_body as execute_generic_vm_expr_body_loop,
+    execute_generic_vm_text_parse_add_assign as execute_generic_vm_text_parse_add_assign_loop,
+    generic_vm_record_field_value, GenericVmInput, GenericVmLoopResult,
 };
 
 const STONE_LAST_RESULT_ENV: &str = "WAYMARK_LAST_RESULT_JSON";
@@ -1227,48 +1227,17 @@ impl Evaluator<'_> {
                 .lowering_miss("unsupported_expr");
             return Ok(GenericVmLoopResult::Unsupported);
         };
-        let mut accumulator = match generic_vm_number_from_runtime(&local_value) {
-            Some(value) => value,
-            None => {
-                self.state
-                    .hot_loop_diagnostics
-                    .lowering_miss("unsupported_expr");
-                return Ok(GenericVmLoopResult::Unsupported);
-            }
+        let Some(result) =
+            execute_generic_vm_text_parse_add_assign_loop(local_value, lines, parse, |reason| {
+                self.state.hot_loop_diagnostics.lowering_miss(reason);
+            })?
+        else {
+            return Ok(GenericVmLoopResult::Unsupported);
         };
-        let mut last_value = None;
-        for line in &lines.lines {
-            let parsed = match parse {
-                GenericParseNumber::Int => match line.trim().parse::<i64>() {
-                    Ok(value) => GenericVmNumber::I64(value),
-                    Err(_) => {
-                        self.state
-                            .hot_loop_diagnostics
-                            .lowering_miss("unsupported_expr");
-                        return Ok(GenericVmLoopResult::Unsupported);
-                    }
-                },
-                GenericParseNumber::Float => match line.trim().parse::<f64>() {
-                    Ok(value) => GenericVmNumber::F64(value),
-                    Err(_) => {
-                        self.state
-                            .hot_loop_diagnostics
-                            .lowering_miss("unsupported_expr");
-                        return Ok(GenericVmLoopResult::Unsupported);
-                    }
-                },
-            };
-            accumulator = generic_vm_add_number(accumulator, parsed)?;
-            last_value = Some(RuntimeValue::Nu(Value::string(
-                line.clone(),
-                Span::unknown(),
-            )));
-        }
-        self.state.set_local(
-            local.to_owned(),
-            RuntimeValue::Nu(generic_vm_number_to_value(accumulator)),
-        );
-        Ok(GenericVmLoopResult::Executed { last_value })
+        self.state.set_local(local.to_owned(), result.value);
+        Ok(GenericVmLoopResult::Executed {
+            last_value: result.last_value,
+        })
     }
 
     fn execute_generic_vm_map_add_i64_const(

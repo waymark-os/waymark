@@ -4,7 +4,7 @@ use nu_protocol::{ShellError, Span, Value};
 
 use super::stone_runtime_value::{RuntimeValue, TextLines};
 use super::{json_object_view_get, stone_error};
-use crate::stone_vm::{GenericVmConst, GenericVmExprBody, GenericVmExprOp};
+use crate::stone_vm::{GenericParseNumber, GenericVmConst, GenericVmExprBody, GenericVmExprOp};
 
 #[derive(Clone, Copy)]
 pub(super) enum GenericVmNumber {
@@ -101,6 +101,50 @@ pub(super) fn execute_generic_vm_add_assign(
         };
         accumulator = generic_vm_add_number(accumulator, number)?;
         last_value = Some(value.clone());
+    }
+
+    Ok(Some(GenericVmAssignResult {
+        value: RuntimeValue::Nu(generic_vm_number_to_value(accumulator)),
+        last_value,
+    }))
+}
+
+pub(super) fn execute_generic_vm_text_parse_add_assign(
+    local_value: RuntimeValue,
+    lines: &TextLines,
+    parse: GenericParseNumber,
+    mut lowering_miss: impl FnMut(&'static str),
+) -> Result<Option<GenericVmAssignResult>, ShellError> {
+    let mut accumulator = match generic_vm_number_from_runtime(&local_value) {
+        Some(value) => value,
+        None => {
+            lowering_miss("unsupported_expr");
+            return Ok(None);
+        }
+    };
+    let mut last_value = None;
+    for line in &lines.lines {
+        let parsed = match parse {
+            GenericParseNumber::Int => match line.trim().parse::<i64>() {
+                Ok(value) => GenericVmNumber::I64(value),
+                Err(_) => {
+                    lowering_miss("unsupported_expr");
+                    return Ok(None);
+                }
+            },
+            GenericParseNumber::Float => match line.trim().parse::<f64>() {
+                Ok(value) => GenericVmNumber::F64(value),
+                Err(_) => {
+                    lowering_miss("unsupported_expr");
+                    return Ok(None);
+                }
+            },
+        };
+        accumulator = generic_vm_add_number(accumulator, parsed)?;
+        last_value = Some(RuntimeValue::Nu(Value::string(
+            line.clone(),
+            Span::unknown(),
+        )));
     }
 
     Ok(Some(GenericVmAssignResult {
