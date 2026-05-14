@@ -72,6 +72,8 @@ use crate::stone_vm::{
 
 #[path = "stone_json_view.rs"]
 mod stone_json_view;
+#[path = "stone_runtime_value.rs"]
+mod stone_runtime_value;
 use stone_json_view::{
     eval_json_object_view_method, eval_runtime_subscript, find_top_level_json_field,
     json_array_bytes_for_each_range, json_array_view_iter_values, json_key_matches,
@@ -81,8 +83,9 @@ use stone_json_view::{
     json_scalar_view_to_i64, json_string_bytes_to_cow, jsonl_row_view, jsonl_row_views,
     jsonl_rows_from_bytes, materialize_json_array_view, materialize_json_object_view,
     materialize_json_scalar_view, materialize_jsonl_rows, runtime_value_to_string_key,
-    trim_json_bytes, JsonArrayView, JsonObjectView, JsonScalarView, JsonlRows,
+    trim_json_bytes, JsonObjectView, JsonlRows,
 };
+use stone_runtime_value::{CallableValue, FileHandle, RuntimeValue, TextLines};
 
 const STONE_LAST_RESULT_ENV: &str = "WAYMARK_LAST_RESULT_JSON";
 
@@ -335,66 +338,6 @@ impl StoneSession {
     }
 }
 
-#[derive(Clone)]
-enum RuntimeValue {
-    Nu(Value),
-    File(FileHandle),
-    TextLines(TextLines),
-    JsonlRows(JsonlRows),
-    JsonObjectView(JsonObjectView),
-    JsonArrayView(JsonArrayView),
-    JsonScalarView(JsonScalarView),
-    Callable(CallableValue),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RuntimeValueTag {
-    Nu,
-    File,
-    TextLines,
-    JsonlRows,
-    JsonObjectView,
-    JsonArrayView,
-    JsonScalarView,
-    Callable,
-}
-
-impl RuntimeValueTag {
-    #[allow(dead_code)]
-    fn id(self) -> u8 {
-        match self {
-            RuntimeValueTag::Nu => 1,
-            RuntimeValueTag::File => 2,
-            RuntimeValueTag::TextLines => 3,
-            RuntimeValueTag::JsonlRows => 4,
-            RuntimeValueTag::JsonObjectView => 5,
-            RuntimeValueTag::JsonArrayView => 6,
-            RuntimeValueTag::JsonScalarView => 7,
-            RuntimeValueTag::Callable => 8,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct CallableValue {
-    function_id: u64,
-    params: Vec<String>,
-    body: Box<Expr>,
-    captures: Vec<(String, RuntimeValue)>,
-}
-
-#[derive(Clone, Copy)]
-struct FileHandle {
-    scope_index: usize,
-    file_id: u64,
-}
-
-#[derive(Clone)]
-struct TextLines {
-    lines: Vec<String>,
-    source: String,
-}
-
 struct FusedMapUpdateIf {
     key_name: String,
     contains_map: String,
@@ -593,67 +536,6 @@ impl EvalState {
             .get_mut(handle.scope_index)
             .and_then(|scope| scope.files.get_mut(&handle.file_id))
             .ok_or_else(|| stone_error("file", "file handle is no longer valid"))
-    }
-}
-
-impl RuntimeValue {
-    fn is_session_persistable(&self) -> bool {
-        match self {
-            RuntimeValue::Nu(_) => true,
-            RuntimeValue::TextLines(_) => true,
-            RuntimeValue::JsonlRows(_) => true,
-            RuntimeValue::JsonObjectView(_) => true,
-            RuntimeValue::JsonArrayView(_) => true,
-            RuntimeValue::JsonScalarView(_) => true,
-            RuntimeValue::Callable(callable) => callable
-                .captures
-                .iter()
-                .all(|(_, value)| value.is_session_persistable()),
-            RuntimeValue::File(_) => false,
-        }
-    }
-
-    #[allow(dead_code)]
-    fn type_tag(&self) -> RuntimeValueTag {
-        match self {
-            RuntimeValue::Nu(_) => RuntimeValueTag::Nu,
-            RuntimeValue::File(_) => RuntimeValueTag::File,
-            RuntimeValue::TextLines(_) => RuntimeValueTag::TextLines,
-            RuntimeValue::JsonlRows(_) => RuntimeValueTag::JsonlRows,
-            RuntimeValue::JsonObjectView(_) => RuntimeValueTag::JsonObjectView,
-            RuntimeValue::JsonArrayView(_) => RuntimeValueTag::JsonArrayView,
-            RuntimeValue::JsonScalarView(_) => RuntimeValueTag::JsonScalarView,
-            RuntimeValue::Callable(_) => RuntimeValueTag::Callable,
-        }
-    }
-
-    fn into_nu_value(self, context: &str) -> Result<Value, ShellError> {
-        match self {
-            RuntimeValue::Nu(value) => Ok(value),
-            RuntimeValue::File(_) => Err(stone_error(
-                context,
-                "file objects are task-owned runtime values and cannot cross this boundary",
-            )),
-            RuntimeValue::TextLines(lines) => Ok(Value::list(
-                lines
-                    .lines
-                    .into_iter()
-                    .map(|line| Value::string(line, Span::unknown()))
-                    .collect(),
-                Span::unknown(),
-            )),
-            RuntimeValue::JsonlRows(rows) => materialize_jsonl_rows(&rows),
-            RuntimeValue::JsonObjectView(view) => materialize_json_object_view(&view),
-            RuntimeValue::JsonArrayView(view) => materialize_json_array_view(&view),
-            RuntimeValue::JsonScalarView(view) => materialize_json_scalar_view(&view),
-            RuntimeValue::Callable(callable) => Err(stone_error(
-                context,
-                format!(
-                    "callable lambda#{} is a task-owned runtime value and cannot cross this boundary",
-                    callable.function_id
-                ),
-            )),
-        }
     }
 }
 

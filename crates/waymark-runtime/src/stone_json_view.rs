@@ -11,7 +11,8 @@ use crate::stone_builtins::{
     normalize_index, record_method_builtin, subscript_builtin, value_to_string,
 };
 
-use super::{stone_error, RuntimeValue};
+use super::stone_error;
+use super::stone_runtime_value::RuntimeValue;
 
 #[derive(Clone)]
 pub(super) struct JsonlRows {
