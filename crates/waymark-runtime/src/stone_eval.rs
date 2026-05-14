@@ -60,13 +60,12 @@ use crate::stone_vm::{
     generic_loop_compile_miss_reason, match_hot_jsonl_aggregation_body,
     match_outer_jsonl_file_loop_body, optimize_loop_ir, optimize_stone_loop_ir,
     try_lower_generic_loop, try_lower_hot_loop, validate_hot_jsonl_native_prefix, AccId, ConstId,
-    GenericLoopIter, GenericLoopOp, GenericLoopPlan, GenericParseNumber, GenericVmConst,
-    GenericVmExprBody, GenericVmExprOp, GenericVmFunction, GenericVmOp, HotJsonlAggregationBody,
-    HotJsonlBodyOp, HotJsonlNestedUserTotals, HotJsonlSlot, HotJsonlTracePlan, HotLoopIter,
-    HotLoopOp, HotLoopPlan, LoopIrFusedKernel, LoopIrOptimizationDiagnostic,
-    LoopIrOptimizationResult, Reg, SnapshotId, StoneAccumulatorKind, StoneConst,
-    StoneFallbackTarget, StoneGuardKind, StoneIrFunction, StoneLoopIrOptimizationResult, StoneOp,
-    StoneTerminator,
+    GenericLoopIter, GenericLoopOp, GenericLoopPlan, GenericParseNumber, GenericVmExprBody,
+    GenericVmFunction, GenericVmOp, HotJsonlAggregationBody, HotJsonlBodyOp,
+    HotJsonlNestedUserTotals, HotJsonlSlot, HotJsonlTracePlan, HotLoopIter, HotLoopOp, HotLoopPlan,
+    LoopIrFusedKernel, LoopIrOptimizationDiagnostic, LoopIrOptimizationResult, Reg, SnapshotId,
+    StoneAccumulatorKind, StoneConst, StoneFallbackTarget, StoneGuardKind, StoneIrFunction,
+    StoneLoopIrOptimizationResult, StoneOp, StoneTerminator,
 };
 
 #[path = "stone_functions.rs"]
@@ -95,9 +94,8 @@ use stone_json_view::{
 use stone_runtime_value::{FileHandle, RuntimeValue, TextLines};
 use stone_state::runtime_state_record;
 use stone_vm_interp::{
-    generic_vm_add_number, generic_vm_number_from_runtime, generic_vm_number_to_value,
-    generic_vm_record_field_value, generic_vm_register_i64, generic_vm_set_register,
-    generic_vm_store_i64_binop, generic_vm_store_shift, GenericVmInput, GenericVmLoopResult,
+    execute_generic_vm_expr_ops, generic_vm_add_number, generic_vm_number_from_runtime,
+    generic_vm_number_to_value, generic_vm_record_field_value, GenericVmInput, GenericVmLoopResult,
     GenericVmNumber,
 };
 
@@ -1489,7 +1487,9 @@ impl Evaluator<'_> {
             }
             locals[0] = Some(*val);
             registers.fill(None);
-            if !self.execute_generic_vm_expr_ops(body, &mut locals, &mut registers)? {
+            if !execute_generic_vm_expr_ops(body, &mut locals, &mut registers, |reason| {
+                self.state.hot_loop_diagnostics.lowering_miss(reason);
+            })? {
                 return Ok(GenericVmLoopResult::Unsupported);
             }
             last_value = Some(RuntimeValue::Nu(value.clone()));
@@ -1505,124 +1505,6 @@ impl Evaluator<'_> {
         }
 
         Ok(GenericVmLoopResult::Executed { last_value })
-    }
-
-    fn execute_generic_vm_expr_ops(
-        &mut self,
-        body: &GenericVmExprBody,
-        locals: &mut [Option<i64>],
-        registers: &mut [Option<i64>],
-    ) -> Result<bool, ShellError> {
-        for op in &body.ops {
-            match *op {
-                GenericVmExprOp::LoadLocal { dst, local } => {
-                    let Some(value) = locals.get(local).copied().flatten() else {
-                        self.state
-                            .hot_loop_diagnostics
-                            .lowering_miss("unsupported_expr_name");
-                        return Ok(false);
-                    };
-                    let Some(slot) = registers.get_mut(dst) else {
-                        return Err(stone_error("hot loop", "VM register is out of range"));
-                    };
-                    *slot = Some(value);
-                }
-                GenericVmExprOp::StoreLocal { local, src } => {
-                    let value = generic_vm_register_i64(registers, src)?;
-                    let Some(slot) = locals.get_mut(local) else {
-                        return Err(stone_error("hot loop", "VM local is out of range"));
-                    };
-                    *slot = Some(value);
-                }
-                GenericVmExprOp::LoadConst { dst, constant } => {
-                    let Some(GenericVmConst::I64(value)) = body.constants.get(constant) else {
-                        return Err(stone_error("hot loop", "VM constant is out of range"));
-                    };
-                    let Some(slot) = registers.get_mut(dst) else {
-                        return Err(stone_error("hot loop", "VM register is out of range"));
-                    };
-                    *slot = Some(*value);
-                }
-                GenericVmExprOp::AddI64 { dst, lhs, rhs } => {
-                    generic_vm_store_i64_binop(
-                        registers,
-                        dst,
-                        lhs,
-                        rhs,
-                        "addition",
-                        i64::checked_add,
-                    )?;
-                }
-                GenericVmExprOp::SubI64 { dst, lhs, rhs } => {
-                    generic_vm_store_i64_binop(
-                        registers,
-                        dst,
-                        lhs,
-                        rhs,
-                        "subtraction",
-                        i64::checked_sub,
-                    )?;
-                }
-                GenericVmExprOp::MulI64 { dst, lhs, rhs } => {
-                    generic_vm_store_i64_binop(
-                        registers,
-                        dst,
-                        lhs,
-                        rhs,
-                        "multiplication",
-                        i64::checked_mul,
-                    )?;
-                }
-                GenericVmExprOp::FloorDivI64 { dst, lhs, rhs } => {
-                    let left = generic_vm_register_i64(registers, lhs)?;
-                    let right = generic_vm_register_i64(registers, rhs)?;
-                    if right == 0 {
-                        return Err(stone_error("floor division", "division by zero"));
-                    }
-                    generic_vm_set_register(registers, dst, left.div_euclid(right))?;
-                }
-                GenericVmExprOp::BitAndI64 { dst, lhs, rhs } => {
-                    let value = generic_vm_register_i64(registers, lhs)?
-                        & generic_vm_register_i64(registers, rhs)?;
-                    generic_vm_set_register(registers, dst, value)?;
-                }
-                GenericVmExprOp::BitOrI64 { dst, lhs, rhs } => {
-                    let value = generic_vm_register_i64(registers, lhs)?
-                        | generic_vm_register_i64(registers, rhs)?;
-                    generic_vm_set_register(registers, dst, value)?;
-                }
-                GenericVmExprOp::BitXorI64 { dst, lhs, rhs } => {
-                    let value = generic_vm_register_i64(registers, lhs)?
-                        ^ generic_vm_register_i64(registers, rhs)?;
-                    generic_vm_set_register(registers, dst, value)?;
-                }
-                GenericVmExprOp::ShlI64 { dst, lhs, rhs } => {
-                    generic_vm_store_shift(
-                        registers,
-                        dst,
-                        lhs,
-                        rhs,
-                        "left shift",
-                        i64::checked_shl,
-                    )?;
-                }
-                GenericVmExprOp::ShrI64 { dst, lhs, rhs } => {
-                    generic_vm_store_shift(
-                        registers,
-                        dst,
-                        lhs,
-                        rhs,
-                        "right shift",
-                        i64::checked_shr,
-                    )?;
-                }
-                GenericVmExprOp::BitNotI64 { dst, src } => {
-                    let value = !generic_vm_register_i64(registers, src)?;
-                    generic_vm_set_register(registers, dst, value)?;
-                }
-            }
-        }
-        Ok(true)
     }
 
     fn eval_for_jsonl_rows(
