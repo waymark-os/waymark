@@ -37,7 +37,9 @@ The expected module map is:
 - `stone_vm/runtime.rs`: generic VM runtime adapter over evaluator state
 - `stone_vm/jsonl_runtime.rs`: hot JSONL/native Stone VM runtime execution
 
-## Current State
+## Implementation Status
+
+Implemented in May 2026.
 
 The generic VM path is split:
 
@@ -47,25 +49,19 @@ The generic VM path is split:
 - `stone_eval.rs` calls `try_eval_for_*_generic_vm(...)` but no longer owns the
   generic VM execution loops
 
-The hot JSONL/native path still has too much VM runtime code in
-`stone_eval.rs`, including:
+The hot JSONL/native path is also split:
 
-- `HotJsonlNativeAccumulators`
-- `HotJsonlRowFields`
-- `HotJsonlStringArray`
-- `HotJsonlRowSlice`
-- `HotJsonlNativeSlots`
-- `StoneVmSlot`
-- hot JSONL row access helpers
-- hot JSONL accumulator load/materialization helpers
-- Stone IR JSONL VM slot helpers and opcode execution
-- native JSONL trace execution helpers
-- hot JSONL entry methods such as `execute_hot_loop_prefix` and
-  `eval_for_text_lines_hot_jsonl`
+- `stone_vm/jsonl_runtime.rs` owns the hot JSONL data shapes, row access
+  helpers, accumulator materialization, Stone IR JSONL VM execution, native
+  trace execution, and top-level hot JSONL runtime entry methods.
+- `stone_eval.rs` owns loop candidate detection and calls the VM runtime
+  adapter methods.
+- `stone_vm/runtime.rs` continues to call the JSONL runtime adapter for generic
+  VM plans whose fused kernel is JSONL aggregation.
 
-## Slice Plan
+## Completed Slice Plan
 
-Keep every slice behavior-preserving and commit-sized.
+Every slice was kept behavior-preserving and commit-sized.
 
 ### Slice 1: Add The Runtime Module Shell
 
