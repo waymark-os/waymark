@@ -2,9 +2,8 @@
 
 use nu_protocol::{ShellError, Span, Value};
 
-use crate::stone_ast::Expr;
-
 use super::stone_error;
+use super::stone_functions::CallableValue;
 use super::stone_json_view::{
     materialize_json_array_view, materialize_json_object_view, materialize_json_scalar_view,
     materialize_jsonl_rows, JsonArrayView, JsonObjectView, JsonScalarView, JsonlRows,
@@ -48,14 +47,6 @@ impl RuntimeValueTag {
             RuntimeValueTag::Callable => 8,
         }
     }
-}
-
-#[derive(Clone)]
-pub(super) struct CallableValue {
-    pub(super) function_id: u64,
-    pub(super) params: Vec<String>,
-    pub(super) body: Box<Expr>,
-    pub(super) captures: Vec<(String, RuntimeValue)>,
 }
 
 #[derive(Clone, Copy)]
