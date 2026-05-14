@@ -6,11 +6,12 @@ mod types;
 
 pub(crate) use crate::stone_ir::{
     generic_loop_compile_miss_reason, match_hot_jsonl_aggregation_body,
-    match_outer_jsonl_file_loop_body, try_lower_generic_loop, try_lower_hot_loop,
+    match_outer_jsonl_file_loop_body, try_lower_generic_loop,
 };
 pub(crate) use lower::{
     compile_generic_vm_function, compile_hot_jsonl_loop_ir_function, compile_hot_jsonl_trace_plan,
     compile_hot_jsonl_trace_plan_from_ir, compile_hot_jsonl_vm_function,
+    lower_json_loads_line_prefix, match_row_get, match_row_subscript, try_lower_hot_loop,
     validate_hot_jsonl_native_prefix,
 };
 pub(crate) use optimize::{

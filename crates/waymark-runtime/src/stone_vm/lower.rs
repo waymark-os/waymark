@@ -11,8 +11,50 @@ use super::{
     StoneSnapshotLocal, StoneTerminator,
 };
 
-use crate::stone_ast::{AssignTarget, AugOp, Expr, Stmt};
+use crate::stone_ast::{AssignTarget, AugOp, Call, CompareOp, Expr, Stmt};
 use crate::stone_vm::match_hot_jsonl_aggregation_ir_subgraph;
+
+pub(crate) fn try_lower_hot_loop(
+    targets: &[String],
+    iter: &Expr,
+    body: &[Stmt],
+) -> Option<HotLoopPlan> {
+    let [target] = targets else {
+        return None;
+    };
+    if let Expr::Call(Call {
+        name,
+        positional,
+        named,
+    }) = iter
+    {
+        if name == "read_jsonl" && !positional.is_empty() && named.is_empty() {
+            let ops = lower_prefix_ops(target, body);
+            if ops.is_empty() {
+                return None;
+            }
+            let body_start = ops.len();
+            return Some(HotLoopPlan {
+                target: target.clone(),
+                iter: super::HotLoopIter::ReadJsonl {
+                    path: super::JsonlPathExpr::Dynamic,
+                },
+                ops,
+                body_start,
+            });
+        }
+    }
+
+    let (record_target, body_start) = lower_json_loads_line_prefix(target, body)?;
+    Some(HotLoopPlan {
+        target: record_target,
+        iter: super::HotLoopIter::JsonlTextLines {
+            line_target: target.clone(),
+        },
+        ops: Vec::new(),
+        body_start,
+    })
+}
 
 pub(crate) fn compile_generic_vm_function(plan: &GenericLoopPlan) -> Option<LoopIrFunction> {
     let [op] = plan.ops.as_slice() else {
@@ -785,4 +827,198 @@ fn generic_vm_local(locals: &mut Vec<String>, name: &str) -> usize {
     let index = locals.len();
     locals.push(name.to_owned());
     index
+}
+
+pub(crate) fn lower_json_loads_line_prefix(
+    line_target: &str,
+    body: &[Stmt],
+) -> Option<(String, usize)> {
+    let mut index = 0;
+    if matches_blank_line_continue(line_target, body.first()?) {
+        index = 1;
+    }
+    let Stmt::Assign {
+        target: AssignTarget::Name(record_target),
+        value:
+            Expr::Call(Call {
+                name,
+                positional,
+                named,
+            }),
+    } = body.get(index)?
+    else {
+        return None;
+    };
+    if name != "json_loads"
+        || !named.is_empty()
+        || positional != &[Expr::Name(line_target.to_owned())]
+    {
+        return None;
+    }
+    Some((record_target.clone(), index + 1))
+}
+
+fn matches_blank_line_continue(line_target: &str, stmt: &Stmt) -> bool {
+    let Stmt::If {
+        condition,
+        then_branch,
+        else_branch,
+    } = stmt
+    else {
+        return false;
+    };
+    if !else_branch.is_empty() || then_branch != &[Stmt::Continue] {
+        return false;
+    }
+    match condition {
+        Expr::Compare {
+            left,
+            ops,
+            comparators,
+        } if ops == &[CompareOp::Eq] && comparators == &[Expr::String(String::new())] => {
+            matches_line_strip_call(line_target, left)
+        }
+        Expr::Not(value) => matches_line_strip_call(line_target, value),
+        _ => false,
+    }
+}
+
+fn matches_line_strip_call(line_target: &str, expr: &Expr) -> bool {
+    let Expr::MethodCall {
+        receiver,
+        method,
+        positional,
+    } = expr
+    else {
+        return false;
+    };
+    method == "strip"
+        && positional.is_empty()
+        && receiver.as_ref() == &Expr::Name(line_target.to_owned())
+}
+
+fn lower_prefix_ops(row_target: &str, body: &[Stmt]) -> Vec<HotLoopOp> {
+    let mut ops = Vec::new();
+    for stmt in body {
+        let Some(op) = lower_prefix_stmt(row_target, stmt) else {
+            break;
+        };
+        ops.push(op);
+    }
+    ops
+}
+
+fn lower_prefix_stmt(row_target: &str, stmt: &Stmt) -> Option<HotLoopOp> {
+    let Stmt::Assign {
+        target: AssignTarget::Name(target),
+        value,
+    } = stmt
+    else {
+        return None;
+    };
+    lower_get_assignment(row_target, target, value)
+}
+
+fn lower_get_assignment(row_target: &str, target: &str, value: &Expr) -> Option<HotLoopOp> {
+    if let Some(key) = match_row_subscript(row_target, value) {
+        return Some(HotLoopOp::JsonGetValue {
+            target: target.to_owned(),
+            key,
+        });
+    }
+
+    if let Some((key, default)) = match_row_get(row_target, value) {
+        return match default {
+            Expr::String(default) => Some(HotLoopOp::JsonGetStrDefault {
+                target: target.to_owned(),
+                key,
+                default: default.clone(),
+            }),
+            Expr::List(items) if items.is_empty() => Some(HotLoopOp::JsonGetArrayDefault {
+                target: target.to_owned(),
+                key,
+            }),
+            _ => None,
+        };
+    }
+
+    let Expr::Call(Call {
+        name,
+        positional,
+        named,
+    }) = value
+    else {
+        return None;
+    };
+    if !named.is_empty() {
+        return None;
+    }
+    let [arg] = positional.as_slice() else {
+        return None;
+    };
+    let (key, default) = match_row_get(row_target, arg)?;
+    match (name.as_str(), default) {
+        ("float", Expr::Float(default)) => Some(HotLoopOp::JsonGetF64Default {
+            target: target.to_owned(),
+            key,
+            default: *default,
+        }),
+        ("int", Expr::Int(default)) => Some(HotLoopOp::JsonGetI64Default {
+            target: target.to_owned(),
+            key,
+            default: default.parse().ok()?,
+        }),
+        _ => None,
+    }
+}
+
+pub(crate) fn match_row_get<'a>(row_target: &str, value: &'a Expr) -> Option<(String, &'a Expr)> {
+    let Expr::MethodCall {
+        receiver,
+        method,
+        positional,
+    } = value
+    else {
+        return None;
+    };
+    if method != "get" {
+        return None;
+    }
+    let Expr::Name(receiver) = receiver.as_ref() else {
+        return None;
+    };
+    if receiver != row_target {
+        return None;
+    }
+    let [Expr::String(key), default] = positional.as_slice() else {
+        return None;
+    };
+    Some((key.clone(), default))
+}
+
+pub(crate) fn match_row_subscript(row_target: &str, value: &Expr) -> Option<String> {
+    match value {
+        Expr::Subscript { value, index } => {
+            let Expr::Name(receiver) = value.as_ref() else {
+                return None;
+            };
+            if receiver != row_target {
+                return None;
+            }
+            let Expr::String(key) = index.as_ref() else {
+                return None;
+            };
+            Some(key.clone())
+        }
+        Expr::Attribute { value, attr } => {
+            let Expr::Name(receiver) = value.as_ref() else {
+                return None;
+            };
+            if receiver != row_target {
+                return None;
+            }
+            Some(attr.clone())
+        }
+        _ => None,
+    }
 }

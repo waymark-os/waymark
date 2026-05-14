@@ -2,9 +2,9 @@
 
 use crate::stone_ast::{AssignTarget, AugOp, Call, CompareOp, Expr, Stmt};
 use crate::stone_vm::{
-    GenericLoopIter, GenericLoopOp, GenericLoopPlan, HotJsonlAggregationBody, HotJsonlBodyOp,
-    HotJsonlNestedUserTotals, HotJsonlSlot, HotLoopIter, HotLoopOp, HotLoopPlan, JsonlPathExpr,
-    OuterJsonlFileLoopBody,
+    lower_json_loads_line_prefix, match_row_get, match_row_subscript, GenericLoopIter,
+    GenericLoopOp, GenericLoopPlan, HotJsonlAggregationBody, HotJsonlBodyOp,
+    HotJsonlNestedUserTotals, HotJsonlSlot, OuterJsonlFileLoopBody,
 };
 
 struct FusedMapUpdateIf {
@@ -17,48 +17,6 @@ struct FusedMapUpdateIf {
 struct FusedMapUpdate {
     map_name: String,
     addend: Expr,
-}
-
-pub(crate) fn try_lower_hot_loop(
-    targets: &[String],
-    iter: &Expr,
-    body: &[Stmt],
-) -> Option<HotLoopPlan> {
-    let [target] = targets else {
-        return None;
-    };
-    if let Expr::Call(Call {
-        name,
-        positional,
-        named,
-    }) = iter
-    {
-        if name == "read_jsonl" && !positional.is_empty() && named.is_empty() {
-            let ops = lower_prefix_ops(target, body);
-            if ops.is_empty() {
-                return None;
-            }
-            let body_start = ops.len();
-            return Some(HotLoopPlan {
-                target: target.clone(),
-                iter: HotLoopIter::ReadJsonl {
-                    path: JsonlPathExpr::Dynamic,
-                },
-                ops,
-                body_start,
-            });
-        }
-    }
-
-    let (record_target, body_start) = lower_json_loads_line_prefix(target, body)?;
-    Some(HotLoopPlan {
-        target: record_target,
-        iter: HotLoopIter::JsonlTextLines {
-            line_target: target.clone(),
-        },
-        ops: Vec::new(),
-        body_start,
-    })
 }
 
 pub(crate) fn try_lower_generic_loop(
@@ -496,197 +454,6 @@ fn lower_generic_unique_append_if(
 fn matches_add_self_item(local: &str, item: &str, left: &Expr, right: &Expr) -> bool {
     matches!((left, right), (Expr::Name(lhs), Expr::Name(rhs)) if lhs == local && rhs == item)
         || matches!((left, right), (Expr::Name(lhs), Expr::Name(rhs)) if lhs == item && rhs == local)
-}
-
-fn lower_json_loads_line_prefix(line_target: &str, body: &[Stmt]) -> Option<(String, usize)> {
-    let mut index = 0;
-    if matches_blank_line_continue(line_target, body.first()?) {
-        index = 1;
-    }
-    let Stmt::Assign {
-        target: AssignTarget::Name(record_target),
-        value:
-            Expr::Call(Call {
-                name,
-                positional,
-                named,
-            }),
-    } = body.get(index)?
-    else {
-        return None;
-    };
-    if name != "json_loads"
-        || !named.is_empty()
-        || positional != &[Expr::Name(line_target.to_owned())]
-    {
-        return None;
-    }
-    Some((record_target.clone(), index + 1))
-}
-
-fn matches_blank_line_continue(line_target: &str, stmt: &Stmt) -> bool {
-    let Stmt::If {
-        condition,
-        then_branch,
-        else_branch,
-    } = stmt
-    else {
-        return false;
-    };
-    if !else_branch.is_empty() || then_branch != &[Stmt::Continue] {
-        return false;
-    }
-    match condition {
-        Expr::Compare {
-            left,
-            ops,
-            comparators,
-        } if ops == &[CompareOp::Eq] && comparators == &[Expr::String(String::new())] => {
-            matches_line_strip_call(line_target, left)
-        }
-        Expr::Not(value) => matches_line_strip_call(line_target, value),
-        _ => false,
-    }
-}
-
-fn matches_line_strip_call(line_target: &str, expr: &Expr) -> bool {
-    let Expr::MethodCall {
-        receiver,
-        method,
-        positional,
-    } = expr
-    else {
-        return false;
-    };
-    method == "strip"
-        && positional.is_empty()
-        && receiver.as_ref() == &Expr::Name(line_target.to_owned())
-}
-
-fn lower_prefix_ops(row_target: &str, body: &[Stmt]) -> Vec<HotLoopOp> {
-    let mut ops = Vec::new();
-    for stmt in body {
-        let Some(op) = lower_prefix_stmt(row_target, stmt) else {
-            break;
-        };
-        ops.push(op);
-    }
-    ops
-}
-
-fn lower_prefix_stmt(row_target: &str, stmt: &Stmt) -> Option<HotLoopOp> {
-    let Stmt::Assign {
-        target: AssignTarget::Name(target),
-        value,
-    } = stmt
-    else {
-        return None;
-    };
-    lower_get_assignment(row_target, target, value)
-}
-
-fn lower_get_assignment(row_target: &str, target: &str, value: &Expr) -> Option<HotLoopOp> {
-    if let Some(key) = match_row_subscript(row_target, value) {
-        return Some(HotLoopOp::JsonGetValue {
-            target: target.to_owned(),
-            key,
-        });
-    }
-
-    if let Some((key, default)) = match_row_get(row_target, value) {
-        return match default {
-            Expr::String(default) => Some(HotLoopOp::JsonGetStrDefault {
-                target: target.to_owned(),
-                key,
-                default: default.clone(),
-            }),
-            Expr::List(items) if items.is_empty() => Some(HotLoopOp::JsonGetArrayDefault {
-                target: target.to_owned(),
-                key,
-            }),
-            _ => None,
-        };
-    }
-
-    let Expr::Call(Call {
-        name,
-        positional,
-        named,
-    }) = value
-    else {
-        return None;
-    };
-    if !named.is_empty() {
-        return None;
-    }
-    let [arg] = positional.as_slice() else {
-        return None;
-    };
-    let (key, default) = match_row_get(row_target, arg)?;
-    match (name.as_str(), default) {
-        ("float", Expr::Float(default)) => Some(HotLoopOp::JsonGetF64Default {
-            target: target.to_owned(),
-            key,
-            default: *default,
-        }),
-        ("int", Expr::Int(default)) => Some(HotLoopOp::JsonGetI64Default {
-            target: target.to_owned(),
-            key,
-            default: default.parse().ok()?,
-        }),
-        _ => None,
-    }
-}
-
-fn match_row_get<'a>(row_target: &str, value: &'a Expr) -> Option<(String, &'a Expr)> {
-    let Expr::MethodCall {
-        receiver,
-        method,
-        positional,
-    } = value
-    else {
-        return None;
-    };
-    if method != "get" {
-        return None;
-    }
-    let Expr::Name(receiver) = receiver.as_ref() else {
-        return None;
-    };
-    if receiver != row_target {
-        return None;
-    }
-    let [Expr::String(key), default] = positional.as_slice() else {
-        return None;
-    };
-    Some((key.clone(), default))
-}
-
-fn match_row_subscript(row_target: &str, value: &Expr) -> Option<String> {
-    match value {
-        Expr::Subscript { value, index } => {
-            let Expr::Name(receiver) = value.as_ref() else {
-                return None;
-            };
-            if receiver != row_target {
-                return None;
-            }
-            let Expr::String(key) = index.as_ref() else {
-                return None;
-            };
-            Some(key.clone())
-        }
-        Expr::Attribute { value, attr } => {
-            let Expr::Name(receiver) = value.as_ref() else {
-                return None;
-            };
-            if receiver != row_target {
-                return None;
-            }
-            Some(attr.clone())
-        }
-        _ => None,
-    }
 }
 
 pub(crate) fn match_hot_jsonl_aggregation_body(
@@ -1842,13 +1609,14 @@ mod tests {
         compile_hot_jsonl_trace_plan, compile_hot_jsonl_trace_plan_from_ir,
         compile_hot_jsonl_vm_function, match_hot_jsonl_ir_subgraph, match_loop_ir_subgraph,
         optimize_loop_ir, optimize_stone_loop_ir, select_hot_jsonl_fused_kernel_from_ir,
-        select_loop_ir_fused_kernel, AccId, BlockId, ConstId, GenericParseNumber, GenericVmExprOp,
-        GenericVmOp, LocalId, LoopIrBlock, LoopIrDiagnostics, LoopIrFusedKernel,
-        LoopIrIteratorAdapter, LoopIrOptimizationDiagnostic, LoopIrOptimizationResult,
-        LoopIrSnapshot, LoopIrSnapshotBoundary, LoopIrSubgraphKind, LoopIrTerminator, Reg,
-        SnapshotId, StoneAccumulatorKind, StoneAccumulatorSpec, StoneConst, StoneFallbackTarget,
-        StoneGuard, StoneGuardKind, StoneIrFunction, StoneOp, StoneSnapshot,
-        StoneSnapshotAccumulator, StoneSnapshotLocal, StoneTerminator,
+        select_loop_ir_fused_kernel, try_lower_hot_loop, AccId, BlockId, ConstId,
+        GenericParseNumber, GenericVmExprOp, GenericVmOp, HotLoopIter, HotLoopOp, LocalId,
+        LoopIrBlock, LoopIrDiagnostics, LoopIrFusedKernel, LoopIrIteratorAdapter,
+        LoopIrOptimizationDiagnostic, LoopIrOptimizationResult, LoopIrSnapshot,
+        LoopIrSnapshotBoundary, LoopIrSubgraphKind, LoopIrTerminator, Reg, SnapshotId,
+        StoneAccumulatorKind, StoneAccumulatorSpec, StoneConst, StoneFallbackTarget, StoneGuard,
+        StoneGuardKind, StoneIrFunction, StoneOp, StoneSnapshot, StoneSnapshotAccumulator,
+        StoneSnapshotLocal, StoneTerminator,
     };
 
     fn required_jsonl_aggregation_vm() -> StoneIrFunction {
