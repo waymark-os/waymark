@@ -2,10 +2,8 @@
 
 use crate::stone_ast::{AssignTarget, AugOp, Call, CompareOp, Expr, Stmt};
 use crate::stone_vm::{
-    compile_hot_jsonl_vm_function, match_hot_jsonl_aggregation_ir_subgraph, GenericLoopIter,
-    HotJsonlAggregationBody, HotJsonlBodyOp, HotJsonlNestedUserTotals, HotJsonlSlot,
-    HotJsonlTracePlan, StoneAccumulatorKind, StoneAccumulatorSpec, StoneConst, StoneIrFunction,
-    StoneLocal,
+    GenericLoopIter, HotJsonlAggregationBody, HotJsonlBodyOp, HotJsonlNestedUserTotals,
+    HotJsonlSlot,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2003,125 +2001,21 @@ pub(crate) fn validate_hot_jsonl_native_prefix(
     }
 }
 
-pub(crate) fn compile_hot_jsonl_trace_plan(
-    body_plan: &HotJsonlAggregationBody,
-) -> Option<HotJsonlTracePlan> {
-    let vm = compile_hot_jsonl_vm_function(body_plan)?;
-    compile_hot_jsonl_trace_plan_from_ir(&vm)
-}
-
-pub(crate) fn compile_hot_jsonl_trace_plan_from_ir(
-    function: &StoneIrFunction,
-) -> Option<HotJsonlTracePlan> {
-    let vm_trace = HotJsonlVmTrace::from_function(function)?;
-
-    Some(HotJsonlTracePlan {
-        user_name: vm_trace.user_name,
-        user_key: vm_trace.user_key,
-        user_has_default: vm_trace.user_has_default,
-        user_default: vm_trace.user_default,
-        user_amounts_map: vm_trace.user_amounts_map,
-        user_amount_key: vm_trace.user_amount_key,
-        user_amount_has_default: vm_trace.user_amount_has_default,
-        user_amount_default: vm_trace.user_amount_default,
-        user_items_map: vm_trace.user_items_map,
-        user_items_key: vm_trace.user_items_key,
-        user_items_has_default: vm_trace.user_items_has_default,
-        user_items_default: vm_trace.user_items_default,
-        users_list: vm_trace.users_list,
-        tags_key: vm_trace.tags_key,
-        tags_default_empty: vm_trace.tags_default_empty,
-        tag_counts_map: vm_trace.tag_counts_map,
-        tags_list: vm_trace.tags_list,
-    })
-}
-
-struct HotJsonlVmTrace {
-    user_name: String,
-    user_key: String,
-    user_has_default: bool,
-    user_default: String,
-    user_amounts_map: String,
-    user_amount_key: String,
-    user_amount_has_default: bool,
-    user_amount_default: f64,
-    user_items_map: String,
-    user_items_key: String,
-    user_items_has_default: bool,
-    user_items_default: i64,
-    users_list: Option<String>,
-    tags_key: String,
-    tags_default_empty: bool,
-    tag_counts_map: String,
-    tags_list: Option<String>,
-}
-
-impl HotJsonlVmTrace {
-    fn from_function(function: &StoneIrFunction) -> Option<Self> {
-        let [StoneConst::String(user_key), StoneConst::String(user_default), StoneConst::String(amount_key), StoneConst::String(items_key), StoneConst::String(tags_key), StoneConst::EmptyList] =
-            function.constants.as_slice()
-        else {
-            return None;
-        };
-        let [StoneLocal { name: user_name }] = function.locals.as_slice() else {
-            return None;
-        };
-        let [StoneAccumulatorSpec {
-            name: user_amounts_map,
-            kind: StoneAccumulatorKind::F64Map,
-        }, StoneAccumulatorSpec {
-            name: user_items_map,
-            kind: StoneAccumulatorKind::I64Map,
-        }, StoneAccumulatorSpec {
-            name: users_list,
-            kind: StoneAccumulatorKind::StringList,
-        }, StoneAccumulatorSpec {
-            name: tag_counts_map,
-            kind: StoneAccumulatorKind::I64Map,
-        }, StoneAccumulatorSpec {
-            name: tags_list,
-            kind: StoneAccumulatorKind::StringList,
-        }] = function.accumulators.as_slice()
-        else {
-            return None;
-        };
-        let subgraph = match_hot_jsonl_aggregation_ir_subgraph(function)?;
-
-        Some(Self {
-            user_name: user_name.clone(),
-            user_key: user_key.clone(),
-            user_has_default: subgraph.user_has_default,
-            user_default: user_default.clone(),
-            user_amounts_map: user_amounts_map.clone(),
-            user_amount_key: amount_key.clone(),
-            user_amount_has_default: subgraph.user_amount_has_default,
-            user_amount_default: subgraph.user_amount_default,
-            user_items_map: user_items_map.clone(),
-            user_items_key: items_key.clone(),
-            user_items_has_default: subgraph.user_items_has_default,
-            user_items_default: subgraph.user_items_default,
-            users_list: subgraph.users_append.map(|_| users_list.clone()),
-            tags_key: tags_key.clone(),
-            tags_default_empty: subgraph.tags_default_empty,
-            tag_counts_map: tag_counts_map.clone(),
-            tags_list: subgraph.tags_append.map(|_| tags_list.clone()),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::stone_ast::{lower_source, Stmt};
     use crate::stone_vm::{
         compile_generic_vm_function, compile_hot_jsonl_loop_ir_function,
-        match_hot_jsonl_ir_subgraph, match_loop_ir_subgraph, optimize_loop_ir,
-        optimize_stone_loop_ir, select_hot_jsonl_fused_kernel_from_ir, select_loop_ir_fused_kernel,
-        AccId, BlockId, ConstId, GenericParseNumber, GenericVmExprOp, GenericVmOp, LocalId,
-        LoopIrBlock, LoopIrDiagnostics, LoopIrFusedKernel, LoopIrIteratorAdapter,
-        LoopIrOptimizationDiagnostic, LoopIrOptimizationResult, LoopIrSnapshot,
-        LoopIrSnapshotBoundary, LoopIrSubgraphKind, LoopIrTerminator, Reg, SnapshotId,
-        StoneFallbackTarget, StoneGuard, StoneGuardKind, StoneOp, StoneSnapshot,
+        compile_hot_jsonl_trace_plan, compile_hot_jsonl_trace_plan_from_ir,
+        compile_hot_jsonl_vm_function, match_hot_jsonl_ir_subgraph, match_loop_ir_subgraph,
+        optimize_loop_ir, optimize_stone_loop_ir, select_hot_jsonl_fused_kernel_from_ir,
+        select_loop_ir_fused_kernel, AccId, BlockId, ConstId, GenericParseNumber, GenericVmExprOp,
+        GenericVmOp, LocalId, LoopIrBlock, LoopIrDiagnostics, LoopIrFusedKernel,
+        LoopIrIteratorAdapter, LoopIrOptimizationDiagnostic, LoopIrOptimizationResult,
+        LoopIrSnapshot, LoopIrSnapshotBoundary, LoopIrSubgraphKind, LoopIrTerminator, Reg,
+        SnapshotId, StoneAccumulatorKind, StoneAccumulatorSpec, StoneConst, StoneFallbackTarget,
+        StoneGuard, StoneGuardKind, StoneIrFunction, StoneOp, StoneSnapshot,
         StoneSnapshotAccumulator, StoneSnapshotLocal, StoneTerminator,
     };
 
