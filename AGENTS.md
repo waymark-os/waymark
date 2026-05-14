@@ -68,6 +68,10 @@ reasoning:
   `WAYMARK_STONE_HELPER_DIRS` to override the helper search path.
 - Keep public docs aligned with actual behavior. Do not document aspirational
   features as present.
+- When adding or changing Stone builtins or language features, update `help()`
+  in the same change and run `python3 host/check_stone_help_examples.py` after
+  rebuilding `waymark`. Every builtin must have help and every help example
+  must execute.
 - Add focused tests for new behavior. Prefer assertions on structured values and
   error envelopes over terminal transcript matching.
 
@@ -78,6 +82,7 @@ cargo check -p waymark
 cargo test -p waymark
 cargo test -p waymark-runtime --lib
 cargo test -p waymark-runtime-support
+python3 host/check_stone_help_examples.py
 python3 host/mcp/test_stone_mcp_server.py
 python3 host/mcp/test_run_codex_stone_mcp.py
 python3 host/mcp/test_write_codex_stone_mcp_config.py

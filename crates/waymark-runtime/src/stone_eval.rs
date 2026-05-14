@@ -4407,6 +4407,84 @@ impl Evaluator<'_> {
     }
 }
 
+const STONE_BUILTIN_NAMES: &[&str] = &[
+    "cat",
+    "diff",
+    "edit",
+    "edit_file",
+    "echo",
+    "emit",
+    "fail",
+    "filter",
+    "find",
+    "float",
+    "format",
+    "first",
+    "head",
+    "from_json",
+    "help",
+    "int",
+    "last",
+    "len",
+    "ls",
+    "list",
+    "list_dir",
+    "join",
+    "map",
+    "max",
+    "min",
+    "mkdir",
+    "open",
+    "parse_float",
+    "parse_int",
+    "print",
+    "pwd",
+    "cd",
+    "range",
+    "read_file",
+    "read_text",
+    "read_csv",
+    "read_jsonl",
+    "round",
+    "rm",
+    "run",
+    "slice",
+    "split",
+    "resolve_command",
+    "state",
+    "starts_with",
+    "startswith",
+    "tail",
+    "last_result",
+    "start_daemon",
+    "daemon_status",
+    "stop_daemon",
+    "wait_port",
+    "save",
+    "search",
+    "sort",
+    "sorted",
+    "stat",
+    "str",
+    "sum",
+    "to_json",
+    "to_jsonl",
+    "set",
+    "unique",
+    "type",
+    "where",
+    "json_dumps",
+    "json_loads",
+    "read_json",
+    "write_file",
+    "write_text",
+    "write_json",
+    "write_jsonl",
+    "all",
+    "any",
+    "enumerate",
+];
+
 fn is_builtin_call(call: &Call) -> bool {
     if matches!(call.name.as_str(), "keys" | "values" | "items") {
         return call.positional.len() == 1;
@@ -4414,84 +4492,7 @@ fn is_builtin_call(call: &Call) -> bool {
     if call.name == "get" {
         return !call.positional.is_empty();
     }
-    matches!(
-        call.name.as_str(),
-        "cat"
-            | "diff"
-            | "edit"
-            | "echo"
-            | "emit"
-            | "all"
-            | "any"
-            | "fail"
-            | "filter"
-            | "enumerate"
-            | "find"
-            | "float"
-            | "format"
-            | "first"
-            | "head"
-            | "from_json"
-            | "help"
-            | "int"
-            | "last"
-            | "len"
-            | "ls"
-            | "list_dir"
-            | "list"
-            | "join"
-            | "map"
-            | "max"
-            | "min"
-            | "mkdir"
-            | "open"
-            | "parse_float"
-            | "parse_int"
-            | "print"
-            | "pwd"
-            | "cd"
-            | "range"
-            | "read_file"
-            | "read_text"
-            | "read_csv"
-            | "read_jsonl"
-            | "round"
-            | "rm"
-            | "run"
-            | "slice"
-            | "split"
-            | "resolve_command"
-            | "state"
-            | "starts_with"
-            | "startswith"
-            | "tail"
-            | "last_result"
-            | "start_daemon"
-            | "daemon_status"
-            | "stop_daemon"
-            | "wait_port"
-            | "save"
-            | "search"
-            | "sort"
-            | "sorted"
-            | "stat"
-            | "str"
-            | "sum"
-            | "to_json"
-            | "to_jsonl"
-            | "set"
-            | "unique"
-            | "type"
-            | "where"
-            | "json_dumps"
-            | "json_loads"
-            | "read_json"
-            | "write_file"
-            | "write_text"
-            | "edit_file"
-            | "write_json"
-            | "write_jsonl"
-    )
+    STONE_BUILTIN_NAMES.contains(&call.name.as_str())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4964,14 +4965,21 @@ mod tests {
     use super::{
         eval_program, eval_program_with_options, eval_program_with_output,
         match_fused_map_update_if, EvalHotLoopDiagnostics, EvalOptions, RuntimeValue, TextLines,
+        STONE_BUILTIN_NAMES,
     };
-    use crate::{json, stone_ast::lower_source, stone_vm::LoopIrOptimizationDiagnostic};
+    use crate::{
+        commands::{
+            stone_help_documented_names_for_tests, stone_help_entries_without_examples_for_tests,
+        },
+        json, stone_ast::lower_source, stone_vm::LoopIrOptimizationDiagnostic,
+    };
     use nu_protocol::{
         engine::{EngineState, Stack},
         PipelineData, ShellError, Span, Value,
     };
     use serde_json::json as json_value;
     use std::{
+        collections::BTreeSet,
         fs,
         path::PathBuf,
         time::{Duration, SystemTime, UNIX_EPOCH},
@@ -5883,6 +5891,65 @@ emit({
                 "write_example": "write_file(\"/app/report.txt\", \"ok\\n\")",
                 "edit_signature": "edit(path: str, old: str, new: str, all: bool = False) -> record",
                 "missing_found": false
+            })
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn stone_help_covers_every_builtin_name() {
+        let mut builtin_names: BTreeSet<&'static str> =
+            STONE_BUILTIN_NAMES.iter().copied().collect();
+        builtin_names.extend(["get", "keys", "values", "items"]);
+
+        let documented = stone_help_documented_names_for_tests();
+        let missing: Vec<_> = builtin_names.difference(&documented).copied().collect();
+
+        assert!(
+            missing.is_empty(),
+            "every Stone builtin must have a help() entry or alias with examples; missing: {missing:?}"
+        );
+
+        let entries_without_examples = stone_help_entries_without_examples_for_tests();
+        assert!(
+            entries_without_examples.is_empty(),
+            "every Stone help() entry must include at least one example; missing examples: {entries_without_examples:?}"
+        );
+    }
+
+    #[test]
+    fn stone_help_supported_and_unsupported_syntax_stay_current() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("stone-help-syntax")?;
+        let program = lower_source(
+            r#"syntax = "\n".join(help("syntax")["bullets"])
+unsupported = "\n".join(help("unsupported")["bullets"])
+emit({
+    "syntax_mentions_try": "try/except catches runtime evaluation errors" in syntax,
+    "syntax_mentions_conditional": "value if condition else fallback" in syntax,
+    "syntax_mentions_defaults": "immutable default values are supported" in syntax,
+    "syntax_mentions_split": "default whitespace splitting" in syntax,
+    "unsupported_try": "No try/except" in unsupported,
+    "unsupported_conditional": "No conditional expression" in unsupported,
+    "unsupported_default_args": "No default args" in unsupported,
+    "unsupported_default_split": "No default split" in unsupported,
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "syntax_mentions_try": true,
+                "syntax_mentions_conditional": true,
+                "syntax_mentions_defaults": true,
+                "syntax_mentions_split": true,
+                "unsupported_try": false,
+                "unsupported_conditional": false,
+                "unsupported_default_args": false,
+                "unsupported_default_split": false,
             })
         );
 

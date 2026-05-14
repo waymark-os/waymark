@@ -700,6 +700,86 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "int",
+        signature: "int(value: Any) -> int",
+        use_when: "Use to explicitly convert strings or floats before integer arithmetic.",
+        examples: &[r#"qty = int(row["qty"])"#],
+        avoid: &["Do not rely on automatic string-number coercion."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "float",
+        signature: "float(value: Any) -> float",
+        use_when: "Use to explicitly convert strings or integers before floating-point arithmetic.",
+        examples: &[r#"amount = float(row["amount"])"#],
+        avoid: &["Use parse_float(value, default) when malformed input should not fail the script."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "str",
+        signature: "str(value: Any) -> str",
+        use_when: "Use to explicitly convert values before string concatenation or formatted text output.",
+        examples: &[r#"line = row["name"] + "," + str(count)"#],
+        avoid: &["Do not concatenate strings and numbers without str()."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "len",
+        signature: "len(value: str | list | record) -> int",
+        use_when: "Use for counts and compact summaries of large values.",
+        examples: &[r#"emit({"rows": len(rows), "sample": head(rows, 5)})"#],
+        avoid: &["Do not emit a full large list just to learn its length."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "list",
+        signature: "list(value: list | record) -> list",
+        use_when: "Use to materialize a list view of an existing list or record keys.",
+        examples: &[r#"names = list(counts)"#],
+        avoid: &["Use keys(record), values(record), or items(record) when the intended record view is specific."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "min",
+        signature: "min(value: Any, ...values: Any) -> Any",
+        use_when: "Use for the smallest comparable value.",
+        examples: &[r#"lowest = min(a, b, c)"#],
+        avoid: &["Do not compare unrelated types such as strings and numbers."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "max",
+        signature: "max(value: Any, ...values: Any) -> Any",
+        use_when: "Use for the largest comparable value.",
+        examples: &[r#"highest = max(a, b, c)"#],
+        avoid: &["Use sort(rows, key=...) for top-N records."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "round",
+        signature: "round(value: int | float, digits: int = 0) -> int | float",
+        use_when: "Use for rounded numeric outputs, especially task-required decimal precision.",
+        examples: &[r#"avg = round(total / count, 2)"#],
+        avoid: &["Do not pass strings; convert with float() first."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "parse_int",
+        signature: "parse_int(value: Any, default: Any) -> int | Any",
+        use_when: "Use when bad integer input should fall back instead of failing.",
+        examples: &[r#"qty = parse_int(row["qty"], 0)"#],
+        avoid: &["Use int(value) when malformed input should be treated as an error."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "parse_float",
+        signature: "parse_float(value: Any, default: Any) -> float | Any",
+        use_when: "Use when bad floating-point input should fall back instead of failing.",
+        examples: &[r#"amount = parse_float(row["amount"], 0.0)"#],
+        avoid: &["Use float(value) when malformed input should be treated as an error."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "pwd",
         signature: "pwd() -> str",
         use_when: "Use to inspect the current Stone working directory.",
@@ -729,13 +809,23 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         use_when: "Use for streaming/line-oriented text reads or simple text writes.",
         examples: &[
             r#"text = open("/app/input.txt").read()"#,
-            r#"for line in open("/app/input.txt"):"#,
+            r#"lines = []
+for line in open("/app/input.txt"):
+    lines.append(line.strip())"#,
             r#"open("/app/out.txt", "w").write("done\n")"#,
         ],
         avoid: &[
             "Do not emit/return file objects; read them first.",
             "For JSON/CSV/JSONL, prefer the structured helpers.",
         ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "cat",
+        signature: "cat(path: str | file_record) -> str",
+        use_when: "Use for quick whole-file UTF-8 text reads.",
+        examples: &[r#"text = cat("/app/report.txt")"#],
+        avoid: &["Use read_file(path, max_bytes=...) for bounded reads and structured helpers for JSON/CSV/JSONL."],
         aliases: &[],
     },
     StoneHelpEntry {
@@ -856,6 +946,14 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "to_jsonl",
+        signature: "to_jsonl(rows: list[Any]) -> str",
+        use_when: "Use to serialize row values to JSON Lines text already held in memory.",
+        examples: &[r#"text = to_jsonl(rows)"#],
+        avoid: &["Use write_jsonl(path, rows) for final JSONL files."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "save",
         signature: "save(value: Any, path: str, append: bool = False, force: bool = False) -> record",
         use_when: "Use to write an explicit value to a file when write_file/write_json do not fit.",
@@ -900,6 +998,40 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "keys",
+        signature: "keys(record: record) -> list[str]",
+        use_when: "Use to inspect or iterate record field names.",
+        examples: &[r#"names = keys(row)"#],
+        avoid: &["Use row.keys() when method syntax is clearer."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "values",
+        signature: "values(record: record) -> list[Any]",
+        use_when: "Use to inspect or iterate record values.",
+        examples: &[r#"vals = values(row)"#],
+        avoid: &["Use items(record) when keys are needed too."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "items",
+        signature: "items(record: record) -> list[list[Any]]",
+        use_when: "Use to iterate key/value pairs from a record.",
+        examples: &[r#"pairs = []
+for key, value in items(counts):
+    pairs.append(key + ":" + str(value))"#],
+        avoid: &["Initialize dictionary counters before incrementing missing keys."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "get",
+        signature: "get(record: record, key: str, default: Any = None) -> Any",
+        use_when: "Use to read optional record fields with a fallback.",
+        examples: &[r#"score = get(row, "score", 0)"#],
+        avoid: &["Use row[key] when a missing key should be an error."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "sort",
         signature: "sort(values, key: str | lambda? = None, reverse: bool = False) -> list",
         use_when: "Use for sorted copies and top-N record lists.",
@@ -925,6 +1057,30 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         use_when: "Use for compact per-item filtering when a lambda is clearer than an explicit loop.",
         examples: &[r#"errors = filter(lambda r: r["status"] == 404, rows)"#],
         avoid: &["Use where(rows, key, expected) for simple equality on one record field."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "all",
+        signature: "all(values: iterable | generator) -> bool",
+        use_when: "Use to test whether every value is truthy, with generator short-circuiting.",
+        examples: &[r#"ok = all("score" in row for row in rows)"#],
+        avoid: &["Use explicit loops when you need to collect diagnostics for failed items."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "any",
+        signature: "any(values: iterable | generator) -> bool",
+        use_when: "Use to test whether any value is truthy, with generator short-circuiting.",
+        examples: &[r#"has_error = any("ERROR" in line for line in lines)"#],
+        avoid: &["Use search(root, needle) for file content search."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "sum",
+        signature: "sum(values: iterable | generator) -> int | float",
+        use_when: "Use for numeric totals over lists or generator expressions.",
+        examples: &[r#"total = sum(int(row["qty"]) for row in rows)"#],
+        avoid: &["Convert strings to numbers before summing."],
         aliases: &[],
     },
     StoneHelpEntry {
@@ -964,13 +1120,83 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         aliases: &["tail"],
     },
     StoneHelpEntry {
+        name: "range",
+        signature: "range(stop: int) | range(start: int, stop: int, step: int = 1) -> list[int]",
+        use_when: "Use for numeric loops and index generation.",
+        examples: &[r#"seen = []
+for i in range(3):
+    seen.append(i)"#, r#"indexes = range(1, 10, 2)"#],
+        avoid: &["Use enumerate(values) when you need indexes and values together."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "enumerate",
+        signature: "enumerate(values: iterable, start: int = 0) -> list[list[Any]]",
+        use_when: "Use to iterate indexes and values together.",
+        examples: &[r#"labels = []
+for i, row in enumerate(rows):
+    labels.append(str(i) + ":" + row["name"])"#],
+        avoid: &["Use range(len(values)) only when you specifically need index-only access."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "split",
+        signature: "split(text: str, separator: str? = None) -> list[str]",
+        use_when: "Use for top-level text splitting; string method syntax also works.",
+        examples: &[r#"parts = split(line, ",")"#, r#"words = split(line)"#],
+        avoid: &["For line splitting, prefer text.splitlines() when operating on a string."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "join",
+        signature: "join(items: list[str], separator: str = \"\") -> str",
+        use_when: "Use for top-level list-to-text joining; string method syntax also works.",
+        examples: &[r#"line = join(fields, ",")"#],
+        avoid: &["Convert non-string items with map(str, items) or explicit str() first."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "slice",
+        signature: "slice(value: str | list, start: int? = None, end: int? = None) -> str | list",
+        use_when: "Use for dynamic slicing when bracket syntax is awkward.",
+        examples: &[r#"top = slice(rows, 0, 5)"#],
+        avoid: &["Use rows[:5] when bounds are simple literals."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "starts_with",
+        signature: "starts_with(text: str, prefix: str) -> bool",
+        use_when: "Use for prefix tests; startswith is an alias.",
+        examples: &[r#"level = "other"
+if starts_with(line, "ERROR"):
+    level = "error""#],
+        avoid: &["Use string method line.startswith(prefix) when method syntax is clearer."],
+        aliases: &["startswith"],
+    },
+    StoneHelpEntry {
+        name: "format",
+        signature: "format(template: str, ...values: Any) -> str",
+        use_when: "Use for small positional text templates.",
+        examples: &[r#"line = format("{}:{}", name, count)"#],
+        avoid: &["Use f-strings when they are clearer and do not need format specs."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "print",
+        signature: "print(value: Any) -> Any",
+        use_when: "Use only for diagnostic stdout during local probes.",
+        examples: &[r#"print("debug: " + str(count))"#],
+        avoid: &["Use emit(value) for structured results and write_file/write_json for task outputs."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "run",
         signature: r#"run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576) -> record"#,
         use_when: "Use only when the task explicitly needs a POSIX program that should finish. Nonzero exits return ok=false with stdout, stderr, and an explanation record.",
         examples: &[
             r#"result = run(["wc", "-l", "/app/input.txt"])"#,
-            r#"result = run(["curl", "-sS", "http://service:8080/health"], timeout_ms=5000)"#,
-            r#"result = run(["pytest", "-q"], stdout="suppress", stderr="capture", max_stderr_bytes=12000)"#,
+            r#"result = run(["printf", "ok"], timeout_ms=5000)"#,
+            r#"result = run(["sh", "-c", "printf warning >&2"], stdout="suppress", stderr="capture", max_stderr_bytes=12000)"#,
             r#"if not result.ok:
     emit({"exit_code": result.exit_code, "stderr": result.stderr, "explanation": result.explanation})"#,
         ],
@@ -990,7 +1216,8 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         use_when: "Use to explain how Stone would resolve an external executable name without starting a process.",
         examples: &[
             r#"info = resolve_command("python3")"#,
-            r#"if not info.ok:
+            r#"info = resolve_command("definitely-not-a-real-command")
+if not info.ok:
     emit(info.explanation)"#,
         ],
         avoid: &[
@@ -1003,7 +1230,7 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         name: "state",
         signature: "state() -> record",
         use_when: "Use to retrieve cheap agent-facing runtime state such as cwd, git status, and common tool availability.",
-        examples: &[r#"snapshot = state()"#, r#"emit(state().git.modified_files)"#],
+        examples: &[r#"snapshot = state()"#, r#"emit(state().cwd)"#],
         avoid: &["Do not shell out to git status or which/version probes when this structured snapshot is enough."],
         aliases: &[],
     },
@@ -1011,7 +1238,7 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         name: "last_result",
         signature: "last_result() -> record | None",
         use_when: "Use to recover the previous Waymark command response after the caller's conversation context dropped it.",
-        examples: &[r#"previous = last_result()"#, r#"emit(last_result().value)"#],
+        examples: &[r#"previous = last_result()"#, r#"emit(last_result())"#],
         avoid: &["Do not use as long-term storage; it only tracks the immediately previous command response."],
         aliases: &[],
     },
@@ -1020,9 +1247,9 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         signature: "start_daemon(argv: list[str], cwd: str? = None, env: record? = None, stdout: str? = None, stderr: str? = None) -> record",
         use_when: "Use for servers and background services that must still be running when tests execute.",
         examples: &[
-            r#"daemon = start_daemon(["python3", "-m", "http.server", "8888"], cwd="/app", stderr="server.err")"#,
-            r#"ready = wait_port(8888, timeout_ms=30000)"#,
-            r#"status = daemon_status(daemon, port=8888, log="server.err")"#,
+            r#"daemon = start_daemon(["sh", "-c", "sleep 0.1"], cwd="/app", stderr="server.err")"#,
+            r#"ready = wait_port(9, timeout_ms=1)"#,
+            r#"status = daemon_status(daemon, log="server.err")"#,
         ],
         avoid: &[
             "Use run() instead for commands expected to finish.",
@@ -1035,7 +1262,7 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         name: "daemon_status",
         signature: "daemon_status(daemon: record | int, port: int? = None, host: str = \"127.0.0.1\", log: str? = None, max_log_bytes: int = 4000) -> record",
         use_when: "Use to check whether a daemon is still alive, whether an expected TCP port is open, and to include recent logs.",
-        examples: &[r#"status = daemon_status(daemon, port=9000, log="namenode.err")"#],
+        examples: &[r#"status = daemon_status(daemon)"#],
         avoid: &["Do not treat a spawn result as ready until daemon_status() or wait_port() confirms it."],
         aliases: &[],
     },
@@ -1051,7 +1278,7 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         name: "wait_port",
         signature: "wait_port(port: int, host: str = \"127.0.0.1\", timeout_ms: int = 30000) -> record",
         use_when: "Use after start_daemon() when service readiness is represented by a TCP port accepting connections.",
-        examples: &[r#"ready = wait_port(8888, host="127.0.0.1", timeout_ms=30000)"#],
+        examples: &[r#"ready = wait_port(9, host="127.0.0.1", timeout_ms=1)"#],
         avoid: &["If wait_port() times out, call daemon_status() with a log path before retrying blindly."],
         aliases: &[],
     },
@@ -1093,8 +1320,11 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "Values: lists, tuples, records/dicts, slices, indexing, item assignment, True, False, None.",
             "Record fields can be read as row[\"name\"] or row.name when the field name is identifier-shaped.",
             "Operators: +, -, *, /, //, &, |, <<, >>, comparisons, and/or/not, membership, is None.",
-            "Functions: def name(arg) works; optional type annotations like def name(arg: str) -> str are checked.",
+            "Conditional expressions use Python's value if condition else fallback shape.",
+            "Functions: def name(arg) works; optional type annotations like def name(arg: str) -> str are checked; immutable default values are supported.",
+            "try/except catches runtime evaluation errors; supported handlers are except:, except Exception:, and except Exception as e:.",
             "Lambdas: expression-only callbacks work in sort/map/filter, e.g. lambda r: r[\"name\"].",
+            "String split() supports both default whitespace splitting and explicit separators.",
             "set() returns an ordered unique list; set/list variables support .add(value) for unique append.",
             "Use emit(value) when you want structured data returned to the caller.",
         ],
@@ -1105,11 +1335,10 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
         bullets: &[
             "No imports/modules/os/pathlib/glob/json; use find/read_json/json_loads/json_dumps.",
             "Lambda is expression-only; use explicit loops when callback logic needs statements or mutation.",
-            "No try/except/classes/decorators/async/nested functions.",
-            "No default args, *args, **kwargs, or keyword calls to user functions.",
-            "No conditional expression a if cond else b; use if/else blocks.",
+            "No classes/decorators/async/nested functions.",
+            "No mutable default args, *args, **kwargs, or keyword calls to user functions.",
+            "No try/finally, try/else, except*, or exception classes other than Exception.",
             "No list.sort(); use sort(list) or sorted(list).",
-            "No default split(); pass split(\" \") or split(\",\").",
             "No automatic string-number coercion; use int(), float(), and str().",
             "No missing-key arithmetic; initialize dictionary counters before incrementing.",
         ],
@@ -1125,6 +1354,27 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
         ],
     },
 ];
+
+#[cfg(test)]
+pub(crate) fn stone_help_documented_names_for_tests() -> std::collections::BTreeSet<&'static str> {
+    let mut names = std::collections::BTreeSet::new();
+    for entry in STONE_HELP_ENTRIES {
+        names.insert(entry.name);
+        for alias in entry.aliases {
+            names.insert(*alias);
+        }
+    }
+    names
+}
+
+#[cfg(test)]
+pub(crate) fn stone_help_entries_without_examples_for_tests() -> Vec<&'static str> {
+    STONE_HELP_ENTRIES
+        .iter()
+        .filter(|entry| entry.examples.is_empty())
+        .map(|entry| entry.name)
+        .collect()
+}
 
 pub(crate) fn stone_help_overview(span: Span) -> Value {
     let mut record = Record::with_capacity(7);
