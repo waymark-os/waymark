@@ -215,6 +215,42 @@ pub(super) fn execute_generic_vm_map_add_i64_const_record_field(
     Ok(Some(GenericVmMapResult { counts, last_value }))
 }
 
+pub(super) fn execute_generic_vm_map_add_i64_const_record_string_field(
+    mut counts: HashMap<String, i64>,
+    field: &str,
+    strip: bool,
+    lower: bool,
+    addend: i64,
+    values: &[RuntimeValue],
+    mut value_to_key: impl FnMut(&RuntimeValue) -> Result<String, ShellError>,
+    mut lowering_miss: impl FnMut(&'static str),
+) -> Result<Option<GenericVmMapResult>, ShellError> {
+    let mut last_value = None;
+    for value in values {
+        let Some(field_value) = generic_vm_record_field_value(value, field)? else {
+            lowering_miss("unsupported_expr");
+            return Ok(None);
+        };
+        let Ok(mut key) = value_to_key(&field_value) else {
+            lowering_miss("unsupported_expr");
+            return Ok(None);
+        };
+        if strip {
+            key = key.trim().to_owned();
+        }
+        if lower {
+            key = key.to_lowercase();
+        }
+        let total = counts.entry(key).or_insert(0);
+        *total = total
+            .checked_add(addend)
+            .ok_or_else(|| stone_error("hot loop", "integer addition overflow"))?;
+        last_value = Some(value.clone());
+    }
+
+    Ok(Some(GenericVmMapResult { counts, last_value }))
+}
+
 pub(super) fn generic_vm_register_i64(
     registers: &[Option<i64>],
     reg: usize,
