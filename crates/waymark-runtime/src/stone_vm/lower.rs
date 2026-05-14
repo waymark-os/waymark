@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::{
-    AccId, BlockId, ConstId, GenericLoopIter, GenericParseNumber, GenericVmConst,
-    GenericVmExprBody, GenericVmExprOp, GenericVmOp, HotJsonlAggregationBody, HotJsonlBodyOp,
-    HotJsonlSlot, HotJsonlTracePlan, LocalId, LoopIrBlock, LoopIrDiagnostics, LoopIrFunction,
-    LoopIrIteratorAdapter, LoopIrSnapshot, LoopIrSnapshotBoundary, LoopIrTerminator, Reg,
-    SnapshotId, StoneAccumulatorKind, StoneAccumulatorSpec, StoneBlock, StoneConst,
-    StoneFallbackTarget, StoneGuard, StoneGuardKind, StoneIrFunction, StoneLocal, StoneOp,
-    StoneSnapshot, StoneSnapshotAccumulator, StoneSnapshotLocal, StoneTerminator,
+    AccId, BlockId, ConstId, GenericLoopIter, GenericLoopOp, GenericLoopPlan, GenericParseNumber,
+    GenericVmConst, GenericVmExprBody, GenericVmExprOp, GenericVmOp, HotJsonlAggregationBody,
+    HotJsonlBodyOp, HotJsonlSlot, HotJsonlTracePlan, LocalId, LoopIrBlock, LoopIrDiagnostics,
+    LoopIrFunction, LoopIrIteratorAdapter, LoopIrSnapshot, LoopIrSnapshotBoundary,
+    LoopIrTerminator, Reg, SnapshotId, StoneAccumulatorKind, StoneAccumulatorSpec, StoneBlock,
+    StoneConst, StoneFallbackTarget, StoneGuard, StoneGuardKind, StoneIrFunction, StoneLocal,
+    StoneOp, StoneSnapshot, StoneSnapshotAccumulator, StoneSnapshotLocal, StoneTerminator,
 };
 
 use crate::stone_ast::{AssignTarget, AugOp, Expr, Stmt};
-use crate::stone_ir::{GenericLoopOp, GenericLoopPlan};
 use crate::stone_vm::match_hot_jsonl_aggregation_ir_subgraph;
 
 pub(crate) fn compile_generic_vm_function(plan: &GenericLoopPlan) -> Option<LoopIrFunction> {
