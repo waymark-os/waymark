@@ -12,8 +12,7 @@ use super::{
 };
 
 use crate::stone_ast::{AssignTarget, AugOp, Call, CompareOp, Expr, Stmt};
-use crate::stone_ir::match_hot_jsonl_aggregation_body;
-use crate::stone_vm::match_hot_jsonl_aggregation_ir_subgraph;
+use crate::stone_vm::{match_hot_jsonl_aggregation_body, match_hot_jsonl_aggregation_ir_subgraph};
 
 pub(crate) struct FusedMapUpdateIf {
     pub(crate) key_name: String,

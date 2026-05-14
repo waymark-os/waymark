@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+mod jsonl_match;
 mod lower;
 mod optimize;
 mod types;
 
-pub(crate) use crate::stone_ir::match_hot_jsonl_aggregation_body;
+#[cfg(test)]
+pub(crate) use jsonl_match::hot_jsonl_aggregation_ops;
+pub(crate) use jsonl_match::match_hot_jsonl_aggregation_body;
 pub(crate) use lower::{
     compile_generic_vm_function, compile_hot_jsonl_loop_ir_function, compile_hot_jsonl_trace_plan,
     compile_hot_jsonl_trace_plan_from_ir, compile_hot_jsonl_vm_function,
