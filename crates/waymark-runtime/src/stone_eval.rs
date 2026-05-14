@@ -1250,7 +1250,7 @@ impl Evaluator<'_> {
         addend: i64,
         values: &[RuntimeValue],
     ) -> Result<GenericVmLoopResult, ShellError> {
-        let mut counts = self.load_i64_record_map(map)?;
+        let counts = self.load_i64_record_map(map)?;
         let Some(result) = execute_generic_vm_map_add_i64_const_loop(
             counts,
             addend,
@@ -1261,14 +1261,7 @@ impl Evaluator<'_> {
         else {
             return Ok(GenericVmLoopResult::Unsupported);
         };
-        counts = result.counts;
-        self.state.set_local(
-            map.to_owned(),
-            RuntimeValue::Nu(Value::record(
-                i64_record_from_native_map(&[], &counts),
-                Span::unknown(),
-            )),
-        );
+        self.store_i64_record_map(map, &result.counts);
         Ok(GenericVmLoopResult::Executed {
             last_value: result.last_value,
         })
@@ -1281,7 +1274,7 @@ impl Evaluator<'_> {
         addend: i64,
         values: &[RuntimeValue],
     ) -> Result<GenericVmLoopResult, ShellError> {
-        let mut counts = self.load_i64_record_map(map)?;
+        let counts = self.load_i64_record_map(map)?;
         let Some(result) = execute_generic_vm_map_add_i64_const_record_field_loop(
             counts,
             field,
@@ -1293,14 +1286,7 @@ impl Evaluator<'_> {
         else {
             return Ok(GenericVmLoopResult::Unsupported);
         };
-        counts = result.counts;
-        self.state.set_local(
-            map.to_owned(),
-            RuntimeValue::Nu(Value::record(
-                i64_record_from_native_map(&[], &counts),
-                Span::unknown(),
-            )),
-        );
+        self.store_i64_record_map(map, &result.counts);
         Ok(GenericVmLoopResult::Executed {
             last_value: result.last_value,
         })
@@ -1315,7 +1301,7 @@ impl Evaluator<'_> {
         addend: i64,
         values: &[RuntimeValue],
     ) -> Result<GenericVmLoopResult, ShellError> {
-        let mut counts = self.load_i64_record_map(map)?;
+        let counts = self.load_i64_record_map(map)?;
         let Some(result) = execute_generic_vm_map_add_i64_const_record_string_field_loop(
             counts,
             field,
@@ -1329,14 +1315,7 @@ impl Evaluator<'_> {
         else {
             return Ok(GenericVmLoopResult::Unsupported);
         };
-        counts = result.counts;
-        self.state.set_local(
-            map.to_owned(),
-            RuntimeValue::Nu(Value::record(
-                i64_record_from_native_map(&[], &counts),
-                Span::unknown(),
-            )),
-        );
+        self.store_i64_record_map(map, &result.counts);
         Ok(GenericVmLoopResult::Executed {
             last_value: result.last_value,
         })
@@ -3090,6 +3069,16 @@ impl Evaluator<'_> {
             map.insert(key.clone(), value_to_i64(value, "hot loop")?);
         }
         Ok(map)
+    }
+
+    fn store_i64_record_map(&mut self, name: &str, map: &HashMap<String, i64>) {
+        self.state.set_local(
+            name.to_owned(),
+            RuntimeValue::Nu(Value::record(
+                i64_record_from_native_map(&[], map),
+                Span::unknown(),
+            )),
+        );
     }
 
     fn load_string_list(&self, name: &str) -> Result<Vec<String>, ShellError> {
