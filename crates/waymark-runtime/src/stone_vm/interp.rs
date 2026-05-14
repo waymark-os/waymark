@@ -39,6 +39,11 @@ pub(super) struct GenericVmMapResult {
     pub(super) last_value: Option<RuntimeValue>,
 }
 
+pub(super) struct GenericVmListResult {
+    pub(super) items: Vec<Value>,
+    pub(super) last_value: Option<RuntimeValue>,
+}
+
 pub(super) fn generic_vm_number_from_runtime(value: &RuntimeValue) -> Option<GenericVmNumber> {
     match value {
         RuntimeValue::Nu(Value::Int { val, .. }) => Some(GenericVmNumber::I64(*val)),
@@ -249,6 +254,35 @@ pub(super) fn execute_generic_vm_map_add_i64_const_record_string_field(
     }
 
     Ok(Some(GenericVmMapResult { counts, last_value }))
+}
+
+pub(super) fn execute_generic_vm_list_append(
+    current: RuntimeValue,
+    values: &[RuntimeValue],
+    unique: bool,
+    values_equal: impl Fn(&Value, &Value) -> bool,
+    mut lowering_miss: impl FnMut(&'static str),
+) -> Result<Option<GenericVmListResult>, ShellError> {
+    let RuntimeValue::Nu(Value::List { vals, .. }) = current else {
+        lowering_miss("unsupported_expr");
+        return Ok(None);
+    };
+    let mut items = vals.to_vec();
+    let mut last_value = None;
+    for value in values {
+        let RuntimeValue::Nu(value) = value else {
+            lowering_miss("unsupported_expr");
+            return Ok(None);
+        };
+        if unique && items.iter().any(|item| values_equal(item, value)) {
+            last_value = Some(RuntimeValue::Nu(value.clone()));
+            continue;
+        }
+        items.push(value.clone());
+        last_value = Some(RuntimeValue::Nu(value.clone()));
+    }
+
+    Ok(Some(GenericVmListResult { items, last_value }))
 }
 
 pub(super) fn generic_vm_register_i64(

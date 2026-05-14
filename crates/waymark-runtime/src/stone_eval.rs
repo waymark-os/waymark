@@ -96,6 +96,7 @@ use stone_state::runtime_state_record;
 use stone_vm_interp::{
     execute_generic_vm_add_assign as execute_generic_vm_add_assign_loop,
     execute_generic_vm_expr_body as execute_generic_vm_expr_body_loop,
+    execute_generic_vm_list_append as execute_generic_vm_list_append_loop,
     execute_generic_vm_map_add_i64_const as execute_generic_vm_map_add_i64_const_loop,
     execute_generic_vm_map_add_i64_const_record_field as execute_generic_vm_map_add_i64_const_record_field_loop,
     execute_generic_vm_map_add_i64_const_record_string_field as execute_generic_vm_map_add_i64_const_record_string_field_loop,
@@ -1351,33 +1352,20 @@ impl Evaluator<'_> {
             .state
             .get_local(list)
             .ok_or_else(|| stone_error("hot loop", format!("unknown name `{list}`")))?;
-        let RuntimeValue::Nu(Value::List { vals, .. }) = current else {
-            self.state
-                .hot_loop_diagnostics
-                .lowering_miss("unsupported_expr");
+        let Some(result) =
+            execute_generic_vm_list_append_loop(current, values, unique, values_equal, |reason| {
+                self.state.hot_loop_diagnostics.lowering_miss(reason)
+            })?
+        else {
             return Ok(GenericVmLoopResult::Unsupported);
         };
-        let mut items = vals.to_vec();
-        let mut last_value = None;
-        for value in values {
-            let RuntimeValue::Nu(value) = value else {
-                self.state
-                    .hot_loop_diagnostics
-                    .lowering_miss("unsupported_expr");
-                return Ok(GenericVmLoopResult::Unsupported);
-            };
-            if unique && items.iter().any(|item| values_equal(item, value)) {
-                last_value = Some(RuntimeValue::Nu(value.clone()));
-                continue;
-            }
-            items.push(value.clone());
-            last_value = Some(RuntimeValue::Nu(value.clone()));
-        }
         self.state.set_local(
             list.to_owned(),
-            RuntimeValue::Nu(Value::list(items, Span::unknown())),
+            RuntimeValue::Nu(Value::list(result.items, Span::unknown())),
         );
-        Ok(GenericVmLoopResult::Executed { last_value })
+        Ok(GenericVmLoopResult::Executed {
+            last_value: result.last_value,
+        })
     }
 
     fn execute_generic_vm_expr_body(
