@@ -96,7 +96,9 @@ use stone_runtime_value::{FileHandle, RuntimeValue, TextLines};
 use stone_state::runtime_state_record;
 use stone_vm_interp::{
     generic_vm_add_number, generic_vm_number_from_runtime, generic_vm_number_to_value,
-    generic_vm_record_field_value, GenericVmInput, GenericVmLoopResult, GenericVmNumber,
+    generic_vm_record_field_value, generic_vm_register_i64, generic_vm_set_register,
+    generic_vm_store_i64_binop, generic_vm_store_shift, GenericVmInput, GenericVmLoopResult,
+    GenericVmNumber,
 };
 
 const STONE_LAST_RESULT_ENV: &str = "WAYMARK_LAST_RESULT_JSON";
@@ -1526,7 +1528,7 @@ impl Evaluator<'_> {
                     *slot = Some(value);
                 }
                 GenericVmExprOp::StoreLocal { local, src } => {
-                    let value = self.generic_vm_register_i64(registers, src)?;
+                    let value = generic_vm_register_i64(registers, src)?;
                     let Some(slot) = locals.get_mut(local) else {
                         return Err(stone_error("hot loop", "VM local is out of range"));
                     };
@@ -1542,7 +1544,7 @@ impl Evaluator<'_> {
                     *slot = Some(*value);
                 }
                 GenericVmExprOp::AddI64 { dst, lhs, rhs } => {
-                    self.generic_vm_store_i64_binop(
+                    generic_vm_store_i64_binop(
                         registers,
                         dst,
                         lhs,
@@ -1552,7 +1554,7 @@ impl Evaluator<'_> {
                     )?;
                 }
                 GenericVmExprOp::SubI64 { dst, lhs, rhs } => {
-                    self.generic_vm_store_i64_binop(
+                    generic_vm_store_i64_binop(
                         registers,
                         dst,
                         lhs,
@@ -1562,7 +1564,7 @@ impl Evaluator<'_> {
                     )?;
                 }
                 GenericVmExprOp::MulI64 { dst, lhs, rhs } => {
-                    self.generic_vm_store_i64_binop(
+                    generic_vm_store_i64_binop(
                         registers,
                         dst,
                         lhs,
@@ -1572,30 +1574,30 @@ impl Evaluator<'_> {
                     )?;
                 }
                 GenericVmExprOp::FloorDivI64 { dst, lhs, rhs } => {
-                    let left = self.generic_vm_register_i64(registers, lhs)?;
-                    let right = self.generic_vm_register_i64(registers, rhs)?;
+                    let left = generic_vm_register_i64(registers, lhs)?;
+                    let right = generic_vm_register_i64(registers, rhs)?;
                     if right == 0 {
                         return Err(stone_error("floor division", "division by zero"));
                     }
-                    self.generic_vm_set_register(registers, dst, left.div_euclid(right))?;
+                    generic_vm_set_register(registers, dst, left.div_euclid(right))?;
                 }
                 GenericVmExprOp::BitAndI64 { dst, lhs, rhs } => {
-                    let value = self.generic_vm_register_i64(registers, lhs)?
-                        & self.generic_vm_register_i64(registers, rhs)?;
-                    self.generic_vm_set_register(registers, dst, value)?;
+                    let value = generic_vm_register_i64(registers, lhs)?
+                        & generic_vm_register_i64(registers, rhs)?;
+                    generic_vm_set_register(registers, dst, value)?;
                 }
                 GenericVmExprOp::BitOrI64 { dst, lhs, rhs } => {
-                    let value = self.generic_vm_register_i64(registers, lhs)?
-                        | self.generic_vm_register_i64(registers, rhs)?;
-                    self.generic_vm_set_register(registers, dst, value)?;
+                    let value = generic_vm_register_i64(registers, lhs)?
+                        | generic_vm_register_i64(registers, rhs)?;
+                    generic_vm_set_register(registers, dst, value)?;
                 }
                 GenericVmExprOp::BitXorI64 { dst, lhs, rhs } => {
-                    let value = self.generic_vm_register_i64(registers, lhs)?
-                        ^ self.generic_vm_register_i64(registers, rhs)?;
-                    self.generic_vm_set_register(registers, dst, value)?;
+                    let value = generic_vm_register_i64(registers, lhs)?
+                        ^ generic_vm_register_i64(registers, rhs)?;
+                    generic_vm_set_register(registers, dst, value)?;
                 }
                 GenericVmExprOp::ShlI64 { dst, lhs, rhs } => {
-                    self.generic_vm_store_shift(
+                    generic_vm_store_shift(
                         registers,
                         dst,
                         lhs,
@@ -1605,7 +1607,7 @@ impl Evaluator<'_> {
                     )?;
                 }
                 GenericVmExprOp::ShrI64 { dst, lhs, rhs } => {
-                    self.generic_vm_store_shift(
+                    generic_vm_store_shift(
                         registers,
                         dst,
                         lhs,
@@ -1615,71 +1617,12 @@ impl Evaluator<'_> {
                     )?;
                 }
                 GenericVmExprOp::BitNotI64 { dst, src } => {
-                    let value = !self.generic_vm_register_i64(registers, src)?;
-                    self.generic_vm_set_register(registers, dst, value)?;
+                    let value = !generic_vm_register_i64(registers, src)?;
+                    generic_vm_set_register(registers, dst, value)?;
                 }
             }
         }
         Ok(true)
-    }
-
-    fn generic_vm_register_i64(
-        &self,
-        registers: &[Option<i64>],
-        reg: usize,
-    ) -> Result<i64, ShellError> {
-        registers
-            .get(reg)
-            .copied()
-            .flatten()
-            .ok_or_else(|| stone_error("hot loop", "VM register is unset"))
-    }
-
-    fn generic_vm_set_register(
-        &self,
-        registers: &mut [Option<i64>],
-        reg: usize,
-        value: i64,
-    ) -> Result<(), ShellError> {
-        let Some(slot) = registers.get_mut(reg) else {
-            return Err(stone_error("hot loop", "VM register is out of range"));
-        };
-        *slot = Some(value);
-        Ok(())
-    }
-
-    fn generic_vm_store_i64_binop(
-        &self,
-        registers: &mut [Option<i64>],
-        dst: usize,
-        lhs: usize,
-        rhs: usize,
-        context: &str,
-        op: impl FnOnce(i64, i64) -> Option<i64>,
-    ) -> Result<(), ShellError> {
-        let left = self.generic_vm_register_i64(registers, lhs)?;
-        let right = self.generic_vm_register_i64(registers, rhs)?;
-        let value = op(left, right)
-            .ok_or_else(|| stone_error(context, format!("integer {context} overflow")))?;
-        self.generic_vm_set_register(registers, dst, value)
-    }
-
-    fn generic_vm_store_shift(
-        &self,
-        registers: &mut [Option<i64>],
-        dst: usize,
-        lhs: usize,
-        rhs: usize,
-        context: &str,
-        op: impl FnOnce(i64, u32) -> Option<i64>,
-    ) -> Result<(), ShellError> {
-        let left = self.generic_vm_register_i64(registers, lhs)?;
-        let right = self.generic_vm_register_i64(registers, rhs)?;
-        let shift = u32::try_from(right)
-            .map_err(|_| stone_error(context, "shift count must be non-negative"))?;
-        let value =
-            op(left, shift).ok_or_else(|| stone_error(context, "shift count is too large"))?;
-        self.generic_vm_set_register(registers, dst, value)
     }
 
     fn eval_for_jsonl_rows(

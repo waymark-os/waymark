@@ -69,3 +69,57 @@ pub(super) fn generic_vm_number_to_value(value: GenericVmNumber) -> Value {
         GenericVmNumber::F64(value) => Value::float(value, Span::unknown()),
     }
 }
+
+pub(super) fn generic_vm_register_i64(
+    registers: &[Option<i64>],
+    reg: usize,
+) -> Result<i64, ShellError> {
+    registers
+        .get(reg)
+        .copied()
+        .flatten()
+        .ok_or_else(|| stone_error("hot loop", "VM register is unset"))
+}
+
+pub(super) fn generic_vm_set_register(
+    registers: &mut [Option<i64>],
+    reg: usize,
+    value: i64,
+) -> Result<(), ShellError> {
+    let Some(slot) = registers.get_mut(reg) else {
+        return Err(stone_error("hot loop", "VM register is out of range"));
+    };
+    *slot = Some(value);
+    Ok(())
+}
+
+pub(super) fn generic_vm_store_i64_binop(
+    registers: &mut [Option<i64>],
+    dst: usize,
+    lhs: usize,
+    rhs: usize,
+    context: &str,
+    op: impl FnOnce(i64, i64) -> Option<i64>,
+) -> Result<(), ShellError> {
+    let left = generic_vm_register_i64(registers, lhs)?;
+    let right = generic_vm_register_i64(registers, rhs)?;
+    let value = op(left, right)
+        .ok_or_else(|| stone_error(context, format!("integer {context} overflow")))?;
+    generic_vm_set_register(registers, dst, value)
+}
+
+pub(super) fn generic_vm_store_shift(
+    registers: &mut [Option<i64>],
+    dst: usize,
+    lhs: usize,
+    rhs: usize,
+    context: &str,
+    op: impl FnOnce(i64, u32) -> Option<i64>,
+) -> Result<(), ShellError> {
+    let left = generic_vm_register_i64(registers, lhs)?;
+    let right = generic_vm_register_i64(registers, rhs)?;
+    let shift = u32::try_from(right)
+        .map_err(|_| stone_error(context, "shift count must be non-negative"))?;
+    let value = op(left, shift).ok_or_else(|| stone_error(context, "shift count is too large"))?;
+    generic_vm_set_register(registers, dst, value)
+}
