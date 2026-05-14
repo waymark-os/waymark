@@ -77,6 +77,8 @@ mod stone_json_view;
 mod stone_runtime_value;
 #[path = "stone_state.rs"]
 mod stone_state;
+#[path = "stone_vm/interp.rs"]
+mod stone_vm_interp;
 use stone_functions::CallableValue;
 pub(crate) use stone_functions::StoneSession;
 use stone_json_view::{
@@ -92,6 +94,10 @@ use stone_json_view::{
 };
 use stone_runtime_value::{FileHandle, RuntimeValue, TextLines};
 use stone_state::runtime_state_record;
+use stone_vm_interp::{
+    generic_vm_add_number, generic_vm_number_from_runtime, generic_vm_number_to_value,
+    generic_vm_record_field_value, GenericVmInput, GenericVmLoopResult, GenericVmNumber,
+};
 
 const STONE_LAST_RESULT_ENV: &str = "WAYMARK_LAST_RESULT_JSON";
 
@@ -371,22 +377,6 @@ enum StoneVmSlot<'a> {
 
 struct StoneMaterializedSnapshot {
     locals: Vec<(String, RuntimeValue)>,
-}
-
-#[derive(Clone, Copy)]
-enum GenericVmNumber {
-    I64(i64),
-    F64(f64),
-}
-
-enum GenericVmLoopResult {
-    Executed { last_value: Option<RuntimeValue> },
-    Unsupported,
-}
-
-enum GenericVmInput<'a> {
-    Values(&'a [RuntimeValue]),
-    TextLines(&'a TextLines),
 }
 
 enum StoneVmExecutionResult {
@@ -6803,55 +6793,6 @@ impl MinMax {
             Self::Min => "min",
             Self::Max => "max",
         }
-    }
-}
-
-fn generic_vm_number_from_runtime(value: &RuntimeValue) -> Option<GenericVmNumber> {
-    match value {
-        RuntimeValue::Nu(Value::Int { val, .. }) => Some(GenericVmNumber::I64(*val)),
-        RuntimeValue::Nu(Value::Float { val, .. }) => Some(GenericVmNumber::F64(*val)),
-        _ => None,
-    }
-}
-
-fn generic_vm_record_field_value(
-    value: &RuntimeValue,
-    field: &str,
-) -> Result<Option<RuntimeValue>, ShellError> {
-    match value {
-        RuntimeValue::Nu(Value::Record { val, .. }) => {
-            Ok(val.get(field).cloned().map(RuntimeValue::Nu))
-        }
-        RuntimeValue::JsonObjectView(view) => json_object_view_get(view, field),
-        _ => Ok(None),
-    }
-}
-
-fn generic_vm_add_number(
-    left: GenericVmNumber,
-    right: GenericVmNumber,
-) -> Result<GenericVmNumber, ShellError> {
-    match (left, right) {
-        (GenericVmNumber::I64(left), GenericVmNumber::I64(right)) => left
-            .checked_add(right)
-            .map(GenericVmNumber::I64)
-            .ok_or_else(|| stone_error("hot loop", "integer addition overflow")),
-        (GenericVmNumber::F64(left), GenericVmNumber::F64(right)) => {
-            Ok(GenericVmNumber::F64(left + right))
-        }
-        (GenericVmNumber::I64(left), GenericVmNumber::F64(right)) => {
-            Ok(GenericVmNumber::F64(left as f64 + right))
-        }
-        (GenericVmNumber::F64(left), GenericVmNumber::I64(right)) => {
-            Ok(GenericVmNumber::F64(left + right as f64))
-        }
-    }
-}
-
-fn generic_vm_number_to_value(value: GenericVmNumber) -> Value {
-    match value {
-        GenericVmNumber::I64(value) => Value::int(value, Span::unknown()),
-        GenericVmNumber::F64(value) => Value::float(value, Span::unknown()),
     }
 }
 
