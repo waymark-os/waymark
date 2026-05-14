@@ -26,6 +26,11 @@ design: register slots, constant pools, blocks, typed VM values, accumulator
 handles, explicit materialization boundaries, and trace plans compiled from VM
 IR.
 
+The current runtime split plan is tracked in
+`docs/STONE_VM_RUNTIME_SPLIT_PLAN.md`. That plan keeps `stone_eval.rs` as the
+AST evaluator and orchestration layer while moving VM runtime entry, bytecode
+interpretation, and hot JSONL/native execution into `stone_vm/`.
+
 ## Architecture First, Workloads Second
 
 The architecture is the Lua-like register interpreter. JSONL, CSV, and
@@ -150,6 +155,13 @@ adapters and typed value ops inside the same interpreter.
 
 Waymark currently has two VM/IR tiers:
 
+- `stone_vm/types.rs`, `lower.rs`, `optimize.rs`, and `jsonl_match.rs` own VM
+  data types, lowering, canonicalization, optimization, and JSONL pattern
+  matching.
+- `stone_vm/interp.rs` owns generic VM instruction mechanics.
+- `stone_vm/runtime.rs` owns the generic VM runtime adapter over evaluator
+  state: compile/selection entry points, local load/store, diagnostics, and
+  fallback signaling.
 - `try_lower_hot_loop` recognizes selected `read_jsonl(...)` aggregation loops.
 - The body matcher recognizes the JSONL aggregation shapes used by current
   structured-data workloads.
@@ -163,6 +175,12 @@ Waymark currently has two VM/IR tiers:
   unique append.
 - General expression bytecode is not complete yet. The AST evaluator remains
   the semantic baseline and fallback.
+
+Hot JSONL native execution and the Stone IR JSONL VM are still partly resident
+in `stone_eval.rs`. The next runtime split is to move those row-view structs,
+slot helpers, accumulator materialization, native trace execution, and hot
+JSONL entry methods into a dedicated `stone_vm/jsonl_runtime.rs`-style module
+without changing supported syntax.
 
 The environment flags are development controls, not a guarantee that every loop
 lowers:
@@ -222,6 +240,12 @@ Stone functions.
 Move current JSONL and generic loop lowering/execution into the VM module
 without widening supported syntax. The goal is to make existing optimized paths
 look like clients of a durable VM, not peers of the AST evaluator.
+
+The generic VM portion of this stage is mostly in place: generic VM execution
+mechanics live in `stone_vm/interp.rs`, and evaluator-state adaptation lives in
+`stone_vm/runtime.rs`. The remaining work in this stage is the hot JSONL native
+and Stone IR runtime split described in
+`docs/STONE_VM_RUNTIME_SPLIT_PLAN.md`.
 
 ### Stage 3: Iterator Adapters
 

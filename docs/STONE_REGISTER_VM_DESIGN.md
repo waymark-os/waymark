@@ -46,6 +46,21 @@ Stone source
 The AST remains valuable for parsing, diagnostics, and fallback. The compiled
 function prototype is the durable execution artifact.
 
+The module split should follow the same broad shape:
+
+- `stone_eval.rs` is the AST evaluator, orchestration layer, and semantic
+  fallback owner.
+- `stone_state.rs` owns session/runtime state.
+- `stone_runtime_value.rs` owns typed runtime values and materialization
+  boundaries.
+- `stone_vm/types.rs`, `lower.rs`, and `optimize.rs` own VM data structures,
+  lowering, and optimization.
+- `stone_vm/interp.rs` owns bytecode execution mechanics.
+- `stone_vm/runtime.rs` owns the runtime bridge from evaluator state into VM
+  execution.
+- hot JSONL/native Stone VM execution should move into a dedicated VM runtime
+  module, as planned in `docs/STONE_VM_RUNTIME_SPLIT_PLAN.md`.
+
 ## Design Goals
 
 - Compile Stone source to a stable intermediate function form before execution.
@@ -66,6 +81,9 @@ function prototype is the durable execution artifact.
 
 - Do not map every Stone operation immediately.
 - Do not build a second generic AST interpreter with renamed nodes.
+- Do not let `stone_eval.rs` become the VM executor. It may decide whether to
+  try an optimized path and how to fall back, but bytecode/native-kernel
+  execution belongs under `stone_vm/`.
 - Do not require process-boundary values for internal arithmetic, JSON field
   access, loop iteration, or accumulator updates.
 - Do not add native-code JIT before the register interpreter is stable and
@@ -210,6 +228,12 @@ Specialization may recognize that `open(...).splitlines()` followed by
 `json_loads(line)` can use a JSONL row-view iterator, but that should be an
 iterator-adapter optimization feeding the general loop VM, not a separate
 JSONL-only loop architecture.
+
+During migration, the existing hot JSONL runtime remains a production fast
+path. Its final home should still be under `stone_vm/`: row views, slots,
+native accumulators, snapshot materialization, and JSONL-specific VM op
+execution are VM runtime mechanics. `stone_eval.rs` should keep only the
+high-level decision to attempt that path and the semantic fallback path.
 
 ## Initial Op Families
 
