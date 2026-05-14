@@ -3,11 +3,12 @@
 use super::{
     AccId, BlockId, ConstId, GenericLoopIter, GenericLoopOp, GenericLoopPlan, GenericParseNumber,
     GenericVmConst, GenericVmExprBody, GenericVmExprOp, GenericVmOp, HotJsonlAggregationBody,
-    HotJsonlBodyOp, HotJsonlSlot, HotJsonlTracePlan, LocalId, LoopIrBlock, LoopIrDiagnostics,
-    LoopIrFunction, LoopIrIteratorAdapter, LoopIrSnapshot, LoopIrSnapshotBoundary,
-    LoopIrTerminator, Reg, SnapshotId, StoneAccumulatorKind, StoneAccumulatorSpec, StoneBlock,
-    StoneConst, StoneFallbackTarget, StoneGuard, StoneGuardKind, StoneIrFunction, StoneLocal,
-    StoneOp, StoneSnapshot, StoneSnapshotAccumulator, StoneSnapshotLocal, StoneTerminator,
+    HotJsonlBodyOp, HotJsonlSlot, HotJsonlTracePlan, HotLoopOp, HotLoopPlan, LocalId, LoopIrBlock,
+    LoopIrDiagnostics, LoopIrFunction, LoopIrIteratorAdapter, LoopIrSnapshot,
+    LoopIrSnapshotBoundary, LoopIrTerminator, Reg, SnapshotId, StoneAccumulatorKind,
+    StoneAccumulatorSpec, StoneBlock, StoneConst, StoneFallbackTarget, StoneGuard, StoneGuardKind,
+    StoneIrFunction, StoneLocal, StoneOp, StoneSnapshot, StoneSnapshotAccumulator,
+    StoneSnapshotLocal, StoneTerminator,
 };
 
 use crate::stone_ast::{AssignTarget, AugOp, Expr, Stmt};
@@ -466,6 +467,71 @@ pub(crate) fn compile_hot_jsonl_trace_plan_from_ir(
         tag_counts_map: vm_trace.tag_counts_map,
         tags_list: vm_trace.tags_list,
     })
+}
+
+pub(crate) fn validate_hot_jsonl_native_prefix(
+    prefix_plan: &HotLoopPlan,
+    body_plan: &HotJsonlAggregationBody,
+) -> bool {
+    match prefix_plan.ops.as_slice() {
+        [HotLoopOp::JsonGetValue { target, key }]
+            if target == &body_plan.user_name && key == &body_plan.user_key =>
+        {
+            true
+        }
+        [HotLoopOp::JsonGetStrDefault {
+            target: user_target,
+            key: user_key,
+            default: user_default,
+        }, HotLoopOp::JsonGetF64Default {
+            target: amount_target,
+            key: amount_key,
+            default: amount_default,
+        }, HotLoopOp::JsonGetI64Default {
+            target: items_target,
+            key: items_key,
+            default: items_default,
+        }, HotLoopOp::JsonGetArrayDefault { key: tags_key, .. }]
+            if user_target == &body_plan.user_name
+                && user_key == &body_plan.user_key
+                && user_default == &body_plan.user_default
+                && amount_target != user_target
+                && amount_key == &body_plan.user_amount_key
+                && *amount_default == body_plan.user_amount_default
+                && items_target != user_target
+                && items_key == &body_plan.user_items_key
+                && *items_default == body_plan.user_items_default
+                && tags_key == &body_plan.tags_key =>
+        {
+            true
+        }
+        [HotLoopOp::JsonGetStrDefault {
+            target: user_target,
+            key: user_key,
+            default: user_default,
+        }, HotLoopOp::JsonGetF64Default {
+            target: amount_target,
+            key: amount_key,
+            default: amount_default,
+        }, HotLoopOp::JsonGetI64Default {
+            target: items_target,
+            key: items_key,
+            default: items_default,
+        }] if user_target == &body_plan.user_name
+            && user_key == &body_plan.user_key
+            && user_default == &body_plan.user_default
+            && amount_target != user_target
+            && amount_key == &body_plan.user_amount_key
+            && *amount_default == body_plan.user_amount_default
+            && items_target != user_target
+            && items_key == &body_plan.user_items_key
+            && *items_default == body_plan.user_items_default
+            && body_plan.tags_default_empty =>
+        {
+            true
+        }
+        _ => false,
+    }
 }
 
 struct HotJsonlVmTrace {
