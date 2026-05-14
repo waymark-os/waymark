@@ -2045,3 +2045,203 @@ impl Evaluator<'_> {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+
+    use super::{
+        f64_record_from_native_map, hot_jsonl_fields, hot_jsonl_row_get_array_default,
+        hot_jsonl_row_get_array_required, hot_jsonl_row_get_f64_default,
+        hot_jsonl_row_get_f64_required, hot_jsonl_row_get_i64_default,
+        hot_jsonl_row_get_i64_required, hot_jsonl_row_get_string_default,
+        hot_jsonl_row_get_string_required, hot_jsonl_string_array_for_each_string, hot_jsonl_user,
+        i64_record_from_native_map, json_object_view_get_hot_jsonl_row_fields,
+        nested_totals_record_from_native_maps, string_list_from_ordered_keys, HotJsonlNativeSlots,
+        HotJsonlRowFields, HotJsonlRowSlice, HotJsonlStringArray,
+    };
+    use crate::stone_vm::HotJsonlTracePlan;
+
+    #[test]
+    fn hot_jsonl_row_getters_return_values_defaults_and_errors() {
+        let row = row(br#"{"user":"Ada","amount":2.5,"items":3,"tags":["rust","stone"]}"#);
+
+        assert_eq!(
+            hot_jsonl_row_get_string_required(&row, "user").expect("user"),
+            Cow::Borrowed("Ada")
+        );
+        assert_eq!(
+            hot_jsonl_row_get_string_default(&row, "missing", "fallback").expect("default"),
+            Cow::<str>::Owned("fallback".to_string())
+        );
+        assert_eq!(
+            hot_jsonl_row_get_f64_required(&row, "amount").expect("amount"),
+            2.5
+        );
+        assert_eq!(
+            hot_jsonl_row_get_f64_default(&row, "missing", 4.5).expect("default"),
+            4.5
+        );
+        assert_eq!(
+            hot_jsonl_row_get_i64_required(&row, "items").expect("items"),
+            3
+        );
+        assert_eq!(
+            hot_jsonl_row_get_i64_default(&row, "missing", 9).expect("default"),
+            9
+        );
+        assert_eq!(
+            hot_jsonl_row_get_array_required(&row, "tags")
+                .expect("tags")
+                .bytes,
+            br#"["rust","stone"]"#
+        );
+        assert_eq!(
+            hot_jsonl_row_get_array_default(&row, "missing")
+                .expect("default tags")
+                .bytes,
+            b"[]"
+        );
+
+        assert!(hot_jsonl_row_get_string_required(&row, "missing").is_err());
+        assert!(hot_jsonl_row_get_array_required(&row, "user").is_err());
+    }
+
+    #[test]
+    fn hot_jsonl_row_fields_apply_plan_defaults() {
+        let plan = trace_plan();
+        let defaulted_row = row(br#"{"amount":1.25,"tags":["a"]}"#);
+        let fields = json_object_view_get_hot_jsonl_row_fields(
+            &defaulted_row,
+            &plan,
+            "user",
+            "amount",
+            "items",
+            "tags",
+        )
+        .expect("fields");
+
+        assert_eq!(fields.user, Cow::<str>::Owned("anonymous".to_string()));
+        assert_eq!(fields.amount, 1.25);
+        assert_eq!(fields.items, 0);
+        assert_eq!(fields.tags.bytes, br#"["a"]"#);
+
+        let bad_tags = row(br#"{"user":"Ada","amount":1,"items":2,"tags":"nope"}"#);
+        assert!(json_object_view_get_hot_jsonl_row_fields(
+            &bad_tags, &plan, "user", "amount", "items", "tags",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn hot_jsonl_slots_require_initialized_fields() {
+        let empty = HotJsonlNativeSlots::default();
+        assert!(hot_jsonl_fields(&empty).is_err());
+
+        let slots = HotJsonlNativeSlots {
+            fields: Some(HotJsonlRowFields {
+                user: Cow::Borrowed("Ada"),
+                amount: 1.0,
+                items: 2,
+                tags: HotJsonlStringArray { bytes: b"[]" },
+            }),
+        };
+        assert_eq!(hot_jsonl_user(&slots).expect("user"), Cow::Borrowed("Ada"));
+    }
+
+    #[test]
+    fn hot_jsonl_string_array_iterates_strings() {
+        let array = HotJsonlStringArray {
+            bytes: br#"["A","B\nC"]"#,
+        };
+        let mut values = Vec::new();
+
+        hot_jsonl_string_array_for_each_string(&array, |value| {
+            values.push(value.into_owned());
+            Ok(())
+        })
+        .expect("iterate");
+
+        assert_eq!(values, ["A", "B\nC"]);
+        assert!(hot_jsonl_string_array_for_each_string(
+            &HotJsonlStringArray { bytes: br#"[1]"# },
+            |_| Ok(())
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn native_map_materializers_preserve_ordered_keys_then_extras() {
+        let ordered = vec!["b".to_string(), "a".to_string()];
+        let mut f64s = HashMap::new();
+        f64s.insert("a".to_string(), 1.0);
+        f64s.insert("b".to_string(), 2.0);
+        f64s.insert("c".to_string(), 3.0);
+        let f64_record = f64_record_from_native_map(&ordered, &f64s);
+        assert_eq!(
+            f64_record.get("b").expect("b").as_float().expect("f64"),
+            2.0
+        );
+        assert_eq!(
+            f64_record.get("a").expect("a").as_float().expect("f64"),
+            1.0
+        );
+
+        let mut i64s = HashMap::new();
+        i64s.insert("a".to_string(), 1);
+        i64s.insert("b".to_string(), 2);
+        let i64_record = i64_record_from_native_map(&ordered, &i64s);
+        assert_eq!(i64_record.get("b").expect("b").as_int().expect("i64"), 2);
+
+        let list = string_list_from_ordered_keys(&ordered);
+        assert_eq!(list.as_list().expect("list").len(), 2);
+    }
+
+    #[test]
+    fn nested_totals_materializer_requires_both_maps() {
+        let ordered = vec!["ada".to_string()];
+        let mut amounts = HashMap::new();
+        amounts.insert("ada".to_string(), 10.0);
+        amounts.insert("missing-items".to_string(), 99.0);
+        let mut items = HashMap::new();
+        items.insert("ada".to_string(), 3);
+        items.insert("missing-amount".to_string(), 4);
+
+        let record =
+            nested_totals_record_from_native_maps(&ordered, &amounts, &items, "amount", "items");
+        assert!(record.get("ada").is_some());
+        assert!(record.get("missing-items").is_none());
+        assert!(record.get("missing-amount").is_none());
+    }
+
+    fn row(bytes: &'static [u8]) -> HotJsonlRowSlice<'static> {
+        HotJsonlRowSlice {
+            bytes,
+            source: "rows.jsonl",
+            line_number: 1,
+        }
+    }
+
+    fn trace_plan() -> HotJsonlTracePlan {
+        HotJsonlTracePlan {
+            user_name: "user".to_string(),
+            user_key: "user".to_string(),
+            user_has_default: true,
+            user_default: "anonymous".to_string(),
+            user_amounts_map: "amounts".to_string(),
+            user_amount_key: "amount".to_string(),
+            user_amount_has_default: true,
+            user_amount_default: 0.0,
+            user_items_map: "items".to_string(),
+            user_items_key: "items".to_string(),
+            user_items_has_default: true,
+            user_items_default: 0,
+            users_list: Some("users".to_string()),
+            tags_key: "tags".to_string(),
+            tags_default_empty: true,
+            tag_counts_map: "tags".to_string(),
+            tags_list: Some("tags_list".to_string()),
+        }
+    }
+}

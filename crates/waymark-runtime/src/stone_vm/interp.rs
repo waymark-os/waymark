@@ -6,6 +6,7 @@ use nu_protocol::{ShellError, Span, Value};
 
 use super::stone_runtime_value::{RuntimeValue, TextLines};
 use super::{json_object_view_get, stone_error};
+use crate::stone_builtins::{python_floor_div_i64, python_mod_i64};
 use crate::stone_vm::{GenericParseNumber, GenericVmConst, GenericVmExprBody, GenericVmExprOp};
 
 #[derive(Clone, Copy)]
@@ -402,7 +403,15 @@ pub(super) fn execute_generic_vm_expr_ops(
                 if right == 0 {
                     return Err(stone_error("floor division", "division by zero"));
                 }
-                generic_vm_set_register(registers, dst, left.div_euclid(right))?;
+                generic_vm_set_register(registers, dst, python_floor_div_i64(left, right)?)?;
+            }
+            GenericVmExprOp::ModI64 { dst, lhs, rhs } => {
+                let left = generic_vm_register_i64(registers, lhs)?;
+                let right = generic_vm_register_i64(registers, rhs)?;
+                if right == 0 {
+                    return Err(stone_error("modulo", "modulo by zero"));
+                }
+                generic_vm_set_register(registers, dst, python_mod_i64(left, right)?)?;
             }
             GenericVmExprOp::BitAndI64 { dst, lhs, rhs } => {
                 let value = generic_vm_register_i64(registers, lhs)?
@@ -424,6 +433,12 @@ pub(super) fn execute_generic_vm_expr_ops(
             }
             GenericVmExprOp::ShrI64 { dst, lhs, rhs } => {
                 generic_vm_store_shift(registers, dst, lhs, rhs, "right shift", i64::checked_shr)?;
+            }
+            GenericVmExprOp::NegI64 { dst, src } => {
+                let value = generic_vm_register_i64(registers, src)?
+                    .checked_neg()
+                    .ok_or_else(|| stone_error("unary minus", "integer negation overflow"))?;
+                generic_vm_set_register(registers, dst, value)?;
             }
             GenericVmExprOp::BitNotI64 { dst, src } => {
                 let value = !generic_vm_register_i64(registers, src)?;

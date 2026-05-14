@@ -2255,3 +2255,201 @@ fn is_json_path(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cmp::Ordering;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use nu_protocol::{casing::Casing, Record, Span, Spanned, Value};
+
+    use super::{
+        compare_values, find_entry_value, find_name_matches, is_json_path, list_entry_value,
+        parse_row_count, search_match_value, sort_values, wildcard_match,
+    };
+
+    #[test]
+    fn parse_row_count_tracks_default_explicit_and_negative_cases() {
+        let default = parse_row_count(None).expect("default");
+        assert_eq!(default.count, 1);
+        assert!(!default.explicit);
+
+        let explicit = parse_row_count(Some(Spanned {
+            item: 0,
+            span: Span::unknown(),
+        }))
+        .expect("explicit");
+        assert_eq!(explicit.count, 0);
+        assert!(explicit.explicit);
+
+        assert!(parse_row_count(Some(Spanned {
+            item: -1,
+            span: Span::unknown(),
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn wildcard_matching_supports_stars_and_question_marks() {
+        assert!(wildcard_match("*.rs", "lib.rs"));
+        assert!(wildcard_match("a?c*", "abcdef"));
+        assert!(wildcard_match("*", "anything"));
+        assert!(!wildcard_match("a?d", "abc"));
+        assert!(!wildcard_match("*.rs", "lib.py"));
+    }
+
+    #[test]
+    fn find_name_matches_combines_contains_and_glob_filters() {
+        assert!(find_name_matches(
+            "stone_runtime.rs",
+            Some("runtime"),
+            Some("*.rs")
+        ));
+        assert!(!find_name_matches(
+            "stone_runtime.rs",
+            Some("missing"),
+            Some("*.rs")
+        ));
+        assert!(!find_name_matches(
+            "stone_runtime.rs",
+            Some("runtime"),
+            Some("*.txt")
+        ));
+        assert!(find_name_matches("stone_runtime.rs", None, None));
+    }
+
+    #[test]
+    fn json_path_detection_is_case_insensitive() {
+        assert!(is_json_path(Path::new("data.json")));
+        assert!(is_json_path(Path::new("data.JSON")));
+        assert!(!is_json_path(Path::new("data.jsonl")));
+        assert!(!is_json_path(Path::new("data")));
+    }
+
+    #[test]
+    fn compare_values_orders_by_value_then_type_fallback() {
+        assert_eq!(
+            compare_values(
+                &Value::int(1, Span::unknown()),
+                &Value::int(2, Span::unknown())
+            ),
+            Ordering::Less
+        );
+        assert_ne!(
+            compare_values(
+                &Value::string("1", Span::unknown()),
+                &Value::int(1, Span::unknown())
+            ),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn sort_values_preserves_records_while_ordering_by_cell_path() {
+        let span = Span::unknown();
+        let mut values = vec![
+            record_value("b", 2, span),
+            record_value("a", 1, span),
+            record_value("c", 3, span),
+        ];
+        let path = nu_protocol::ast::CellPath {
+            members: vec![nu_protocol::ast::PathMember::String {
+                val: "name".to_string(),
+                span,
+                optional: false,
+                casing: Casing::Sensitive,
+            }],
+        };
+
+        sort_values(&mut values, Some(&path.members)).expect("sort by name");
+
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value
+                    .as_record()
+                    .expect("record")
+                    .get("name")
+                    .expect("name")
+                    .as_str()
+                    .expect("string"))
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn entry_value_helpers_describe_files_and_matches() {
+        let root = temp_dir("commands-entry-values");
+        fs::create_dir_all(&root).expect("root");
+        let file = root.join("answer.txt");
+        fs::write(&file, "hello").expect("file");
+        let dir = root.join("nested");
+        fs::create_dir(&dir).expect("dir");
+
+        let file_meta = fs::symlink_metadata(&file).expect("file metadata");
+        let listed = list_entry_value(
+            "answer.txt".to_string(),
+            file.clone(),
+            file_meta,
+            Span::unknown(),
+        );
+        let listed_record = listed.as_record().expect("record");
+        assert_eq!(
+            listed_record
+                .get("type")
+                .expect("type")
+                .as_str()
+                .expect("string"),
+            "file"
+        );
+
+        let dir_meta = fs::symlink_metadata(&dir).expect("dir metadata");
+        let found = find_entry_value("nested".to_string(), dir.clone(), dir_meta, Span::unknown());
+        let found_record = found.as_record().expect("record");
+        assert_eq!(
+            found_record
+                .get("type")
+                .expect("type")
+                .as_str()
+                .expect("string"),
+            "dir"
+        );
+
+        let matched = search_match_value(file.clone(), 12, "needle".to_string(), Span::unknown());
+        let matched_record = matched.as_record().expect("record");
+        assert_eq!(
+            matched_record
+                .get("line")
+                .expect("line")
+                .as_int()
+                .expect("int"),
+            12
+        );
+        assert!(matched_record
+            .get("path")
+            .expect("path")
+            .as_str()
+            .expect("string")
+            .ends_with("answer.txt"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn record_value(name: &str, size: i64, span: Span) -> Value {
+        let mut record = Record::new();
+        record.push("name", Value::string(name, span));
+        record.push("size", Value::int(size, span));
+        Value::record(record, span)
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        Path::new("/tmp").join(format!("waymark-{label}-{nanos}"))
+    }
+}

@@ -121,3 +121,100 @@ impl RuntimeValue {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use nu_protocol::{Span, Value};
+
+    use super::super::stone_functions::CallableValue;
+    use super::{FileHandle, RuntimeValue, RuntimeValueTag, TextLines};
+    use crate::stone_ast::Expr;
+
+    #[test]
+    fn runtime_value_tags_have_stable_compact_ids() {
+        assert_eq!(RuntimeValueTag::Nu.id(), 1);
+        assert_eq!(RuntimeValueTag::File.id(), 2);
+        assert_eq!(RuntimeValueTag::TextLines.id(), 3);
+        assert_eq!(RuntimeValueTag::JsonlRows.id(), 4);
+        assert_eq!(RuntimeValueTag::JsonObjectView.id(), 5);
+        assert_eq!(RuntimeValueTag::JsonArrayView.id(), 6);
+        assert_eq!(RuntimeValueTag::JsonScalarView.id(), 7);
+        assert_eq!(RuntimeValueTag::Callable.id(), 8);
+    }
+
+    #[test]
+    fn file_handles_are_not_session_persistable() {
+        let value = RuntimeValue::File(FileHandle {
+            scope_index: 1,
+            file_id: 2,
+        });
+
+        assert!(!value.is_session_persistable());
+        assert_eq!(value.type_tag(), RuntimeValueTag::File);
+    }
+
+    #[test]
+    fn callables_are_persistable_only_when_captures_are_persistable() {
+        let persistable = RuntimeValue::Callable(CallableValue {
+            function_id: 1,
+            params: Vec::new(),
+            body: Box::new(Expr::None),
+            captures: vec![(
+                "answer".to_string(),
+                RuntimeValue::Nu(Value::int(42, Span::unknown())),
+            )],
+        });
+        assert!(persistable.is_session_persistable());
+        assert_eq!(persistable.type_tag(), RuntimeValueTag::Callable);
+
+        let non_persistable = RuntimeValue::Callable(CallableValue {
+            function_id: 2,
+            params: Vec::new(),
+            body: Box::new(Expr::None),
+            captures: vec![(
+                "file".to_string(),
+                RuntimeValue::File(FileHandle {
+                    scope_index: 0,
+                    file_id: 7,
+                }),
+            )],
+        });
+        assert!(!non_persistable.is_session_persistable());
+    }
+
+    #[test]
+    fn text_lines_materialize_to_nu_list() {
+        let value = RuntimeValue::TextLines(TextLines {
+            lines: vec!["alpha".to_string(), "beta".to_string()],
+            source: "memory".to_string(),
+        })
+        .into_nu_value("test")
+        .expect("text lines should materialize");
+
+        let list = value.as_list().expect("text lines become a list");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].as_str().expect("string"), "alpha");
+        assert_eq!(list[1].as_str().expect("string"), "beta");
+    }
+
+    #[test]
+    fn task_owned_runtime_values_cannot_cross_nu_boundary() {
+        let file_error = RuntimeValue::File(FileHandle {
+            scope_index: 0,
+            file_id: 1,
+        })
+        .into_nu_value("file boundary")
+        .expect_err("file handles cannot materialize");
+        assert!(file_error.to_string().contains("file boundary"));
+
+        let callable_error = RuntimeValue::Callable(CallableValue {
+            function_id: 99,
+            params: Vec::new(),
+            body: Box::new(Expr::None),
+            captures: Vec::new(),
+        })
+        .into_nu_value("callable boundary")
+        .expect_err("callables cannot materialize");
+        assert!(callable_error.to_string().contains("callable boundary"));
+    }
+}

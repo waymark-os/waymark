@@ -43,6 +43,41 @@ persist across eval calls. For large values, keep the binding live and emit
 small summaries with `len`, `head`/`first`, or `tail`/`last` unless the caller
 explicitly asks for full output.
 
+## Expression Semantics
+
+Stone uses Python-shaped expression syntax for familiar agent-generated code,
+but operators stay strongly typed. Automatic text-to-number parsing is not part
+of operator evaluation. Use explicit conversions such as `int(value)` or
+`float(value)` when input text should become a number.
+
+Truthiness follows Python's common data model: `False`, `None`, numeric zero,
+empty strings, empty lists, and empty records are falsey; non-empty values and
+non-zero numbers are truthy. Boolean operators short-circuit and return booleans.
+
+Numeric operators support integers and floats:
+
+- `+`, `-`, and `*` work on numbers. `+` also concatenates strings with strings
+  and lists with lists.
+- `/` returns a float for numeric operands.
+- `//` floors toward negative infinity, matching Python for signed operands:
+  `-7 // 2 == -4` and `7 // -2 == -4`.
+- `%` uses the same divisor-sign rule as Python: `-7 % 2 == 1` and
+  `7 % -2 == -1`.
+- Integer overflow is an error instead of wrapping.
+
+Bitwise operators are integer-only: `&`, `|`, `^`, `<<`, `>>`, and `~` reject
+strings and floats. Shift counts must be non-negative and within the supported
+integer width.
+
+Comparisons support numeric ordering across ints and floats, lexicographic
+string ordering, and lexicographic list ordering. Equality is recursive for
+lists and records, numeric across ints/floats, and strongly typed for booleans:
+`2 == 2.0` is true, but `True == 1` is false. Ordering unrelated types, such as
+`"1" < 2`, is an error.
+
+Membership supports strings, lists, and record keys: `"mark" in "waymark"`,
+`2 in [1, 2, 3]`, and `"path" in record`. Other containers are an error.
+
 ## Core Builtins
 
 - `emit(value)`: return a structured success value.

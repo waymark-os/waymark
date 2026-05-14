@@ -222,11 +222,13 @@ pub(crate) enum GenericVmExprOp {
     SubI64 { dst: usize, lhs: usize, rhs: usize },
     MulI64 { dst: usize, lhs: usize, rhs: usize },
     FloorDivI64 { dst: usize, lhs: usize, rhs: usize },
+    ModI64 { dst: usize, lhs: usize, rhs: usize },
     BitAndI64 { dst: usize, lhs: usize, rhs: usize },
     BitOrI64 { dst: usize, lhs: usize, rhs: usize },
     BitXorI64 { dst: usize, lhs: usize, rhs: usize },
     ShlI64 { dst: usize, lhs: usize, rhs: usize },
     ShrI64 { dst: usize, lhs: usize, rhs: usize },
+    NegI64 { dst: usize, src: usize },
     BitNotI64 { dst: usize, src: usize },
 }
 
@@ -247,6 +249,8 @@ impl GenericVmExprOp {
             GenericVmExprOp::ShlI64 { .. } => 111,
             GenericVmExprOp::ShrI64 { .. } => 112,
             GenericVmExprOp::BitNotI64 { .. } => 113,
+            GenericVmExprOp::ModI64 { .. } => 114,
+            GenericVmExprOp::NegI64 { .. } => 115,
         }
     }
 }
@@ -636,4 +640,281 @@ pub(crate) enum StoneTerminator {
         target: BlockId,
     },
     Return,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AccId, ConstId, GenericParseNumber, GenericVmExprBody, GenericVmExprOp, GenericVmOp,
+        LoopIrFusedKernel, Reg, StoneOp,
+    };
+
+    #[test]
+    fn generic_vm_opcode_ids_are_stable() {
+        let body = GenericVmExprBody {
+            registers: 0,
+            constants: Vec::new(),
+            ops: Vec::new(),
+        };
+
+        assert_eq!(GenericVmOp::AddAssign { local: 0 }.opcode_id(), 1);
+        assert_eq!(
+            GenericVmOp::AddAssignParsed {
+                local: 0,
+                parse: GenericParseNumber::Int,
+            }
+            .opcode_id(),
+            2
+        );
+        assert_eq!(
+            GenericVmOp::MapAddI64Const { map: 0, addend: 1 }.opcode_id(),
+            3
+        );
+        assert_eq!(
+            GenericVmOp::MapAddI64ConstRecordField {
+                map: 0,
+                field: "field".to_string(),
+                addend: 1,
+            }
+            .opcode_id(),
+            4
+        );
+        assert_eq!(
+            GenericVmOp::MapAddI64ConstRecordStringField {
+                map: 0,
+                field: "field".to_string(),
+                strip: true,
+                lower: true,
+                addend: 1,
+            }
+            .opcode_id(),
+            5
+        );
+        assert_eq!(
+            GenericVmOp::ListAppend {
+                list: 0,
+                unique: false,
+            }
+            .opcode_id(),
+            6
+        );
+        assert_eq!(GenericVmOp::ExprBody(body).opcode_id(), 7);
+    }
+
+    #[test]
+    fn generic_expr_opcode_ids_are_stable() {
+        let binary_ops = [
+            (
+                GenericVmExprOp::AddI64 {
+                    dst: 0,
+                    lhs: 1,
+                    rhs: 2,
+                },
+                104,
+            ),
+            (
+                GenericVmExprOp::SubI64 {
+                    dst: 0,
+                    lhs: 1,
+                    rhs: 2,
+                },
+                105,
+            ),
+            (
+                GenericVmExprOp::MulI64 {
+                    dst: 0,
+                    lhs: 1,
+                    rhs: 2,
+                },
+                106,
+            ),
+            (
+                GenericVmExprOp::FloorDivI64 {
+                    dst: 0,
+                    lhs: 1,
+                    rhs: 2,
+                },
+                107,
+            ),
+            (
+                GenericVmExprOp::BitAndI64 {
+                    dst: 0,
+                    lhs: 1,
+                    rhs: 2,
+                },
+                108,
+            ),
+            (
+                GenericVmExprOp::BitOrI64 {
+                    dst: 0,
+                    lhs: 1,
+                    rhs: 2,
+                },
+                109,
+            ),
+            (
+                GenericVmExprOp::BitXorI64 {
+                    dst: 0,
+                    lhs: 1,
+                    rhs: 2,
+                },
+                110,
+            ),
+            (
+                GenericVmExprOp::ShlI64 {
+                    dst: 0,
+                    lhs: 1,
+                    rhs: 2,
+                },
+                111,
+            ),
+            (
+                GenericVmExprOp::ShrI64 {
+                    dst: 0,
+                    lhs: 1,
+                    rhs: 2,
+                },
+                112,
+            ),
+        ];
+
+        assert_eq!(
+            GenericVmExprOp::LoadLocal { dst: 0, local: 1 }.opcode_id(),
+            101
+        );
+        assert_eq!(
+            GenericVmExprOp::StoreLocal { local: 0, src: 1 }.opcode_id(),
+            102
+        );
+        assert_eq!(
+            GenericVmExprOp::LoadConst {
+                dst: 0,
+                constant: 1,
+            }
+            .opcode_id(),
+            103
+        );
+        for (op, id) in binary_ops {
+            assert_eq!(op.opcode_id(), id);
+        }
+        assert_eq!(
+            GenericVmExprOp::BitNotI64 { dst: 0, src: 1 }.opcode_id(),
+            113
+        );
+        assert_eq!(
+            GenericVmExprOp::ModI64 {
+                dst: 0,
+                lhs: 1,
+                rhs: 2,
+            }
+            .opcode_id(),
+            114
+        );
+        assert_eq!(GenericVmExprOp::NegI64 { dst: 0, src: 1 }.opcode_id(), 115);
+    }
+
+    #[test]
+    fn fused_kernel_type_assumptions_are_stable() {
+        let map = LoopIrFusedKernel::MapAddI64Const.type_assumptions();
+        assert_eq!(map.inputs, ["string_key", "i64_addend", "i64_map"]);
+        assert_eq!(map.outputs, ["i64_map"]);
+
+        let list = LoopIrFusedKernel::ListAppend.type_assumptions();
+        assert_eq!(list.inputs, ["list", "item"]);
+        assert_eq!(list.outputs, ["list"]);
+
+        let jsonl = LoopIrFusedKernel::JsonlAggregation.type_assumptions();
+        assert_eq!(
+            jsonl.inputs,
+            ["json_object_row", "f64_map", "i64_map", "string_list"]
+        );
+        assert_eq!(jsonl.outputs, ["f64_map", "i64_map", "string_list"]);
+    }
+
+    #[test]
+    fn stone_opcode_ids_are_stable() {
+        let object = Reg(0);
+        let dst = Reg(1);
+        let key = ConstId(0);
+        let default = ConstId(1);
+        let map = AccId(0);
+
+        assert_eq!(
+            StoneOp::JsonGetStrDefault {
+                dst,
+                object,
+                key,
+                default,
+            }
+            .opcode_id(),
+            201
+        );
+        assert_eq!(StoneOp::JsonGetValue { dst, object, key }.opcode_id(), 202);
+        assert_eq!(
+            StoneOp::JsonGetF64Default {
+                dst,
+                object,
+                key,
+                default: 0.0,
+            }
+            .opcode_id(),
+            203
+        );
+        assert_eq!(
+            StoneOp::JsonGetI64Default {
+                dst,
+                object,
+                key,
+                default: 0,
+            }
+            .opcode_id(),
+            204
+        );
+        assert_eq!(
+            StoneOp::JsonGetArrayDefault { dst, object, key }.opcode_id(),
+            205
+        );
+        assert_eq!(
+            StoneOp::MapAddF64 {
+                map,
+                key: dst,
+                value: object,
+                append: None,
+            }
+            .opcode_id(),
+            206
+        );
+        assert_eq!(
+            StoneOp::MapAddI64 {
+                map,
+                key: dst,
+                value: object,
+                append: None,
+            }
+            .opcode_id(),
+            207
+        );
+        assert_eq!(
+            StoneOp::MapAddI64Const {
+                map,
+                key: dst,
+                value: 1,
+                append: Some(map),
+            }
+            .opcode_id(),
+            208
+        );
+        assert_eq!(
+            StoneOp::JsonGetF64Required { dst, object, key }.opcode_id(),
+            209
+        );
+        assert_eq!(
+            StoneOp::JsonGetI64Required { dst, object, key }.opcode_id(),
+            210
+        );
+        assert_eq!(
+            StoneOp::JsonGetArrayRequired { dst, object, key }.opcode_id(),
+            211
+        );
+    }
 }

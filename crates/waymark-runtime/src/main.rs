@@ -415,7 +415,68 @@ fn usage(program_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_trailing_hermit_boot_args;
+    use super::{
+        frontend_for_script_path, is_trailing_hermit_boot_arg, normalize_exit_code, remove_flag,
+        remove_optional_value, strip_trailing_hermit_boot_args, usage,
+    };
+    use waymark_runtime::FrontendKind;
+
+    #[test]
+    fn normalizes_exit_codes_to_process_status_range() {
+        assert_eq!(normalize_exit_code(0), 0);
+        assert_eq!(normalize_exit_code(255), 255);
+        assert_eq!(normalize_exit_code(256), 0);
+        assert_eq!(normalize_exit_code(257), 1);
+        assert_eq!(normalize_exit_code(-1), 255);
+        assert_eq!(normalize_exit_code(-257), 255);
+    }
+
+    #[test]
+    fn detects_frontend_from_script_extension() {
+        assert_eq!(
+            frontend_for_script_path("script.stone"),
+            FrontendKind::Stone
+        );
+        assert_eq!(frontend_for_script_path("/tmp/script.nu"), FrontendKind::Nu);
+        assert_eq!(frontend_for_script_path("/tmp/script"), FrontendKind::Nu);
+        assert_eq!(frontend_for_script_path("/tmp/STONE"), FrontendKind::Nu);
+    }
+
+    #[test]
+    fn removes_flags_in_place() {
+        let mut args = vec!["--stdin".to_string(), "-c".to_string(), "1 + 1".to_string()];
+
+        assert!(remove_flag(&mut args, "--stdin"));
+        assert!(!remove_flag(&mut args, "--stdin"));
+        assert_eq!(args, ["-c", "1 + 1"]);
+    }
+
+    #[test]
+    fn removes_optional_flag_values_with_defaults() {
+        let mut args = vec![
+            "--task-server-vsock".to_string(),
+            "1234".to_string(),
+            "--stone".to_string(),
+        ];
+
+        assert_eq!(
+            remove_optional_value(&mut args, "--task-server-vsock", "9975"),
+            Some("1234".to_string())
+        );
+        assert_eq!(args, ["--stone"]);
+
+        let mut args = vec!["--task".to_string(), "--stone".to_string()];
+        assert_eq!(
+            remove_optional_value(&mut args, "--task", "/work/task/task.json"),
+            Some("/work/task/task.json".to_string())
+        );
+        assert_eq!(args, ["--stone"]);
+
+        assert_eq!(
+            remove_optional_value(&mut args, "--missing", "default"),
+            None
+        );
+    }
 
     #[test]
     fn strips_loader_appended_boot_args_from_task_server_mode() {
@@ -432,11 +493,52 @@ mod tests {
     }
 
     #[test]
+    fn strips_loader_appended_boot_args_from_task_file_mode() {
+        let mut args = vec![
+            "--task".to_string(),
+            "/tmp/task.json".to_string(),
+            "console=ttyS0".to_string(),
+            "reboot=k".to_string(),
+            "panic=abort".to_string(),
+            "pci=on".to_string(),
+        ];
+
+        strip_trailing_hermit_boot_args(&mut args);
+
+        assert_eq!(args, ["--task", "/tmp/task.json"]);
+    }
+
+    #[test]
     fn leaves_command_args_alone() {
         let mut args = vec!["-c".to_string(), "echo pci=off".to_string()];
 
         strip_trailing_hermit_boot_args(&mut args);
 
         assert_eq!(args, ["-c", "echo pci=off"]);
+    }
+
+    #[test]
+    fn detects_trailing_hermit_boot_arg_shapes() {
+        assert!(is_trailing_hermit_boot_arg("pci=off"));
+        assert!(is_trailing_hermit_boot_arg("pci=on"));
+        assert!(is_trailing_hermit_boot_arg(
+            "virtio_mmio.device=4K@0xc0001000:5"
+        ));
+        assert!(is_trailing_hermit_boot_arg("console=ttyS0"));
+        assert!(is_trailing_hermit_boot_arg("reboot=k"));
+        assert!(is_trailing_hermit_boot_arg("panic=abort"));
+        assert!(!is_trailing_hermit_boot_arg("panic"));
+        assert!(!is_trailing_hermit_boot_arg("user_arg=pci=off"));
+    }
+
+    #[test]
+    fn usage_mentions_all_execution_modes() {
+        let text = usage("waymark-runtime");
+
+        assert!(text.contains("waymark-runtime eval"));
+        assert!(text.contains("--stdin-script"));
+        assert!(text.contains("--task [task.json]"));
+        assert!(text.contains("--task-server"));
+        assert!(text.contains("--task-server-vsock [port]"));
     }
 }

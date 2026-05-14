@@ -687,3 +687,265 @@ fn json_scalar_view_error(view: &JsonScalarView, err: serde_json::Error) -> Shel
         format!("{} line {}: {}", view.source, view.line_number, err),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+    use std::sync::Arc;
+
+    use nu_protocol::{Span, Value};
+
+    use super::RuntimeValue;
+    use super::{
+        eval_json_object_view_method, eval_runtime_subscript, find_top_level_json_field,
+        json_array_bytes_for_each_range, json_array_view_iter_values, json_key_matches,
+        json_number_bytes_to_f64, json_number_bytes_to_i64, json_object_for_each_field,
+        json_object_view_get_array_default, json_object_view_get_f64_default,
+        json_object_view_get_i64_default, json_object_view_get_string_default,
+        json_scalar_view_to_f64, json_scalar_view_to_i64, json_scalar_view_to_string,
+        json_string_bytes_to_cow, jsonl_row_views, jsonl_rows_from_bytes,
+        materialize_json_array_view, materialize_json_object_view, materialize_json_scalar_view,
+        materialize_jsonl_rows, runtime_value_to_string_key, trim_json_bytes, JsonArrayView,
+        JsonObjectView, JsonScalarView,
+    };
+
+    fn object_view(bytes: &[u8]) -> JsonObjectView {
+        JsonObjectView {
+            bytes: Arc::from(bytes),
+            range: 0..bytes.len(),
+            source: Arc::from("test.jsonl"),
+            line_number: 7,
+        }
+    }
+
+    fn array_view(bytes: &[u8]) -> JsonArrayView {
+        JsonArrayView {
+            bytes: Arc::from(bytes),
+            range: 0..bytes.len(),
+        }
+    }
+
+    fn scalar_view(bytes: &[u8]) -> JsonScalarView {
+        JsonScalarView {
+            bytes: Arc::from(bytes),
+            range: 0..bytes.len(),
+            source: Arc::from("test.jsonl"),
+            line_number: 3,
+        }
+    }
+
+    #[test]
+    fn jsonl_rows_trim_blank_lines_and_apply_limit() {
+        let rows = jsonl_rows_from_bytes(
+            b" \n {\"a\":1} \n\n{\"a\":2}\n{\"a\":3}".to_vec(),
+            Some(2),
+            "rows.jsonl".to_string(),
+        );
+
+        assert_eq!(rows.lines.len(), 2);
+        assert_eq!(rows.lines[0].line_number, 2);
+        assert_eq!(rows.lines[1].line_number, 4);
+        assert_eq!(jsonl_row_views(&rows).len(), 2);
+        assert_eq!(
+            materialize_jsonl_rows(&rows)
+                .expect("rows")
+                .as_list()
+                .expect("list")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn object_views_get_defaults_and_materialize_nested_values() {
+        let view = object_view(
+            br#"{"name":"Ada","amount":2.5,"count":3,"tags":["rust","stone"],"nested":{"ok":true},"missing":null}"#,
+        );
+
+        assert_eq!(
+            json_object_view_get_string_default(&view, "name", "default").expect("name"),
+            "Ada"
+        );
+        assert_eq!(
+            json_object_view_get_string_default(&view, "absent", "default").expect("default"),
+            "default"
+        );
+        assert_eq!(
+            json_object_view_get_f64_default(&view, "amount", 0.0).expect("amount"),
+            2.5
+        );
+        assert_eq!(
+            json_object_view_get_i64_default(&view, "count", 0).expect("count"),
+            3
+        );
+
+        let tags = json_object_view_get_array_default(&view, "tags").expect("tags");
+        assert!(matches!(tags, RuntimeValue::JsonArrayView(_)));
+        let absent = json_object_view_get_array_default(&view, "absent").expect("absent");
+        assert_eq!(
+            absent
+                .into_nu_value("test")
+                .expect("default list")
+                .as_list()
+                .expect("list")
+                .len(),
+            0
+        );
+
+        let materialized = materialize_json_object_view(&view).expect("object");
+        assert!(materialized.as_record().expect("record").contains("nested"));
+    }
+
+    #[test]
+    fn object_view_methods_and_subscript_handle_hits_and_defaults() {
+        let view = object_view(br#"{"name":"Ada","city":"London"}"#);
+
+        let name = eval_runtime_subscript(
+            RuntimeValue::JsonObjectView(view.clone()),
+            &Value::string("name", Span::unknown()),
+        )
+        .expect("subscript");
+        assert_eq!(
+            runtime_value_to_string_key(&name, "test").expect("string key"),
+            "Ada"
+        );
+
+        let default = eval_json_object_view_method(
+            &view,
+            "get",
+            &[
+                Value::string("missing", Span::unknown()),
+                Value::string("fallback", Span::unknown()),
+            ],
+        )
+        .expect("get default");
+        assert_eq!(
+            default
+                .into_nu_value("test")
+                .expect("nu")
+                .as_str()
+                .expect("string"),
+            "fallback"
+        );
+
+        assert!(eval_json_object_view_method(&view, "bad", &[]).is_err());
+        assert!(eval_runtime_subscript(
+            RuntimeValue::JsonObjectView(view),
+            &Value::string("missing", Span::unknown()),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn array_views_iterate_subscript_and_materialize() {
+        let view = array_view(br#"[1, "two", {"three": 3}, [4], true]"#);
+        let values = json_array_view_iter_values(&view).expect("values");
+
+        assert_eq!(values.len(), 5);
+        assert!(matches!(values[0], RuntimeValue::JsonScalarView(_)));
+        assert!(matches!(values[2], RuntimeValue::Nu(_)));
+        assert!(matches!(values[3], RuntimeValue::JsonArrayView(_)));
+
+        let last = eval_runtime_subscript(
+            RuntimeValue::JsonArrayView(view.clone()),
+            &Value::int(-1, Span::unknown()),
+        )
+        .expect("negative index");
+        assert_eq!(
+            last.into_nu_value("test")
+                .expect("bool")
+                .as_bool()
+                .expect("bool"),
+            true
+        );
+
+        let materialized = materialize_json_array_view(&view).expect("array");
+        assert_eq!(materialized.as_list().expect("list").len(), 5);
+        assert!(eval_runtime_subscript(
+            RuntimeValue::JsonArrayView(view),
+            &Value::string("0", Span::unknown()),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn scalar_views_convert_to_expected_types() {
+        let string = scalar_view(br#""hello\nworld""#);
+        assert_eq!(
+            json_scalar_view_to_string(&string).expect("string"),
+            "hello\nworld"
+        );
+
+        let int = scalar_view(b"42");
+        assert_eq!(json_scalar_view_to_i64(&int).expect("int"), 42);
+        assert_eq!(
+            materialize_json_scalar_view(&int)
+                .expect("materialize")
+                .as_int()
+                .expect("int"),
+            42
+        );
+
+        let float = scalar_view(b"3.25");
+        assert_eq!(json_scalar_view_to_f64(&float).expect("float"), 3.25);
+        assert!(json_scalar_view_to_i64(&float).is_err());
+    }
+
+    #[test]
+    fn json_object_and_array_range_scanners_report_ranges() {
+        let object = br#"{"a":1, "b": [true, {"c": 3}], "escaped\u0020key": "value"}"#;
+        let b_range = find_top_level_json_field(object, "b")
+            .expect("scan")
+            .expect("b field");
+        assert_eq!(trim_json_bytes(&object[b_range]), br#"[true, {"c": 3}]"#);
+        assert!(find_top_level_json_field(object, "missing")
+            .expect("scan")
+            .is_none());
+        assert!(json_key_matches(
+            br#"escaped\u0020key"#,
+            0..16,
+            "escaped key"
+        ));
+
+        let mut fields = Vec::new();
+        json_object_for_each_field(object, |key, value| {
+            fields.push((key, value));
+            Ok(())
+        })
+        .expect("fields");
+        assert_eq!(fields.len(), 3);
+
+        let mut array_ranges = Vec::new();
+        json_array_bytes_for_each_range(br#"[1, {"two": 2}, [3]]"#, |range| {
+            array_ranges.push(range);
+            Ok(())
+        })
+        .expect("array ranges");
+        assert_eq!(array_ranges.len(), 3);
+    }
+
+    #[test]
+    fn primitive_json_byte_helpers_handle_errors() {
+        assert_eq!(trim_json_bytes(b" \n value \t"), b"value");
+        assert_eq!(
+            json_string_bytes_to_cow(br#""plain""#).expect("plain"),
+            Cow::Borrowed("plain")
+        );
+        assert_eq!(
+            json_string_bytes_to_cow(br#""escaped\n""#).expect("escaped"),
+            Cow::<str>::Owned("escaped\n".to_string())
+        );
+        assert!(json_string_bytes_to_cow(b"not-string").is_err());
+        assert_eq!(
+            json_number_bytes_to_f64(b"2.5", "source", 1).expect("float"),
+            2.5
+        );
+        assert_eq!(
+            json_number_bytes_to_i64(b"25", "source", 1).expect("int"),
+            25
+        );
+        assert!(json_number_bytes_to_f64(b"nope", "source", 1).is_err());
+        assert!(find_top_level_json_field(b"[]", "x").is_err());
+        assert!(json_array_bytes_for_each_range(b"{}", |_| Ok(())).is_err());
+    }
+}

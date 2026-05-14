@@ -188,8 +188,8 @@ pub(crate) fn bitwise_int_values(
     context: &str,
     op: impl FnOnce(i64, i64) -> i64,
 ) -> Result<Value, ShellError> {
-    let left = value_to_i64(left, context)?;
-    let right = value_to_i64(right, context)?;
+    let left = value_to_operator_i64(left, context)?;
+    let right = value_to_operator_i64(right, context)?;
     Ok(Value::int(op(left, right), Span::unknown()))
 }
 
@@ -237,7 +237,7 @@ pub(crate) fn floor_div_values(left: &Value, right: &Value) -> Result<Value, She
             if *right == 0 {
                 return Err(stone_error("floor division", "division by zero"));
             }
-            Ok(Value::int(left.div_euclid(*right), Span::unknown()))
+            python_floor_div_i64(*left, *right).map(|value| Value::int(value, Span::unknown()))
         }
         _ => {
             let Value::Float { val, .. } = div_values(left, right)? else {
@@ -254,15 +254,33 @@ pub(crate) fn mod_values(left: &Value, right: &Value) -> Result<Value, ShellErro
             if *right == 0 {
                 return Err(stone_error("modulo", "modulo by zero"));
             }
-            Ok(Value::int(left.rem_euclid(*right), Span::unknown()))
+            python_mod_i64(*left, *right).map(|value| Value::int(value, Span::unknown()))
         }
         _ => {
-            let left = value_to_f64(left, "modulo")?;
-            let right = value_to_f64(right, "modulo")?;
+            let (left, right) = match (left, right) {
+                (Value::Int { val: left, .. }, Value::Float { val: right, .. }) => {
+                    (*left as f64, *right)
+                }
+                (Value::Float { val: left, .. }, Value::Int { val: right, .. }) => {
+                    (*left, *right as f64)
+                }
+                (Value::Float { val: left, .. }, Value::Float { val: right, .. }) => {
+                    (*left, *right)
+                }
+                _ => {
+                    return Err(stone_error(
+                        "modulo",
+                        format!("cannot modulo {} and {}", left.get_type(), right.get_type()),
+                    ));
+                }
+            };
             if right == 0.0 {
                 return Err(stone_error("modulo", "modulo by zero"));
             }
-            Ok(Value::float(left.rem_euclid(right), Span::unknown()))
+            Ok(Value::float(
+                left - (left / right).floor() * right,
+                Span::unknown(),
+            ))
         }
     }
 }
@@ -313,8 +331,8 @@ pub(crate) fn shift_value(
     context: &str,
     op: impl FnOnce(i64, u32) -> Option<i64>,
 ) -> Result<Value, ShellError> {
-    let left = value_to_i64(left, context)?;
-    let right = value_to_i64(right, context)?;
+    let left = value_to_operator_i64(left, context)?;
+    let right = value_to_operator_i64(right, context)?;
     let shift = u32::try_from(right)
         .map_err(|_| stone_error(context, "shift count must be non-negative"))?;
     op(left, shift)
@@ -580,7 +598,19 @@ pub(crate) fn value_truthy(value: &Value) -> bool {
     match value {
         Value::Bool { val, .. } => *val,
         Value::Nothing { .. } => false,
+        Value::Int { val, .. } => *val != 0,
+        Value::Float { val, .. } => *val != 0.0,
         value => !value.is_empty(),
+    }
+}
+
+pub(crate) fn value_to_operator_i64(value: &Value, context: &str) -> Result<i64, ShellError> {
+    match value {
+        Value::Int { val, .. } => Ok(*val),
+        other => Err(stone_error(
+            context,
+            format!("expected integer, got {}", other.get_type()),
+        )),
     }
 }
 
@@ -597,6 +627,32 @@ pub(crate) fn value_to_i64(value: &Value, context: &str) -> Result<i64, ShellErr
             format!("expected integer, got {}", other.get_type()),
         )),
     }
+}
+
+pub(crate) fn python_floor_div_i64(left: i64, right: i64) -> Result<i64, ShellError> {
+    let quotient = left
+        .checked_div(right)
+        .ok_or_else(|| stone_error("floor division", "integer floor division overflow"))?;
+    let remainder = left
+        .checked_rem(right)
+        .ok_or_else(|| stone_error("floor division", "integer floor division overflow"))?;
+    if remainder != 0 && ((remainder > 0) != (right > 0)) {
+        quotient
+            .checked_sub(1)
+            .ok_or_else(|| stone_error("floor division", "integer floor division overflow"))
+    } else {
+        Ok(quotient)
+    }
+}
+
+pub(crate) fn python_mod_i64(left: i64, right: i64) -> Result<i64, ShellError> {
+    let quotient = python_floor_div_i64(left, right)?;
+    left.checked_sub(
+        quotient
+            .checked_mul(right)
+            .ok_or_else(|| stone_error("modulo", "integer modulo overflow"))?,
+    )
+    .ok_or_else(|| stone_error("modulo", "integer modulo overflow"))
 }
 
 pub(crate) fn value_to_limit(value: &Value, context: &str) -> Result<usize, ShellError> {
@@ -706,6 +762,21 @@ pub(crate) fn values_equal(left: &Value, right: &Value) -> bool {
         | (Value::Glob { val: left, .. }, Value::Glob { val: right, .. })
         | (Value::String { val: left, .. }, Value::Glob { val: right, .. })
         | (Value::Glob { val: left, .. }, Value::String { val: right, .. }) => left == right,
+        (Value::List { vals: left, .. }, Value::List { vals: right, .. }) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| values_equal(left, right))
+        }
+        (Value::Record { val: left, .. }, Value::Record { val: right, .. }) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, left_value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|right_value| values_equal(left_value, right_value))
+                })
+        }
         _ => false,
     }
 }

@@ -716,6 +716,7 @@ total = 0
 mask = 0
 for n in [1, 2, 3]:
     total += n * 2
+    total = total + (-n % 4)
     mask = mask | (n << 1)
 "#,
             2,
@@ -729,6 +730,14 @@ for n in [1, 2, 3]:
             .ops
             .iter()
             .any(|op| matches!(op, GenericVmExprOp::MulI64 { .. })));
+        assert!(body
+            .ops
+            .iter()
+            .any(|op| matches!(op, GenericVmExprOp::NegI64 { .. })));
+        assert!(body
+            .ops
+            .iter()
+            .any(|op| matches!(op, GenericVmExprOp::ModI64 { .. })));
         assert!(body
             .ops
             .iter()

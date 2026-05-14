@@ -1211,6 +1211,12 @@ impl<'a> GenericVmExprBuilder<'a> {
                 self.ops.push(GenericVmExprOp::BitNotI64 { dst, src });
                 Some(dst)
             }
+            Expr::Neg(value) => {
+                let src = self.lower_expr(value)?;
+                let dst = self.reg();
+                self.ops.push(GenericVmExprOp::NegI64 { dst, src });
+                Some(dst)
+            }
             Expr::Add { left, right } => self.lower_binary(left, right, |dst, lhs, rhs| {
                 GenericVmExprOp::AddI64 { dst, lhs, rhs }
             }),
@@ -1222,6 +1228,9 @@ impl<'a> GenericVmExprBuilder<'a> {
             }),
             Expr::FloorDiv { left, right } => self.lower_binary(left, right, |dst, lhs, rhs| {
                 GenericVmExprOp::FloorDivI64 { dst, lhs, rhs }
+            }),
+            Expr::Mod { left, right } => self.lower_binary(left, right, |dst, lhs, rhs| {
+                GenericVmExprOp::ModI64 { dst, lhs, rhs }
             }),
             Expr::BitAnd { left, right } => self.lower_binary(left, right, |dst, lhs, rhs| {
                 GenericVmExprOp::BitAndI64 { dst, lhs, rhs }

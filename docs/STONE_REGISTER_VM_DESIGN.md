@@ -294,8 +294,17 @@ CmpEq     { dst: Reg, lhs: Reg, rhs: Reg }
 
 Avoid broad generic arithmetic until typed ops and fallback behavior are clear.
 The Stone AST evaluator supports integer bitwise `&`, `|`, `^`, `<<`, `>>`,
-and `~`; those operators should become VM bytecode only after typed fallback
-rules are explicit.
+and `~`; those operators are integer-only and must reject strings/floats rather
+than parsing or coercing them. Numeric `//` and `%` follow Python-style signed
+floor and remainder semantics. VM bytecode must either exactly preserve those
+operator contracts or fall back before mutating visible state.
+
+The current generic expression loop VM lowers straight-line integer assignments
+and `+=` bodies over local variables. Its typed opcode subset covers integer
+`+`, `-`, unary `-`, `*`, `//`, `%`, `&`, `|`, `^`, `<<`, `>>`, and `~`.
+Operators requiring floats, generic values, calls, comparisons, boolean
+short-circuiting, collection access, or branching remain baseline-evaluated
+until the VM grows explicit value registers and control-flow opcodes.
 
 ### Strings, Lists, And Records
 

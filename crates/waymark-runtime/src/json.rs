@@ -307,3 +307,168 @@ fn to_snake_case(name: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use nu_protocol::{IntoPipelineData, Record, ShellError, Span, Value};
+    use serde_json::json;
+
+    use super::{
+        encode_hex, error_response, json_to_nu_value, nu_to_json_value, parse_json_bytes,
+        pipeline_to_json_text, success_response, success_response_with_output, to_snake_case,
+    };
+
+    #[test]
+    fn response_helpers_build_stable_envelopes() {
+        assert_eq!(
+            success_response(json!({"answer": 42}), "/work".to_string()),
+            json!({
+                "ok": true,
+                "cwd": "/work",
+                "value": {"answer": 42},
+            })
+        );
+        assert_eq!(
+            success_response_with_output(
+                json!(["a", "b"]),
+                "/work".to_string(),
+                "out".to_string(),
+                "err".to_string(),
+            ),
+            json!({
+                "ok": true,
+                "cwd": "/work",
+                "value": ["a", "b"],
+                "output": {
+                    "stdout": "out",
+                    "stderr": "err",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn nu_values_convert_to_json_losslessly_where_possible() {
+        let span = Span::unknown();
+        let mut record = Record::new();
+        record.push("nothing", Value::nothing(span));
+        record.push("bool", Value::bool(true, span));
+        record.push("int", Value::int(-3, span));
+        record.push("float", Value::float(1.5, span));
+        record.push("string", Value::string("text", span));
+        record.push("binary", Value::binary(vec![0, 15, 255], span));
+        record.push(
+            "list",
+            Value::list(vec![Value::int(1, span), Value::string("two", span)], span),
+        );
+
+        assert_eq!(
+            nu_to_json_value(&Value::record(record, span)),
+            json!({
+                "nothing": null,
+                "bool": true,
+                "int": -3,
+                "float": 1.5,
+                "string": "text",
+                "binary": {
+                    "$type": "binary",
+                    "hex": "000fff",
+                },
+                "list": [1, "two"],
+            })
+        );
+    }
+
+    #[test]
+    fn non_finite_nu_floats_use_typed_json_markers() {
+        assert_eq!(
+            nu_to_json_value(&Value::float(f64::INFINITY, Span::unknown())),
+            json!({
+                "$type": "float",
+                "value": "inf",
+            })
+        );
+        assert_eq!(
+            nu_to_json_value(&Value::float(f64::NEG_INFINITY, Span::unknown())),
+            json!({
+                "$type": "float",
+                "value": "-inf",
+            })
+        );
+    }
+
+    #[test]
+    fn json_numbers_convert_to_nu_int_or_float() {
+        let span = Span::unknown();
+
+        assert_eq!(json_to_nu_value(json!(-7), span).as_int().expect("int"), -7);
+        assert_eq!(
+            json_to_nu_value(json!(u64::MAX), span)
+                .as_float()
+                .expect("large unsigned becomes float"),
+            u64::MAX as f64
+        );
+        assert_eq!(
+            json_to_nu_value(json!(1.25), span)
+                .as_float()
+                .expect("float"),
+            1.25
+        );
+    }
+
+    #[test]
+    fn parse_json_bytes_reports_invalid_json() {
+        let err = parse_json_bytes(b"{not-json", Span::unknown()).expect_err("invalid json");
+
+        assert!(err.to_string().contains("Invalid JSON"));
+    }
+
+    #[test]
+    fn pipeline_json_text_encodes_pipeline_values() {
+        let span = Span::unknown();
+        let text = pipeline_to_json_text(Value::string("hello", span).into_pipeline_data(), span)
+            .expect("json text");
+
+        assert_eq!(text, "\"hello\"");
+    }
+
+    #[test]
+    fn generic_error_response_includes_cwd_and_related_errors() {
+        let inner = ShellError::Generic(nu_protocol::shell_error::generic::GenericError::new(
+            "Inner",
+            "inner detail",
+            Span::new(1, 2),
+        ));
+        let err = ShellError::Generic(
+            nu_protocol::shell_error::generic::GenericError::new(
+                "Outer",
+                "outer detail",
+                Span::new(3, 5),
+            )
+            .with_code("custom_code")
+            .with_help("try another value")
+            .with_inner(vec![inner]),
+        );
+
+        let response = error_response(&err, Some("/work".to_string()));
+        assert_eq!(response["ok"], json!(false));
+        assert_eq!(response["cwd"], json!("/work"));
+        assert_eq!(response["error"]["kind"], json!("generic"));
+        assert_eq!(response["error"]["code"], json!("custom_code"));
+        assert_eq!(response["error"]["detail"], json!("outer detail"));
+        assert_eq!(response["error"]["help"], json!("try another value"));
+        assert_eq!(response["error"]["span"], json!({"start": 3, "end": 5}));
+        assert_eq!(
+            response["error"]["related"][0]["detail"],
+            json!("inner detail")
+        );
+    }
+
+    #[test]
+    fn hex_and_snake_case_helpers_are_stable() {
+        assert_eq!(encode_hex(&[0, 1, 10, 255]), "00010aff");
+        assert_eq!(to_snake_case("AlreadyExists"), "already_exists");
+        assert_eq!(to_snake_case("ioError"), "io_error");
+        assert_eq!(to_snake_case("lowercase"), "lowercase");
+    }
+}

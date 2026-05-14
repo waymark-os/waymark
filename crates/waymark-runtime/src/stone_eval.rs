@@ -28,9 +28,9 @@ use crate::stone_builtins::{
     set_builtin, shift_value, slice_builtin, sort_builtin_values, sort_key_for_value,
     split_builtin, starts_with_builtin, str_builtin, string_method_builtin, sub_values,
     subscript_builtin, sum_builtin, unique_builtin, value_identity_key, value_to_bool,
-    value_to_display_string, value_to_f64, value_to_i64, value_to_limit, value_to_path_string,
-    value_to_string, value_to_u64, value_truthy, value_type_name, where_builtin,
-    where_compare_builtin, zfill_text,
+    value_to_display_string, value_to_f64, value_to_i64, value_to_limit, value_to_operator_i64,
+    value_to_path_string, value_to_string, value_to_u64, value_truthy, value_type_name,
+    where_builtin, where_compare_builtin, zfill_text,
 };
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_file_ops::{
@@ -1516,7 +1516,7 @@ impl Evaluator<'_> {
                     let value = self
                         .eval_expr_value(value, PipelineData::empty())?
                         .into_nu_value("bitwise invert")?;
-                    let value = value_to_i64(&value, "bitwise invert")?;
+                    let value = value_to_operator_i64(&value, "bitwise invert")?;
                     Ok(RuntimeValue::Nu(Value::int(!value, span)))
                 }
                 Expr::Add { left, right } => {
@@ -6669,6 +6669,557 @@ emit(seen)
     }
 
     #[test]
+    fn differential_tests_compare_baseline_and_hot_loop_interpreters() -> Result<(), ShellError> {
+        assert_hot_loop_matches_baseline(
+            "differential-jsonl-aggregation",
+            r#"user_amounts = {}
+user_items = {}
+tag_counts = {}
+users = []
+tags_seen = []
+for row in read_jsonl("records.jsonl"):
+    user = row.get("user", "unknown")
+    amount = float(row.get("amount", 0.0))
+    items = int(row.get("items", 0))
+    if user not in users:
+        users.append(user)
+    if user in user_amounts:
+        user_amounts[user] += amount
+        user_items[user] += items
+    else:
+        user_amounts[user] = amount
+        user_items[user] = items
+    for tag in row.get("tags", []):
+        if tag not in tags_seen:
+            tags_seen.append(tag)
+        if tag in tag_counts:
+            tag_counts[tag] += 1
+        else:
+            tag_counts[tag] = 1
+emit({"amounts": user_amounts, "items": user_items, "tags": tag_counts, "users": users, "tags_seen": tags_seen})
+"#,
+            &[(
+                "records.jsonl",
+                "{\"user\":\"ada\",\"amount\":1.5,\"items\":2,\"tags\":[\"a\",\"b\"]}\n\
+                 {\"user\":\"grace\",\"amount\":2.0,\"items\":1,\"tags\":[\"a\"]}\n\
+                 {\"user\":\"ada\",\"amount\":3.25,\"items\":4,\"tags\":[\"b\",\"c\"]}\n",
+            )],
+        )?;
+        assert_hot_loop_matches_baseline(
+            "differential-text-lines-parse",
+            r#"total = 0
+for line in open("numbers.txt").splitlines():
+    total += int(line)
+emit(total)
+"#,
+            &[("numbers.txt", "5\n-2\n9\n")],
+        )?;
+        assert_hot_loop_matches_baseline(
+            "differential-range-expression-body",
+            r#"total = 0
+mask = 0
+for n in range(8):
+    total = total + (n * 3) - (n // 2)
+    mask = (mask | n) ^ (n << 1)
+emit({"total": total, "mask": mask})
+"#,
+            &[],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn generated_semantic_cases_match_baseline_and_hot_loop() -> Result<(), ShellError> {
+        let cases: &[(&str, &[i64])] = &[
+            ("empty", &[]),
+            ("single", &[7]),
+            ("mixed", &[3, -1, 4, -1, 5]),
+            ("zeros", &[0, 0, 0]),
+        ];
+        for (name, numbers) in cases {
+            let literal = stone_int_list_literal(numbers);
+            let expected_sum: i64 = numbers.iter().sum();
+            let source = format!(
+                r#"total = 0
+for n in {literal}:
+    total += n
+emit(total)
+"#
+            );
+            assert_hot_loop_matches_baseline(
+                &format!("generated-sum-{name}-{expected_sum}"),
+                &source,
+                &[],
+            )?;
+
+            let source = format!(
+                r#"seen = []
+for n in {literal}:
+    if not n in seen:
+        seen.append(n)
+emit(seen)
+"#
+            );
+            assert_hot_loop_matches_baseline(&format!("generated-unique-{name}"), &source, &[])?;
+        }
+
+        let tag_cases: &[(&str, &[&str])] = &[
+            ("empty-tags", &[]),
+            ("repeated-tags", &["a", "b", "a", "c", "b", "a"]),
+            ("case-sensitive-tags", &["A", "a", "A"]),
+        ];
+        for (name, tags) in tag_cases {
+            let literal = stone_str_list_literal(tags);
+            let source = format!(
+                r#"counts = {{}}
+for tag in {literal}:
+    if tag in counts:
+        counts[tag] += 1
+    else:
+        counts[tag] = 1
+emit(counts)
+"#
+            );
+            assert_hot_loop_matches_baseline(&format!("generated-counts-{name}"), &source, &[])?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn golden_semantic_tests_lock_down_interpreter_results() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("golden-semantics")?;
+        let program = lower_source(
+            r#"rows = [{"name": "Ada", "score": 3}, {"name": "Grace", "score": 5}, {"name": "Linus", "score": 5}]
+scores = []
+for row in rows:
+    scores.append(row.score)
+best = sort(rows, key=lambda row: row["name"])[-1]
+counts = {}
+for score in scores:
+    key = str(score)
+    if key in counts:
+        counts[key] += 1
+    else:
+        counts[key] = 1
+def scale(value: int) -> int:
+    return value * 10
+scaled = []
+for score in scores:
+    scaled.append(scale(score))
+emit({
+    "first_two": scores[0:2],
+    "last": scores[-1],
+    "best_name": best.name,
+    "counts": counts,
+    "scaled": scaled,
+    "filtered": map(lambda row: row.name, filter(lambda row: row.score == 5, rows)),
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "first_two": [3, 5],
+                "last": 5,
+                "best_name": "Linus",
+                "counts": {"3": 1, "5": 2},
+                "scaled": [30, 50, 50],
+                "filtered": ["Grace", "Linus"],
+            })
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn expression_operator_matrix_locks_down_baseline_semantics() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("expr-operator-matrix")?;
+        let program = lower_source(
+            r#"values = [1, 2, 3]
+names = {"ada": 1, "grace": 2}
+missing = None
+present = 0
+emit({
+    "eq": 2 == 2,
+    "eq_int_float": 2 == 2.0,
+    "eq_bool_int_strong": True == 1,
+    "eq_string": "a" == "a",
+    "eq_list": [1, "a", [2]] == [1, "a", [2]],
+    "eq_record": {"a": 1, "b": [2]} == {"b": [2], "a": 1},
+    "neq_list": [1, 2] != [1, 3],
+    "not_eq": 2 != 3,
+    "lt": 1 < 2,
+    "lt_float_mixed": 1.5 < 2,
+    "lt_string": "a" < "b",
+    "lt_list": [1, 2] < [1, 3],
+    "lt_list_prefix": [1] < [1, 0],
+    "lte_equal": 2 <= 2,
+    "lte_less": 2 <= 3,
+    "gt": 3 > 2,
+    "gt_float_mixed": 3 > 2.5,
+    "gt_string": "b" > "a",
+    "gt_list": [1, 4] > [1, 3],
+    "gte_equal": 3 >= 3,
+    "gte_greater": 3 >= 2,
+    "chain_true": 1 < 2 < 3,
+    "chain_false": 1 < 3 < 2,
+    "list_in": 2 in values,
+    "list_not_in": 4 not in values,
+    "dict_key_in": "ada" in names,
+    "dict_key_not_in": "linus" not in names,
+    "string_in": "mark" in "waymark",
+    "string_not_in": "shell" not in "waymark",
+    "is_none": missing is None,
+    "is_not_none": present is not None,
+    "and_true": True and 1 and "x",
+    "and_zero_false": True and 0 and unknown_name,
+    "and_false_short": True and False and unknown_name,
+    "or_true": False or "" or "fallback",
+    "or_short": True or unknown_name,
+    "not_false": not False,
+    "not_zero": not 0,
+    "not_empty": not [],
+    "neg_int": -7,
+    "neg_float": -2.5,
+    "add_int": 4 + 3,
+    "add_float": 4.5 + 3,
+    "add_string": "way" + "mark",
+    "add_list": [1, 2] + [3],
+    "sub_int": 4 - 7,
+    "sub_float": 4 - 1.5,
+    "mul_int": 6 * 7,
+    "mul_float": 2.5 * 4,
+    "div_int": 7 / 2,
+    "div_float": 7.5 / 2.5,
+    "floor_div": 7 // 2,
+    "floor_div_negative_left": -7 // 2,
+    "floor_div_negative_right": 7 // -2,
+    "floor_div_both_negative": -7 // -2,
+    "floor_div_float": -7.0 // 2,
+    "mod_int": 7 % 3,
+    "mod_negative_left": -7 % 2,
+    "mod_negative_right": 7 % -2,
+    "mod_both_negative": -7 % -2,
+    "mod_float": -5.5 % 2.0,
+    "bit_and": 6 & 3,
+    "bit_or": 4 | 1,
+    "bit_xor": 7 ^ 3,
+    "left_shift": 3 << 2,
+    "right_shift": 8 >> 1,
+    "bit_invert": ~5
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+
+        let actual = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        let expected = [
+            ("eq", json_value!(true)),
+            ("eq_int_float", json_value!(true)),
+            ("eq_bool_int_strong", json_value!(false)),
+            ("eq_string", json_value!(true)),
+            ("eq_list", json_value!(true)),
+            ("eq_record", json_value!(true)),
+            ("neq_list", json_value!(true)),
+            ("not_eq", json_value!(true)),
+            ("lt", json_value!(true)),
+            ("lt_float_mixed", json_value!(true)),
+            ("lt_string", json_value!(true)),
+            ("lt_list", json_value!(true)),
+            ("lt_list_prefix", json_value!(true)),
+            ("lte_equal", json_value!(true)),
+            ("lte_less", json_value!(true)),
+            ("gt", json_value!(true)),
+            ("gt_float_mixed", json_value!(true)),
+            ("gt_string", json_value!(true)),
+            ("gt_list", json_value!(true)),
+            ("gte_equal", json_value!(true)),
+            ("gte_greater", json_value!(true)),
+            ("chain_true", json_value!(true)),
+            ("chain_false", json_value!(false)),
+            ("list_in", json_value!(true)),
+            ("list_not_in", json_value!(true)),
+            ("dict_key_in", json_value!(true)),
+            ("dict_key_not_in", json_value!(true)),
+            ("string_in", json_value!(true)),
+            ("string_not_in", json_value!(true)),
+            ("is_none", json_value!(true)),
+            ("is_not_none", json_value!(true)),
+            ("and_true", json_value!(true)),
+            ("and_zero_false", json_value!(false)),
+            ("and_false_short", json_value!(false)),
+            ("or_true", json_value!(true)),
+            ("or_short", json_value!(true)),
+            ("not_false", json_value!(true)),
+            ("not_zero", json_value!(true)),
+            ("not_empty", json_value!(true)),
+            ("neg_int", json_value!(-7)),
+            ("neg_float", json_value!(-2.5)),
+            ("add_int", json_value!(7)),
+            ("add_float", json_value!(7.5)),
+            ("add_string", json_value!("waymark")),
+            ("add_list", json_value!([1, 2, 3])),
+            ("sub_int", json_value!(-3)),
+            ("sub_float", json_value!(2.5)),
+            ("mul_int", json_value!(42)),
+            ("mul_float", json_value!(10.0)),
+            ("div_int", json_value!(3.5)),
+            ("div_float", json_value!(3.0)),
+            ("floor_div", json_value!(3)),
+            ("floor_div_negative_left", json_value!(-4)),
+            ("floor_div_negative_right", json_value!(-4)),
+            ("floor_div_both_negative", json_value!(3)),
+            ("floor_div_float", json_value!(-4.0)),
+            ("mod_int", json_value!(1)),
+            ("mod_negative_left", json_value!(1)),
+            ("mod_negative_right", json_value!(-1)),
+            ("mod_both_negative", json_value!(-1)),
+            ("mod_float", json_value!(0.5)),
+            ("bit_and", json_value!(2)),
+            ("bit_or", json_value!(5)),
+            ("bit_xor", json_value!(4)),
+            ("left_shift", json_value!(12)),
+            ("right_shift", json_value!(4)),
+            ("bit_invert", json_value!(-6)),
+        ];
+        for (key, expected) in expected {
+            assert_eq!(actual[key], expected, "{key}");
+        }
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn expression_operator_edge_errors_do_not_return_values() -> Result<(), ShellError> {
+        let cases = [
+            ("div-zero", r#"emit(1 / 0)"#, "division by zero"),
+            ("floor-div-zero", r#"emit(1 // 0)"#, "division by zero"),
+            ("mod-zero", r#"emit(1 % 0)"#, "modulo by zero"),
+            (
+                "add-overflow",
+                r#"emit(9223372036854775807 + 1)"#,
+                "integer addition overflow",
+            ),
+            (
+                "sub-overflow",
+                r#"emit((0 - 9223372036854775807) - 2)"#,
+                "integer subtraction overflow",
+            ),
+            (
+                "mul-overflow",
+                r#"emit(9223372036854775807 * 2)"#,
+                "integer multiplication overflow",
+            ),
+            (
+                "neg-overflow",
+                r#"emit(-((0 - 9223372036854775807) - 1))"#,
+                "integer negation overflow",
+            ),
+            (
+                "floor-div-overflow",
+                r#"emit(((0 - 9223372036854775807) - 1) // -1)"#,
+                "integer floor division overflow",
+            ),
+            (
+                "mod-overflow",
+                r#"emit(((0 - 9223372036854775807) - 1) % -1)"#,
+                "integer floor division overflow",
+            ),
+            ("bad-add", r#"emit("1" + 1)"#, "cannot add"),
+            ("bad-sub", r#"emit("1" - 1)"#, "cannot subtract"),
+            ("bad-mul", r#"emit("1" * 2)"#, "cannot multiply"),
+            ("bad-div", r#"emit("1" / 2)"#, "cannot divide"),
+            ("bad-floor-div", r#"emit("1" // 2)"#, "cannot divide"),
+            ("bad-mod", r#"emit("1" % 2)"#, "cannot modulo"),
+            ("bad-order", r#"emit("1" < 2)"#, "cannot order"),
+            (
+                "bad-membership",
+                r#"emit(1 in 2)"#,
+                "cannot test membership",
+            ),
+            (
+                "negative-shift",
+                r#"emit(1 << -1)"#,
+                "shift count must be non-negative",
+            ),
+            (
+                "oversized-shift",
+                r#"emit(1 << 100)"#,
+                "shift count is too large",
+            ),
+            ("bad-unary-minus", r#"emit(-"not-number")"#, "cannot negate"),
+            ("bad-bitwise", r#"emit("1" & 1)"#, "expected integer"),
+            ("bad-bitwise-invert", r#"emit(~"1")"#, "expected integer"),
+        ];
+
+        for (name, source, expected) in cases {
+            let (engine_state, mut stack, root) = test_engine(&format!("expr-edge-{name}"))?;
+            let program = lower_source(source)?;
+            let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+                .expect_err(name);
+            let text = format!("{error:?}");
+            assert!(text.contains(expected), "{name}: {text}");
+            cleanup_dir(&root);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_expression_ops_in_hot_loop_match_baseline_by_fallback() -> Result<(), ShellError>
+    {
+        assert_hot_loop_matches_baseline(
+            "hot-loop-fallback-div-mod-neg",
+            r#"total = 0.0
+for n in [2, 4, 6]:
+    total = total + (n / 2)
+    total = total + (n % 4)
+    total = total + -1
+emit(total)
+"#,
+            &[],
+        )?;
+
+        assert_hot_loop_matches_baseline(
+            "hot-loop-fallback-comparison-bool",
+            r#"seen = []
+for n in [1, 2, 3, 4]:
+    if (n > 1 and n <= 3) or n == 4:
+        seen.append(n)
+emit(seen)
+"#,
+            &[],
+        )?;
+
+        let source = r#"total = 0.0
+for n in [2, 4, 6]:
+    total = total + (n / 2)
+emit(total)
+"#;
+        let (engine_state, mut stack, root) = test_engine("hot-loop-fallback-div-diagnostics")?;
+        let program = lower_source(source)?;
+        let output = eval_program_with_options(
+            &engine_state,
+            &mut stack,
+            &program,
+            PipelineData::empty(),
+            EvalOptions {
+                hot_loop_enabled: true,
+                hot_loop_vm_interpreter: true,
+                hot_loop_validate_snapshot: false,
+                session: None,
+            },
+        )?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())?,
+            json_value!(6.0)
+        );
+        assert_eq!(
+            output.diagnostics["hot_loop"]["generic_vm_loops_executed"],
+            json_value!(0)
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn negative_semantic_tests_fail_instead_of_returning_wrong_values() -> Result<(), ShellError> {
+        assert!(lower_source(
+            r#"try:
+    emit(1)
+except:
+    emit(2)
+"#
+        )
+        .is_err());
+
+        let (engine_state, mut stack, root) = test_engine("negative-semantics")?;
+        let missing_key = lower_source(r#"emit({"a": 1}["b"])"#)?;
+        let error = eval_program(
+            &engine_state,
+            &mut stack,
+            &missing_key,
+            PipelineData::empty(),
+        )
+        .expect_err("missing key should fail");
+        let text = format!("{error:?}");
+        assert!(
+            text.contains("no key") || text.contains("cannot find column"),
+            "{text}"
+        );
+
+        let bad_type = lower_source(
+            r#"total = 0
+for value in ["not-int"]:
+    total += int(value)
+emit(total)
+"#,
+        )?;
+        let error = eval_program_hot_loop(&engine_state, &mut stack, &bad_type)
+            .expect_err("bad int conversion should fail");
+        let text = format!("{error:?}");
+        assert!(
+            text.contains("invalid digit") || text.contains("int"),
+            "{text}"
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_tests_match_baseline_without_partial_mutation() -> Result<(), ShellError> {
+        let source = r#"total = "seed"
+for part in ["a", "b", "c"]:
+    total += part
+emit(total)
+"#;
+        assert_hot_loop_matches_baseline("fallback-string-add-no-partial-mutation", source, &[])?;
+
+        let (engine_state, mut stack, root) = test_engine("fallback-no-partial-diagnostics")?;
+        let program = lower_source(source)?;
+        let output = eval_program_with_options(
+            &engine_state,
+            &mut stack,
+            &program,
+            PipelineData::empty(),
+            EvalOptions {
+                hot_loop_enabled: true,
+                hot_loop_vm_interpreter: true,
+                hot_loop_validate_snapshot: false,
+                session: None,
+            },
+        )?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())?,
+            json_value!("seedabc")
+        );
+        assert_eq!(
+            output.diagnostics["hot_loop"]["loop_ir_lowered"],
+            json_value!(1)
+        );
+        assert_eq!(
+            output.diagnostics["hot_loop"]["loop_fallbacks"],
+            json_value!(1)
+        );
+        assert_eq!(
+            output.diagnostics["hot_loop"]["generic_vm_loops_executed"],
+            json_value!(0)
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
     fn expression_vm_matches_baseline_for_integer_arithmetic_and_bitwise() -> Result<(), ShellError>
     {
         assert_hot_loop_matches_baseline(
@@ -6677,6 +7228,7 @@ emit(seen)
 mask = 0
 for n in [1, 2, 3]:
     total += n * 2
+    total = total + (-n % 4)
     mask = mask | (n << 1)
 emit({"total": total, "mask": mask})
 "#,
@@ -8287,6 +8839,24 @@ emit({
 
         assert_eq!(hot, baseline, "{name}");
         Ok(())
+    }
+
+    fn stone_int_list_literal(values: &[i64]) -> String {
+        let values = values
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("[{values}]")
+    }
+
+    fn stone_str_list_literal(values: &[&str]) -> String {
+        let values = values
+            .iter()
+            .map(|value| format!("{value:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("[{values}]")
     }
 
     fn test_root(name: &str) -> PathBuf {

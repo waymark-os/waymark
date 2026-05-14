@@ -36,6 +36,13 @@ guessing at host-language standard-library behavior. The builtins are shell and
 data operations: read files, write files, parse JSON/CSV/JSONL, run commands,
 and emit structured results.
 
+Expression behavior is intentionally Python-like where that avoids surprises:
+zero and empty values are falsey, signed `//` and `%` follow Python's floor and
+remainder rules, comparisons and membership use familiar syntax, and boolean
+expressions short-circuit. Operators remain strongly typed: text is not
+implicitly parsed as a number for arithmetic or bitwise operations; use explicit
+conversions such as `int(...)` or `float(...)` at data boundaries.
+
 Waymark Shell favors typed values over string pipelines. Commands and scripts pass
 records, lists, booleans, numbers, and nulls directly instead of repeatedly
 serializing and reparsing text. Text still matters at process boundaries, but it

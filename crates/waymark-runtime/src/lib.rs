@@ -472,13 +472,29 @@ pub fn pipeline_input_from_bytes(bytes: Vec<u8>) -> PipelineData {
 
 #[cfg(test)]
 mod tests {
-    use super::{pipeline_input_from_bytes, StoneGuest};
+    use super::{pipeline_input_from_bytes, run_vsock_task_server, StoneGuest};
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use nu_protocol::{ListStream, PipelineData, Record, ShellError, Signals, Span, Value};
+
+    #[test]
+    fn vsock_task_server_reports_unsupported_in_default_build() -> Result<(), ShellError> {
+        let start_dir = test_root("vsock-unsupported");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let err = run_vsock_task_server(&mut guest, 9975).expect_err("vsock is not built in");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(err
+            .to_string()
+            .contains("vsock task server is not included"));
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
 
     #[test]
     fn pwd_uses_configured_start_dir() -> Result<(), ShellError> {
@@ -605,6 +621,101 @@ emit(names)"#,
         let response = guest.stone_command_response(r#"emit({"status": "ok", "count": 2})"#);
         assert_eq!(response["ok"], json!(true));
         assert_eq!(response["value"], json!({"status": "ok", "count": 2}));
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn help_returns_topic_records_and_unknown_topic_feedback() -> Result<(), ShellError> {
+        let start_dir = test_root("help-topics");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let overview = guest.command_response("help");
+        assert_eq!(overview["ok"], json!(true));
+        assert!(overview["value"]["builtins"].is_array());
+        assert!(overview["value"]["syntax"].is_array());
+
+        let topic = guest.command_response("help emit");
+        assert_eq!(topic["ok"], json!(true));
+        assert_eq!(topic["value"]["found"], json!(true));
+        assert_eq!(topic["value"]["name"], json!("emit"));
+
+        let missing = guest.command_response("help no_such_topic");
+        assert_eq!(missing["ok"], json!(true));
+        assert_eq!(missing["value"]["found"], json!(false));
+        assert!(missing["value"]["available"].is_array());
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn mkdir_and_rm_handle_files_and_directories() -> Result<(), ShellError> {
+        let start_dir = test_root("mkdir-rm");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let mkdir = guest.command_response("mkdir nested nested/deeper");
+        assert_eq!(mkdir["ok"], json!(true));
+        assert!(start_dir.join("nested/deeper").is_dir());
+
+        fs::write(start_dir.join("nested/file.txt"), "remove me").expect("write file");
+        let rm_file = guest.command_response("rm nested/file.txt");
+        assert_eq!(rm_file["ok"], json!(true));
+        assert!(!start_dir.join("nested/file.txt").exists());
+
+        let rm_dir = guest.command_response("rm nested");
+        assert_eq!(rm_dir["ok"], json!(true));
+        assert!(!start_dir.join("nested").exists());
+
+        let missing_arg = guest.command_response("mkdir");
+        assert_eq!(missing_arg["ok"], json!(false));
+        assert_eq!(missing_arg["error"]["code"], json!("missing_parameter"));
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn to_json_and_to_jsonl_serialize_structured_values() -> Result<(), ShellError> {
+        let start_dir = test_root("json-serializers");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let json_text =
+            guest.command_response(r#"'{"name":"Ada","count":2}' | from_json | to_json"#);
+        assert_eq!(json_text["ok"], json!(true));
+        assert_eq!(json_text["value"], json!(r#"{"count":2,"name":"Ada"}"#));
+
+        let jsonl_text =
+            guest.command_response(r#"'[{"name":"Ada"},{"name":"Grace"}]' | from_json | to_jsonl"#);
+        assert_eq!(jsonl_text["ok"], json!(true));
+        assert_eq!(
+            jsonl_text["value"],
+            json!("{\"name\":\"Ada\"}\n{\"name\":\"Grace\"}\n")
+        );
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn open_raw_and_binary_text_paths_preserve_bytes() -> Result<(), ShellError> {
+        let start_dir = test_root("open-raw");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+        fs::write(start_dir.join("bytes.bin"), [0_u8, 159, 146, 150]).expect("write bytes");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let raw = guest.command_response("open --raw bytes.bin");
+        assert_eq!(raw["ok"], json!(true));
+        assert_eq!(raw["value"]["$type"], json!("binary"));
+        assert_eq!(raw["value"]["hex"], json!("009f9296"));
+
+        let decoded = guest.command_response("open bytes.bin");
+        assert_eq!(decoded["ok"], json!(true));
+        assert_eq!(decoded["value"]["$type"], json!("binary"));
 
         cleanup_dir(&start_dir);
         Ok(())

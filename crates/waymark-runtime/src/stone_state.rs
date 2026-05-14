@@ -205,3 +205,62 @@ fn string_list_value(items: Vec<String>, span: Span) -> Value {
         span,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use nu_protocol::Span;
+
+    use super::{runtime_state_record, string_list_value};
+
+    #[cfg(not(target_os = "hermit"))]
+    use super::{parse_git_count, tool_version};
+
+    #[test]
+    fn string_list_value_preserves_order() {
+        let value = string_list_value(
+            vec!["alpha".to_string(), "beta".to_string()],
+            Span::unknown(),
+        );
+        let list = value.as_list().expect("list");
+
+        assert_eq!(list[0].as_str().expect("string"), "alpha");
+        assert_eq!(list[1].as_str().expect("string"), "beta");
+    }
+
+    #[test]
+    fn runtime_state_includes_cwd_git_and_tools_records() {
+        let state = runtime_state_record(Path::new("/tmp"));
+        let record = state.as_record().expect("record");
+
+        assert_eq!(
+            record
+                .get("cwd")
+                .expect("cwd")
+                .as_str()
+                .expect("cwd string"),
+            "/tmp"
+        );
+        assert!(record.get("git").expect("git").as_record().is_ok());
+        assert!(record.get("tools").expect("tools").as_record().is_ok());
+    }
+
+    #[cfg(not(target_os = "hermit"))]
+    #[test]
+    fn parse_git_count_reads_named_counts() {
+        assert_eq!(parse_git_count("[ahead 12, behind 3]", "ahead"), Some(12));
+        assert_eq!(parse_git_count("[ahead 12, behind 3]", "behind"), Some(3));
+        assert_eq!(parse_git_count("[ahead x]", "ahead"), None);
+        assert_eq!(parse_git_count("[behind 3]", "ahead"), None);
+    }
+
+    #[cfg(not(target_os = "hermit"))]
+    #[test]
+    fn unknown_tool_has_no_version_probe() {
+        assert_eq!(
+            tool_version("definitely-not-a-waymark-tool", Path::new("/tmp")),
+            None
+        );
+    }
+}
