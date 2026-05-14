@@ -10156,6 +10156,63 @@ emit(counts)
     }
 
     #[test]
+    fn generic_vm_executes_read_jsonl_record_count_through_loop_ir() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("generic-vm-jsonl-loop-ir")?;
+        fs::write(
+            root.join("input.jsonl"),
+            "{\"status\":\" open \"}\n{\"status\":\"closed\"}\n{\"status\":\"OPEN\"}\n",
+        )
+        .expect("write jsonl fixture");
+        let program = lower_source(
+            r#"counts = {}
+for row in read_jsonl("input.jsonl"):
+    status = row["status"].strip().lower()
+    if status in counts:
+        counts[status] += 1
+    else:
+        counts[status] = 1
+emit(counts)
+"#,
+        )?;
+        let output = eval_program_with_options(
+            &engine_state,
+            &mut stack,
+            &program,
+            PipelineData::empty(),
+            EvalOptions {
+                hot_loop_enabled: true,
+                hot_loop_vm_interpreter: true,
+                hot_loop_validate_snapshot: false,
+                session: None,
+            },
+        )?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())?,
+            json_value!({"open": 2, "closed": 1})
+        );
+        assert_eq!(
+            output.diagnostics["hot_loop"]["loop_ir_lowered"],
+            json_value!(1)
+        );
+        assert_eq!(
+            output.diagnostics["hot_loop"]["loop_fused_kernels_selected"],
+            json_value!(1)
+        );
+        assert_eq!(
+            output.diagnostics["hot_loop"]["loop_fused_kernels_executed"],
+            json_value!(1)
+        );
+        assert_eq!(
+            output.diagnostics["hot_loop"]["loop_ir_optimization_counts"],
+            json_value!({})
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
     fn hot_loop_diagnostics_report_loop_ir_canonicalization_count() {
         let mut diagnostics = EvalHotLoopDiagnostics::default();
         diagnostics.loop_ir_optimized(&[LoopIrOptimizationDiagnostic::Canonicalized]);
@@ -10333,15 +10390,47 @@ for row in read_csv("input.csv"):
     #[test]
     fn generic_vm_unsupported_value_type_falls_back_without_partial_mutation(
     ) -> Result<(), ShellError> {
-        assert_hot_loop_matches_baseline(
-            "generic-vm-unsupported-fallback",
-            r#"total = ""
+        let source = r#"total = ""
 for n in ["a", "b", "c"]:
     total += n
 emit(total)
-"#,
-            &[],
-        )
+"#;
+        assert_hot_loop_matches_baseline("generic-vm-unsupported-fallback", source, &[])?;
+
+        let (engine_state, mut stack, root) = test_engine("generic-vm-unsupported-diagnostics")?;
+        let program = lower_source(source)?;
+        let output = eval_program_with_options(
+            &engine_state,
+            &mut stack,
+            &program,
+            PipelineData::empty(),
+            EvalOptions {
+                hot_loop_enabled: true,
+                hot_loop_vm_interpreter: true,
+                hot_loop_validate_snapshot: false,
+                session: None,
+            },
+        )?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())?,
+            json_value!("abc")
+        );
+        assert_eq!(
+            output.diagnostics["hot_loop"]["loop_ir_lowered"],
+            json_value!(1)
+        );
+        assert_eq!(
+            output.diagnostics["hot_loop"]["loop_fallbacks"],
+            json_value!(1)
+        );
+        assert_eq!(
+            output.diagnostics["hot_loop"]["generic_vm_loops_executed"],
+            json_value!(0)
+        );
+
+        cleanup_dir(&root);
+        Ok(())
     }
 
     #[test]
