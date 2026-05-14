@@ -32,6 +32,8 @@ A later eval call in the same runtime process can use the binding directly:
 
 ```python
 errors = where(rows, "level", "ERROR")
+recent = where(rows, "mtime_ms", ">", cutoff)
+large_errors = where(rows, lambda r: r["level"] == "ERROR" and r["size"] > 1024)
 emit(len(errors))
 ```
 
@@ -59,6 +61,9 @@ explicitly asks for full output.
 - `search(root, needle, regex=False)`: content search. Literal search is the
   default fast path; pass `regex=True` for Rust-regex patterns. Results remain
   structured records with `path`, `line`, and `text`.
+- `where(rows, key, expected)`, `where(rows, key, op, expected)`, or
+  `where(rows, lambda r: ...)`: filter record lists by equality, comparison
+  (`==`, `!=`, `>`, `>=`, `<`, `<=`, `in`, `not in`), or a predicate.
 - `split(text, separator=None)`, `join(items, separator="")`,
   `slice(value, start=None, end=None)`, `starts_with(text, prefix)`, and
   `format(template, ...)`: small text/list helpers for scripts and dynamic
@@ -66,6 +71,8 @@ explicitly asks for full output.
   `",".join(items)` are also supported.
 - `run(argv, cwd=None, stdin=None, timeout_ms=None, env=None)`: Linux command
   execution with structured stdout, stderr, status, and helper observations.
+- `pwd()`, `cd(path)`: inspect or change the current Stone working directory
+  for the current session.
 - `state()`: typed runtime snapshot with `cwd`, git summary, and common tool
   availability/version probes.
 - `last_result()`: previous Waymark command response as typed data, or `None`

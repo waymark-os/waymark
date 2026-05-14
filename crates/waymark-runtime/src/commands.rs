@@ -708,6 +708,14 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "cd",
+        signature: "cd(path: str) -> str",
+        use_when: "Use to change the current Stone working directory for later session calls.",
+        examples: &[r#"cd("/app/subdir")"#],
+        avoid: &["For one command only, prefer run(argv, cwd=...) instead of changing session cwd."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "ls",
         signature: "ls(path: str? = cwd) -> list[record]",
         use_when: "Use for shallow directory inspection. Alias for list_dir.",
@@ -881,10 +889,14 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
     },
     StoneHelpEntry {
         name: "where",
-        signature: "where(rows: list[record], key: str, expected: Any) -> list[record]",
-        use_when: "Use for simple record equality filtering without pipeline syntax.",
-        examples: &[r#"west = where(rows, "region", "west")"#],
-        avoid: &["Use explicit loops for compound conditions."],
+        signature: "where(rows: list[record], key: str, expected: Any) | where(rows, key, op, expected) | where(rows, predicate) -> list[record]",
+        use_when: "Use for equality, comparison, or lambda predicate filtering without pipeline syntax.",
+        examples: &[
+            r#"west = where(rows, "region", "west")"#,
+            r#"large = where(rows, "size", ">", 1024)"#,
+            r#"open_west = where(rows, lambda r: r["status"] == "open" and r["region"] == "west")"#,
+        ],
+        avoid: &["Use explicit loops when filtering needs side effects or expensive setup."],
         aliases: &[],
     },
     StoneHelpEntry {

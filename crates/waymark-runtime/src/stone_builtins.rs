@@ -526,6 +526,51 @@ pub(crate) fn where_builtin(
     Ok(Value::list(selected, Span::unknown()))
 }
 
+pub(crate) fn where_compare_builtin(
+    values: &Value,
+    key: &Value,
+    op: &Value,
+    expected: &Value,
+) -> Result<Value, ShellError> {
+    let key = value_to_string(key, "where key")?;
+    let op = value_to_string(op, "where operator")?;
+    let op = where_compare_op(&op)?;
+    let Value::List { vals, .. } = values else {
+        return Err(stone_error(
+            "where",
+            format!("expected list, got {}", values.get_type()),
+        ));
+    };
+    let mut selected = Vec::new();
+    for value in vals {
+        if let Value::Record { val, .. } = value {
+            if let Some(candidate) = val.get(&key) {
+                if compare_values(candidate, op, expected)? {
+                    selected.push(value.clone());
+                }
+            }
+        }
+    }
+    Ok(Value::list(selected, Span::unknown()))
+}
+
+fn where_compare_op(op: &str) -> Result<CompareOp, ShellError> {
+    match op {
+        "==" | "=" | "eq" => Ok(CompareOp::Eq),
+        "!=" | "<>" | "ne" => Ok(CompareOp::NotEq),
+        ">" | "gt" => Ok(CompareOp::Gt),
+        ">=" | "gte" | "ge" => Ok(CompareOp::GtE),
+        "<" | "lt" => Ok(CompareOp::Lt),
+        "<=" | "lte" | "le" => Ok(CompareOp::LtE),
+        "in" => Ok(CompareOp::In),
+        "not in" | "not_in" => Ok(CompareOp::NotIn),
+        other => Err(stone_error(
+            "where",
+            format!("unsupported operator `{other}`; expected ==, !=, >, >=, <, <=, in, or not in"),
+        )),
+    }
+}
+
 pub(crate) fn value_identity_key(value: &Value, context: &str) -> Result<String, ShellError> {
     serde_json::to_string(&nu_to_json_value(value))
         .map_err(|err| stone_error(context, err.to_string()))

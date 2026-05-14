@@ -33,7 +33,7 @@ use crate::stone_builtins::{
     subscript_builtin, sum_builtin, unique_builtin, value_identity_key, value_to_bool,
     value_to_display_string, value_to_f64, value_to_i64, value_to_limit, value_to_path_string,
     value_to_string, value_to_u64, value_truthy, value_type_name, values_equal, where_builtin,
-    zfill_text,
+    where_compare_builtin, zfill_text,
 };
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_file_ops::{
@@ -4341,6 +4341,7 @@ impl Evaluator<'_> {
             "min" => self.eval_min_max_call(call, MinMax::Min),
             "open" => self.eval_open_call(call),
             "pwd" => self.eval_pwd_call(call),
+            "cd" => self.eval_cd_call(call),
             "cat" => self.eval_cat_call(call),
             "ls" => self.eval_list_dir_call(call),
             "list_dir" => self.eval_list_dir_call(call),
@@ -4852,6 +4853,38 @@ impl Evaluator<'_> {
         Ok(RuntimeValue::Nu(Value::string(cwd, Span::unknown())))
     }
 
+    fn eval_cd_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let [path] = call.positional.as_slice() else {
+            return Err(stone_error("cd", "cd() requires exactly one path"));
+        };
+        if !call.named.is_empty() {
+            return Err(stone_error(
+                "cd",
+                "cd() keyword arguments are not supported",
+            ));
+        }
+        let path = self
+            .eval_expr_value(path, PipelineData::empty())?
+            .into_nu_value("cd")?;
+        let path = value_to_path_string(&path, "cd")?;
+        let target = self.resolve_script_path(&path)?;
+        let target =
+            std::fs::canonicalize(&target).map_err(|err| io_stone_error("cd", err, &target))?;
+        if !target.is_dir() {
+            return Err(stone_error(
+                "cd",
+                format!("cwd is not a directory: {}", target.display()),
+            ));
+        }
+        self.stack
+            .set_cwd(&target)
+            .map_err(|err| stone_error("cd", err.to_string()))?;
+        Ok(RuntimeValue::Nu(Value::string(
+            target.display().to_string(),
+            Span::unknown(),
+        )))
+    }
+
     fn eval_find_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let [root, rest @ ..] = call.positional.as_slice() else {
             return Err(stone_error(
@@ -5340,28 +5373,75 @@ impl Evaluator<'_> {
     }
 
     fn eval_where_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        let [values, key, expected] = call.positional.as_slice() else {
-            return Err(stone_error(
-                "where",
-                "where() requires rows, key, and expected arguments",
-            ));
-        };
         if !call.named.is_empty() {
             return Err(stone_error(
                 "where",
                 "where() keyword arguments are not supported",
             ));
         }
-        let values = self
-            .eval_expr_value(values, PipelineData::empty())?
-            .into_nu_value("where")?;
-        let key = self
-            .eval_expr_value(key, PipelineData::empty())?
-            .into_nu_value("where")?;
-        let expected = self
-            .eval_expr_value(expected, PipelineData::empty())?
-            .into_nu_value("where")?;
-        where_builtin(&values, &key, &expected).map(RuntimeValue::Nu)
+        match call.positional.as_slice() {
+            [values, predicate] => {
+                let values = self
+                    .eval_expr_value(values, PipelineData::empty())?
+                    .into_nu_value("where")?;
+                let predicate = self.eval_callable_expr(predicate)?;
+                self.eval_where_predicate(&values, &predicate)
+            }
+            [values, key, expected] => {
+                let values = self
+                    .eval_expr_value(values, PipelineData::empty())?
+                    .into_nu_value("where")?;
+                let key = self
+                    .eval_expr_value(key, PipelineData::empty())?
+                    .into_nu_value("where")?;
+                let expected = self
+                    .eval_expr_value(expected, PipelineData::empty())?
+                    .into_nu_value("where")?;
+                where_builtin(&values, &key, &expected).map(RuntimeValue::Nu)
+            }
+            [values, key, op, expected] => {
+                let values = self
+                    .eval_expr_value(values, PipelineData::empty())?
+                    .into_nu_value("where")?;
+                let key = self
+                    .eval_expr_value(key, PipelineData::empty())?
+                    .into_nu_value("where")?;
+                let op = self
+                    .eval_expr_value(op, PipelineData::empty())?
+                    .into_nu_value("where")?;
+                let expected = self
+                    .eval_expr_value(expected, PipelineData::empty())?
+                    .into_nu_value("where")?;
+                where_compare_builtin(&values, &key, &op, &expected).map(RuntimeValue::Nu)
+            }
+            _ => Err(stone_error(
+                "where",
+                "where() requires rows plus a predicate, or rows, key, and expected arguments",
+            )),
+        }
+    }
+
+    fn eval_where_predicate(
+        &mut self,
+        values: &Value,
+        predicate: &CallableValue,
+    ) -> Result<RuntimeValue, ShellError> {
+        let Value::List { vals, .. } = values else {
+            return Err(stone_error(
+                "where",
+                format!("expected list, got {}", values.get_type()),
+            ));
+        };
+        let mut selected = Vec::new();
+        for value in vals {
+            let keep = self
+                .invoke_callable(predicate, vec![RuntimeValue::Nu(value.clone())])?
+                .into_nu_value("where predicate")?;
+            if value_truthy(&keep) {
+                selected.push(value.clone());
+            }
+        }
+        Ok(RuntimeValue::Nu(Value::list(selected, Span::unknown())))
     }
 
     fn eval_from_json_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -6822,6 +6902,7 @@ fn is_builtin_call(call: &Call) -> bool {
             | "parse_int"
             | "print"
             | "pwd"
+            | "cd"
             | "range"
             | "read_file"
             | "read_text"
@@ -8524,6 +8605,34 @@ mod tests {
     }
 
     #[test]
+    fn evaluates_cd_builtin_updates_session_cwd() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("cd-builtin")?;
+        fs::create_dir_all(root.join("subdir")).expect("create subdir");
+        fs::write(root.join("subdir/input.txt"), "hello").expect("write input");
+        let program = lower_source(
+            r#"new_cwd = cd("subdir")
+text = read_text("input.txt")
+emit({"cwd": pwd(), "new_cwd": new_cwd, "state_cwd": state()["cwd"], "text": text})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let expected_cwd = root.join("subdir").display().to_string();
+
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "cwd": expected_cwd,
+                "new_cwd": expected_cwd,
+                "state_cwd": expected_cwd,
+                "text": "hello",
+            })
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
     fn evaluates_coding_helpers_as_explicit_stone_calls() -> Result<(), ShellError> {
         let (engine_state, mut stack, root) = test_engine("explicit-helpers")?;
         fs::write(root.join("input.txt"), "alpha\nbeta\nalpha\n").expect("write input");
@@ -8566,6 +8675,41 @@ emit({
                 "first_region": "west",
                 "last_qty": 9,
                 "roundtrip_qty": 2,
+            })
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn where_supports_comparisons_and_predicates() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("where-comparisons")?;
+        let program = lower_source(
+            r#"rows = [
+    {"region": "west", "status": "open", "qty": 2},
+    {"region": "east", "status": "open", "qty": 9},
+    {"region": "west", "status": "closed", "qty": 7},
+    {"region": "west", "status": "open", "qty": 11},
+]
+large = where(rows, "qty", ">", 5)
+not_east = where(rows, "region", "!=", "east")
+open_west = where(rows, lambda r: r["status"] == "open" and r["region"] == "west")
+emit({
+    "large_qty": [row["qty"] for row in large],
+    "not_east_count": len(not_east),
+    "open_west_qty": [row["qty"] for row in open_west],
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "large_qty": [9, 7, 11],
+                "not_east_count": 3,
+                "open_west_qty": [2, 11],
             })
         );
 
