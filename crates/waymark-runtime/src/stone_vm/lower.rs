@@ -5,13 +5,14 @@ use super::{
     GenericVmConst, GenericVmExprBody, GenericVmExprOp, GenericVmOp, HotJsonlAggregationBody,
     HotJsonlBodyOp, HotJsonlSlot, HotJsonlTracePlan, HotLoopOp, HotLoopPlan, LocalId, LoopIrBlock,
     LoopIrDiagnostics, LoopIrFunction, LoopIrIteratorAdapter, LoopIrSnapshot,
-    LoopIrSnapshotBoundary, LoopIrTerminator, Reg, SnapshotId, StoneAccumulatorKind,
-    StoneAccumulatorSpec, StoneBlock, StoneConst, StoneFallbackTarget, StoneGuard, StoneGuardKind,
-    StoneIrFunction, StoneLocal, StoneOp, StoneSnapshot, StoneSnapshotAccumulator,
-    StoneSnapshotLocal, StoneTerminator,
+    LoopIrSnapshotBoundary, LoopIrTerminator, OuterJsonlFileLoopBody, Reg, SnapshotId,
+    StoneAccumulatorKind, StoneAccumulatorSpec, StoneBlock, StoneConst, StoneFallbackTarget,
+    StoneGuard, StoneGuardKind, StoneIrFunction, StoneLocal, StoneOp, StoneSnapshot,
+    StoneSnapshotAccumulator, StoneSnapshotLocal, StoneTerminator,
 };
 
 use crate::stone_ast::{AssignTarget, AugOp, Call, CompareOp, Expr, Stmt};
+use crate::stone_ir::match_hot_jsonl_aggregation_body;
 use crate::stone_vm::match_hot_jsonl_aggregation_ir_subgraph;
 
 pub(crate) struct FusedMapUpdateIf {
@@ -66,6 +67,443 @@ pub(crate) fn try_lower_hot_loop(
         ops: Vec::new(),
         body_start,
     })
+}
+
+pub(crate) fn try_lower_generic_loop(
+    targets: &[String],
+    iter: &Expr,
+    body: &[Stmt],
+) -> Option<GenericLoopPlan> {
+    let [target] = targets else {
+        return None;
+    };
+    let iter = match iter {
+        Expr::List(_) | Expr::Tuple(_) | Expr::Name(_) => GenericLoopIter::MaterializedList,
+        Expr::MethodCall {
+            method, positional, ..
+        } if method == "splitlines" && positional.is_empty() => GenericLoopIter::OpenSplitlines,
+        Expr::Call(Call {
+            name,
+            positional,
+            named,
+        }) if name == "range" && !positional.is_empty() && named.is_empty() => {
+            GenericLoopIter::Range
+        }
+        Expr::Call(Call {
+            name,
+            positional,
+            named,
+        }) if name == "read_jsonl" && !positional.is_empty() && named.is_empty() => {
+            GenericLoopIter::ReadJsonl
+        }
+        Expr::Call(Call {
+            name,
+            positional,
+            named,
+        }) if name == "read_csv" && !positional.is_empty() && named.is_empty() => {
+            GenericLoopIter::ReadCsv
+        }
+        _ => return None,
+    };
+    if matches!(
+        iter,
+        GenericLoopIter::ReadJsonl | GenericLoopIter::MaterializedList
+    ) {
+        if let Some(body) = match_generic_jsonl_aggregation_body(target, body) {
+            return Some(GenericLoopPlan {
+                target: target.clone(),
+                iter,
+                ops: vec![GenericLoopOp::JsonlAggregation { body }],
+            });
+        }
+    }
+    if matches!(
+        iter,
+        GenericLoopIter::OpenSplitlines | GenericLoopIter::MaterializedList
+    ) {
+        if let Some((record_target, body_start)) = lower_json_loads_line_prefix(target, body) {
+            if let Some(body) =
+                match_hot_jsonl_aggregation_body(&record_target, body.get(body_start..)?)
+            {
+                return Some(GenericLoopPlan {
+                    target: target.clone(),
+                    iter,
+                    ops: vec![GenericLoopOp::JsonlAggregation { body }],
+                });
+            }
+        }
+    }
+    let op = lower_generic_record_field_count(target, body).or_else(|| {
+        let [stmt] = body else {
+            return None;
+        };
+        lower_generic_loop_stmt(target, stmt)
+    });
+    let op = op.or_else(|| {
+        (!body.is_empty()).then(|| GenericLoopOp::ExprBody {
+            body: body.to_vec(),
+        })
+    })?;
+    Some(GenericLoopPlan {
+        target: target.clone(),
+        iter,
+        ops: vec![op],
+    })
+}
+
+pub(crate) fn generic_loop_compile_miss_reason(plan: &GenericLoopPlan) -> &'static str {
+    let [op] = plan.ops.as_slice() else {
+        return "generic_loop_multi_op";
+    };
+    match op {
+        GenericLoopOp::JsonlAggregation { .. } => "jsonl_aggregation_wrong_input",
+        GenericLoopOp::ExprBody { body }
+            if match_outer_jsonl_file_loop_body(&plan.target, body).is_some() =>
+        {
+            "outer_jsonl_file_loop"
+        }
+        GenericLoopOp::ExprBody { .. } => "unsupported_expr_body",
+        GenericLoopOp::AddAssign { item, .. }
+        | GenericLoopOp::AddAssignParsedInt { item, .. }
+        | GenericLoopOp::AddAssignParsedFloat { item, .. }
+        | GenericLoopOp::ListAppend { item, .. }
+        | GenericLoopOp::ListAppendUnique { item, .. }
+        | GenericLoopOp::MapAddI64ConstRecordStringField { item, .. }
+            if item != &plan.target =>
+        {
+            "loop_target_mismatch"
+        }
+        GenericLoopOp::MapAddI64Const { key, .. } if key != &plan.target => "loop_target_mismatch",
+        _ => "unsupported_body_stmt",
+    }
+}
+
+pub(crate) fn match_outer_jsonl_file_loop_body(
+    file_target: &str,
+    body: &[Stmt],
+) -> Option<OuterJsonlFileLoopBody> {
+    let [rows_stmt, row_loop] = body else {
+        return None;
+    };
+    let Stmt::Assign {
+        target: AssignTarget::Name(rows_name),
+        value:
+            Expr::Call(Call {
+                name,
+                positional,
+                named,
+            }),
+    } = rows_stmt
+    else {
+        return None;
+    };
+    if name != "read_jsonl" || !named.is_empty() {
+        return None;
+    }
+    let [path_expr] = positional.as_slice() else {
+        return None;
+    };
+    if !matches_record_field_access(file_target, "path", path_expr) {
+        return None;
+    }
+    let Stmt::For {
+        targets,
+        iter,
+        body: row_body,
+    } = row_loop
+    else {
+        return None;
+    };
+    let [row_target] = targets.as_slice() else {
+        return None;
+    };
+    if iter != &Expr::Name(rows_name.clone()) {
+        return None;
+    }
+    let body = match_generic_jsonl_aggregation_body(row_target, row_body)?;
+    Some(OuterJsonlFileLoopBody {
+        row_target: row_target.clone(),
+        body,
+    })
+}
+
+fn matches_record_field_access(record_name: &str, field_name: &str, expr: &Expr) -> bool {
+    match expr {
+        Expr::Attribute { value, attr } => {
+            attr == field_name && value.as_ref() == &Expr::Name(record_name.to_owned())
+        }
+        Expr::Subscript { value, index } => {
+            value.as_ref() == &Expr::Name(record_name.to_owned())
+                && index.as_ref() == &Expr::String(field_name.to_owned())
+        }
+        _ => false,
+    }
+}
+
+fn match_generic_jsonl_aggregation_body(
+    row_name: &str,
+    body: &[Stmt],
+) -> Option<HotJsonlAggregationBody> {
+    if let Some(body) = match_hot_jsonl_aggregation_body(row_name, body) {
+        return Some(body);
+    }
+    let Stmt::Assign {
+        target: AssignTarget::Name(local),
+        value: Expr::Subscript {
+            value: receiver,
+            index,
+        },
+    } = body.first()?
+    else {
+        return None;
+    };
+    if receiver.as_ref() != &Expr::Name(row_name.to_owned()) {
+        return None;
+    }
+    let Expr::String(field) = index.as_ref() else {
+        return None;
+    };
+    let body = match_hot_jsonl_aggregation_body(row_name, body.get(1..)?)?;
+    if body.user_name == *local && body.user_key == *field {
+        Some(body)
+    } else {
+        None
+    }
+}
+
+fn lower_generic_loop_stmt(item: &str, stmt: &Stmt) -> Option<GenericLoopOp> {
+    match stmt {
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => lower_generic_unique_append_if(item, condition, then_branch, else_branch)
+            .or_else(|| lower_generic_count_if(item, condition, then_branch, else_branch)),
+        Stmt::Expr(Expr::MethodCall {
+            receiver,
+            method,
+            positional,
+        }) => lower_generic_list_append(item, receiver, method, positional),
+        Stmt::AugAssign {
+            target: AssignTarget::Name(local),
+            op: AugOp::Add,
+            value: Expr::Name(value),
+        } if value == item => Some(GenericLoopOp::AddAssign {
+            local: local.clone(),
+            item: item.to_owned(),
+        }),
+        Stmt::AugAssign {
+            target: AssignTarget::Name(local),
+            op: AugOp::Add,
+            value,
+        } => lower_generic_parse_add_assign(local, item, value),
+        Stmt::Assign {
+            target: AssignTarget::Name(local),
+            value: Expr::Add { left, right },
+        } if matches_add_self_item(local, item, left, right) => Some(GenericLoopOp::AddAssign {
+            local: local.clone(),
+            item: item.to_owned(),
+        }),
+        _ => None,
+    }
+}
+
+fn lower_generic_parse_add_assign(local: &str, item: &str, value: &Expr) -> Option<GenericLoopOp> {
+    let Expr::Call(Call {
+        name,
+        positional,
+        named,
+    }) = value
+    else {
+        return None;
+    };
+    if !named.is_empty() || positional != &[Expr::Name(item.to_owned())] {
+        return None;
+    }
+    match name.as_str() {
+        "int" => Some(GenericLoopOp::AddAssignParsedInt {
+            local: local.to_owned(),
+            item: item.to_owned(),
+        }),
+        "float" => Some(GenericLoopOp::AddAssignParsedFloat {
+            local: local.to_owned(),
+            item: item.to_owned(),
+        }),
+        _ => None,
+    }
+}
+
+fn lower_generic_record_field_count(item: &str, body: &[Stmt]) -> Option<GenericLoopOp> {
+    let [assign, count_stmt] = body else {
+        return None;
+    };
+    let Stmt::Assign {
+        target: AssignTarget::Name(key_local),
+        value,
+    } = assign
+    else {
+        return None;
+    };
+    let field = match_record_string_field_expr(item, value)?;
+    let Stmt::If {
+        condition,
+        then_branch,
+        else_branch,
+    } = count_stmt
+    else {
+        return None;
+    };
+    let update = match_fused_map_update_if(condition, then_branch, else_branch)?;
+    if update.key_name != *key_local || update.append_list.is_some() {
+        return None;
+    }
+    let [count] = update.updates.as_slice() else {
+        return None;
+    };
+    if update.contains_map != count.map_name {
+        return None;
+    }
+    let Expr::Int(value) = &count.addend else {
+        return None;
+    };
+    let value = value.parse().ok()?;
+    Some(GenericLoopOp::MapAddI64ConstRecordStringField {
+        map: count.map_name.clone(),
+        item: item.to_owned(),
+        field: field.field,
+        strip: field.strip,
+        lower: field.lower,
+        value,
+    })
+}
+
+struct RecordStringFieldExpr {
+    field: String,
+    strip: bool,
+    lower: bool,
+}
+
+fn match_record_string_field_expr(item: &str, value: &Expr) -> Option<RecordStringFieldExpr> {
+    match value {
+        Expr::Subscript {
+            value: receiver,
+            index,
+        } if receiver.as_ref() == &Expr::Name(item.to_owned()) => {
+            let Expr::String(field) = index.as_ref() else {
+                return None;
+            };
+            Some(RecordStringFieldExpr {
+                field: field.clone(),
+                strip: false,
+                lower: false,
+            })
+        }
+        Expr::MethodCall {
+            receiver,
+            method,
+            positional,
+        } if positional.is_empty() && (method == "strip" || method == "lower") => {
+            let mut field = match_record_string_field_expr(item, receiver)?;
+            match method.as_str() {
+                "strip" => field.strip = true,
+                "lower" => field.lower = true,
+                _ => return None,
+            }
+            Some(field)
+        }
+        _ => None,
+    }
+}
+
+fn lower_generic_count_if(
+    item: &str,
+    condition: &Expr,
+    then_branch: &[Stmt],
+    else_branch: &[Stmt],
+) -> Option<GenericLoopOp> {
+    let update = match_fused_map_update_if(condition, then_branch, else_branch)?;
+    if update.key_name != item || update.append_list.is_some() {
+        return None;
+    }
+    let [count] = update.updates.as_slice() else {
+        return None;
+    };
+    if update.contains_map != count.map_name {
+        return None;
+    }
+    let Expr::Int(value) = &count.addend else {
+        return None;
+    };
+    let value = value.parse().ok()?;
+    Some(GenericLoopOp::MapAddI64Const {
+        map: count.map_name.clone(),
+        key: item.to_owned(),
+        value,
+    })
+}
+
+fn lower_generic_list_append(
+    item: &str,
+    receiver: &Expr,
+    method: &str,
+    positional: &[Expr],
+) -> Option<GenericLoopOp> {
+    if method != "append" || positional != &[Expr::Name(item.to_owned())] {
+        return None;
+    }
+    let Expr::Name(list) = receiver else {
+        return None;
+    };
+    Some(GenericLoopOp::ListAppend {
+        list: list.clone(),
+        item: item.to_owned(),
+    })
+}
+
+fn lower_generic_unique_append_if(
+    item: &str,
+    condition: &Expr,
+    then_branch: &[Stmt],
+    else_branch: &[Stmt],
+) -> Option<GenericLoopOp> {
+    if !else_branch.is_empty() {
+        return None;
+    }
+    let Expr::Not(condition) = condition else {
+        return None;
+    };
+    let Expr::Compare {
+        left,
+        ops,
+        comparators,
+    } = condition.as_ref()
+    else {
+        return None;
+    };
+    let ([CompareOp::In], [Expr::Name(list)]) = (ops.as_slice(), comparators.as_slice()) else {
+        return None;
+    };
+    if left.as_ref() != &Expr::Name(item.to_owned()) {
+        return None;
+    }
+    let [stmt] = then_branch else {
+        return None;
+    };
+    match lower_generic_loop_stmt(item, stmt)? {
+        GenericLoopOp::ListAppend {
+            list: append_list,
+            item,
+        } if append_list == *list => Some(GenericLoopOp::ListAppendUnique {
+            list: append_list,
+            item,
+        }),
+        _ => None,
+    }
+}
+
+fn matches_add_self_item(local: &str, item: &str, left: &Expr, right: &Expr) -> bool {
+    matches!((left, right), (Expr::Name(lhs), Expr::Name(rhs)) if lhs == local && rhs == item)
+        || matches!((left, right), (Expr::Name(lhs), Expr::Name(rhs)) if lhs == item && rhs == local)
 }
 
 pub(crate) fn compile_generic_vm_function(plan: &GenericLoopPlan) -> Option<LoopIrFunction> {
