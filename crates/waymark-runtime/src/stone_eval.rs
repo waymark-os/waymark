@@ -96,6 +96,7 @@ use stone_state::runtime_state_record;
 use stone_vm_interp::{
     execute_generic_vm_add_assign as execute_generic_vm_add_assign_loop,
     execute_generic_vm_expr_body as execute_generic_vm_expr_body_loop,
+    execute_generic_vm_map_add_i64_const as execute_generic_vm_map_add_i64_const_loop,
     execute_generic_vm_text_parse_add_assign as execute_generic_vm_text_parse_add_assign_loop,
     generic_vm_record_field_value, GenericVmInput, GenericVmLoopResult,
 };
@@ -1247,26 +1248,17 @@ impl Evaluator<'_> {
         values: &[RuntimeValue],
     ) -> Result<GenericVmLoopResult, ShellError> {
         let mut counts = self.load_i64_record_map(map)?;
-        let mut last_value = None;
-        for value in values {
-            let RuntimeValue::Nu(value) = value else {
-                self.state
-                    .hot_loop_diagnostics
-                    .lowering_miss("unsupported_expr");
-                return Ok(GenericVmLoopResult::Unsupported);
-            };
-            let Ok(key) = value_to_string(value, "hot loop") else {
-                self.state
-                    .hot_loop_diagnostics
-                    .lowering_miss("unsupported_expr");
-                return Ok(GenericVmLoopResult::Unsupported);
-            };
-            let total = counts.entry(key).or_insert(0);
-            *total = total
-                .checked_add(addend)
-                .ok_or_else(|| stone_error("hot loop", "integer addition overflow"))?;
-            last_value = Some(RuntimeValue::Nu(value.clone()));
-        }
+        let Some(result) = execute_generic_vm_map_add_i64_const_loop(
+            counts,
+            addend,
+            values,
+            |value| value_to_string(value, "hot loop"),
+            |reason| self.state.hot_loop_diagnostics.lowering_miss(reason),
+        )?
+        else {
+            return Ok(GenericVmLoopResult::Unsupported);
+        };
+        counts = result.counts;
         self.state.set_local(
             map.to_owned(),
             RuntimeValue::Nu(Value::record(
@@ -1274,7 +1266,9 @@ impl Evaluator<'_> {
                 Span::unknown(),
             )),
         );
-        Ok(GenericVmLoopResult::Executed { last_value })
+        Ok(GenericVmLoopResult::Executed {
+            last_value: result.last_value,
+        })
     }
 
     fn execute_generic_vm_map_add_i64_const_record_field(

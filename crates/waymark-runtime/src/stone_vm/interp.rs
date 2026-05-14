@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::collections::HashMap;
+
 use nu_protocol::{ShellError, Span, Value};
 
 use super::stone_runtime_value::{RuntimeValue, TextLines};
@@ -29,6 +31,11 @@ pub(super) struct GenericVmExprBodyResult {
 
 pub(super) struct GenericVmAssignResult {
     pub(super) value: RuntimeValue,
+    pub(super) last_value: Option<RuntimeValue>,
+}
+
+pub(super) struct GenericVmMapResult {
+    pub(super) counts: HashMap<String, i64>,
     pub(super) last_value: Option<RuntimeValue>,
 }
 
@@ -151,6 +158,33 @@ pub(super) fn execute_generic_vm_text_parse_add_assign(
         value: RuntimeValue::Nu(generic_vm_number_to_value(accumulator)),
         last_value,
     }))
+}
+
+pub(super) fn execute_generic_vm_map_add_i64_const(
+    mut counts: HashMap<String, i64>,
+    addend: i64,
+    values: &[RuntimeValue],
+    mut value_to_key: impl FnMut(&Value) -> Result<String, ShellError>,
+    mut lowering_miss: impl FnMut(&'static str),
+) -> Result<Option<GenericVmMapResult>, ShellError> {
+    let mut last_value = None;
+    for value in values {
+        let RuntimeValue::Nu(value) = value else {
+            lowering_miss("unsupported_expr");
+            return Ok(None);
+        };
+        let Ok(key) = value_to_key(value) else {
+            lowering_miss("unsupported_expr");
+            return Ok(None);
+        };
+        let total = counts.entry(key).or_insert(0);
+        *total = total
+            .checked_add(addend)
+            .ok_or_else(|| stone_error("hot loop", "integer addition overflow"))?;
+        last_value = Some(RuntimeValue::Nu(value.clone()));
+    }
+
+    Ok(Some(GenericVmMapResult { counts, last_value }))
 }
 
 pub(super) fn generic_vm_register_i64(
