@@ -26,9 +26,10 @@ mod stone_eval;
 mod stone_file_ops;
 mod stone_frontend;
 mod stone_helpers;
-mod stone_ir;
 mod stone_run;
 mod stone_vm;
+#[cfg(test)]
+mod stone_vm_tests;
 mod task;
 pub mod tools;
 mod vsock;
