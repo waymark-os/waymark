@@ -78,6 +78,58 @@ lists and records, numeric across ints/floats, and strongly typed for booleans:
 Membership supports strings, lists, and record keys: `"mark" in "waymark"`,
 `2 in [1, 2, 3]`, and `"path" in record`. Other containers are an error.
 
+Conditional expressions use Python's `then if condition else otherwise` shape
+and evaluate only the selected branch:
+
+```python
+size = row["size"] if "size" in row else 0
+```
+
+Augmented assignment is available for names and supported item targets with the
+same typed operator semantics as the corresponding expression: `+=`, `-=`,
+`*=`, `/=`, `//=`, `%=`, `&=`, `|=`, `^=`, `<<=`, and `>>=`.
+
+List and record comprehensions support one or more `for` clauses, `if` filters,
+and simple name or tuple targets:
+
+```python
+pairs = [name + ":" + str(count) for name, count in counts.items()]
+flat = [item for row in rows for item in row["items"] if item]
+lookup = {row["name"]: row["score"] for row in rows if row["score"]}
+```
+
+Generator expressions are intentionally narrow. They are accepted by `sum`,
+`any`, and `all`, support filters, and use Stone truthiness. `any` and `all`
+short-circuit generator evaluation.
+
+Functions support positional parameters, optional type annotations, return
+annotations, and default values:
+
+```python
+def head(path: str, limit: int = 10) -> list:
+    return read_text(path).splitlines()[0:limit]
+```
+
+Default expressions are evaluated when a call omits that argument. Mutable
+default literals such as `[]` and `{}` are rejected to avoid shared mutable
+state surprises.
+
+`try` / `except` catches runtime evaluation errors, not parse or lowering
+errors:
+
+```python
+try:
+    text = read_text(path)
+except Exception as e:
+    text = ""
+    emit({"warning": e.message, "code": e.code})
+```
+
+Supported handlers are `except:`, `except Exception:`, and
+`except Exception as name:`. A bound error is a Stone record with stable
+`kind`, `code`, and `message` fields. I/O errors also include `path` and
+`operation` when available.
+
 ## Core Builtins
 
 - `emit(value)`: return a structured success value.
@@ -99,6 +151,11 @@ Membership supports strings, lists, and record keys: `"mark" in "waymark"`,
 - `where(rows, key, expected)`, `where(rows, key, op, expected)`, or
   `where(rows, lambda r: ...)`: filter record lists by equality, comparison
   (`==`, `!=`, `>`, `>=`, `<`, `<=`, `in`, `not in`), or a predicate.
+- `any(iterable)`, `all(iterable)`, and `sum(iterable)`: aggregate lists or
+  supported generator expressions with Stone truthiness and typed numeric
+  semantics.
+- `set()` and `set(iterable)`: materialize a deterministic unique list. The
+  `.add(value)` method appends only values not already present.
 - `split(text, separator=None)`, `join(items, separator="")`,
   `slice(value, start=None, end=None)`, `starts_with(text, prefix)`, and
   `format(template, ...)`: small text/list helpers for scripts and dynamic

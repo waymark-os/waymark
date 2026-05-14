@@ -38,6 +38,10 @@ pub enum Stmt {
         context: Expr,
         body: Vec<Stmt>,
     },
+    Try {
+        body: Vec<Stmt>,
+        handlers: Vec<ExceptHandler>,
+    },
     FunctionDef(FunctionDef),
     Return(Option<Expr>),
     Break,
@@ -58,6 +62,7 @@ pub struct FunctionDef {
 pub struct FunctionParam {
     pub name: String,
     pub ty: StoneType,
+    pub default: Option<Expr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,18 +98,14 @@ pub enum Expr {
     List(Vec<Expr>),
     Tuple(Vec<Expr>),
     ListComprehension {
-        target: String,
-        iter: Box<Expr>,
         elt: Box<Expr>,
-        filters: Vec<Expr>,
+        clauses: Vec<ComprehensionClause>,
     },
     Record(Vec<(String, Expr)>),
     DictComprehension {
-        target: String,
-        iter: Box<Expr>,
         key: Box<Expr>,
         value: Box<Expr>,
-        filters: Vec<Expr>,
+        clauses: Vec<ComprehensionClause>,
     },
     Name(String),
     Subscript {
@@ -127,6 +128,11 @@ pub enum Expr {
     BoolOp {
         op: BoolOp,
         values: Vec<Expr>,
+    },
+    Conditional {
+        then_expr: Box<Expr>,
+        condition: Box<Expr>,
+        else_expr: Box<Expr>,
     },
     Not(Box<Expr>),
     Neg(Box<Expr>),
@@ -176,9 +182,8 @@ pub enum Expr {
         right: Box<Expr>,
     },
     Generator {
-        target: String,
-        iter: Box<Expr>,
         elt: Box<Expr>,
+        clauses: Vec<ComprehensionClause>,
     },
     Lambda {
         params: Vec<String>,
@@ -222,6 +227,22 @@ pub enum CompareOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AugOp {
     Add,
+    Sub,
+    Mul,
+    Div,
+    FloorDiv,
+    Mod,
+    BitAnd,
+    BitOr,
+    BitXor,
+    LShift,
+    RShift,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExceptHandler {
+    pub name: Option<String>,
+    pub body: Vec<Stmt>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +256,13 @@ pub struct Call {
     pub name: String,
     pub positional: Vec<Expr>,
     pub named: Vec<(String, Expr)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComprehensionClause {
+    pub targets: Vec<String>,
+    pub iter: Expr,
+    pub filters: Vec<Expr>,
 }
 
 pub fn lower_source(source: &str) -> Result<Program, ShellError> {
@@ -268,6 +296,7 @@ fn lower_stmt(statement: py::Stmt) -> Result<Stmt, ShellError> {
         py::Stmt::If(if_stmt) => lower_if(if_stmt),
         py::Stmt::Pass(_) => Ok(Stmt::Pass),
         py::Stmt::Return(return_stmt) => lower_return(return_stmt),
+        py::Stmt::Try(try_stmt) => lower_try(try_stmt),
         py::Stmt::While(while_stmt) => lower_while(while_stmt),
         py::Stmt::With(with_stmt) => lower_with(with_stmt),
         py::Stmt::Expr(expr) => Ok(Stmt::Expr(lower_expr(*expr.value)?)),
@@ -307,19 +336,16 @@ fn lower_function_def(function: py::StmtFunctionDef) -> Result<Stmt, ShellError>
     }
     let mut params = Vec::with_capacity(parameters.args.len());
     for parameter in parameters.args {
-        if parameter.default.is_some() {
-            return Err(unsupported_message(
-                "function definition",
-                "default parameter values are not supported",
-            ));
-        }
-        params.push(FunctionParam {
-            name: parameter.name().to_string(),
-            ty: match parameter.parameter.annotation.as_deref() {
-                Some(annotation) => lower_type_annotation(annotation)?,
-                None => StoneType::Any,
-            },
-        });
+        let name = parameter.name().to_string();
+        let ty = match parameter.parameter.annotation.as_deref() {
+            Some(annotation) => lower_type_annotation(annotation)?,
+            None => StoneType::Any,
+        };
+        let default = parameter
+            .default
+            .map(|default| lower_function_default(*default))
+            .transpose()?;
+        params.push(FunctionParam { name, ty, default });
     }
     let return_type = match function.returns {
         Some(return_type) => lower_type_annotation(&return_type)?,
@@ -332,6 +358,16 @@ fn lower_function_def(function: py::StmtFunctionDef) -> Result<Stmt, ShellError>
         return_type,
         body: lower_stmt_block(function.body)?,
     }))
+}
+
+fn lower_function_default(default: py::Expr) -> Result<Expr, ShellError> {
+    match default {
+        py::Expr::List(_) | py::Expr::Dict(_) | py::Expr::Set(_) => Err(unsupported_message(
+            "function definition",
+            "mutable default parameter values are not supported",
+        )),
+        other => lower_expr(other),
+    }
 }
 
 fn lower_return(return_stmt: py::StmtReturn) -> Result<Stmt, ShellError> {
@@ -427,6 +463,16 @@ fn lower_aug_assign(assign: py::StmtAugAssign) -> Result<Stmt, ShellError> {
     let target = lower_assign_target(&assign.target)?;
     let op = match assign.op {
         py::Operator::Add => AugOp::Add,
+        py::Operator::Sub => AugOp::Sub,
+        py::Operator::Mult => AugOp::Mul,
+        py::Operator::Div => AugOp::Div,
+        py::Operator::FloorDiv => AugOp::FloorDiv,
+        py::Operator::Mod => AugOp::Mod,
+        py::Operator::BitAnd => AugOp::BitAnd,
+        py::Operator::BitOr => AugOp::BitOr,
+        py::Operator::BitXor => AugOp::BitXor,
+        py::Operator::LShift => AugOp::LShift,
+        py::Operator::RShift => AugOp::RShift,
         unsupported => {
             return Err(unsupported_message(
                 "augmented assignment",
@@ -438,6 +484,55 @@ fn lower_aug_assign(assign: py::StmtAugAssign) -> Result<Stmt, ShellError> {
         target,
         op,
         value: lower_expr(*assign.value)?,
+    })
+}
+
+fn lower_try(try_stmt: py::StmtTry) -> Result<Stmt, ShellError> {
+    if try_stmt.is_star {
+        return Err(unsupported_message(
+            "try statement",
+            "except* handlers are not supported",
+        ));
+    }
+    if !try_stmt.orelse.is_empty() {
+        return Err(unsupported_message(
+            "try statement",
+            "try/else is not supported yet",
+        ));
+    }
+    if !try_stmt.finalbody.is_empty() {
+        return Err(unsupported_message(
+            "try statement",
+            "finally is not supported yet",
+        ));
+    }
+    if try_stmt.handlers.is_empty() {
+        return Err(unsupported_message(
+            "try statement",
+            "try requires at least one except handler",
+        ));
+    }
+    let mut handlers = Vec::with_capacity(try_stmt.handlers.len());
+    for handler in try_stmt.handlers {
+        let py::ExceptHandler::ExceptHandler(handler) = handler;
+        match handler.type_.as_deref() {
+            None => {}
+            Some(py::Expr::Name(name)) if name.id.as_str() == "Exception" => {}
+            Some(_) => {
+                return Err(unsupported_message(
+                    "try statement",
+                    "only bare except and except Exception handlers are supported",
+                ));
+            }
+        }
+        handlers.push(ExceptHandler {
+            name: handler.name.map(|name| name.to_string()),
+            body: lower_stmt_block(handler.body)?,
+        });
+    }
+    Ok(Stmt::Try {
+        body: lower_stmt_block(try_stmt.body)?,
+        handlers,
     })
 }
 
@@ -642,6 +737,11 @@ fn lower_expr(expression: py::Expr) -> Result<Expr, ShellError> {
             right: Box::new(lower_expr(*bin_op.right)?),
         }),
         py::Expr::Compare(compare) => lower_compare(compare),
+        py::Expr::If(if_expr) => Ok(Expr::Conditional {
+            then_expr: Box::new(lower_expr(*if_expr.body)?),
+            condition: Box::new(lower_expr(*if_expr.test)?),
+            else_expr: Box::new(lower_expr(*if_expr.orelse)?),
+        }),
         py::Expr::BoolOp(bool_op) => lower_bool_op(bool_op),
         py::Expr::UnaryOp(unary_op) if matches!(unary_op.op, py::UnaryOp::Not) => {
             Ok(Expr::Not(Box::new(lower_expr(*unary_op.operand)?)))
@@ -855,103 +955,58 @@ fn lower_fstring_format_spec(
 }
 
 fn lower_generator(generator: py::ExprGenerator) -> Result<Expr, ShellError> {
-    let [comprehension] = generator.generators.as_slice() else {
-        return Err(unsupported_message(
-            "generator expression",
-            "only one generator clause is supported yet",
-        ));
-    };
-    if comprehension.is_async {
-        return Err(unsupported_message(
-            "generator expression",
-            "async generator clauses are not supported",
-        ));
-    }
-    if !comprehension.ifs.is_empty() {
-        return Err(unsupported_message(
-            "generator expression",
-            "if filters are not supported yet",
-        ));
-    }
-    let py::Expr::Name(target) = &comprehension.target else {
-        return Err(unsupported_message(
-            "generator expression",
-            "only simple name generator targets are supported yet",
-        ));
-    };
-
     Ok(Expr::Generator {
-        target: target.id.to_string(),
-        iter: Box::new(lower_expr(comprehension.iter.clone())?),
         elt: Box::new(lower_expr(*generator.elt)?),
+        clauses: lower_comprehension_clauses("generator expression", &generator.generators)?,
     })
 }
 
 fn lower_list_comprehension(list_comp: py::ExprListComp) -> Result<Expr, ShellError> {
-    let [comprehension] = list_comp.generators.as_slice() else {
-        return Err(unsupported_message(
-            "list comprehension",
-            "only one for clause is supported yet",
-        ));
-    };
-    if comprehension.is_async {
-        return Err(unsupported_message(
-            "list comprehension",
-            "async list comprehensions are not supported",
-        ));
-    }
-    let py::Expr::Name(target) = &comprehension.target else {
-        return Err(unsupported_message(
-            "list comprehension",
-            "only simple name targets are supported yet",
-        ));
-    };
-
     Ok(Expr::ListComprehension {
-        target: target.id.to_string(),
-        iter: Box::new(lower_expr(comprehension.iter.clone())?),
         elt: Box::new(lower_expr(*list_comp.elt)?),
-        filters: comprehension
-            .ifs
-            .iter()
-            .cloned()
-            .map(lower_expr)
-            .collect::<Result<Vec<_>, _>>()?,
+        clauses: lower_comprehension_clauses("list comprehension", &list_comp.generators)?,
     })
 }
 
 fn lower_dict_comprehension(dict_comp: py::ExprDictComp) -> Result<Expr, ShellError> {
-    let [comprehension] = dict_comp.generators.as_slice() else {
-        return Err(unsupported_message(
-            "dict comprehension",
-            "only one for clause is supported",
-        ));
-    };
-    if comprehension.is_async {
-        return Err(unsupported_message(
-            "dict comprehension",
-            "async dict comprehensions are not supported",
-        ));
-    }
-    let py::Expr::Name(target) = &comprehension.target else {
-        return Err(unsupported_message(
-            "dict comprehension",
-            "only simple name targets are supported",
-        ));
-    };
-
     Ok(Expr::DictComprehension {
-        target: target.id.to_string(),
-        iter: Box::new(lower_expr(comprehension.iter.clone())?),
         key: Box::new(lower_expr(*dict_comp.key)?),
         value: Box::new(lower_expr(*dict_comp.value)?),
-        filters: comprehension
-            .ifs
-            .iter()
-            .cloned()
-            .map(lower_expr)
-            .collect::<Result<Vec<_>, _>>()?,
+        clauses: lower_comprehension_clauses("dict comprehension", &dict_comp.generators)?,
     })
+}
+
+fn lower_comprehension_clauses(
+    context: &str,
+    comprehensions: &[py::Comprehension],
+) -> Result<Vec<ComprehensionClause>, ShellError> {
+    if comprehensions.is_empty() {
+        return Err(unsupported_message(
+            context,
+            "at least one for clause is required",
+        ));
+    }
+    comprehensions
+        .iter()
+        .map(|comprehension| {
+            if comprehension.is_async {
+                return Err(unsupported_message(
+                    context,
+                    "async comprehension clauses are not supported",
+                ));
+            }
+            Ok(ComprehensionClause {
+                targets: lower_loop_targets(comprehension.target.clone())?,
+                iter: lower_expr(comprehension.iter.clone())?,
+                filters: comprehension
+                    .ifs
+                    .iter()
+                    .cloned()
+                    .map(lower_expr)
+                    .collect::<Result<Vec<_>, _>>()?,
+            })
+        })
+        .collect()
 }
 
 fn lower_dict(dict: py::ExprDict) -> Result<Expr, ShellError> {
@@ -1286,12 +1341,106 @@ trimmed = [item.strip() for item in items]
             Stmt::Assign {
                 value:
                     Expr::ListComprehension {
-                        ref target,
-                        ref filters,
+                        ref clauses,
                         ..
                     },
                 ..
-            } if target == "text" && filters.len() == 1
+            } if clauses.len() == 1
+                && clauses[0].targets == vec!["text".to_string()]
+                && clauses[0].filters.len() == 1
+        ));
+    }
+
+    #[test]
+    fn accepts_llm_compatibility_shapes() {
+        let program = lower_source(
+            r#"value = row["size"] if "size" in row else 0
+total = 10
+total -= 1
+total *= 2
+total /= 3
+total //= 2
+total %= 2
+mask = 1
+mask |= 2
+mask &= 3
+mask ^= 1
+mask <<= 2
+mask >>= 1
+def head(path, limit=10):
+    return limit
+try:
+    text = read_text(path)
+except Exception as e:
+    text = e.message
+pairs = [name + ":" + str(count) for name, count in counts.items()]
+flat = [item for row in rows for item in row["items"]]
+total = sum(int(x) for x in values if x)
+"#,
+        )
+        .expect("lower llm compatibility features");
+
+        assert!(matches!(
+            program.statements[0],
+            Stmt::Assign {
+                value: Expr::Conditional { .. },
+                ..
+            }
+        ));
+        let aug_ops = program
+            .statements
+            .iter()
+            .filter_map(|statement| match statement {
+                Stmt::AugAssign { op, .. } => Some(*op),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(aug_ops.len(), 10);
+        for (actual, op) in aug_ops.into_iter().zip(
+            [
+                AugOp::Sub,
+                AugOp::Mul,
+                AugOp::Div,
+                AugOp::FloorDiv,
+                AugOp::Mod,
+                AugOp::BitOr,
+                AugOp::BitAnd,
+                AugOp::BitXor,
+                AugOp::LShift,
+                AugOp::RShift,
+            ]
+            .into_iter(),
+        ) {
+            assert_eq!(actual, op);
+        }
+        let Stmt::FunctionDef(function) = &program.statements[13] else {
+            panic!("expected function definition");
+        };
+        assert!(matches!(function.params[1].default, Some(Expr::Int(_))));
+        assert!(matches!(
+            program.statements[14],
+            Stmt::Try { ref handlers, .. } if handlers[0].name.as_deref() == Some("e")
+        ));
+        assert!(matches!(
+            program.statements[15],
+            Stmt::Assign {
+                value: Expr::ListComprehension { ref clauses, .. },
+                ..
+            } if clauses[0].targets == vec!["name".to_string(), "count".to_string()]
+        ));
+        assert!(matches!(
+            program.statements[16],
+            Stmt::Assign {
+                value: Expr::ListComprehension { ref clauses, .. },
+                ..
+            } if clauses.len() == 2
+        ));
+        assert!(matches!(
+            program.statements[17],
+            Stmt::Assign {
+                value: Expr::Call(ref call),
+                ..
+            } if matches!(call.positional[0], Expr::Generator { ref clauses, .. } if clauses[0].filters.len() == 1)
         ));
     }
 
@@ -1499,6 +1648,7 @@ value = normalize("01/02/2024")
         assert_eq!(function.params.len(), 1);
         assert_eq!(function.params[0].name, "text");
         assert_eq!(function.params[0].ty, StoneType::Str);
+        assert_eq!(function.params[0].default, None);
         assert_eq!(function.return_type, StoneType::Str);
         assert!(matches!(function.body.last(), Some(Stmt::Return(Some(_)))));
     }
@@ -1634,7 +1784,9 @@ else:
             "import os",
             "async def f():\n    pass",
             "class C:\n    pass",
-            "try:\n    x = 1\nexcept Exception:\n    x = 2",
+            "try:\n    x = 1\nfinally:\n    x = 2",
+            "try:\n    x = 1\nexcept ValueError:\n    x = 2",
+            "def f(x=[]):\n    return x",
         ] {
             assert_unsupported(source);
         }
@@ -1642,12 +1794,7 @@ else:
 
     #[test]
     fn rejects_unsupported_python_expressions() {
-        for source in [
-            "x if ok else y",
-            "[x for a, b in items]",
-            "(x for x in items if x)",
-            "b'abc'",
-        ] {
+        for source in ["b'abc'"] {
             assert_unsupported(source);
         }
     }

@@ -16,8 +16,8 @@ use serde_json::{json, Value as JsonValue};
 use crate::commands::{stone_help_overview, stone_help_topic};
 use crate::json::{json_to_nu_value, nu_to_json_value};
 use crate::stone_ast::{
-    AssignTarget, AugOp, BoolOp, Call, CompareOp, Expr, FormattedStringPart, FunctionDef, Program,
-    Stmt, StoneFormatSpec, StoneType,
+    AssignTarget, AugOp, BoolOp, Call, CompareOp, ComprehensionClause, ExceptHandler, Expr,
+    FormattedStringPart, FunctionDef, Program, Stmt, StoneFormatSpec, StoneType,
 };
 use crate::stone_builtins::{
     add_values, bitwise_int_values, compare_values, div_values, enumerate_builtin,
@@ -661,9 +661,7 @@ impl Evaluator<'_> {
                 let right = self
                     .eval_expr_value(value, input)?
                     .into_nu_value("augmented assignment")?;
-                let value = match op {
-                    AugOp::Add => add_values(&left, &right)?,
-                };
+                let value = apply_aug_op(*op, &left, &right)?;
                 self.assign_value(target, RuntimeValue::Nu(value), record_session_bindings)?;
                 Ok(EvalFlow::Output(PipelineData::empty()))
             }
@@ -737,6 +735,7 @@ impl Evaluator<'_> {
                 context,
                 body,
             } => self.eval_with_stmt(target.as_deref(), context, body),
+            Stmt::Try { body, handlers } => self.eval_try_stmt(body, handlers),
             Stmt::Break => Ok(EvalFlow::Break),
             Stmt::Continue => Ok(EvalFlow::Continue),
             Stmt::Expr(expression) => self
@@ -1089,6 +1088,31 @@ impl Evaluator<'_> {
         result
     }
 
+    fn eval_try_stmt(
+        &mut self,
+        body: &[Stmt],
+        handlers: &[ExceptHandler],
+    ) -> Result<EvalFlow, ShellError> {
+        match self.eval_block(body, PipelineData::empty(), false) {
+            Ok(flow) => Ok(flow),
+            Err(err) => {
+                let Some(handler) = handlers.first() else {
+                    return Err(err);
+                };
+                let error_record = shell_error_record(&err);
+                self.state.push_scope();
+                if let Some(name) = &handler.name {
+                    self.state
+                        .set_local(name.clone(), RuntimeValue::Nu(error_record));
+                }
+                let result = self.eval_block(&handler.body, PipelineData::empty(), false);
+                self.state
+                    .pop_scope_merging_nu_locals(handler.name.as_deref())?;
+                result
+            }
+        }
+    }
+
     fn assign_value(
         &mut self,
         target: &AssignTarget,
@@ -1282,85 +1306,89 @@ impl Evaluator<'_> {
 
     fn eval_list_comprehension(
         &mut self,
-        target: &str,
-        iter: &Expr,
         elt: &Expr,
-        filters: &[Expr],
+        clauses: &[ComprehensionClause],
     ) -> Result<RuntimeValue, ShellError> {
-        let values = self.eval_iterable_expr(iter)?;
-        let previous = self.state.get_local(target);
         let mut output = Vec::new();
-
-        for value in values {
-            self.state.set_local(target.to_owned(), value);
-            let mut keep = true;
-            for filter in filters {
-                let value = self
-                    .eval_expr_value(filter, PipelineData::empty())?
-                    .into_nu_value("list comprehension")?;
-                if !value_truthy(&value) {
-                    keep = false;
-                    break;
-                }
-            }
-            if keep {
-                output.push(
-                    self.eval_expr_value(elt, PipelineData::empty())?
-                        .into_nu_value("list comprehension")?,
-                );
-            }
-        }
-
-        match previous {
-            Some(value) => self.state.set_local(target.to_owned(), value),
-            None => self.state.remove_local(target),
-        }
-
+        self.eval_comprehension_clauses("list comprehension", clauses, 0, &mut |evaluator| {
+            output.push(
+                evaluator
+                    .eval_expr_value(elt, PipelineData::empty())?
+                    .into_nu_value("list comprehension")?,
+            );
+            Ok(false)
+        })?;
         Ok(RuntimeValue::Nu(Value::list(output, Span::unknown())))
     }
 
     fn eval_dict_comprehension(
         &mut self,
-        target: &str,
-        iter: &Expr,
         key: &Expr,
         value: &Expr,
-        filters: &[Expr],
+        clauses: &[ComprehensionClause],
     ) -> Result<RuntimeValue, ShellError> {
-        let values = self.eval_iterable_expr(iter)?;
-        let previous = self.state.get_local(target);
-        let mut record = Record::with_capacity(values.len());
+        let mut record = Record::new();
+        self.eval_comprehension_clauses("dict comprehension", clauses, 0, &mut |evaluator| {
+            let key = evaluator
+                .eval_expr_value(key, PipelineData::empty())?
+                .into_nu_value("dict comprehension")?;
+            let key = value_to_string(&key, "dict comprehension key")?;
+            let value = evaluator
+                .eval_expr_value(value, PipelineData::empty())?
+                .into_nu_value("dict comprehension")?;
+            record.push(key, value);
+            Ok(false)
+        })?;
+        Ok(RuntimeValue::Nu(Value::record(record, Span::unknown())))
+    }
 
+    fn eval_comprehension_clauses(
+        &mut self,
+        context: &str,
+        clauses: &[ComprehensionClause],
+        index: usize,
+        visitor: &mut impl FnMut(&mut Self) -> Result<bool, ShellError>,
+    ) -> Result<bool, ShellError> {
+        let Some(clause) = clauses.get(index) else {
+            return visitor(self);
+        };
+        let previous = self.capture_target_values(&clause.targets);
+        let values = self.eval_iterable_expr(&clause.iter)?;
         for item in values {
-            self.state.set_local(target.to_owned(), item);
+            self.assign_loop_targets(&clause.targets, item)?;
             let mut keep = true;
-            for filter in filters {
+            for filter in &clause.filters {
                 let value = self
                     .eval_expr_value(filter, PipelineData::empty())?
-                    .into_nu_value("dict comprehension")?;
+                    .into_nu_value(context)?;
                 if !value_truthy(&value) {
                     keep = false;
                     break;
                 }
             }
-            if keep {
-                let key = self
-                    .eval_expr_value(key, PipelineData::empty())?
-                    .into_nu_value("dict comprehension")?;
-                let key = value_to_string(&key, "dict comprehension key")?;
-                let value = self
-                    .eval_expr_value(value, PipelineData::empty())?
-                    .into_nu_value("dict comprehension")?;
-                record.push(key, value);
+            if keep && self.eval_comprehension_clauses(context, clauses, index + 1, visitor)? {
+                self.restore_target_values(previous);
+                return Ok(true);
             }
         }
+        self.restore_target_values(previous);
+        Ok(false)
+    }
 
-        match previous {
-            Some(value) => self.state.set_local(target.to_owned(), value),
-            None => self.state.remove_local(target),
+    fn capture_target_values(&self, targets: &[String]) -> Vec<(String, Option<RuntimeValue>)> {
+        targets
+            .iter()
+            .map(|target| (target.clone(), self.state.get_local(target)))
+            .collect()
+    }
+
+    fn restore_target_values(&mut self, previous: Vec<(String, Option<RuntimeValue>)>) {
+        for (target, value) in previous {
+            match value {
+                Some(value) => self.state.set_local(target, value),
+                None => self.state.remove_local(&target),
+            }
         }
-
-        Ok(RuntimeValue::Nu(Value::record(record, Span::unknown())))
     }
 
     fn eval_formatted_string(
@@ -1440,19 +1468,14 @@ impl Evaluator<'_> {
                     }
                     Ok(RuntimeValue::Nu(Value::list(values, span)))
                 }
-                Expr::ListComprehension {
-                    target,
-                    iter,
-                    elt,
-                    filters,
-                } => self.eval_list_comprehension(target, iter, elt, filters),
+                Expr::ListComprehension { elt, clauses } => {
+                    self.eval_list_comprehension(elt, clauses)
+                }
                 Expr::DictComprehension {
-                    target,
-                    iter,
                     key,
                     value,
-                    filters,
-                } => self.eval_dict_comprehension(target, iter, key, value, filters),
+                    clauses,
+                } => self.eval_dict_comprehension(key, value, clauses),
                 Expr::Record(items) => {
                     let mut record = Record::with_capacity(items.len());
                     for (key, value) in items {
@@ -1501,6 +1524,20 @@ impl Evaluator<'_> {
                     comparators,
                 } => self.eval_compare(left, ops, comparators),
                 Expr::BoolOp { op, values } => self.eval_bool_op(*op, values),
+                Expr::Conditional {
+                    then_expr,
+                    condition,
+                    else_expr,
+                } => {
+                    let condition = self
+                        .eval_expr_value(condition, PipelineData::empty())?
+                        .into_nu_value("conditional expression")?;
+                    if value_truthy(&condition) {
+                        self.eval_expr_value(then_expr, PipelineData::empty())
+                    } else {
+                        self.eval_expr_value(else_expr, PipelineData::empty())
+                    }
+                }
                 Expr::Not(value) => {
                     let value = self.eval_expr_value(value, PipelineData::empty())?;
                     let value = value.into_nu_value("not")?;
@@ -1749,6 +1786,8 @@ impl Evaluator<'_> {
                 str_builtin(&value).map(RuntimeValue::Nu)
             }
             "type" => self.eval_type_call(call),
+            "any" => self.eval_any_all_call(call, true),
+            "all" => self.eval_any_all_call(call, false),
             "enumerate" => self.eval_enumerate_call(call),
             "echo" => self.eval_echo_call(call),
             "emit" => self.eval_emit_call(call, input),
@@ -1836,23 +1875,42 @@ impl Evaluator<'_> {
             .ok_or_else(|| {
                 stone_error("function call", format!("unknown function `{}`", call.name))
             })?;
-        if call.positional.len() != function.params.len() {
+        let required = function
+            .params
+            .iter()
+            .filter(|param| param.default.is_none())
+            .count();
+        if call.positional.len() < required || call.positional.len() > function.params.len() {
             return Err(stone_error(
                 "function call",
                 format!(
-                    "{}() expected {} argument(s), got {}",
+                    "{}() expected {} to {} argument(s), got {}",
                     function.name,
+                    required,
                     function.params.len(),
                     call.positional.len()
                 ),
             ));
         }
 
-        let mut args = Vec::with_capacity(call.positional.len());
-        for (expr, param) in call.positional.iter().zip(&function.params) {
-            let value = self
-                .eval_expr_value(expr, PipelineData::empty())?
-                .into_nu_value("function argument")?;
+        let mut args = Vec::with_capacity(function.params.len());
+        for (index, param) in function.params.iter().enumerate() {
+            let value = match call.positional.get(index) {
+                Some(expr) => self
+                    .eval_expr_value(expr, PipelineData::empty())?
+                    .into_nu_value("function argument")?,
+                None => self
+                    .eval_expr_value(
+                        param.default.as_ref().ok_or_else(|| {
+                            stone_error(
+                                "function call",
+                                format!("missing required argument `{}`", param.name),
+                            )
+                        })?,
+                        PipelineData::empty(),
+                    )?
+                    .into_nu_value("function default")?,
+            };
             ensure_type(&value, param.ty, &format!("argument `{}`", param.name))?;
             args.push((param.name.clone(), value));
         }
@@ -4141,29 +4199,94 @@ impl Evaluator<'_> {
         sum_builtin(values).map(RuntimeValue::Nu)
     }
 
+    fn eval_any_all_call(&mut self, call: &Call, is_any: bool) -> Result<RuntimeValue, ShellError> {
+        let context = if is_any { "any" } else { "all" };
+        let [arg] = call.positional.as_slice() else {
+            return Err(stone_error(
+                context,
+                format!("{context}() requires exactly one argument"),
+            ));
+        };
+        if !call.named.is_empty() {
+            return Err(stone_error(
+                context,
+                format!("{context}() keyword arguments are not supported"),
+            ));
+        }
+
+        let result = match arg {
+            Expr::Generator { .. } => self.eval_generator_truthy(arg, is_any)?,
+            _ => {
+                let values = self.eval_iterable_expr(arg)?;
+                if is_any {
+                    values
+                        .into_iter()
+                        .map(|value| value.into_nu_value(context))
+                        .try_fold(false, |found, value| {
+                            if found {
+                                Ok(true)
+                            } else {
+                                value.map(|value| value_truthy(&value))
+                            }
+                        })?
+                } else {
+                    values
+                        .into_iter()
+                        .map(|value| value.into_nu_value(context))
+                        .try_fold(true, |all, value| {
+                            if !all {
+                                Ok(false)
+                            } else {
+                                value.map(|value| value_truthy(&value))
+                            }
+                        })?
+                }
+            }
+        };
+        Ok(RuntimeValue::Nu(Value::bool(result, Span::unknown())))
+    }
+
     fn eval_generator_values(&mut self, expression: &Expr) -> Result<Vec<Value>, ShellError> {
-        let Expr::Generator { target, iter, elt } = expression else {
+        let Expr::Generator { elt, clauses } = expression else {
             return Err(stone_error("generator expression", "expected generator"));
         };
-        let values = self.eval_iterable_expr(iter)?;
-        let previous = self.state.get_local(target);
-        let mut output = Vec::with_capacity(values.len());
-        for value in values {
-            self.state.set_local(target.clone(), value);
+        let mut output = Vec::new();
+        self.eval_comprehension_clauses("generator expression", clauses, 0, &mut |evaluator| {
             output.push(
-                self.eval_expr_value(elt, PipelineData::empty())?
+                evaluator
+                    .eval_expr_value(elt, PipelineData::empty())?
                     .into_nu_value("generator expression")?,
             );
-        }
-        match previous {
-            Some(value) => {
-                self.state.set_local(target.clone(), value);
-            }
-            None => {
-                self.state.remove_local(target);
-            }
-        }
+            Ok(false)
+        })?;
         Ok(output)
+    }
+
+    fn eval_generator_truthy(
+        &mut self,
+        expression: &Expr,
+        is_any: bool,
+    ) -> Result<bool, ShellError> {
+        let Expr::Generator { elt, clauses } = expression else {
+            return Err(stone_error("generator expression", "expected generator"));
+        };
+        let mut result = !is_any;
+        self.eval_comprehension_clauses("generator expression", clauses, 0, &mut |evaluator| {
+            let value = evaluator
+                .eval_expr_value(elt, PipelineData::empty())?
+                .into_nu_value("generator expression")?;
+            let truthy = value_truthy(&value);
+            if is_any && truthy {
+                result = true;
+                return Ok(true);
+            }
+            if !is_any && !truthy {
+                result = false;
+                return Ok(true);
+            }
+            Ok(false)
+        })?;
+        Ok(result)
     }
 
     fn eval_iterable_expr(&mut self, expression: &Expr) -> Result<Vec<RuntimeValue>, ShellError> {
@@ -4298,6 +4421,8 @@ fn is_builtin_call(call: &Call) -> bool {
             | "edit"
             | "echo"
             | "emit"
+            | "all"
+            | "any"
             | "fail"
             | "filter"
             | "enumerate"
@@ -4414,6 +4539,59 @@ fn ensure_type(value: &Value, expected: StoneType, context: &str) -> Result<(), 
             ),
         ))
     }
+}
+
+fn apply_aug_op(op: AugOp, left: &Value, right: &Value) -> Result<Value, ShellError> {
+    match op {
+        AugOp::Add => add_values(left, right),
+        AugOp::Sub => sub_values(left, right),
+        AugOp::Mul => mul_values(left, right),
+        AugOp::Div => div_values(left, right),
+        AugOp::FloorDiv => floor_div_values(left, right),
+        AugOp::Mod => mod_values(left, right),
+        AugOp::BitAnd => bitwise_int_values(left, right, "bitwise and", |left, right| left & right),
+        AugOp::BitOr => bitwise_int_values(left, right, "bitwise or", |left, right| left | right),
+        AugOp::BitXor => bitwise_int_values(left, right, "bitwise xor", |left, right| left ^ right),
+        AugOp::LShift => shift_value(left, right, "left shift", i64::checked_shl),
+        AugOp::RShift => shift_value(left, right, "right shift", i64::checked_shr),
+    }
+}
+
+fn shell_error_record(err: &ShellError) -> Value {
+    let span = Span::unknown();
+    let mut record = Record::new();
+    match err {
+        ShellError::Generic(generic) => {
+            record.push("kind", Value::string(generic.error.to_string(), span));
+            record.push("code", Value::string(generic.code.to_string(), span));
+            record.push("message", Value::string(generic.msg.to_string(), span));
+            if let Some(help) = &generic.help {
+                record.push(
+                    "suggested_next_action",
+                    Value::string(help.to_string(), span),
+                );
+            }
+        }
+        ShellError::Io(io) => {
+            record.push("kind", Value::string(io.to_string(), span));
+            record.push("code", Value::string("stone_io_error", span));
+            let message = match &io.path {
+                Some(path) => format!("{io}: {}", path.display()),
+                None => io.to_string(),
+            };
+            record.push("message", Value::string(message, span));
+            if let Some(path) = &io.path {
+                record.push("path", Value::string(path.display().to_string(), span));
+            }
+            record.push("operation", Value::string("io", span));
+        }
+        other => {
+            record.push("kind", Value::string("runtime", span));
+            record.push("code", Value::string("stone_runtime_error", span));
+            record.push("message", Value::string(other.to_string(), span));
+        }
+    }
+    Value::record(record, span)
 }
 
 fn stone_type_name(ty: StoneType) -> &'static str {
@@ -5761,6 +5939,125 @@ emit({
                 "ordered": [1, 2, 3],
                 "fallback": 1.5,
                 "i": 3,
+            })
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn evaluates_llm_compatibility_features() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("llm-compat-features")?;
+        fs::write(root.join("bad.json"), "{not json").expect("write bad json");
+        let program = lower_source(
+            r#"row = {"size": 7}
+empty = {}
+ternary = {
+    "true": row["size"] if "size" in row else unknown_name,
+    "false": unknown_name if "size" in empty else 0,
+    "nested": "big" if row["size"] > 10 else ("medium" if row["size"] > 5 else "small"),
+}
+total = 20
+total -= 3
+total *= 2
+total //= 5
+total %= 5
+ratio = 9
+ratio /= 2
+mask = 1
+mask |= 4
+mask &= 5
+mask ^= 1
+mask <<= 2
+mask >>= 1
+stats = {"alice": {"count": 10, "mask": 1}}
+stats["alice"]["count"] -= 3
+stats["alice"]["mask"] |= 2
+def head(path, limit=10):
+    return path + ":" + str(limit)
+def choose(value: int = 4, scale: int = 2) -> int:
+    return value * scale
+try:
+    missing = read_text("missing.txt")
+except Exception as e:
+    missing = {"code": e.code, "message": e.message}
+try:
+    parsed = read_json("bad.json")
+except:
+    parsed = {"fallback": True}
+try:
+    ok = read_text("bad.json")
+except Exception:
+    ok = "handler should not run"
+rows = [{"name": "ada", "items": [1, 2]}, {"name": "grace", "items": [3]}]
+counts = {"ada": 2, "grace": 1}
+pairs = [name + ":" + str(count) for name, count in counts.items()]
+dict_pairs = {name: count * 10 for name, count in counts.items()}
+flat = [row["name"] + ":" + str(item) for row in rows for item in row["items"] if item > 1]
+total_from_filter = sum(int(x) for x in ["", "2", "3"] if x)
+checks = {
+    "any_empty": any([]),
+    "all_empty": all([]),
+    "any_list": any([False, 0, "ok"]),
+    "all_list": all([1, "ok", True]),
+    "any_records": any(row["name"] == "grace" for row in rows),
+    "all_records": all("items" in row for row in rows),
+    "any_string": any(line == "beta" for line in "alpha\nbeta".splitlines()),
+    "any_short": any(flag or unknown_name for flag in [True]),
+    "all_short": all(flag and unknown_name for flag in [False]),
+}
+seen = set(["a", "a", "b"])
+seen.add("c")
+seen.add("c")
+emit({
+    "ternary": ternary,
+    "aug": {"total": total, "ratio": ratio, "mask": mask, "stats": stats},
+    "defaults": [head("p"), head("p", 3), choose(), choose(5), choose(5, 3)],
+    "try": {"missing_code": missing["code"], "missing_has_path": "missing.txt" in missing["message"], "parsed": parsed, "ok": ok},
+    "comprehensions": {"pairs": pairs, "dict_pairs": dict_pairs, "flat": flat, "total": total_from_filter},
+    "checks": checks,
+    "set": seen,
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "ternary": {"true": 7, "false": 0, "nested": "medium"},
+                "aug": {
+                    "total": 1,
+                    "ratio": 4.5,
+                    "mask": 8,
+                    "stats": {"alice": {"count": 7, "mask": 3}},
+                },
+                "defaults": ["p:10", "p:3", 8, 10, 15],
+                "try": {
+                    "missing_code": "stone_io_error",
+                    "missing_has_path": true,
+                    "parsed": {"fallback": true},
+                    "ok": "{not json",
+                },
+                "comprehensions": {
+                    "pairs": ["ada:2", "grace:1"],
+                    "dict_pairs": {"ada": 20, "grace": 10},
+                    "flat": ["ada:2", "grace:3"],
+                    "total": 5,
+                },
+                "checks": {
+                    "any_empty": false,
+                    "all_empty": true,
+                    "any_list": true,
+                    "all_list": true,
+                    "any_records": true,
+                    "all_records": true,
+                    "any_string": true,
+                    "any_short": true,
+                    "all_short": false,
+                },
+                "set": ["a", "b", "c"],
             })
         );
 
@@ -7131,15 +7428,6 @@ emit(total)
 
     #[test]
     fn negative_semantic_tests_fail_instead_of_returning_wrong_values() -> Result<(), ShellError> {
-        assert!(lower_source(
-            r#"try:
-    emit(1)
-except:
-    emit(2)
-"#
-        )
-        .is_err());
-
         let (engine_state, mut stack, root) = test_engine("negative-semantics")?;
         let missing_key = lower_source(r#"emit({"a": 1}["b"])"#)?;
         let error = eval_program(
@@ -7169,6 +7457,59 @@ emit(total)
             text.contains("invalid digit") || text.contains("int"),
             "{text}"
         );
+
+        for (name, source, expected) in [
+            (
+                "bad-augassign-sub",
+                r#"value = "1"
+value -= 1
+"#,
+                "cannot subtract",
+            ),
+            (
+                "bad-augassign-bitwise",
+                r#"value = "1"
+value |= 1
+"#,
+                "expected integer",
+            ),
+            (
+                "bad-augassign-zero-div",
+                r#"value = 1
+value /= 0
+"#,
+                "division by zero",
+            ),
+            (
+                "bad-augassign-zero-mod",
+                r#"value = 1
+value %= 0
+"#,
+                "modulo by zero",
+            ),
+            (
+                "bad-augassign-overflow",
+                r#"value = 9223372036854775807
+value += 1
+"#,
+                "integer addition overflow",
+            ),
+            ("bad-any-non-iterable", r#"any(1)"#, "cannot iterate int"),
+            (
+                "bad-default-type",
+                r#"def f(value: int = "bad") -> int:
+    return value
+f()
+"#,
+                "argument `value` expected int",
+            ),
+        ] {
+            let program = lower_source(source)?;
+            let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+                .expect_err(name);
+            let text = format!("{error:?}");
+            assert!(text.contains(expected), "{name}: {text}");
+        }
 
         cleanup_dir(&root);
         Ok(())
@@ -7250,6 +7591,18 @@ emit(mask)
 for n in [1, 2, 3]:
     total = total - (n // 2)
 emit(total)
+"#,
+            &[],
+        )?;
+        assert_hot_loop_matches_baseline(
+            "llm-compat-fallback-ternary-and-augassign",
+            r#"total = 0
+mask = 0
+for n in [1, 2, 3]:
+    total += n if n > 1 else 10
+    total -= 1
+    mask |= n
+emit({"total": total, "mask": mask})
 "#,
             &[],
         )?;
