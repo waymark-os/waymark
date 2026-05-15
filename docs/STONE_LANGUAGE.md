@@ -142,6 +142,8 @@ Supported handlers are `except:`, `except Exception:`, and
 - `read_json(path)`, `write_json(path, value)`: JSON file I/O.
 - `read_jsonl(path)`, `write_jsonl(path, rows)`: JSONL file I/O.
 - `read_csv(path)`: CSV records.
+- `write_csv(path, rows, columns=None)`: write headered CSV from record rows
+  with standard CSV quoting.
 - `find(root, name_glob="*", path_glob=None, type=None, min_size=None,
   max_size=None, modified_after_ms=None, modified_before_ms=None)`: file
   discovery. Names support simple wildcard globs, `path_glob` can match

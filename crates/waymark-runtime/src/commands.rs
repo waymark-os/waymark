@@ -903,6 +903,14 @@ for line in open("/app/input.txt"):
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "write_csv",
+        signature: "write_csv(path: str, rows: list[record], columns: list[str]? = None) -> record",
+        use_when: "Use to write headered CSV output from record rows with standard CSV quoting.",
+        examples: &[r#"write_csv("/app/out.csv", [{"name": "ada", "score": 10}])"#],
+        avoid: &["Do not hand-roll CSV quoting with string concatenation unless the format is intentionally nonstandard."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "read_json",
         signature: "read_json(path_or_file: str | record) -> Any",
         use_when: "Use for JSON files.",

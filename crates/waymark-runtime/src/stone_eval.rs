@@ -1843,6 +1843,7 @@ impl Evaluator<'_> {
             "sort" | "sorted" => self.eval_sort_call(call),
             "set" => self.eval_set_call(call),
             "unique" => self.eval_unique_call(call),
+            "write_csv" => self.eval_write_csv_call(call),
             "write_json" => self.eval_write_json_call(call),
             "write_jsonl" => self.eval_write_jsonl_call(call),
             "filter" => self.eval_filter_call(call),
@@ -2602,6 +2603,53 @@ impl Evaluator<'_> {
             .eval_expr_value(value, PipelineData::empty())?
             .into_nu_value("write_json")?;
         Ok(RuntimeValue::Nu(write_json_file(&target, &value)?))
+    }
+
+    fn eval_write_csv_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let ([path, rows] | [path, rows, _]) = call.positional.as_slice() else {
+            return Err(stone_error(
+                "write_csv",
+                "write_csv() requires path, rows, and optional columns",
+            ));
+        };
+        let mut named_columns = None;
+        for (name, argument) in &call.named {
+            if name == "columns" && named_columns.is_none() {
+                named_columns = Some(argument);
+            } else {
+                return Err(stone_error(
+                    "write_csv",
+                    format!("unsupported keyword `{name}`; expected columns"),
+                ));
+            }
+        }
+        if named_columns.is_some() && call.positional.len() > 2 {
+            return Err(stone_error(
+                "write_csv",
+                "write_csv() got multiple columns values",
+            ));
+        }
+        let path = self
+            .eval_expr_value(path, PipelineData::empty())?
+            .into_nu_value("write_csv")?;
+        let path = value_to_string(&path, "write_csv")?;
+        let target = self.resolve_script_path(&path)?;
+        let rows = self
+            .eval_expr_value(rows, PipelineData::empty())?
+            .into_nu_value("write_csv")?;
+        let columns = match call.positional.as_slice() {
+            [_, _, columns] => Some(
+                self.eval_expr_value(columns, PipelineData::empty())?
+                    .into_nu_value("write_csv columns")?,
+            ),
+            _ => named_columns
+                .map(|expr| self.eval_expr_value(expr, PipelineData::empty()))
+                .transpose()?
+                .map(|value| value.into_nu_value("write_csv columns"))
+                .transpose()?,
+        };
+        let text = csv_text_from_rows(&rows, columns.as_ref())?;
+        Ok(RuntimeValue::Nu(stone_write_text(&target, &text, false)?))
     }
 
     fn eval_write_jsonl_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -4507,6 +4555,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "json_dumps",
     "json_loads",
     "read_json",
+    "write_csv",
     "write_file",
     "write_text",
     "write_json",
@@ -4524,6 +4573,115 @@ fn is_builtin_call(call: &Call) -> bool {
         return !call.positional.is_empty();
     }
     STONE_BUILTIN_NAMES.contains(&call.name.as_str())
+}
+
+fn csv_text_from_rows(rows: &Value, columns: Option<&Value>) -> Result<String, ShellError> {
+    let Value::List { vals, .. } = rows else {
+        return Err(stone_error(
+            "write_csv",
+            format!("expected list of records, got {}", rows.get_type()),
+        ));
+    };
+    let columns = match columns {
+        Some(columns) => csv_columns_from_value(columns)?,
+        None => infer_csv_columns(vals)?,
+    };
+
+    let mut text = String::new();
+    write_csv_line(&mut text, &columns);
+    for row in vals {
+        let Value::Record { val, .. } = row else {
+            return Err(stone_error(
+                "write_csv",
+                format!("expected record row, got {}", row.get_type()),
+            ));
+        };
+        let mut fields = Vec::with_capacity(columns.len());
+        for column in &columns {
+            fields.push(
+                val.get(column)
+                    .map(csv_field_value)
+                    .transpose()?
+                    .unwrap_or_default(),
+            );
+        }
+        write_csv_line(&mut text, &fields);
+    }
+    Ok(text)
+}
+
+fn csv_columns_from_value(value: &Value) -> Result<Vec<String>, ShellError> {
+    let Value::List { vals, .. } = value else {
+        return Err(stone_error(
+            "write_csv",
+            format!(
+                "columns must be a list of strings, got {}",
+                value.get_type()
+            ),
+        ));
+    };
+    let mut columns = Vec::with_capacity(vals.len());
+    for value in vals {
+        columns.push(value_to_string(value, "write_csv columns")?);
+    }
+    Ok(columns)
+}
+
+fn infer_csv_columns(rows: &[Value]) -> Result<Vec<String>, ShellError> {
+    let mut columns = Vec::new();
+    for row in rows {
+        let Value::Record { val, .. } = row else {
+            return Err(stone_error(
+                "write_csv",
+                format!("expected record row, got {}", row.get_type()),
+            ));
+        };
+        for (key, _) in val.iter() {
+            if !columns.contains(key) {
+                columns.push(key.clone());
+            }
+        }
+    }
+    Ok(columns)
+}
+
+fn csv_field_value(value: &Value) -> Result<String, ShellError> {
+    match value {
+        Value::Nothing { .. } => Ok(String::new()),
+        Value::Bool { val, .. } => Ok(val.to_string()),
+        Value::Int { val, .. } => Ok(val.to_string()),
+        Value::Float { val, .. } => Ok(val.to_string()),
+        Value::String { val, .. } | Value::Glob { val, .. } => Ok(val.clone()),
+        other => serde_json::to_string(&nu_to_json_value(other))
+            .map_err(|err| stone_error("write_csv", err.to_string())),
+    }
+}
+
+fn write_csv_line(text: &mut String, fields: &[String]) {
+    let mut first = true;
+    for field in fields {
+        if !first {
+            text.push(',');
+        }
+        first = false;
+        write_csv_field(text, field);
+    }
+    text.push('\n');
+}
+
+fn write_csv_field(text: &mut String, field: &str) {
+    if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
+        text.push('"');
+        for ch in field.chars() {
+            if ch == '"' {
+                text.push('"');
+            }
+            text.push(ch);
+        }
+        text.push('"');
+    } else {
+        text.push_str(&field);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6527,6 +6685,36 @@ emit({
                 "name": "North West Capital",
                 "account": "BUS-1",
                 "description": "alpha, beta",
+            })
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn evaluates_write_csv_records() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("write-csv")?;
+        let program = lower_source(
+            r#"rows = [
+    {"name": "Ada", "score": 10, "note": "alpha, beta"},
+    {"name": "Grace", "score": 7, "note": "said \"ok\"", "extra": True},
+]
+write_csv("out.csv", rows, columns=["name", "score", "note", "extra"])
+roundtrip = read_csv("out.csv")
+emit({"text": cat("out.csv"), "rows": roundtrip})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "text": "name,score,note,extra\nAda,10,\"alpha, beta\",\nGrace,7,\"said \"\"ok\"\"\",true\n",
+                "rows": [
+                    {"name": "Ada", "score": "10", "note": "alpha, beta", "extra": ""},
+                    {"name": "Grace", "score": "7", "note": "said \"ok\"", "extra": "true"},
+                ],
             })
         );
 

@@ -294,6 +294,11 @@ fn lower_stmt(statement: py::Stmt) -> Result<Stmt, ShellError> {
         py::Stmt::For(for_stmt) => lower_for(for_stmt),
         py::Stmt::FunctionDef(function) => lower_function_def(function),
         py::Stmt::If(if_stmt) => lower_if(if_stmt),
+        py::Stmt::Import(import) => Err(unsupported_import_statement(&import.names)),
+        py::Stmt::ImportFrom(import) => Err(unsupported_import_from_statement(
+            import.module.as_ref().map(|module| module.to_string()),
+            &import.names,
+        )),
         py::Stmt::Pass(_) => Ok(Stmt::Pass),
         py::Stmt::Return(return_stmt) => lower_return(return_stmt),
         py::Stmt::Try(try_stmt) => lower_try(try_stmt),
@@ -1167,6 +1172,80 @@ fn unsupported_error(kind: &str, value: &impl std::fmt::Debug) -> ShellError {
     unsupported_message(kind, format!("unsupported {kind}: {value:?}"))
 }
 
+fn unsupported_import_statement(aliases: &[py::Alias]) -> ShellError {
+    let modules = aliases
+        .iter()
+        .map(|alias| alias.name.to_string())
+        .collect::<Vec<_>>();
+    unsupported_import_modules("import", &modules)
+}
+
+fn unsupported_import_from_statement(module: Option<String>, aliases: &[py::Alias]) -> ShellError {
+    let module = module.unwrap_or_else(|| "<relative>".to_owned());
+    let names = aliases
+        .iter()
+        .map(|alias| alias.name.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    unsupported_message(
+        "import",
+        format!(
+            "Python import is not supported: from {module} import {names}. {}",
+            import_suggestions_for_module(&module)
+        ),
+    )
+}
+
+fn unsupported_import_modules(kind: &str, modules: &[String]) -> ShellError {
+    let modules_text = if modules.is_empty() {
+        "<unknown>".to_owned()
+    } else {
+        modules.join(", ")
+    };
+    let suggestions = modules
+        .iter()
+        .map(|module| import_suggestions_for_module(module))
+        .collect::<Vec<_>>()
+        .join(" ");
+    unsupported_message(
+        "import",
+        format!("Python {kind} is not supported: {modules_text}. {suggestions}"),
+    )
+}
+
+fn import_suggestions_for_module(module: &str) -> &'static str {
+    match module.split('.').next().unwrap_or(module) {
+        "os" => {
+            "Stone replacements for os: use ls(path) or find(path, \"*\") for directory listings; use string concatenation for simple path joins; use pwd()/cd(path) for cwd."
+        }
+        "pathlib" => {
+            "Stone replacements for pathlib: use string paths directly, ls(path)/find(path, \"*\"), read_file(path), write_file(path, text), and path string concatenation."
+        }
+        "json" => {
+            "Stone replacements for json: use json_loads(text), json_dumps(value), read_json(path), and read_jsonl(path)."
+        }
+        "csv" => {
+            "Stone replacements for csv: use read_csv(path) for record rows and write_csv(path, rows) for CSV outputs."
+        }
+        "glob" => {
+            "Stone replacements for glob: use find(root, pattern) for recursive matches or ls(path) for directory entries."
+        }
+        "base64" => {
+            "Stone has no base64 builtin yet; use run([\"base64\", ...]) only when the task explicitly allows POSIX tools."
+        }
+        "re" => {
+            "Stone has no regex module yet; use search(root, needle) for literal file search or string split/find/startswith/endswith for simple parsing."
+        }
+        "datetime" | "time" => {
+            "Stone has no datetime module yet; parse fixed-format dates with string split/slice and int() when possible."
+        }
+        "math" => {
+            "Stone has typed numeric operators and round(value, ndigits), but no math module."
+        }
+        _ => "Use help() to inspect Stone builtins and replace module APIs with typed Stone file, JSON, CSV, text, and run helpers.",
+    }
+}
+
 fn unsupported_message(kind: &str, message: impl Into<String>) -> ShellError {
     ShellError::Generic(
         GenericError::new_internal(format!("unsupported Stone {kind}"), message.into())
@@ -1815,6 +1894,7 @@ else:
     fn rejects_unsupported_python_statements() {
         for source in [
             "import os",
+            "from json import loads",
             "async def f():\n    pass",
             "class C:\n    pass",
             "try:\n    x = 1\nfinally:\n    x = 2",
@@ -1823,6 +1903,22 @@ else:
         ] {
             assert_unsupported(source);
         }
+    }
+
+    #[test]
+    fn import_errors_include_module_specific_suggestions() {
+        let os_error = lower_source("import os").expect_err("import os");
+        let os_debug = format!("{os_error:?}");
+        assert!(os_debug.contains("Python import is not supported"));
+        assert!(os_debug.contains("ls(path)"));
+        assert!(os_debug.contains("find(path"));
+
+        let json_error =
+            lower_source("from json import loads").expect_err("from json import loads");
+        let json_debug = format!("{json_error:?}");
+        assert!(json_debug.contains("from json import loads"));
+        assert!(json_debug.contains("json_loads(text)"));
+        assert!(json_debug.contains("read_json(path)"));
     }
 
     #[test]
