@@ -159,7 +159,8 @@ Supported handlers are `except:`, `except Exception:`, and
 - `split(text, separator=None)`, `join(items, separator="")`,
   `slice(value, start=None, end=None)`, `starts_with(text, prefix)`, and
   `format(template, ...)`: small text/list helpers for scripts and dynamic
-  helper callbacks. String method forms such as `"a,b".split(",")` and
+  helper callbacks. String method forms such as `"a,b".split(",")`,
+  `line.strip()`, `line.lstrip()`, `line.rstrip()`, `text.isdigit()`, and
   `",".join(items)` are also supported.
 - `run(argv, cwd=None, stdin=None, timeout_ms=None, env=None)`: Linux command
   execution with structured stdout, stderr, status, and helper observations.

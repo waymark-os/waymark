@@ -1324,7 +1324,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "Functions: def name(arg) works; optional type annotations like def name(arg: str) -> str are checked; immutable default values are supported.",
             "try/except catches runtime evaluation errors; supported handlers are except:, except Exception:, and except Exception as e:.",
             "Lambdas: expression-only callbacks work in sort/map/filter, e.g. lambda r: r[\"name\"].",
-            "String split() supports both default whitespace splitting and explicit separators.",
+            "String methods include strip/lstrip/rstrip, isdigit, split/splitlines, replace, join, lower/upper, zfill, startswith, and endswith.",
             "set() returns an ordered unique list; set/list variables support .add(value) for unique append.",
             "Use emit(value) when you want structured data returned to the caller.",
         ],

@@ -4014,8 +4014,9 @@ impl Evaluator<'_> {
 
             let receiver = receiver.into_nu_value("method call")?;
             match method {
-                "strip" | "split" | "splitlines" | "replace" | "join" | "lower" | "upper"
-                | "zfill" | "startswith" | "endswith" => {
+                "strip" | "lstrip" | "rstrip" | "isdigit" | "split" | "splitlines"
+                | "replace" | "join" | "lower" | "upper" | "zfill" | "startswith"
+                | "endswith" => {
                     string_method_builtin(&receiver, method, &args).map(RuntimeValue::Nu)
                 }
                 "get" | "items" | "keys" | "values" => {
@@ -9106,6 +9107,13 @@ emit({
     "substring_find": "alpha beta".find("gamma"),
     "substring_find_from": "alpha beta beta".find("beta", 7),
     "trimmed": "[svc]:".strip("[]:"),
+    "left_trimmed": "  svc  ".lstrip(),
+    "right_trimmed": "  svc  ".rstrip(),
+    "left_chars": "xyxsvc".lstrip("xy"),
+    "right_chars": "svcxyx".rstrip("xy"),
+    "digits": "12345".isdigit(),
+    "empty_digits": "".isdigit(),
+    "mixed_digits": "12a".isdigit(),
     "positions": positions,
     "keys": keys,
     "json_line": json_lines[0]
@@ -9126,6 +9134,13 @@ emit({
                 "substring_find": -1,
                 "substring_find_from": 11,
                 "trimmed": "svc",
+                "left_trimmed": "svc  ",
+                "right_trimmed": "  svc",
+                "left_chars": "svc",
+                "right_chars": "svc",
+                "digits": true,
+                "empty_digits": false,
+                "mixed_digits": false,
                 "positions": ["0:alpha", "1:bee"],
                 "keys": ["region", "qty", "count"],
                 "json_line": "{\"count\":3,\"qty\":\"12\",\"region\":\"west\"}",

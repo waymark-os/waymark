@@ -1144,6 +1144,37 @@ pub(crate) fn string_method_builtin(
             };
             Ok(Value::string(stripped, Span::unknown()))
         }
+        "lstrip" => {
+            let stripped = match args {
+                [] => text.trim_start().to_owned(),
+                [chars] => {
+                    let chars = value_to_string(chars, "lstrip")?;
+                    text.trim_start_matches(|ch| chars.contains(ch)).to_owned()
+                }
+                _ => return Err(stone_error("lstrip", "lstrip() takes at most one argument")),
+            };
+            Ok(Value::string(stripped, Span::unknown()))
+        }
+        "rstrip" => {
+            let stripped = match args {
+                [] => text.trim_end().to_owned(),
+                [chars] => {
+                    let chars = value_to_string(chars, "rstrip")?;
+                    text.trim_end_matches(|ch| chars.contains(ch)).to_owned()
+                }
+                _ => return Err(stone_error("rstrip", "rstrip() takes at most one argument")),
+            };
+            Ok(Value::string(stripped, Span::unknown()))
+        }
+        "isdigit" => {
+            let [] = args else {
+                return Err(stone_error("isdigit", "isdigit() takes no arguments"));
+            };
+            Ok(Value::bool(
+                !text.is_empty() && text.chars().all(|ch| ch.is_ascii_digit()),
+                Span::unknown(),
+            ))
+        }
         "split" => {
             let parts = match args {
                 [] => text.split_whitespace().collect::<Vec<_>>(),
