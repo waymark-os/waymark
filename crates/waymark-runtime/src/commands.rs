@@ -740,6 +740,14 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "tuple",
+        signature: "tuple(value: list | record) -> list",
+        use_when: "Use as a Python-compatibility alias for list(value); Stone represents tuples as list values.",
+        examples: &[r#"names = tuple(counts)"#],
+        avoid: &["Use list(value) when you do not need Python compatibility for generated code."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "min",
         signature: "min(value: Any, ...values: Any) -> Any",
         use_when: "Use for the smallest comparable value.",
@@ -1183,9 +1191,9 @@ if starts_with(line, "ERROR"):
     },
     StoneHelpEntry {
         name: "print",
-        signature: "print(value: Any) -> Any",
+        signature: "print(...values: Any) -> Any",
         use_when: "Use only for diagnostic stdout during local probes.",
-        examples: &[r#"print("debug: " + str(count))"#],
+        examples: &[r#"print("debug:", count)"#],
         avoid: &["Use emit(value) for structured results and write_file/write_json for task outputs."],
         aliases: &[],
     },
@@ -1317,7 +1325,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
         bullets: &[
             "Assignments: name = value; counters[key] += 1 works after initialization.",
             "Blocks: if/elif/else, for, while, break, continue, pass use indentation.",
-            "Values: lists, tuples, records/dicts, slices, indexing, item assignment, True, False, None.",
+            "Values: lists, tuple literals as list values, records/dicts, slices, indexing, item assignment, True, False, None.",
             "Record fields can be read as row[\"name\"] or row.name when the field name is identifier-shaped.",
             "Operators: +, -, *, /, //, &, |, <<, >>, comparisons, and/or/not, membership, is None.",
             "Conditional expressions use Python's value if condition else fallback shape.",

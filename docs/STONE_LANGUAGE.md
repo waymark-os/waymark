@@ -69,6 +69,10 @@ Bitwise operators are integer-only: `&`, `|`, `^`, `<<`, `>>`, and `~` reject
 strings and floats. Shift counts must be non-negative and within the supported
 integer width.
 
+List literals use `[]`. Tuple literals use Python syntax but are represented as
+Stone list values, so `("left", "right")` and `["left", "right"]` have the same
+runtime behavior.
+
 Comparisons support numeric ordering across ints and floats, lexicographic
 string ordering, and lexicographic list ordering. Equality is recursive for
 lists and records, numeric across ints/floats, and strongly typed for booleans:
@@ -162,6 +166,8 @@ Supported handlers are `except:`, `except Exception:`, and
   helper callbacks. String method forms such as `"a,b".split(",")`,
   `line.strip()`, `line.lstrip()`, `line.rstrip()`, `text.isdigit()`, and
   `",".join(items)` are also supported.
+- `list(value)` and `tuple(value)`: materialize a list view. In Stone,
+  `tuple()` is an agent-compatibility alias for `list()`.
 - `run(argv, cwd=None, stdin=None, timeout_ms=None, env=None)`: Linux command
   execution with structured stdout, stderr, status, and helper observations.
 - `pwd()`, `cd(path)`: inspect or change the current Stone working directory

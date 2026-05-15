@@ -1769,7 +1769,7 @@ impl Evaluator<'_> {
                     .into_nu_value("len")?;
                 len_builtin(&value).map(RuntimeValue::Nu)
             }
-            "list" => self.eval_list_call(call),
+            "list" | "tuple" => self.eval_list_call(call),
             "str" => {
                 let [arg] = call.positional.as_slice() else {
                     return Err(stone_error("str", "str() requires exactly one argument"));
@@ -3547,18 +3547,22 @@ impl Evaluator<'_> {
     }
 
     fn eval_list_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let name = call.name.as_str();
         if !call.named.is_empty() {
             return Err(stone_error(
-                "list",
-                "list() keyword arguments are not supported",
+                name,
+                format!("{name}() keyword arguments are not supported"),
             ));
         }
         let [value] = call.positional.as_slice() else {
-            return Err(stone_error("list", "list() requires exactly one argument"));
+            return Err(stone_error(
+                name,
+                format!("{name}() requires exactly one argument"),
+            ));
         };
         let value = self
             .eval_expr_value(value, PipelineData::empty())?
-            .into_nu_value("list")?;
+            .into_nu_value(name)?;
         list_builtin(&value).map(RuntimeValue::Nu)
     }
 
@@ -3760,26 +3764,35 @@ impl Evaluator<'_> {
     }
 
     fn eval_print_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        let [arg] = call.positional.as_slice() else {
-            return Err(stone_error(
-                "print",
-                "print() requires exactly one argument. Use string concatenation such as `print(\"Line \" + str(i))`, or emit a list/record such as `emit([\"Line\", i, value])`",
-            ));
-        };
         if !call.named.is_empty() {
             return Err(stone_error(
                 "print",
                 "print() keyword arguments are not supported",
             ));
         }
-        let value = self
-            .eval_expr_value(arg, PipelineData::empty())?
-            .into_nu_value("print")?;
+        if call.positional.is_empty() {
+            self.state.stdout.push('\n');
+            return Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())));
+        }
+        let mut values = Vec::with_capacity(call.positional.len());
+        let mut parts = Vec::with_capacity(call.positional.len());
+        for arg in &call.positional {
+            let value = self
+                .eval_expr_value(arg, PipelineData::empty())?
+                .into_nu_value("print")?;
+            parts.push(value_to_display_string(&value)?);
+            values.push(value);
+        }
         self.state
             .stdout
-            .push_str(&value_to_display_string(&value)?);
+            .push_str(&parts.join(" "));
         self.state.stdout.push('\n');
-        Ok(RuntimeValue::Nu(value))
+        let result = if values.len() == 1 {
+            values.remove(0)
+        } else {
+            Value::list(values, Span::unknown())
+        };
+        Ok(RuntimeValue::Nu(result))
     }
 
     fn eval_range_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -4456,6 +4469,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "starts_with",
     "startswith",
     "tail",
+    "tuple",
     "last_result",
     "start_daemon",
     "daemon_status",
@@ -5443,7 +5457,9 @@ emit({
     "missing": record.get("missing", 9),
     "keys": record.keys(),
     "list_keys": list(record.keys()),
+    "tuple_keys": tuple(record.keys()),
     "record_as_list": list(record),
+    "record_as_tuple": tuple(record),
     "values": record.values(),
     "pairs": pairs,
 })
@@ -5457,7 +5473,9 @@ emit({
                 "missing": 9,
                 "keys": ["a", "b"],
                 "list_keys": ["a", "b"],
+                "tuple_keys": ["a", "b"],
                 "record_as_list": ["a", "b"],
+                "record_as_tuple": ["a", "b"],
                 "values": [1, 2],
                 "pairs": ["a:1", "b:2"],
             })
@@ -5749,18 +5767,21 @@ emit(lines)
     }
 
     #[test]
-    fn print_arity_error_suggests_typed_alternatives() -> Result<(), ShellError> {
-        let (engine_state, mut stack, root) = test_engine("print-arity-suggestion")?;
+    fn print_accepts_multiple_arguments() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("print-multiple-arguments")?;
         let program = lower_source(
             r#"print("Line", 1, ":", "value")
+print()
 "#,
         )?;
-        let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
-            .expect_err("multi-argument print should fail with suggestion");
-        let text = format!("{error:?}");
-        assert!(text.contains("print() requires exactly one argument"));
-        assert!(text.contains("string concatenation"));
-        assert!(text.contains("emit a list/record"));
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())?,
+            json_value!(null)
+        );
+        assert_eq!(output.stdout, "Line 1 : value\n\n");
 
         cleanup_dir(&root);
         Ok(())
