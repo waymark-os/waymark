@@ -1030,22 +1030,93 @@ pub(crate) fn slice_builtin(
     }
 }
 
-pub(crate) fn split_builtin(text: &Value, separator: Option<&Value>) -> Result<Value, ShellError> {
+pub(crate) fn split_builtin(
+    text: &Value,
+    separator: Option<&Value>,
+    maxsplit: Option<&Value>,
+) -> Result<Value, ShellError> {
     let text = value_to_string(text, "split")?;
-    let parts = match separator {
-        None => text.split_whitespace().collect::<Vec<_>>(),
+    let maxsplit = split_maxsplit(maxsplit)?;
+    split_text(&text, separator, maxsplit)
+}
+
+fn split_maxsplit(maxsplit: Option<&Value>) -> Result<Option<usize>, ShellError> {
+    maxsplit
+        .map(|value| {
+            let value = value_to_i64(value, "split maxsplit")?;
+            if value < 0 {
+                Ok(None)
+            } else {
+                usize::try_from(value)
+                    .map(Some)
+                    .map_err(|_| stone_error("split", "maxsplit is too large"))
+            }
+        })
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn split_text(
+    text: &str,
+    separator: Option<&Value>,
+    maxsplit: Option<usize>,
+) -> Result<Value, ShellError> {
+    let separator = match separator {
+        Some(Value::Nothing { .. }) => None,
+        other => other,
+    };
+    let parts: Vec<String> = match separator {
+        None => match maxsplit {
+            None => text.split_whitespace().map(str::to_owned).collect(),
+            Some(limit) => split_whitespace_limited(text, limit),
+        },
         Some(separator) => {
             let separator = value_to_string(separator, "split")?;
-            text.split(&separator).collect::<Vec<_>>()
+            if separator.is_empty() {
+                return Err(stone_error("split", "empty separator is not supported"));
+            }
+            match maxsplit {
+                None => text.split(&separator).map(str::to_owned).collect(),
+                Some(limit) => text
+                    .splitn(limit + 1, &separator)
+                    .map(str::to_owned)
+                    .collect(),
+            }
         }
     };
     Ok(Value::list(
         parts
             .into_iter()
-            .map(|part| Value::string(part.to_owned(), Span::unknown()))
+            .map(|part| Value::string(part, Span::unknown()))
             .collect(),
         Span::unknown(),
     ))
+}
+
+fn split_whitespace_limited(text: &str, limit: usize) -> Vec<String> {
+    let mut rest = text.trim_start_matches(char::is_whitespace);
+    if rest.is_empty() {
+        return Vec::new();
+    }
+    if limit == 0 {
+        return vec![rest.to_owned()];
+    }
+
+    let mut parts = Vec::new();
+    for _ in 0..limit {
+        let Some((start, _)) = rest.char_indices().find(|(_, ch)| ch.is_whitespace()) else {
+            parts.push(rest.to_owned());
+            return parts;
+        };
+        parts.push(rest[..start].to_owned());
+        let after_word = &rest[start..];
+        rest = after_word.trim_start_matches(char::is_whitespace);
+        if rest.is_empty() {
+            return parts;
+        }
+    }
+    parts.push(rest.to_owned());
+    parts
 }
 
 pub(crate) fn sort_key_for_value(value: &Value, field: Option<&str>) -> Result<Value, ShellError> {
@@ -1176,21 +1247,18 @@ pub(crate) fn string_method_builtin(
             ))
         }
         "split" => {
-            let parts = match args {
-                [] => text.split_whitespace().collect::<Vec<_>>(),
-                [separator] => {
-                    let separator = value_to_string(separator, "split")?;
-                    text.split(&separator).collect::<Vec<_>>()
+            let (separator, maxsplit) = match args {
+                [] => (None, None),
+                [separator] => (Some(separator), None),
+                [separator, maxsplit] => (Some(separator), Some(maxsplit)),
+                _ => {
+                    return Err(stone_error(
+                        "split",
+                        "split() takes separator and optional maxsplit",
+                    ));
                 }
-                _ => return Err(stone_error("split", "split() takes at most one argument")),
             };
-            Ok(Value::list(
-                parts
-                    .into_iter()
-                    .map(|part| Value::string(part.to_owned(), Span::unknown()))
-                    .collect(),
-                Span::unknown(),
-            ))
+            split_text(text, separator, split_maxsplit(maxsplit)?)
         }
         "splitlines" => {
             let [] = args else {

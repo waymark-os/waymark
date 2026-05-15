@@ -1081,12 +1081,6 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
             }))
         }
         py::Expr::Attribute(attribute) => {
-            if !call.arguments.keywords.is_empty() {
-                return Err(unsupported_message(
-                    "method call",
-                    "method keyword arguments are not supported yet",
-                ));
-            }
             let method = attribute.attr.to_string();
             if !matches!(
                 method.as_str(),
@@ -1099,9 +1093,12 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
                     | "index"
                     | "join"
                     | "keys"
+                    | "isdigit"
+                    | "lstrip"
                     | "lower"
                     | "read"
                     | "replace"
+                    | "rstrip"
                     | "strip"
                     | "split"
                     | "splitlines"
@@ -1116,6 +1113,42 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
                     "method call",
                     format!("unsupported method `{method}`"),
                 ));
+            }
+            let mut positional = positional;
+            if !call.arguments.keywords.is_empty() {
+                if method != "split" {
+                    return Err(unsupported_message(
+                        "method call",
+                        "method keyword arguments are not supported yet",
+                    ));
+                }
+                for keyword in call.arguments.keywords.into_vec() {
+                    let Some(name) = keyword.arg else {
+                        return Err(unsupported_message(
+                            "method call",
+                            "keyword spread is not supported yet",
+                        ));
+                    };
+                    if name.as_str() != "maxsplit" {
+                        return Err(unsupported_message(
+                            "method call",
+                            format!("unsupported split() keyword argument `{name}`"),
+                        ));
+                    }
+                    match positional.len() {
+                        0 => {
+                            positional.push(Expr::None);
+                            positional.push(lower_expr(keyword.value)?);
+                        }
+                        1 => positional.push(lower_expr(keyword.value)?),
+                        _ => {
+                            return Err(unsupported_message(
+                                "method call",
+                                "split() got multiple maxsplit values",
+                            ));
+                        }
+                    }
+                }
             }
             Ok(Expr::MethodCall {
                 receiver: Box::new(lower_expr(*attribute.value)?),

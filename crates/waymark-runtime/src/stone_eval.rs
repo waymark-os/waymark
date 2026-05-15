@@ -3615,16 +3615,24 @@ impl Evaluator<'_> {
     }
 
     fn eval_split_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        if !call.named.is_empty() {
-            return Err(stone_error(
-                "split",
-                "split() keyword arguments are not supported",
-            ));
+        let mut named_maxsplit = None;
+        for (name, value) in &call.named {
+            if name == "maxsplit" && named_maxsplit.is_none() {
+                named_maxsplit = Some(value);
+            } else {
+                return Err(stone_error(
+                    "split",
+                    format!("split() unsupported keyword argument `{name}`"),
+                ));
+            }
         }
-        let ([text] | [text, _]) = call.positional.as_slice() else {
+        if named_maxsplit.is_some() && call.positional.len() > 2 {
+            return Err(stone_error("split", "split() got multiple maxsplit values"));
+        }
+        let ([text] | [text, _] | [text, _, _]) = call.positional.as_slice() else {
             return Err(stone_error(
                 "split",
-                "split() requires text and optional separator",
+                "split() requires text, optional separator, and optional maxsplit",
             ));
         };
         let text = self
@@ -3632,7 +3640,7 @@ impl Evaluator<'_> {
             .into_nu_value("split")?;
         let separator = match call.positional.as_slice() {
             [_] => None,
-            [_, separator] => {
+            [_, separator] | [_, separator, _] => {
                 let separator = self
                     .eval_expr_value(separator, PipelineData::empty())?
                     .into_nu_value("split")?;
@@ -3640,7 +3648,18 @@ impl Evaluator<'_> {
             }
             _ => unreachable!(),
         };
-        split_builtin(&text, separator.as_ref()).map(RuntimeValue::Nu)
+        let maxsplit = match call.positional.as_slice() {
+            [_, _, maxsplit] => Some(
+                self.eval_expr_value(maxsplit, PipelineData::empty())?
+                    .into_nu_value("split")?,
+            ),
+            _ => named_maxsplit
+                .map(|expr| self.eval_expr_value(expr, PipelineData::empty()))
+                .transpose()?
+                .map(|value| value.into_nu_value("split"))
+                .transpose()?,
+        };
+        split_builtin(&text, separator.as_ref(), maxsplit.as_ref()).map(RuntimeValue::Nu)
     }
 
     fn eval_join_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -3783,9 +3802,7 @@ impl Evaluator<'_> {
             parts.push(value_to_display_string(&value)?);
             values.push(value);
         }
-        self.state
-            .stdout
-            .push_str(&parts.join(" "));
+        self.state.stdout.push_str(&parts.join(" "));
         self.state.stdout.push('\n');
         let result = if values.len() == 1 {
             values.remove(0)
@@ -4027,9 +4044,8 @@ impl Evaluator<'_> {
 
             let receiver = receiver.into_nu_value("method call")?;
             match method {
-                "strip" | "lstrip" | "rstrip" | "isdigit" | "split" | "splitlines"
-                | "replace" | "join" | "lower" | "upper" | "zfill" | "startswith"
-                | "endswith" => {
+                "strip" | "lstrip" | "rstrip" | "isdigit" | "split" | "splitlines" | "replace"
+                | "join" | "lower" | "upper" | "zfill" | "startswith" | "endswith" => {
                     string_method_builtin(&receiver, method, &args).map(RuntimeValue::Nu)
                 }
                 "get" | "items" | "keys" | "values" => {
@@ -4986,7 +5002,9 @@ mod tests {
         commands::{
             stone_help_documented_names_for_tests, stone_help_entries_without_examples_for_tests,
         },
-        json, stone_ast::lower_source, stone_vm::LoopIrOptimizationDiagnostic,
+        json,
+        stone_ast::lower_source,
+        stone_vm::LoopIrOptimizationDiagnostic,
     };
     use nu_protocol::{
         engine::{EngineState, Stack},
@@ -6270,7 +6288,20 @@ emit({"total": total, "kept": kept, "count": len(kept), "has_20": "20" in kept})
         let (engine_state, mut stack, root) = test_engine("split-endswith")?;
         let program = lower_source(
             r#"parts = "alpha,beta.txt".split(",")
-emit({"left": parts[0], "right": parts[1], "txt": parts[1].endswith(".txt"), "missing": "gamma" not in parts})
+limited = "a:b:c".split(":", 1)
+keyword_limited = "a:b:c".split(":", maxsplit=1)
+top_limited = split("a:b:c", ":", 1)
+top_keyword_limited = split("a b  c", None, maxsplit=1)
+emit({
+    "left": parts[0],
+    "right": parts[1],
+    "txt": parts[1].endswith(".txt"),
+    "missing": "gamma" not in parts,
+    "limited": limited,
+    "keyword_limited": keyword_limited,
+    "top_limited": top_limited,
+    "top_keyword_limited": top_keyword_limited,
+})
 "#,
         )?;
         let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
@@ -6282,6 +6313,10 @@ emit({"left": parts[0], "right": parts[1], "txt": parts[1].endswith(".txt"), "mi
                 "right": "beta.txt",
                 "txt": true,
                 "missing": true,
+                "limited": ["a", "b:c"],
+                "keyword_limited": ["a", "b:c"],
+                "top_limited": ["a", "b:c"],
+                "top_keyword_limited": ["a", "b  c"],
             })
         );
 

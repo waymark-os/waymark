@@ -160,12 +160,13 @@ Supported handlers are `except:`, `except Exception:`, and
   semantics.
 - `set()` and `set(iterable)`: materialize a deterministic unique list. The
   `.add(value)` method appends only values not already present.
-- `split(text, separator=None)`, `join(items, separator="")`,
+- `split(text, separator=None, maxsplit=None)`, `join(items, separator="")`,
   `slice(value, start=None, end=None)`, `starts_with(text, prefix)`, and
   `format(template, ...)`: small text/list helpers for scripts and dynamic
   helper callbacks. String method forms such as `"a,b".split(",")`,
-  `line.strip()`, `line.lstrip()`, `line.rstrip()`, `text.isdigit()`, and
-  `",".join(items)` are also supported.
+  `line.split(":", 1)`, `line.split(":", maxsplit=1)`, `line.strip()`,
+  `line.lstrip()`, `line.rstrip()`, `text.isdigit()`, and `",".join(items)`
+  are also supported.
 - `list(value)` and `tuple(value)`: materialize a list view. In Stone,
   `tuple()` is an agent-compatibility alias for `list()`.
 - `run(argv, cwd=None, stdin=None, timeout_ms=None, env=None)`: Linux command
