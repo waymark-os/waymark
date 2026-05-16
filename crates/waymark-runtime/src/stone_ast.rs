@@ -267,10 +267,12 @@ pub struct ComprehensionClause {
 
 pub fn lower_source(source: &str) -> Result<Program, ShellError> {
     let parsed = ruff_python_parser::parse_module(source).map_err(|err| {
-        ShellError::Generic(
-            GenericError::new_internal("python parse error", err.to_string())
-                .with_code("stone_parse_error"),
-        )
+        let mut error = GenericError::new_internal("python parse error", err.to_string())
+            .with_code("stone_parse_error");
+        if source.lines().any(|line| line.trim_start().starts_with("//")) {
+            error = error.with_help("Stone comments use #. The // operator is floor division, not a comment.");
+        }
+        ShellError::Generic(error)
     })?;
 
     lower_module(parsed.into_syntax())
@@ -1919,6 +1921,15 @@ else:
         assert!(json_debug.contains("from json import loads"));
         assert!(json_debug.contains("json_loads(text)"));
         assert!(json_debug.contains("read_json(path)"));
+    }
+
+    #[test]
+    fn parse_errors_suggest_hash_comments_for_slash_comments() {
+        let err = lower_source("// inspect input\nrows = []").expect_err("slash comment");
+        let debug = format!("{err:?}");
+        assert!(debug.contains("stone_parse_error"));
+        assert!(debug.contains("Stone comments use #"));
+        assert!(debug.contains("// operator is floor division"));
     }
 
     #[test]
