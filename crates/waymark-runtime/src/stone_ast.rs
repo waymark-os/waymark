@@ -1235,6 +1235,9 @@ fn import_suggestions_for_module(module: &str) -> &'static str {
         "base64" => {
             "Stone has no base64 builtin yet; use run([\"base64\", ...]) only when the task explicitly allows POSIX tools."
         }
+        "hashlib" => {
+            "Stone replacements for hashlib: use md5(text), sha1(text), or sha256(text) for lowercase hexadecimal digests."
+        }
         "re" => {
             "Stone has no regex module yet; use search(root, needle) for literal file search or string split/find/startswith/endswith for simple parsing."
         }
@@ -1921,6 +1924,13 @@ else:
         assert!(json_debug.contains("from json import loads"));
         assert!(json_debug.contains("json_loads(text)"));
         assert!(json_debug.contains("read_json(path)"));
+
+        let hashlib_error = lower_source("import hashlib").expect_err("import hashlib");
+        let hashlib_debug = format!("{hashlib_error:?}");
+        assert!(hashlib_debug.contains("Python import is not supported"));
+        assert!(hashlib_debug.contains("md5(text)"));
+        assert!(hashlib_debug.contains("sha1(text)"));
+        assert!(hashlib_debug.contains("sha256(text)"));
     }
 
     #[test]

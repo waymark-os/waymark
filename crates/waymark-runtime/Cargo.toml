@@ -10,6 +10,7 @@ name = "waymark_runtime"
 asset-image = { path = "../asset-image" }
 waymark-runtime-support = { path = "../waymark-runtime-support" }
 libc = "0.2.186"
+md5 = { version = "0.10", package = "md-5" }
 memchr = "2.8.0"
 nu-engine = { version = "0.112.2", default-features = false }
 nu-parser = "0.112.2"
@@ -18,6 +19,8 @@ regex = "1.12.2"
 ruff_python_parser = { git = "https://github.com/astral-sh/ruff", tag = "0.15.11", package = "ruff_python_parser" }
 ruff_python_ast = { git = "https://github.com/astral-sh/ruff", tag = "0.15.11", package = "ruff_python_ast" }
 serde_json = "1.0"
+sha1 = "0.10"
+sha2 = "0.10"
 
 [features]
 default = []

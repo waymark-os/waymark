@@ -32,6 +32,7 @@ use crate::stone_builtins::{
     value_to_path_string, value_to_string, value_to_u64, value_truthy, value_type_name,
     where_builtin, where_compare_builtin, zfill_text,
 };
+use crate::stone_hash::hash_builtin;
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_file_ops::{
     cat_text, create_dir_all, diff_record_for_paths, edit_text_file, find_records, io_stone_error,
@@ -1785,6 +1786,7 @@ impl Evaluator<'_> {
                     .into_nu_value("str")?;
                 str_builtin(&value).map(RuntimeValue::Nu)
             }
+            "md5" | "sha1" | "sha256" => self.eval_hash_call(call),
             "type" => self.eval_type_call(call),
             "any" => self.eval_any_all_call(call, true),
             "all" => self.eval_any_all_call(call, false),
@@ -3614,6 +3616,27 @@ impl Evaluator<'_> {
         list_builtin(&value).map(RuntimeValue::Nu)
     }
 
+    fn eval_hash_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let name = call.name.as_str();
+        if !call.named.is_empty() {
+            return Err(stone_error(
+                name,
+                format!("{name}() keyword arguments are not supported"),
+            ));
+        }
+        let [value] = call.positional.as_slice() else {
+            return Err(stone_error(
+                name,
+                format!("{name}() requires exactly one argument"),
+            ));
+        };
+        let value = self
+            .eval_expr_value(value, PipelineData::empty())?
+            .into_nu_value(name)?;
+        let text = value_to_string(&value, name)?;
+        hash_builtin(name, &text).map(RuntimeValue::Nu)
+    }
+
     fn eval_type_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let [arg] = call.positional.as_slice() else {
             return Err(stone_error("type", "type() requires exactly one argument"));
@@ -4510,6 +4533,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "join",
     "map",
     "max",
+    "md5",
     "min",
     "mkdir",
     "open",
@@ -4541,6 +4565,8 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "wait_port",
     "save",
     "search",
+    "sha1",
+    "sha256",
     "sort",
     "sorted",
     "stat",
@@ -6148,6 +6174,33 @@ emit({
                 "unsupported_conditional": false,
                 "unsupported_default_args": false,
                 "unsupported_default_split": false,
+            })
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn evaluates_hash_builtins() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("hash-builtins")?;
+        let program = lower_source(
+            r#"
+emit({
+    "md5": md5("abcdefghijklmnopqrstuvwxyz"),
+    "sha1": sha1("abcdefghijklmnopqrstuvwxyz"),
+    "sha256": sha256("abcdefghijklmnopqrstuvwxyz"),
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "md5": "c3fcd3d76192e4007dfb496cca67e13b",
+                "sha1": "32d10c7b8cf96570ca04ce37f2a19d84240d3a89",
+                "sha256": "71c480df93d6ae2f1efad1447c66c9525e316218cf51fc8d9ed832f2daf18b73",
             })
         );
 
