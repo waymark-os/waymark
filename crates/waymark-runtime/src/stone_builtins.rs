@@ -452,7 +452,7 @@ pub(crate) fn list_builtin(value: &Value) -> Result<Value, ShellError> {
 }
 
 pub(crate) fn is_map_builtin_name(func_name: &str) -> bool {
-    matches!(func_name, "int" | "float" | "json_dumps" | "str")
+    matches!(func_name, "int" | "float" | "json_dumps" | "repr" | "str")
 }
 
 pub(crate) fn map_builtin_value(func_name: &str, value: &Value) -> Result<Value, ShellError> {
@@ -462,7 +462,7 @@ pub(crate) fn map_builtin_value(func_name: &str, value: &Value) -> Result<Value,
         "json_dumps" => serde_json::to_string(&nu_to_json_value(value))
             .map(|text| Value::string(text, Span::unknown()))
             .map_err(|err| stone_error("map", err.to_string())),
-        "str" => str_builtin(value),
+        "repr" | "str" => str_builtin(value),
         other => Err(stone_error(
             "map",
             format!("map() does not support `{other}` yet"),

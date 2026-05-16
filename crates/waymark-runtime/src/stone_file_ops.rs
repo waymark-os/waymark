@@ -639,27 +639,24 @@ fn stone_wildcard_match(pattern: &str, text: &str) -> bool {
 }
 
 fn parse_csv_records(text: &str, limit: Option<usize>) -> Result<Vec<Value>, ShellError> {
-    let mut lines = text.lines();
-    let Some(header_line) = lines.next() else {
+    let records = parse_csv_record_fields(text).map_err(|err| stone_error("read_csv", err))?;
+    let Some(headers) = records.first() else {
         return Ok(Vec::new());
     };
-    let headers = parse_csv_line(header_line).map_err(|err| stone_error("read_csv", err))?;
     let mut rows = Vec::new();
-    for (line_index, line) in lines.enumerate() {
+    for (record_index, fields) in records.iter().skip(1).enumerate() {
         if limit.is_some_and(|limit| rows.len() >= limit) {
             break;
         }
-        if line.is_empty() {
+        if fields.len() == 1 && fields[0].is_empty() {
             continue;
         }
-        let fields = parse_csv_line(line)
-            .map_err(|err| stone_error("read_csv", format!("line {}: {err}", line_index + 2)))?;
         if fields.len() != headers.len() {
             return Err(stone_error(
                 "read_csv",
                 format!(
-                    "line {} has {} field(s), expected {}",
-                    line_index + 2,
+                    "record {} has {} field(s), expected {}",
+                    record_index + 2,
                     fields.len(),
                     headers.len()
                 ),
@@ -674,10 +671,11 @@ fn parse_csv_records(text: &str, limit: Option<usize>) -> Result<Vec<Value>, She
     Ok(rows)
 }
 
-fn parse_csv_line(line: &str) -> Result<Vec<String>, String> {
-    let mut fields = Vec::new();
+fn parse_csv_record_fields(text: &str) -> Result<Vec<Vec<String>>, String> {
+    let mut records = Vec::new();
+    let mut record = Vec::new();
     let mut field = String::new();
-    let mut chars = line.chars().peekable();
+    let mut chars = text.chars().peekable();
     let mut in_quotes = false;
     while let Some(ch) = chars.next() {
         match ch {
@@ -689,7 +687,18 @@ fn parse_csv_line(line: &str) -> Result<Vec<String>, String> {
                 in_quotes = !in_quotes;
             }
             ',' if !in_quotes => {
-                fields.push(std::mem::take(&mut field));
+                record.push(std::mem::take(&mut field));
+            }
+            '\n' if !in_quotes => {
+                record.push(std::mem::take(&mut field));
+                records.push(std::mem::take(&mut record));
+            }
+            '\r' if !in_quotes => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                record.push(std::mem::take(&mut field));
+                records.push(std::mem::take(&mut record));
             }
             _ => field.push(ch),
         }
@@ -697,8 +706,11 @@ fn parse_csv_line(line: &str) -> Result<Vec<String>, String> {
     if in_quotes {
         return Err("unterminated quoted field".to_owned());
     }
-    fields.push(field);
-    Ok(fields)
+    if !field.is_empty() || !record.is_empty() {
+        record.push(field);
+        records.push(record);
+    }
+    Ok(records)
 }
 
 trait StoneFileAdapter {

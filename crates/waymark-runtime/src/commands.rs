@@ -724,6 +724,14 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "repr",
+        signature: "repr(value: Any) -> str",
+        use_when: "Use as a Python-compatibility alias for str(value) when generated code wants a printable representation.",
+        examples: &[r#"debug = repr(["ok", 2])"#],
+        avoid: &["Use json_dumps(value) when the output must be valid JSON."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "len",
         signature: "len(value: str | list | record) -> int",
         use_when: "Use for counts and compact summaries of large values.",
@@ -894,7 +902,7 @@ for line in open("/app/input.txt"):
     StoneHelpEntry {
         name: "read_csv",
         signature: "read_csv(path_or_file: str | record, limit: int? = None) -> list[record]",
-        use_when: "Use for headered CSV. Values are strings.",
+        use_when: "Use for headered CSV. Values are strings. Quoted fields may contain commas, quotes, and newlines.",
         examples: &[
             r#"rows = read_csv("/app/input.csv")"#,
             r#"sample = read_csv("/app/input.csv", limit=5)"#,

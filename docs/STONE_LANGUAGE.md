@@ -141,7 +141,7 @@ Supported handlers are `except:`, `except Exception:`, and
 - `read_text(path)`, `write_text(path, text)`: text file I/O.
 - `read_json(path)`, `write_json(path, value)`: JSON file I/O.
 - `read_jsonl(path)`, `write_jsonl(path, rows)`: JSONL file I/O.
-- `read_csv(path)`: CSV records.
+- `read_csv(path)`: headered CSV records, including multiline quoted fields.
 - `write_csv(path, rows, columns=None)`: write headered CSV from record rows
   with standard CSV quoting.
 - `find(root, name_glob="*", path_glob=None, type=None, min_size=None,
@@ -162,6 +162,9 @@ Supported handlers are `except:`, `except Exception:`, and
   semantics.
 - `set()` and `set(iterable)`: materialize a deterministic unique list. The
   `.add(value)` method appends only values not already present.
+- `str(value)` and `repr(value)`: convert a typed value to display text.
+  `repr()` is a Python-compatibility alias; use `json_dumps(value)` when valid
+  JSON text is required.
 - `split(text, separator=None, maxsplit=None)`, `join(items, separator="")`,
   `slice(value, start=None, end=None)`, `starts_with(text, prefix)`, and
   `format(template, ...)`: small text/list helpers for scripts and dynamic

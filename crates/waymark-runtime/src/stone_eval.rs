@@ -1771,19 +1771,23 @@ impl Evaluator<'_> {
                 len_builtin(&value).map(RuntimeValue::Nu)
             }
             "list" | "tuple" => self.eval_list_call(call),
-            "str" => {
+            "repr" | "str" => {
+                let name = call.name.as_str();
                 let [arg] = call.positional.as_slice() else {
-                    return Err(stone_error("str", "str() requires exactly one argument"));
+                    return Err(stone_error(
+                        name,
+                        format!("{name}() requires exactly one argument"),
+                    ));
                 };
                 if !call.named.is_empty() {
                     return Err(stone_error(
-                        "str",
-                        "str() keyword arguments are not supported",
+                        name,
+                        format!("{name}() keyword arguments are not supported"),
                     ));
                 }
                 let value = self
                     .eval_expr_value(arg, PipelineData::empty())?
-                    .into_nu_value("str")?;
+                    .into_nu_value(name)?;
                 str_builtin(&value).map(RuntimeValue::Nu)
             }
             "md5" | "sha1" | "sha256" => self.eval_hash_call(call),
@@ -4626,6 +4630,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "pwd",
     "cd",
     "range",
+    "repr",
     "read_file",
     "read_text",
     "read_csv",
@@ -6733,6 +6738,7 @@ emit({
     "startswith": startswith("abcdef", "def"),
     "format": format("{}:{} {{ok}}", "port", 8080),
     "max": max(1, 7, 3),
+    "repr": repr(["ok", 2]),
 })
 "#,
         )?;
@@ -6751,6 +6757,7 @@ emit({
                 "startswith": false,
                 "format": "port:8080 {ok}",
                 "max": 7,
+                "repr": "[\"ok\",2]",
             })
         );
 
@@ -6874,6 +6881,38 @@ emit({
                 "name": "North West Capital",
                 "account": "BUS-1",
                 "description": "alpha, beta",
+            })
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn evaluates_read_csv_records_with_multiline_quoted_fields() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("read-csv-multiline")?;
+        fs::write(
+            root.join("input.csv"),
+            "id,note\n1,\"alpha\nbeta\"\n2,\"said \"\"ok\"\"\"\n",
+        )
+        .expect("write csv");
+        let program = lower_source(
+            r#"rows = read_csv("input.csv", limit=1)
+emit({
+    "count": len(rows),
+    "id": rows[0]["id"],
+    "note": rows[0]["note"]
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "count": 1,
+                "id": "1",
+                "note": "alpha\nbeta",
             })
         );
 
