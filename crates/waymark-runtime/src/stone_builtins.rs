@@ -1246,6 +1246,34 @@ pub(crate) fn string_method_builtin(
                 Span::unknown(),
             ))
         }
+        "isalpha" => {
+            let [] = args else {
+                return Err(stone_error("isalpha", "isalpha() takes no arguments"));
+            };
+            Ok(Value::bool(
+                !text.is_empty() && text.chars().all(|ch| ch.is_alphabetic()),
+                Span::unknown(),
+            ))
+        }
+        "count" => {
+            let [needle] = args else {
+                return Err(stone_error(
+                    "count",
+                    "count() requires exactly one argument",
+                ));
+            };
+            let needle = value_to_string(needle, "count")?;
+            if needle.is_empty() {
+                let count = text.chars().count().saturating_add(1);
+                let count =
+                    i64::try_from(count).map_err(|_| stone_error("count", "count is too large"))?;
+                return Ok(Value::int(count, Span::unknown()));
+            }
+            let count = text.match_indices(&needle).count();
+            let count =
+                i64::try_from(count).map_err(|_| stone_error("count", "count is too large"))?;
+            Ok(Value::int(count, Span::unknown()))
+        }
         "split" => {
             let (separator, maxsplit) = match args {
                 [] => (None, None),

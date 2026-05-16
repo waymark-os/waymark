@@ -22,10 +22,10 @@ mod server;
 mod stone_ast;
 mod stone_builtins;
 mod stone_eval;
-mod stone_hash;
 #[cfg(not(target_os = "hermit"))]
 mod stone_file_ops;
 mod stone_frontend;
+mod stone_hash;
 mod stone_helpers;
 mod stone_run;
 mod stone_vm;

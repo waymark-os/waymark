@@ -32,7 +32,6 @@ use crate::stone_builtins::{
     value_to_path_string, value_to_string, value_to_u64, value_truthy, value_type_name,
     where_builtin, where_compare_builtin, zfill_text,
 };
-use crate::stone_hash::hash_builtin;
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_file_ops::{
     cat_text, create_dir_all, diff_record_for_paths, edit_text_file, find_records, io_stone_error,
@@ -41,6 +40,7 @@ use crate::stone_file_ops::{
     write_json_file, write_jsonl_file, write_text as stone_write_text, RuntimeFile,
     StoneFindOptions,
 };
+use crate::stone_hash::hash_builtin;
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_helpers::{
     helper_error_observation, stone_helper_observations_from_value, stone_helper_registry,
@@ -1662,7 +1662,7 @@ impl Evaluator<'_> {
                 }
                 Expr::Generator { .. } => Err(stone_error(
                     "generator expression",
-                    "generator expressions are only supported inside sum(...) for now",
+                    "generator expressions are only supported inside sum(...), any(...), and all(...) for now; use a list comprehension like [expr for x in items] when you need a list",
                 )),
                 Expr::Lambda { params, body } => Ok(RuntimeValue::Callable(CallableValue {
                     function_id: self.state.next_callable_id(),
@@ -3999,25 +3999,25 @@ impl Evaluator<'_> {
                     }
                 }
             }
-            "splitlines" => {
+            "splitlines" | "readlines" => {
                 let [] = args else {
                     return Err(stone_error(
-                        "splitlines",
-                        "splitlines() takes no arguments for now",
+                        method,
+                        format!("{method}() takes no arguments for now"),
                     ));
                 };
                 match self.state.file_mut(handle)? {
                     RuntimeFile::Read { text, closed, .. } => {
                         if *closed {
-                            return Err(stone_error("splitlines", "I/O operation on closed file"));
+                            return Err(stone_error(method, "I/O operation on closed file"));
                         }
                         Ok(RuntimeValue::TextLines(TextLines {
                             lines: text.lines().map(str::to_owned).collect(),
-                            source: "open(...).splitlines()".to_owned(),
+                            source: format!("open(...).{method}()"),
                         }))
                     }
                     RuntimeFile::Write { .. } => {
-                        Err(stone_error("splitlines", "file is not open for reading"))
+                        Err(stone_error(method, "file is not open for reading"))
                     }
                 }
             }
@@ -4093,6 +4093,12 @@ impl Evaluator<'_> {
             if method == "append" {
                 return self.eval_append_call(receiver, positional);
             }
+            if method == "extend" {
+                return self.eval_extend_call(receiver, positional);
+            }
+            if method == "sort" {
+                return self.eval_sort_method_call(receiver, positional);
+            }
             if method == "add" {
                 return self.eval_add_method_call(receiver, positional);
             }
@@ -4115,10 +4121,11 @@ impl Evaluator<'_> {
 
             let receiver = receiver.into_nu_value("method call")?;
             match method {
-                "strip" | "lstrip" | "rstrip" | "isdigit" | "split" | "splitlines" | "replace"
-                | "join" | "lower" | "upper" | "zfill" | "startswith" | "endswith" => {
+                "strip" | "lstrip" | "rstrip" | "isdigit" | "isalpha" | "split" | "splitlines"
+                | "replace" | "join" | "lower" | "upper" | "zfill" | "startswith" | "endswith" => {
                     string_method_builtin(&receiver, method, &args).map(RuntimeValue::Nu)
                 }
+                "count" => self.eval_count_method(receiver, &args),
                 "get" | "items" | "keys" | "values" => {
                     record_method_builtin(&receiver, method, &args).map(RuntimeValue::Nu)
                 }
@@ -4155,6 +4162,47 @@ impl Evaluator<'_> {
         Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())))
     }
 
+    fn eval_extend_call(
+        &mut self,
+        receiver: &Expr,
+        positional: &[Expr],
+    ) -> Result<RuntimeValue, ShellError> {
+        let [arg] = positional else {
+            return Err(stone_error(
+                "extend",
+                "extend() requires exactly one iterable argument",
+            ));
+        };
+        let values = self
+            .eval_iterable_expr(arg)?
+            .into_iter()
+            .map(|value| value.into_nu_value("extend"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let target = self.mutable_list_method_target(receiver, "extend")?;
+        target.extend(values);
+        Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())))
+    }
+
+    fn eval_sort_method_call(
+        &mut self,
+        receiver: &Expr,
+        positional: &[Expr],
+    ) -> Result<RuntimeValue, ShellError> {
+        if !positional.is_empty() {
+            return Err(stone_error(
+                "sort",
+                "sort() method takes no arguments; use top-level sort(values, key=..., reverse=...) for advanced sorting",
+            ));
+        }
+        let target = self.mutable_list_method_target(receiver, "sort")?;
+        let sorted = sort_builtin_values(target.clone(), false, |value| Ok(value.clone()))?;
+        let Value::List { vals, .. } = sorted else {
+            unreachable!("sort_builtin_values returns a list");
+        };
+        *target = vals;
+        Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())))
+    }
+
     fn eval_add_method_call(
         &mut self,
         receiver: &Expr,
@@ -4175,6 +4223,41 @@ impl Evaluator<'_> {
         }
         vals.push(value);
         Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())))
+    }
+
+    fn eval_count_method(
+        &mut self,
+        receiver: Value,
+        args: &[Value],
+    ) -> Result<RuntimeValue, ShellError> {
+        let [needle] = args else {
+            return Err(stone_error(
+                "count",
+                "count() requires exactly one argument",
+            ));
+        };
+        match receiver {
+            Value::String { .. } | Value::Glob { .. } => {
+                string_method_builtin(&receiver, "count", args).map(RuntimeValue::Nu)
+            }
+            Value::List { vals, .. } => {
+                let needle_key = value_identity_key(needle, "count")?;
+                let count = vals
+                    .iter()
+                    .map(|value| value_identity_key(value, "count"))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .filter(|key| key == &needle_key)
+                    .count();
+                let count =
+                    i64::try_from(count).map_err(|_| stone_error("count", "count is too large"))?;
+                Ok(RuntimeValue::Nu(Value::int(count, Span::unknown())))
+            }
+            other => Err(stone_error(
+                "count",
+                format!("{} has no count()", other.get_type()),
+            )),
+        }
     }
 
     fn mutable_list_method_target(
@@ -6203,6 +6286,59 @@ emit({
                 "sha256": "71c480df93d6ae2f1efad1447c66c9525e316218cf51fc8d9ed832f2daf18b73",
             })
         );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn evaluates_common_python_method_compatibility() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("common-methods")?;
+        fs::write(root.join("input.txt"), "alpha\nbeta\n").expect("write input fixture");
+        let program = lower_source(
+            r#"
+items = [3, 1]
+items.extend([2, 3])
+items.sort()
+lines = open("input.txt").readlines()
+emit({
+    "items": items,
+    "list_count": items.count(3),
+    "text_count": "banana".count("an"),
+    "alpha": "abcXYZ".isalpha(),
+    "mixed_alpha": "abc123".isalpha(),
+    "lines": lines,
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "items": [1, 2, 3, 3],
+                "list_count": 2,
+                "text_count": 2,
+                "alpha": true,
+                "mixed_alpha": false,
+                "lines": ["alpha", "beta"],
+            })
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn generator_expression_error_mentions_supported_contexts() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("generator-error")?;
+        let program = lower_source(r#"emit(int(x) for x in ["1"])"#)?;
+        let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("bare generator expression should fail");
+        let text = format!("{err:?}");
+
+        assert!(text.contains("sum(...), any(...), and all(...)"));
+        assert!(text.contains("list comprehension"));
 
         cleanup_dir(&root);
         Ok(())

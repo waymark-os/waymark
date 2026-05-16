@@ -167,7 +167,9 @@ Supported handlers are `except:`, `except Exception:`, and
   `format(template, ...)`: small text/list helpers for scripts and dynamic
   helper callbacks. String method forms such as `"a,b".split(",")`,
   `line.split(":", 1)`, `line.split(":", maxsplit=1)`, `line.strip()`,
-  `line.lstrip()`, `line.rstrip()`, `text.isdigit()`, and `",".join(items)`
+  `line.lstrip()`, `line.rstrip()`, `text.isdigit()`, `text.isalpha()`,
+  `text.count("x")`, `",".join(items)`, `open(path).readlines()`,
+  `items.extend(other)`, `items.count(value)`, and mutating `items.sort()`
   are also supported.
 - `list(value)` and `tuple(value)`: materialize a list view. In Stone,
   `tuple()` is an agent-compatibility alias for `list()`.

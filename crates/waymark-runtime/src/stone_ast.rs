@@ -269,8 +269,13 @@ pub fn lower_source(source: &str) -> Result<Program, ShellError> {
     let parsed = ruff_python_parser::parse_module(source).map_err(|err| {
         let mut error = GenericError::new_internal("python parse error", err.to_string())
             .with_code("stone_parse_error");
-        if source.lines().any(|line| line.trim_start().starts_with("//")) {
-            error = error.with_help("Stone comments use #. The // operator is floor division, not a comment.");
+        if source
+            .lines()
+            .any(|line| line.trim_start().starts_with("//"))
+        {
+            error = error.with_help(
+                "Stone comments use #. The // operator is floor division, not a comment.",
+            );
         }
         ShellError::Generic(error)
     })?;
@@ -1101,11 +1106,16 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
                     | "join"
                     | "keys"
                     | "isdigit"
+                    | "isalpha"
                     | "lstrip"
                     | "lower"
                     | "read"
+                    | "readlines"
                     | "replace"
                     | "rstrip"
+                    | "count"
+                    | "extend"
+                    | "sort"
                     | "strip"
                     | "split"
                     | "splitlines"
