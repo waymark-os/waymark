@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT OR Apache-2.0
+"""Waymark-side MCP server backed by Waymark Gateway RPC.
+
+This server is intended to run next to the agent, including inside an agent
+container. It does not own workspace state; each tool delegates to the host
+gateway through the Gateway RPC Unix socket.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, TextIO
+
+
+TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "env_snapshot",
+        "description": "Open a Gateway transaction for a workspace.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"workspace": {"type": "string"}},
+            "required": ["workspace"],
+        },
+    },
+    {
+        "name": "state",
+        "description": "Show whether a Gateway transaction has uncommitted changes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"tx": {"type": "string"}, "sample_limit": {"type": "integer"}},
+            "required": ["tx"],
+        },
+    },
+    {
+        "name": "stone_call",
+        "description": "Run a Linux command in the Gateway transaction view.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tx": {"type": "string"},
+                "workspace": {"type": "string"},
+                "dry_run": {"type": "boolean"},
+                "image": {"type": "string"},
+                "argv": {"type": "array", "items": {"type": "string"}},
+                "workspace_mount": {"type": "string"},
+                "workdir": {"type": "string"},
+                "env": {"type": "object", "additionalProperties": {"type": "string"}},
+                "user": {"type": "string"},
+            },
+            "required": ["image", "argv"],
+        },
+    },
+    {
+        "name": "restore",
+        "description": "Restore paths in a Gateway transaction.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tx": {"type": "string"},
+                "paths": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["tx", "paths"],
+        },
+    },
+    {
+        "name": "rollback",
+        "description": "Discard a Gateway transaction.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"tx": {"type": "string"}},
+            "required": ["tx"],
+        },
+    },
+    {
+        "name": "commit",
+        "description": "Publish a Gateway transaction as a new generation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tx": {"type": "string"},
+                "message": {"type": "string"},
+                "allow_risky": {"type": "boolean"},
+            },
+            "required": ["tx"],
+        },
+    },
+    {
+        "name": "finish",
+        "description": "Check that a Gateway transaction is clean or explicitly resolved.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"tx": {"type": "string"}},
+            "required": ["tx"],
+        },
+    },
+]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--gateway-bin",
+        default=os.environ.get("WAYMARK_GATEWAY_BIN", "waymark-gateway"),
+        help="Gateway CLI with the protobuf RPC client.",
+    )
+    parser.add_argument(
+        "--socket",
+        type=Path,
+        default=Path(os.environ.get("WAYMARK_GATEWAY_SOCKET", "/run/waymark/gateway.sock")),
+    )
+    parser.add_argument("--trace", type=Path, default=None)
+    return parser.parse_args()
+
+
+def json_rpc_result(request_id: Any, result: Any) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+
+def json_rpc_error(request_id: Any, code: int, message: str, data: Any = None) -> dict[str, Any]:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": request_id, "error": error}
+
+
+def content_result(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "content": [{"type": "text", "text": json.dumps(value, indent=2, sort_keys=True)}],
+        "structuredContent": value,
+    }
+
+
+class GatewayCliRpc:
+    def __init__(self, gateway_bin: str, socket_path: Path) -> None:
+        self.gateway_bin = gateway_bin
+        self.socket_path = socket_path
+
+    def call(self, method: str, args: list[str]) -> dict[str, Any]:
+        command = [self.gateway_bin, "rpc", "call", "--socket", str(self.socket_path), method, *args]
+        completed = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        result = {
+            "ok": completed.returncode == 0,
+            "method": method,
+            "command": command,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "exit_code": completed.returncode,
+        }
+        return decorate_gateway_result(method, result)
+
+
+class GatewayMcp:
+    def __init__(self, rpc: GatewayCliRpc, trace: Path | None = None) -> None:
+        self.rpc = rpc
+        self.trace = trace
+        if self.trace is not None:
+            self.trace.parent.mkdir(parents=True, exist_ok=True)
+
+    def trace_call(self, name: str, args: dict[str, Any], result: dict[str, Any], duration_ms: int) -> None:
+        if self.trace is None:
+            return
+        record = {
+            "ts_ms": int(time.time() * 1000),
+            "tool": name,
+            "args": args,
+            "ok": result.get("ok"),
+            "duration_ms": duration_ms,
+            "exit_code": result.get("exit_code"),
+        }
+        with self.trace.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n")
+
+    def tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
+        try:
+            result = self.run_tool(name, args)
+            return result
+        finally:
+            duration_ms = int((time.monotonic() - start) * 1000)
+            if "result" in locals():
+                self.trace_call(name, args, result, duration_ms)
+
+    def run_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        if name == "env_snapshot":
+            return self.rpc.call("env.snapshot", ["--workspace", required(args, "workspace")])
+        if name == "state":
+            sample_limit = str(args.get("sample_limit", 50))
+            return self.rpc.call("env.diff", ["--tx", required(args, "tx"), "--sample-limit", sample_limit])
+        if name in {"finish", "env_finish"}:
+            return self.rpc.call("env.finish", ["--tx", required(args, "tx")])
+        if name in {"restore", "env_restore"}:
+            return self.rpc.call("env.restore", ["--tx", required(args, "tx"), *string_list(args.get("paths"))])
+        if name in {"rollback", "env_rollback"}:
+            return self.rpc.call("env.rollback", ["--tx", required(args, "tx")])
+        if name in {"commit", "env_commit"}:
+            call_args = ["--tx", required(args, "tx")]
+            if args.get("message"):
+                call_args.extend(["--message", str(args["message"])])
+            if args.get("allow_risky"):
+                call_args.append("--allow-risky")
+            return self.rpc.call("env.commit", call_args)
+        if name == "stone_call":
+            return self.stone_call(args)
+        raise ValueError(f"unknown tool: {name}")
+
+    def stone_call(self, args: dict[str, Any]) -> dict[str, Any]:
+        dry_run = bool(args.get("dry_run"))
+        tx = args.get("tx")
+        cleanup: dict[str, Any] | None = None
+        if dry_run:
+            workspace = required(args, "workspace")
+            snapshot = self.rpc.call("env.snapshot", ["--workspace", workspace])
+            tx = parse_tx(snapshot["stdout"])
+            if not tx:
+                return {**snapshot, "error": "dry-run env.snapshot did not return a tx"}
+        elif not tx:
+            raise ValueError("stone_call requires tx unless dry_run is true")
+
+        call_args = [
+            "--tx",
+            str(tx),
+            "--image",
+            required(args, "image"),
+            "--workspace-mount",
+            str(args.get("workspace_mount", "/app")),
+        ]
+        if args.get("workdir"):
+            call_args.extend(["--workdir", str(args["workdir"])])
+        if args.get("user"):
+            call_args.extend(["--user", str(args["user"])])
+        env = args.get("env")
+        if isinstance(env, dict):
+            for key, value in sorted(env.items()):
+                call_args.extend(["--env", f"{key}={value}"])
+        call_args.append("--")
+        call_args.extend(string_list(args.get("argv")))
+        result = self.rpc.call("linux.exec", call_args)
+        if dry_run and tx:
+            cleanup = self.rpc.call("env.rollback", ["--tx", str(tx)])
+            result = {**result, "dry_run": True, "dry_run_tx": tx, "dry_run_cleanup": cleanup}
+        return result
+
+
+def required(args: dict[str, Any], name: str) -> str:
+    value = args.get(name)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"missing required string argument: {name}")
+    return value
+
+
+def string_list(value: Any) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError("expected list[str]")
+    return value
+
+
+def parse_tx(stdout: str) -> str | None:
+    for line in stdout.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2 and parts[0] == "tx":
+            return parts[1]
+    return None
+
+
+def decorate_gateway_result(method: str, result: dict[str, Any]) -> dict[str, Any]:
+    stdout = result.get("stdout") if isinstance(result.get("stdout"), str) else ""
+    if method == "linux.exec":
+        env_diff = stdout.split("\ndiff\n", 1)[1] if "\ndiff\n" in stdout else ""
+        result["env_diff"] = env_diff
+        result["env_warnings"] = warning_lines(env_diff)
+        result["env_clean"] = preview_clean(env_diff)
+        return result
+    if method in {"env.diff", "env.finish", "env.restore"}:
+        result["env_diff"] = stdout
+        result["env_warnings"] = warning_lines(stdout)
+        result["env_clean"] = preview_clean(stdout)
+        if method == "env.finish":
+            result["next_actions"] = next_actions(stdout)
+            result["ok"] = result["ok"] and (result["env_clean"] or "transaction closed" in stdout)
+        return result
+    return result
+
+
+def warning_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.startswith("warning\t")]
+
+
+def next_actions(text: str) -> list[str]:
+    for line in text.splitlines():
+        if line.startswith("next_actions\t"):
+            raw = line.split("\t", 1)[1]
+            return [item for item in raw.split(",") if item]
+    return []
+
+
+def preview_clean(text: str) -> bool:
+    stripped = text.strip()
+    if stripped in {"", "clean", "transaction closed", "rolled_back", "No changes"}:
+        return True
+    for line in text.splitlines():
+        if line == "changes\tcreated=0 modified=0 deleted=0 type_changed=0 env=0":
+            return True
+        if line.startswith(("Created\t", "Modified\t", "Deleted\t", "TypeChanged\t", "warning\t")):
+            return False
+    if "next_actions\t" in text:
+        return False
+    return False
+
+
+def serve(server: GatewayMcp, stdin: Any = sys.stdin.buffer, stdout: Any = sys.stdout.buffer) -> None:
+    framing = "headers"
+    while True:
+        request = read_message(stdin)
+        if request is None:
+            return
+        if request.get("_framing") == "jsonl":
+            framing = "jsonl"
+            request.pop("_framing", None)
+        try:
+            method = request.get("method")
+            request_id = request.get("id")
+            if method == "initialize":
+                response = json_rpc_result(
+                    request_id,
+                    {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "waymark-gateway-mcp", "version": "0.1.0"},
+                    },
+                )
+            elif method == "notifications/initialized":
+                continue
+            elif method == "tools/list":
+                response = json_rpc_result(request_id, {"tools": TOOLS})
+            elif method == "tools/call":
+                params = request.get("params") if isinstance(request.get("params"), dict) else {}
+                name = params.get("name")
+                args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+                if not isinstance(name, str):
+                    raise ValueError("tools/call requires string params.name")
+                response = json_rpc_result(request_id, content_result(server.tool(name, args)))
+            else:
+                response = json_rpc_error(request_id, -32601, f"unknown method: {method}")
+        except Exception as err:
+            response = json_rpc_error(request.get("id") if isinstance(request, dict) else None, -32000, str(err))
+        write_message(stdout, response, framing)
+
+
+def read_message(stdin: Any) -> dict[str, Any] | None:
+    headers: dict[str, str] = {}
+    while True:
+        line = stdin.readline()
+        if line == b"":
+            return None
+        stripped = line.strip()
+        if not stripped:
+            break
+        if stripped.startswith(b"{"):
+            value = json.loads(stripped.decode("utf-8"))
+            if isinstance(value, dict):
+                value["_framing"] = "jsonl"
+            return value
+        decoded = line.decode("ascii", errors="replace").strip()
+        if ":" in decoded:
+            key, value = decoded.split(":", 1)
+            headers[key.lower()] = value.strip()
+    length = int(headers.get("content-length", "0"))
+    if length <= 0:
+        return None
+    return json.loads(stdin.read(length).decode("utf-8"))
+
+
+def write_message(stdout: Any, message: dict[str, Any], framing: str) -> None:
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    if framing == "jsonl":
+        stdout.write(body + b"\n")
+    else:
+        stdout.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii"))
+        stdout.write(body)
+    stdout.flush()
+
+
+def main() -> int:
+    args = parse_args()
+    serve(GatewayMcp(GatewayCliRpc(args.gateway_bin, args.socket), args.trace))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
