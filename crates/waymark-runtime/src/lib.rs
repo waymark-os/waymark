@@ -17,6 +17,7 @@ use serde_json::Value as JsonValue;
 pub mod agent;
 mod commands;
 mod frontend;
+mod gateway_runtime;
 mod json;
 mod server;
 mod stone_ast;

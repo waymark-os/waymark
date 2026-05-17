@@ -8,6 +8,7 @@ name = "waymark_runtime"
 
 [dependencies]
 asset-image = { path = "../asset-image" }
+waymark-gateway-client = { path = "../../../waymark-gateway/crates/waymark-gateway-client" }
 waymark-runtime-support = { path = "../waymark-runtime-support" }
 libc = "0.2.186"
 md5 = { version = "0.10", package = "md-5" }

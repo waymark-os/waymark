@@ -11,6 +11,7 @@ use std::time::UNIX_EPOCH;
 use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, Value};
 use regex::bytes::Regex;
 
+use crate::gateway_runtime;
 use crate::json::{json_to_nu_value, nu_to_json_value};
 
 pub(crate) const STONE_MAX_FIND_ENTRIES: usize = 4096;
@@ -36,6 +37,22 @@ pub(crate) enum RuntimeFile {
 }
 
 pub(crate) fn open_runtime_file(path: &Path, mode: &str) -> Result<RuntimeFile, ShellError> {
+    if gateway_runtime::enabled() {
+        return match mode {
+            "r" | "rt" => Ok(RuntimeFile::Read {
+                text: gateway_runtime::read_text(path, usize::MAX)?,
+                closed: false,
+            }),
+            "w" | "wt" | "a" | "at" => Err(stone_error(
+                "open",
+                "Gateway runtime does not support streaming open() writes yet; use write_text/write_json/write_jsonl",
+            )),
+            other => Err(stone_error(
+                "open",
+                format!("unsupported mode `{other}`; expected r, w, or a"),
+            )),
+        };
+    }
     match mode {
         "r" | "rt" => {
             let mut file =
@@ -82,7 +99,7 @@ pub(crate) fn open_runtime_file(path: &Path, mode: &str) -> Result<RuntimeFile, 
 }
 
 pub(crate) fn cat_text(path: &Path) -> Result<String, ShellError> {
-    fs::read_to_string(path).map_err(|err| io_read_stone_error("cat", err, path))
+    read_text(path, usize::MAX)
 }
 
 pub(crate) fn read_text(path: &Path, max_bytes: usize) -> Result<String, ShellError> {
@@ -189,15 +206,14 @@ pub(crate) fn diff_record_for_paths(
 }
 
 pub(crate) fn read_json_file(path: &Path) -> Result<Value, ShellError> {
-    let bytes = fs::read(path).map_err(|err| io_read_stone_error("read_json", err, path))?;
+    let bytes = read_bytes_for_jsonl(path, "read_json")?;
     let json = serde_json::from_slice::<serde_json::Value>(&bytes)
         .map_err(|err| stone_error("read_json", format!("{}: {}", path.display(), err)))?;
     Ok(json_to_nu_value(json, Span::unknown()))
 }
 
 pub(crate) fn read_csv_file(path: &Path, limit: Option<usize>) -> Result<Value, ShellError> {
-    let text =
-        fs::read_to_string(path).map_err(|err| io_read_stone_error("read_csv", err, path))?;
+    let text = read_text(path, usize::MAX)?;
     let rows = parse_csv_records(&text, limit)?;
     Ok(Value::list(rows, Span::unknown()))
 }
@@ -207,8 +223,7 @@ pub(crate) fn write_json_file(path: &Path, value: &Value) -> Result<Value, Shell
     let text = serde_json::to_string_pretty(&json)
         .map_err(|err| stone_error("write_json", err.to_string()))?
         + "\n";
-    ensure_parent_dir_for_write("write_json", path)?;
-    fs::write(path, text.as_bytes()).map_err(|err| io_stone_error("write_json", err, path))?;
+    write_text(path, &text, false)?;
     Ok(Value::int(
         i64::try_from(text.len()).unwrap_or(i64::MAX),
         Span::unknown(),
@@ -225,8 +240,7 @@ pub(crate) fn write_jsonl_file(path: &Path, rows: Vec<Value>) -> Result<Value, S
         );
         text.push('\n');
     }
-    ensure_parent_dir_for_write("write_jsonl", path)?;
-    fs::write(path, text.as_bytes()).map_err(|err| io_stone_error("write_jsonl", err, path))?;
+    write_text(path, &text, false)?;
     Ok(Value::int(
         i64::try_from(text.len()).unwrap_or(i64::MAX),
         Span::unknown(),
@@ -234,14 +248,23 @@ pub(crate) fn write_jsonl_file(path: &Path, rows: Vec<Value>) -> Result<Value, S
 }
 
 pub(crate) fn read_bytes_for_jsonl(path: &Path, context: &str) -> Result<Vec<u8>, ShellError> {
+    if gateway_runtime::enabled() {
+        return gateway_runtime::read_bytes(path, usize::MAX);
+    }
     fs::read(path).map_err(|err| io_read_stone_error(context, err, path))
 }
 
 pub(crate) fn create_dir_all(path: &Path) -> Result<(), ShellError> {
+    if gateway_runtime::enabled() {
+        return gateway_runtime::mkdir(path);
+    }
     fs::create_dir_all(path).map_err(|err| io_stone_error("mkdir", err, path))
 }
 
 pub(crate) fn remove_path(path: &Path) -> Result<(), ShellError> {
+    if gateway_runtime::enabled() {
+        return gateway_runtime::remove(path);
+    }
     if path.is_dir() {
         fs::remove_dir_all(path).map_err(|err| io_stone_error("rm", err, path))
     } else {
@@ -258,7 +281,7 @@ pub(crate) fn edit_text_file(
     if old.is_empty() {
         return Err(stone_error("edit", "old text must not be empty"));
     }
-    let text = fs::read_to_string(path).map_err(|err| io_read_stone_error("edit", err, path))?;
+    let text = read_text(path, usize::MAX)?;
     let matches = text.matches(old).count();
     if matches == 0 {
         return Err(stone_error("edit", "old text was not found"));
@@ -268,7 +291,7 @@ pub(crate) fn edit_text_file(
     } else {
         text.replacen(old, new, 1)
     };
-    fs::write(path, replaced.as_bytes()).map_err(|err| io_stone_error("edit", err, path))?;
+    write_text(path, &replaced, false)?;
     let mut record = Record::with_capacity(4);
     record.push(
         "path",
@@ -292,7 +315,12 @@ pub(crate) fn save_value_file(
     append: bool,
     force: bool,
 ) -> Result<Value, ShellError> {
-    if path.exists() && !append && !force {
+    let exists = if gateway_runtime::enabled() {
+        stone_file_adapter().stat(path, false).is_ok()
+    } else {
+        path.exists()
+    };
+    if exists && !append && !force {
         return Err(stone_error(
             "save",
             format!(
@@ -301,19 +329,32 @@ pub(crate) fn save_value_file(
             ),
         ));
     }
-    ensure_parent_dir_for_write("save", path)?;
     let bytes = value_to_save_bytes(value)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(append)
-        .truncate(!append)
-        .open(path)
-        .map_err(|err| io_stone_error("save", err, path))?;
-    file.write_all(&bytes)
-        .map_err(|err| io_stone_error("save", err, path))?;
-    file.flush()
-        .map_err(|err| io_stone_error("save", err, path))?;
+    if gateway_runtime::enabled() {
+        let text = String::from_utf8(bytes.clone()).map_err(|err| {
+            stone_error(
+                "save",
+                format!(
+                    "{}: Gateway save currently supports UTF-8 text, got invalid UTF-8: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        write_text(path, &text, append)?;
+    } else {
+        ensure_parent_dir_for_write("save", path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(append)
+            .truncate(!append)
+            .open(path)
+            .map_err(|err| io_stone_error("save", err, path))?;
+        file.write_all(&bytes)
+            .map_err(|err| io_stone_error("save", err, path))?;
+        file.flush()
+            .map_err(|err| io_stone_error("save", err, path))?;
+    }
     let mut record = Record::with_capacity(3);
     record.push(
         "path",
@@ -363,7 +404,7 @@ pub(crate) fn search_records(
             continue;
         }
         files_visited += 1;
-        let Ok(bytes) = fs::read(&path) else {
+        let Ok(bytes) = read_bytes_for_jsonl(&path, "search") else {
             continue;
         };
         if stone_bytes_look_binary(&bytes) || !matcher.is_match(&bytes) {
@@ -762,6 +803,9 @@ fn stone_file_adapter() -> &'static dyn StoneFileAdapter {
 
 impl StoneFileAdapter for StdStoneFileAdapter {
     fn read_text(&self, path: &Path, max_bytes: usize) -> Result<String, ShellError> {
+        if gateway_runtime::enabled() {
+            return gateway_runtime::read_text(path, max_bytes);
+        }
         let mut bytes =
             fs::read(path).map_err(|err| io_read_stone_error("read_text", err, path))?;
         if bytes.len() > max_bytes {
@@ -784,6 +828,14 @@ impl StoneFileAdapter for StdStoneFileAdapter {
         text: &str,
         append: bool,
     ) -> Result<StoneFileWrite, ShellError> {
+        if gateway_runtime::enabled() {
+            let bytes = gateway_runtime::write_text(path, text, append)?;
+            return Ok(StoneFileWrite {
+                path: path.to_path_buf(),
+                bytes,
+                append,
+            });
+        }
         ensure_parent_dir_for_write("write_text", path)?;
         let mut file = OpenOptions::new()
             .create(true)
@@ -804,6 +856,9 @@ impl StoneFileAdapter for StdStoneFileAdapter {
     }
 
     fn stat(&self, path: &Path, follow_symlinks: bool) -> Result<StoneFileStat, ShellError> {
+        if gateway_runtime::enabled() {
+            return stone_file_stat_from_gateway(path);
+        }
         let metadata = if follow_symlinks {
             fs::metadata(path)
         } else {
@@ -814,6 +869,12 @@ impl StoneFileAdapter for StdStoneFileAdapter {
     }
 
     fn list_dir(&self, path: &Path) -> Result<Vec<StoneFileEntry>, ShellError> {
+        if gateway_runtime::enabled() {
+            return gateway_runtime::list_dir_records(path, Span::unknown())?
+                .into_iter()
+                .map(stone_file_entry_from_value)
+                .collect();
+        }
         let mut entries = fs::read_dir(path)
             .map_err(|err| io_read_stone_error("list_dir", err, path))?
             .map(|entry| {
@@ -844,6 +905,67 @@ fn file_stat_from_metadata(path: PathBuf, metadata: &fs::Metadata) -> StoneFileS
         modified_ms: system_time_ms(metadata.modified().ok()),
         accessed_ms: system_time_ms(metadata.accessed().ok()),
         created_ms: system_time_ms(metadata.created().ok()),
+    }
+}
+
+fn stone_file_stat_from_gateway(path: &Path) -> Result<StoneFileStat, ShellError> {
+    let value = gateway_runtime::stat_record(path, Span::unknown())?;
+    stone_file_stat_from_value(value)
+}
+
+fn stone_file_entry_from_value(value: Value) -> Result<StoneFileEntry, ShellError> {
+    let stat = stone_file_stat_from_value(value)?;
+    let name = stat
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| stat.path.display().to_string());
+    Ok(StoneFileEntry { name, stat })
+}
+
+fn stone_file_stat_from_value(value: Value) -> Result<StoneFileStat, ShellError> {
+    let Value::Record { val, .. } = value else {
+        return Err(stone_error(
+            "gateway stat",
+            "Gateway stat returned a non-record",
+        ));
+    };
+    let path = record_string(&val, "path")?;
+    let kind = match record_string(&val, "type")?.as_str() {
+        "file" => "file",
+        "dir" => "dir",
+        "symlink" => "symlink",
+        _ => "other",
+    };
+    Ok(StoneFileStat {
+        path: PathBuf::from(path),
+        kind,
+        is_file: record_bool(&val, "is_file"),
+        is_dir: record_bool(&val, "is_dir"),
+        is_symlink: record_bool(&val, "is_symlink"),
+        readonly: record_bool(&val, "readonly"),
+        size: record_i64(&val, "size").unwrap_or(0).max(0) as u64,
+        modified_ms: record_i64(&val, "modified_ms"),
+        accessed_ms: record_i64(&val, "accessed_ms"),
+        created_ms: record_i64(&val, "created_ms"),
+    })
+}
+
+fn record_string(record: &Record, key: &str) -> Result<String, ShellError> {
+    record
+        .get(key)
+        .and_then(|value| value.coerce_string().ok())
+        .ok_or_else(|| stone_error("gateway stat", format!("missing string field `{key}`")))
+}
+
+fn record_bool(record: &Record, key: &str) -> bool {
+    matches!(record.get(key), Some(Value::Bool { val: true, .. }))
+}
+
+fn record_i64(record: &Record, key: &str) -> Option<i64> {
+    match record.get(key) {
+        Some(Value::Int { val, .. }) => Some(*val),
+        _ => None,
     }
 }
 

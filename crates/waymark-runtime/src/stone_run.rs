@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, Value};
 use serde_json::Value as JsonValue;
 
+use crate::gateway_runtime;
 use crate::stone_helpers::attach_service_helper_observation;
 
 #[cfg(unix)]
@@ -1269,6 +1270,42 @@ fn run_posix_command(
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
 ) -> Result<Record, ShellError> {
+    if gateway_runtime::enabled() {
+        if stdout_target == RunOutputTarget::Stdout || stderr_target == RunOutputTarget::Stdout {
+            return Err(stone_error(
+                "run",
+                "Gateway linux.exec only supports captured or suppressed output",
+            ));
+        }
+        let mut record = gateway_runtime::run_command(
+            argv,
+            cwd,
+            env_overrides,
+            stdin,
+            timeout,
+            max_stdout_bytes,
+            max_stderr_bytes,
+        )?;
+        let span = Span::unknown();
+        let mut suppressed = Record::new();
+        suppressed.push(
+            "stdout",
+            Value::bool(stdout_target == RunOutputTarget::Suppress, span),
+        );
+        suppressed.push(
+            "stderr",
+            Value::bool(stderr_target == RunOutputTarget::Suppress, span),
+        );
+        if stdout_target == RunOutputTarget::Suppress {
+            record.push("stdout", Value::string("", span));
+        }
+        if stderr_target == RunOutputTarget::Suppress {
+            record.push("stderr", Value::string("", span));
+        }
+        record.push("suppressed", Value::record(suppressed, span));
+        record.push("stderr_to_stdout", Value::bool(false, span));
+        return Ok(record);
+    }
     static RUN_ID: AtomicU64 = AtomicU64::new(0);
 
     let span = Span::unknown();
