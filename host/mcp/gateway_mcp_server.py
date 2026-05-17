@@ -30,6 +30,61 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "workspace_list",
+        "description": "List files in a Gateway workspace generation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string"},
+                "generation": {"type": "string"},
+                "path": {"type": "string"},
+            },
+            "required": ["workspace"],
+        },
+    },
+    {
+        "name": "workspace_stat",
+        "description": "Stat one file in a Gateway workspace generation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string"},
+                "generation": {"type": "string"},
+                "path": {"type": "string"},
+            },
+            "required": ["workspace", "path"],
+        },
+    },
+    {
+        "name": "workspace_read",
+        "description": "Read one text file from a Gateway workspace generation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string"},
+                "generation": {"type": "string"},
+                "path": {"type": "string"},
+            },
+            "required": ["workspace", "path"],
+        },
+    },
+    {
+        "name": "workspace_grep",
+        "description": "Search files in a Gateway workspace generation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string"},
+                "generation": {"type": "string"},
+                "pattern": {"type": "string"},
+                "path": {"type": "string"},
+                "regex": {"type": "boolean"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["workspace", "pattern"],
+        },
+    },
+    {
         "name": "state",
         "description": "Show whether a Gateway transaction has uncommitted changes.",
         "inputSchema": {
@@ -179,6 +234,8 @@ class GatewayMcp:
             "ok": result.get("ok"),
             "duration_ms": duration_ms,
             "exit_code": result.get("exit_code"),
+            "stderr": bound_text(result.get("stderr"), 600),
+            "stdout": bound_text(result.get("stdout"), 600),
         }
         with self.trace.open("a", encoding="utf-8") as file:
             file.write(json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n")
@@ -196,6 +253,28 @@ class GatewayMcp:
     def run_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name == "env_snapshot":
             return self.rpc.call("env.snapshot", ["--workspace", required(args, "workspace")])
+        if name == "workspace_list":
+            call_args = ["--workspace", required(args, "workspace")]
+            add_optional(call_args, args, "generation", "--generation")
+            add_optional(call_args, args, "path", "--path")
+            return self.rpc.call("workspace.list", call_args)
+        if name == "workspace_stat":
+            call_args = ["--workspace", required(args, "workspace"), "--path", required(args, "path")]
+            add_optional(call_args, args, "generation", "--generation")
+            return self.rpc.call("workspace.stat", call_args)
+        if name == "workspace_read":
+            call_args = ["--workspace", required(args, "workspace"), "--path", required(args, "path")]
+            add_optional(call_args, args, "generation", "--generation")
+            return self.rpc.call("workspace.read", call_args)
+        if name == "workspace_grep":
+            call_args = ["--workspace", required(args, "workspace"), "--pattern", required(args, "pattern")]
+            add_optional(call_args, args, "generation", "--generation")
+            add_optional(call_args, args, "path", "--path")
+            if args.get("regex"):
+                call_args.append("--regex")
+            if args.get("limit") is not None:
+                call_args.extend(["--limit", str(args["limit"])])
+            return self.rpc.call("workspace.grep", call_args)
         if name == "state":
             sample_limit = str(args.get("sample_limit", 50))
             return self.rpc.call("env.diff", ["--tx", required(args, "tx"), "--sample-limit", sample_limit])
@@ -267,6 +346,12 @@ def string_list(value: Any) -> list[str]:
     return value
 
 
+def add_optional(call_args: list[str], args: dict[str, Any], name: str, flag: str) -> None:
+    value = args.get(name)
+    if isinstance(value, str) and value:
+        call_args.extend([flag, value])
+
+
 def parse_tx(stdout: str) -> str | None:
     for line in stdout.splitlines():
         parts = line.split("\t", 1)
@@ -318,6 +403,15 @@ def preview_clean(text: str) -> bool:
     if "next_actions\t" in text:
         return False
     return False
+
+
+def bound_text(value: Any, max_bytes: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="replace") + "\n...[truncated]"
 
 
 def serve(server: GatewayMcp, stdin: Any = sys.stdin.buffer, stdout: Any = sys.stdout.buffer) -> None:
