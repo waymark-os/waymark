@@ -947,9 +947,13 @@ for line in open("/app/input.txt"):
     },
     StoneHelpEntry {
         name: "json_dumps",
-        signature: "json_dumps(value: Any) -> str",
-        use_when: "Use to serialize a value to compact JSON text.",
-        examples: &[r#"text = json_dumps({"ok": True})"#],
+        signature: "json_dumps(value: Any, indent: int? = None, separators: list? = None) -> str",
+        use_when: "Use to serialize a value to JSON text. Supports compact output, indent=2, and separators=(\",\", \":\") for Python-shaped agent code.",
+        examples: &[
+            r#"text = json_dumps({"ok": True})"#,
+            r#"pretty = json_dumps({"ok": True}, indent=2)"#,
+            r#"compact = json_dumps({"ok": True}, separators=(",", ":"))"#,
+        ],
         avoid: &["Use write_json(path, value) for final JSON files."],
         aliases: &["to_json"],
     },
@@ -1086,11 +1090,10 @@ for key, value in items(counts):
         examples: &[
             r#"top = sort(rows, key="amount", reverse=True)[:5]"#,
             r#"top = sort(rows, key=lambda r: (-r["count"], r["name"]))[:5]"#,
+            r#"rows.sort(key=lambda r: r["name"], reverse=True)"#,
             r#"names = sort(names)"#,
         ],
-        avoid: &[
-            "Use top-level sort(values, key=..., reverse=...) for advanced sorting; list.sort() only mutates a list in place with default ordering.",
-        ],
+        avoid: &["Remember list.sort(...) mutates in place and returns None; use top-level sort(...) when you need a sorted copy."],
         aliases: &["sorted"],
     },
     StoneHelpEntry {
@@ -1135,12 +1138,13 @@ for key, value in items(counts):
     },
     StoneHelpEntry {
         name: "set",
-        signature: "set(values: iterable? = None) -> list",
+        signature: "set(values: iterable | generator? = None) -> list",
         use_when: "Use for Python-shaped ordered uniqueness. The result is a list with unique values.",
         examples: &[
             r#"seen = set()"#,
             r#"seen.add(user)"#,
             r#"unique_names = set(names)"#,
+            r#"unique_names = set(row["name"] for row in rows)"#,
         ],
         avoid: &["Do not rely on hash-set ordering; Stone preserves first-seen order."],
         aliases: &["unique"],
@@ -1199,9 +1203,12 @@ for i, row in enumerate(rows):
     },
     StoneHelpEntry {
         name: "join",
-        signature: "join(items: list[str], separator: str = \"\") -> str",
+        signature: "join(items: iterable | generator, separator: str = \"\") -> str",
         use_when: "Use for top-level list-to-text joining; string method syntax also works.",
-        examples: &[r#"line = join(fields, ",")"#],
+        examples: &[
+            r#"line = join(fields, ",")"#,
+            r#"initials = "".join(word[0] for word in names)"#,
+        ],
         avoid: &["Convert non-string items with map(str, items) or explicit str() first."],
         aliases: &[],
     },
@@ -1226,8 +1233,11 @@ if starts_with(line, "ERROR"):
     StoneHelpEntry {
         name: "format",
         signature: "format(template: str, ...values: Any) -> str",
-        use_when: "Use for small positional text templates.",
-        examples: &[r#"line = format("{}:{}", name, count)"#],
+        use_when: "Use for small positional text templates, including simple fixed decimal specs.",
+        examples: &[
+            r#"line = format("{}:{}", name, count)"#,
+            r#"amount = format("{:.2f}", total)"#,
+        ],
         avoid: &["Use f-strings when they are clearer and do not need format specs."],
         aliases: &[],
     },
@@ -1376,7 +1386,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "Lambdas: expression-only callbacks work in sort/map/filter, e.g. lambda r: r[\"name\"].",
             "String methods include strip/lstrip/rstrip, isdigit/isalpha, count, split/splitlines, replace, join, lower/upper, zfill, startswith, and endswith; split accepts optional maxsplit and default whitespace splitting.",
             "File handles support read(), readlines()/splitlines(), write(text), and close().",
-            "List variables support append(value), extend(values), count(value), mutating sort(), and set-style add(value) for unique append.",
+            "List variables support append(value), extend(values), count(value), mutating sort(key=..., reverse=...), and set-style add(value) for unique append.",
             "Use emit(value) when you want structured data returned to the caller.",
         ],
     },
@@ -1389,7 +1399,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "No classes/decorators/async/nested functions.",
             "No mutable default args, *args, **kwargs, or keyword calls to user functions.",
             "No try/finally, try/else, except*, or exception classes other than Exception.",
-            "No method keyword arguments such as items.sort(reverse=True); use top-level sort(items, reverse=True) for advanced sorting.",
+            "Method keyword arguments are intentionally narrow: split(maxsplit=...) and sort(key=..., reverse=...) are supported; most other methods take positional arguments only.",
             "No automatic string-number coercion; use int(), float(), and str().",
             "No missing-key arithmetic; initialize dictionary counters before incrementing.",
         ],

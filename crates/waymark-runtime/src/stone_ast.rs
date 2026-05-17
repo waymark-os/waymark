@@ -193,6 +193,7 @@ pub enum Expr {
         receiver: Box<Expr>,
         method: String,
         positional: Vec<Expr>,
+        named: Vec<(String, Expr)>,
     },
     Call(Call),
 }
@@ -1132,38 +1133,70 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
                 ));
             }
             let mut positional = positional;
+            let mut named = Vec::new();
             if !call.arguments.keywords.is_empty() {
-                if method != "split" {
-                    return Err(unsupported_message(
-                        "method call",
-                        "method keyword arguments are not supported yet",
-                    ));
-                }
-                for keyword in call.arguments.keywords.into_vec() {
-                    let Some(name) = keyword.arg else {
-                        return Err(unsupported_message(
-                            "method call",
-                            "keyword spread is not supported yet",
-                        ));
-                    };
-                    if name.as_str() != "maxsplit" {
-                        return Err(unsupported_message(
-                            "method call",
-                            format!("unsupported split() keyword argument `{name}`"),
-                        ));
-                    }
-                    match positional.len() {
-                        0 => {
-                            positional.push(Expr::None);
-                            positional.push(lower_expr(keyword.value)?);
-                        }
-                        1 => positional.push(lower_expr(keyword.value)?),
-                        _ => {
+                if method == "split" {
+                    for keyword in call.arguments.keywords.into_vec() {
+                        let Some(name) = keyword.arg else {
                             return Err(unsupported_message(
                                 "method call",
-                                "split() got multiple maxsplit values",
+                                "keyword spread is not supported yet",
+                            ));
+                        };
+                        if name.as_str() != "maxsplit" {
+                            return Err(unsupported_message(
+                                "method call",
+                                format!("unsupported split() keyword argument `{name}`"),
                             ));
                         }
+                        match positional.len() {
+                            0 => {
+                                positional.push(Expr::None);
+                                positional.push(lower_expr(keyword.value)?);
+                            }
+                            1 => positional.push(lower_expr(keyword.value)?),
+                            _ => {
+                                return Err(unsupported_message(
+                                    "method call",
+                                    "split() got multiple maxsplit values",
+                                ));
+                            }
+                        }
+                    }
+                } else if method == "sort" {
+                    for keyword in call.arguments.keywords.into_vec() {
+                        let Some(name) = keyword.arg else {
+                            return Err(unsupported_message(
+                                "method call",
+                                "keyword spread is not supported yet",
+                            ));
+                        };
+                        match name.as_str() {
+                            "key" | "reverse" => {
+                                named.push((name.to_string(), lower_expr(keyword.value)?));
+                            }
+                            _ => {
+                                return Err(unsupported_message(
+                                    "method call",
+                                    format!("unsupported sort() keyword argument `{name}`"),
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    for keyword in call.arguments.keywords.into_vec() {
+                        let Some(name) = keyword.arg else {
+                            return Err(unsupported_message(
+                                "method call",
+                                "keyword spread is not supported yet",
+                            ));
+                        };
+                        return Err(unsupported_message(
+                            "method call",
+                            format!(
+                                "unsupported {method}() keyword argument `{name}`; method keyword arguments are supported only for split(maxsplit=...) and sort(key=..., reverse=...)"
+                            ),
+                        ));
                     }
                 }
             }
@@ -1171,6 +1204,7 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
                 receiver: Box::new(lower_expr(*attribute.value)?),
                 method,
                 positional,
+                named,
             })
         }
         unsupported => Err(unsupported_message(

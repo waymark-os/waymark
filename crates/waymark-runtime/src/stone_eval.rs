@@ -1662,7 +1662,7 @@ impl Evaluator<'_> {
                 }
                 Expr::Generator { .. } => Err(stone_error(
                     "generator expression",
-                    "generator expressions are only supported inside sum(...), any(...), and all(...) for now; use a list comprehension like [expr for x in items] when you need a list",
+                    "generator expressions are only supported inside sum(...), any(...), all(...), join(...), and set(...) for now; use a list comprehension like [expr for x in items] when you need a list",
                 )),
                 Expr::Lambda { params, body } => Ok(RuntimeValue::Callable(CallableValue {
                     function_id: self.state.next_callable_id(),
@@ -1681,7 +1681,8 @@ impl Evaluator<'_> {
                     receiver,
                     method,
                     positional,
-                } => self.eval_method_call(receiver, method, positional),
+                    named,
+                } => self.eval_method_call(receiver, method, positional, named),
                 Expr::Call(call) => Err(unknown_stone_call_error(&call.name)),
             }
         })();
@@ -3088,17 +3089,50 @@ impl Evaluator<'_> {
                 "json_dumps() requires exactly one value",
             ));
         };
-        if !call.named.is_empty() {
-            return Err(stone_error(
-                "json_dumps",
-                "json_dumps() keyword arguments are not supported",
-            ));
+        let mut indent = None;
+        for (name, argument) in &call.named {
+            match name.as_str() {
+                "indent" => {
+                    let value = self
+                        .eval_expr_value(argument, PipelineData::empty())?
+                        .into_nu_value("json_dumps")?;
+                    if matches!(value, Value::Nothing { .. }) {
+                        indent = None;
+                    } else {
+                        let value = value_to_limit(&value, "json_dumps indent")?;
+                        if value != 2 {
+                            return Err(stone_error(
+                                "json_dumps",
+                                "json_dumps() currently supports only indent=2",
+                            ));
+                        }
+                        indent = Some(value);
+                    }
+                }
+                "separators" => {
+                    let value = self
+                        .eval_expr_value(argument, PipelineData::empty())?
+                        .into_nu_value("json_dumps")?;
+                    validate_json_dumps_separators(&value)?;
+                }
+                other => {
+                    return Err(stone_error(
+                        "json_dumps",
+                        format!("unsupported keyword `{other}`; expected indent or separators"),
+                    ));
+                }
+            }
         }
         let value = self
             .eval_expr_value(value, PipelineData::empty())?
             .into_nu_value("json_dumps")?;
-        let text = serde_json::to_string(&nu_to_json_value(&value))
-            .map_err(|err| stone_error("json_dumps", err.to_string()))?;
+        let json = nu_to_json_value(&value);
+        let text = if indent.is_some() {
+            serde_json::to_string_pretty(&json)
+        } else {
+            serde_json::to_string(&json)
+        }
+        .map_err(|err| stone_error("json_dumps", err.to_string()))?;
         Ok(RuntimeValue::Nu(Value::string(text, Span::unknown())))
     }
 
@@ -3182,13 +3216,16 @@ impl Evaluator<'_> {
         }
         let values = match call.positional.as_slice() {
             [] => Vec::new(),
-            [iterable] => self.eval_iterable_expr(iterable)?,
+            [Expr::Generator { .. }] => {
+                self.eval_generator_values(call.positional.first().unwrap())?
+            }
+            [iterable] => self
+                .eval_iterable_expr(iterable)?
+                .into_iter()
+                .map(|value| value.into_nu_value("set"))
+                .collect::<Result<Vec<_>, _>>()?,
             _ => unreachable!(),
         };
-        let values = values
-            .into_iter()
-            .map(|value| value.into_nu_value("set"))
-            .collect::<Result<Vec<_>, _>>()?;
         set_builtin(values).map(RuntimeValue::Nu)
     }
 
@@ -3750,9 +3787,14 @@ impl Evaluator<'_> {
                 "join() requires items and optional separator",
             ));
         };
-        let first = self
-            .eval_expr_value(items, PipelineData::empty())?
-            .into_nu_value("join")?;
+        let first = match items {
+            Expr::Generator { .. } => {
+                Value::list(self.eval_generator_values(items)?, Span::unknown())
+            }
+            _ => self
+                .eval_expr_value(items, PipelineData::empty())?
+                .into_nu_value("join")?,
+        };
         let second = match call.positional.as_slice() {
             [_] => None,
             [_, second] => {
@@ -4091,9 +4133,18 @@ impl Evaluator<'_> {
         receiver: &Expr,
         method: &str,
         positional: &[Expr],
+        named: &[(String, Expr)],
     ) -> Result<RuntimeValue, ShellError> {
         let started = self.state.profiler.start();
         let result = (|| {
+            if !named.is_empty() && method != "sort" {
+                return Err(stone_error(
+                    "method call",
+                    format!(
+                        "{method}() keyword arguments are not supported; method keyword arguments are supported only for split(maxsplit=...) and sort(key=..., reverse=...)"
+                    ),
+                ));
+            }
             if method == "append" {
                 return self.eval_append_call(receiver, positional);
             }
@@ -4101,7 +4152,7 @@ impl Evaluator<'_> {
                 return self.eval_extend_call(receiver, positional);
             }
             if method == "sort" {
-                return self.eval_sort_method_call(receiver, positional);
+                return self.eval_sort_method_call(receiver, positional, named);
             }
             if method == "add" {
                 return self.eval_add_method_call(receiver, positional);
@@ -4111,8 +4162,13 @@ impl Evaluator<'_> {
             let args = positional
                 .iter()
                 .map(|arg| {
-                    self.eval_expr_value(arg, PipelineData::empty())?
-                        .into_nu_value("method call")
+                    if method == "join" && matches!(arg, Expr::Generator { .. }) {
+                        let values = self.eval_generator_values(arg)?;
+                        Ok(Value::list(values, Span::unknown()))
+                    } else {
+                        self.eval_expr_value(arg, PipelineData::empty())?
+                            .into_nu_value("method call")
+                    }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
@@ -4191,18 +4247,45 @@ impl Evaluator<'_> {
         &mut self,
         receiver: &Expr,
         positional: &[Expr],
+        named: &[(String, Expr)],
     ) -> Result<RuntimeValue, ShellError> {
         if !positional.is_empty() {
             return Err(stone_error(
                 "sort",
-                "sort() method takes no arguments; use top-level sort(values, key=..., reverse=...) for advanced sorting",
+                "sort() method takes only keyword arguments key=... and reverse=...",
             ));
         }
-        let target = self.mutable_list_method_target(receiver, "sort")?;
-        let sorted = sort_builtin_values(target.clone(), false, |value| Ok(value.clone()))?;
+        let mut key = SortKey::Identity;
+        let mut reverse = false;
+        for (name, argument) in named {
+            match name.as_str() {
+                "key" => key = self.eval_sort_key(argument)?,
+                "reverse" => {
+                    let value = self
+                        .eval_expr_value(argument, PipelineData::empty())?
+                        .into_nu_value("sort")?;
+                    reverse = value_to_bool(&value, "sort reverse")?;
+                }
+                other => {
+                    return Err(stone_error(
+                        "sort",
+                        format!("unsupported keyword `{other}`; expected key or reverse"),
+                    ));
+                }
+            }
+        }
+        let values = self.mutable_list_method_target(receiver, "sort")?.clone();
+        let sorted = sort_builtin_values(values, reverse, |value| match &key {
+            SortKey::Callable(callable) => self
+                .invoke_callable(callable, vec![RuntimeValue::Nu(value.clone())])?
+                .into_nu_value("sort key"),
+            SortKey::Identity => sort_key_for_value(value, None),
+            SortKey::Field(field) => sort_key_for_value(value, Some(field)),
+        })?;
         let Value::List { vals, .. } = sorted else {
             unreachable!("sort_builtin_values returns a list");
         };
+        let target = self.mutable_list_method_target(receiver, "sort")?;
         *target = vals;
         Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())))
     }
@@ -4689,6 +4772,30 @@ fn is_builtin_call(call: &Call) -> bool {
     STONE_BUILTIN_NAMES.contains(&call.name.as_str())
 }
 
+fn validate_json_dumps_separators(value: &Value) -> Result<(), ShellError> {
+    let Value::List { vals, .. } = value else {
+        return Err(stone_error(
+            "json_dumps",
+            "json_dumps() separators must be a two-item list or tuple like [\",\", \":\"]",
+        ));
+    };
+    let [item_separator, key_separator] = vals.as_slice() else {
+        return Err(stone_error(
+            "json_dumps",
+            "json_dumps() separators must contain exactly two strings",
+        ));
+    };
+    let item_separator = value_to_string(item_separator, "json_dumps separators")?;
+    let key_separator = value_to_string(key_separator, "json_dumps separators")?;
+    if item_separator == "," && key_separator == ":" {
+        return Ok(());
+    }
+    Err(stone_error(
+        "json_dumps",
+        "json_dumps() currently supports only separators=(\",\", \":\")",
+    ))
+}
+
 fn csv_text_from_rows(rows: &Value, columns: Option<&Value>) -> Result<String, ShellError> {
     let Value::List { vals, .. } = rows else {
         return Err(stone_error(
@@ -5028,6 +5135,7 @@ fn match_append_key(stmt: &Stmt, key_name: &str) -> Option<String> {
         receiver,
         method,
         positional,
+        ..
     }) = stmt
     else {
         return None;
@@ -6305,9 +6413,12 @@ emit({
 items = [3, 1]
 items.extend([2, 3])
 items.sort()
+pairs = [["b", 1], ["a", 2], ["b", 0]]
+pairs.sort(key=lambda pair: (pair[0], pair[1]), reverse=True)
 lines = open("input.txt").readlines()
 emit({
     "items": items,
+    "pairs": pairs,
     "list_count": items.count(3),
     "text_count": "banana".count("an"),
     "alpha": "abcXYZ".isalpha(),
@@ -6322,6 +6433,7 @@ emit({
             json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
             json_value!({
                 "items": [1, 2, 3, 3],
+                "pairs": [["b", 1], ["b", 0], ["a", 2]],
                 "list_count": 2,
                 "text_count": 2,
                 "alpha": true,
@@ -6342,7 +6454,7 @@ emit({
             .expect_err("bare generator expression should fail");
         let text = format!("{err:?}");
 
-        assert!(text.contains("sum(...), any(...), and all(...)"));
+        assert!(text.contains("sum(...), any(...), all(...), join(...), and set(...)"));
         assert!(text.contains("list comprehension"));
 
         cleanup_dir(&root);
@@ -6730,13 +6842,15 @@ emit({
 emit({
     "split": items,
     "join": join(items, "|"),
+    "join_generator": join(part[0] for part in items),
     "join_reversed_args": join("/", ["tmp", "waymark"]),
     "slice": slice(items, 1, 3),
     "tail": slice(items, 1),
     "prefix": slice("abcdef", None, 3),
     "starts_with": starts_with("abcdef", "abc"),
     "startswith": startswith("abcdef", "def"),
-    "format": format("{}:{} {{ok}}", "port", 8080),
+    "set_generator": set(part[0] for part in items),
+    "format": format("{}:{} {{ok}} {:.2f}", "port", 8080, 3),
     "max": max(1, 7, 3),
     "repr": repr(["ok", 2]),
 })
@@ -6749,13 +6863,15 @@ emit({
             json_value!({
                 "split": ["alpha", "beta", "gamma"],
                 "join": "alpha|beta|gamma",
+                "join_generator": "abg",
                 "join_reversed_args": "tmp/waymark",
                 "slice": ["beta", "gamma"],
                 "tail": ["beta", "gamma"],
                 "prefix": "abc",
                 "starts_with": true,
                 "startswith": false,
-                "format": "port:8080 {ok}",
+                "set_generator": ["a", "b", "g"],
+                "format": "port:8080 {ok} 3.00",
                 "max": 7,
                 "repr": "[\"ok\",2]",
             })
@@ -9466,12 +9582,16 @@ else:
             r#"data = read_json("input.json")
 input_rows = read_jsonl("input.jsonl")
 encoded = json_dumps({"ok": data["ok"], "count": len(data["items"])})
+pretty = json_dumps({"ok": True}, indent=2)
+compact = json_dumps({"ok": True}, separators=(",", ":"))
 decoded = json_loads(encoded)
 rows = [{"name": "a"}, {"name": "b"}]
 json_bytes = write_json("out.json", decoded)
 jsonl_bytes = write_jsonl("rows.jsonl", rows)
 emit({
     "decoded": decoded,
+    "pretty": pretty,
+    "compact": compact,
     "json": read_json("out.json"),
     "json_bytes": json_bytes,
     "jsonl": cat("rows.jsonl"),
@@ -9487,6 +9607,8 @@ emit({
             json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
             json_value!({
                 "decoded": {"ok": true, "count": 2},
+                "pretty": "{\n  \"ok\": true\n}",
+                "compact": "{\"ok\":true}",
                 "json": {"ok": true, "count": 2},
                 "json_bytes": 31,
                 "jsonl": "{\"name\":\"a\"}\n{\"name\":\"b\"}\n",

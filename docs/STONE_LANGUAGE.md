@@ -157,23 +157,28 @@ Supported handlers are `except:`, `except Exception:`, and
 - `where(rows, key, expected)`, `where(rows, key, op, expected)`, or
   `where(rows, lambda r: ...)`: filter record lists by equality, comparison
   (`==`, `!=`, `>`, `>=`, `<`, `<=`, `in`, `not in`), or a predicate.
-- `any(iterable)`, `all(iterable)`, and `sum(iterable)`: aggregate lists or
-  supported generator expressions with Stone truthiness and typed numeric
-  semantics.
+- `any(iterable)`, `all(iterable)`, `sum(iterable)`, `join(iterable)`, and
+  `set(iterable)`: aggregate lists or supported generator expressions with
+  Stone truthiness, typed numeric semantics, or deterministic first-seen
+  uniqueness.
 - `set()` and `set(iterable)`: materialize a deterministic unique list. The
   `.add(value)` method appends only values not already present.
 - `str(value)` and `repr(value)`: convert a typed value to display text.
   `repr()` is a Python-compatibility alias; use `json_dumps(value)` when valid
   JSON text is required.
+- `json_dumps(value, indent=None, separators=None)`: serialize typed Stone
+  values as JSON text. The common Python-shaped calls `indent=2` and
+  `separators=(",", ":")` are supported.
 - `split(text, separator=None, maxsplit=None)`, `join(items, separator="")`,
   `slice(value, start=None, end=None)`, `starts_with(text, prefix)`, and
   `format(template, ...)`: small text/list helpers for scripts and dynamic
-  helper callbacks. String method forms such as `"a,b".split(",")`,
+  helper callbacks. `format` supports `{}` and simple fixed decimal specs like
+  `{:.2f}`. String method forms such as `"a,b".split(",")`,
   `line.split(":", 1)`, `line.split(":", maxsplit=1)`, `line.strip()`,
   `line.lstrip()`, `line.rstrip()`, `text.isdigit()`, `text.isalpha()`,
   `text.count("x")`, `",".join(items)`, `open(path).readlines()`,
-  `items.extend(other)`, `items.count(value)`, and mutating `items.sort()`
-  are also supported.
+  `items.extend(other)`, `items.count(value)`, and mutating
+  `items.sort(key=..., reverse=...)` are also supported.
 - `list(value)` and `tuple(value)`: materialize a list view. In Stone,
   `tuple()` is an agent-compatibility alias for `list()`.
 - `run(argv, cwd=None, stdin=None, timeout_ms=None, env=None)`: Linux command

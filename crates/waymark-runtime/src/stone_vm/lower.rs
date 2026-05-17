@@ -282,6 +282,7 @@ fn lower_generic_loop_stmt(item: &str, stmt: &Stmt) -> Option<GenericLoopOp> {
             receiver,
             method,
             positional,
+            ..
         }) => lower_generic_list_append(item, receiver, method, positional),
         Stmt::AugAssign {
             target: AssignTarget::Name(local),
@@ -401,6 +402,7 @@ fn match_record_string_field_expr(item: &str, value: &Expr) -> Option<RecordStri
             receiver,
             method,
             positional,
+            ..
         } if positional.is_empty() && (method == "strip" || method == "lower") => {
             let mut field = match_record_string_field_expr(item, receiver)?;
             match method.as_str() {
@@ -1346,6 +1348,7 @@ fn matches_line_strip_call(line_target: &str, expr: &Expr) -> bool {
         receiver,
         method,
         positional,
+        ..
     } = expr
     else {
         return false;
@@ -1435,6 +1438,7 @@ pub(crate) fn match_row_get<'a>(row_target: &str, value: &'a Expr) -> Option<(St
         receiver,
         method,
         positional,
+        ..
     } = value
     else {
         return None;
@@ -1620,6 +1624,7 @@ fn match_append_key(stmt: &Stmt, key_name: &str) -> Option<String> {
         receiver,
         method,
         positional,
+        ..
     }) = stmt
     else {
         return None;

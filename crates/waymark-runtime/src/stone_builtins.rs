@@ -110,10 +110,6 @@ pub(crate) fn float_builtin(value: &Value) -> Result<Value, ShellError> {
 
 pub(crate) fn format_builtin(template: &Value, args: &[Value]) -> Result<Value, ShellError> {
     let template = value_to_string(template, "format")?;
-    let args = args
-        .iter()
-        .map(value_to_display_string)
-        .collect::<Result<Vec<_>, _>>()?;
     format_template(&template, &args).map(|text| Value::string(text, Span::unknown()))
 }
 
@@ -1481,7 +1477,7 @@ pub(crate) fn zfill_text(text: &str, width: usize) -> String {
     format!("{sign}{}{}", "0".repeat(width - len), digits)
 }
 
-fn format_template(template: &str, args: &[String]) -> Result<String, ShellError> {
+fn format_template(template: &str, args: &[Value]) -> Result<String, ShellError> {
     let mut output = String::new();
     let mut chars = template.chars().peekable();
     let mut arg_index = 0;
@@ -1495,21 +1491,32 @@ fn format_template(template: &str, args: &[String]) -> Result<String, ShellError
                 chars.next();
                 output.push('}');
             }
-            '{' if chars.peek() == Some(&'}') => {
-                chars.next();
+            '{' => {
+                let mut spec = String::new();
+                let mut closed = false;
+                for ch in chars.by_ref() {
+                    if ch == '}' {
+                        closed = true;
+                        break;
+                    }
+                    spec.push(ch);
+                }
+                if !closed {
+                    return Err(stone_error("format", "format() found an unmatched `{`"));
+                }
                 let Some(value) = args.get(arg_index) else {
                     return Err(stone_error(
                         "format",
                         "format() has fewer arguments than placeholders",
                     ));
                 };
-                output.push_str(value);
+                output.push_str(&format_value(value, &spec)?);
                 arg_index += 1;
             }
-            '{' | '}' => {
+            '}' => {
                 return Err(stone_error(
                     "format",
-                    "format() supports only `{}` placeholders and escaped `{{` or `}}`",
+                    "format() supports `{}`, simple fixed decimal specs like `{:.2f}`, and escaped `{{` or `}}`",
                 ));
             }
             _ => output.push(ch),
@@ -1522,6 +1529,28 @@ fn format_template(template: &str, args: &[String]) -> Result<String, ShellError
         ));
     }
     Ok(output)
+}
+
+fn format_value(value: &Value, spec: &str) -> Result<String, ShellError> {
+    if spec.is_empty() {
+        return value_to_display_string(value);
+    }
+    if let Some(precision) = parse_fixed_decimal_format_spec(spec) {
+        let value = value_to_f64(value, "format")?;
+        return Ok(format!("{value:.precision$}"));
+    }
+    Err(stone_error(
+        "format",
+        format!("unsupported format spec `{{{spec}}}`; supported specs are {{}} and {{:.Nf}}"),
+    ))
+}
+
+fn parse_fixed_decimal_format_spec(spec: &str) -> Option<usize> {
+    let digits = spec.strip_prefix(":.")?.strip_suffix('f')?;
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<usize>().ok()
 }
 
 fn unique_values(values: Vec<Value>, context: &str) -> Result<Vec<Value>, ShellError> {
