@@ -20,7 +20,6 @@ pub(crate) struct GatewayRuntimeConfig {
     pub(crate) endpoint: GatewayEndpoint,
     pub(crate) tx: String,
     pub(crate) image: String,
-    pub(crate) container: Option<String>,
     pub(crate) workspace_mount: String,
 }
 
@@ -143,7 +142,6 @@ pub(crate) fn run_command(
     let mut options = LinuxExecOptions::new(config.tx.clone(), config.image.clone(), argv.to_vec())
         .workspace_mount(config.workspace_mount.clone())
         .workdir(workdir);
-    options.container = config.container.clone();
     for (key, value) in env_overrides {
         options = options.env(key.clone(), value.clone());
     }
@@ -196,19 +194,12 @@ fn config_from_process_env() -> Option<GatewayRuntimeConfig> {
     let socket = std::env::var_os("WAYMARK_GATEWAY_SOCKET")?;
     let tx = std::env::var("WAYMARK_GATEWAY_TX").ok()?;
     let image = std::env::var("WAYMARK_GATEWAY_IMAGE").unwrap_or_default();
-    let container = std::env::var("WAYMARK_GATEWAY_CONTAINER")
-        .ok()
-        .filter(|value| !value.is_empty());
-    if image.is_empty() && container.is_none() {
-        return None;
-    }
     let workspace_mount =
         std::env::var("WAYMARK_GATEWAY_WORKSPACE_MOUNT").unwrap_or_else(|_| "/app".to_string());
     Some(GatewayRuntimeConfig {
         endpoint: GatewayEndpoint::Unix(PathBuf::from(socket)),
         tx,
         image,
-        container,
         workspace_mount,
     })
 }

@@ -25,7 +25,11 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Open a Gateway transaction for a workspace.",
         "inputSchema": {
             "type": "object",
-            "properties": {"workspace": {"type": "string"}},
+            "properties": {
+                "workspace": {"type": "string"},
+                "container": {"type": "string"},
+                "workspace_mount": {"type": "string"},
+            },
             "required": ["workspace"],
         },
     },
@@ -253,7 +257,11 @@ class GatewayMcp:
 
     def run_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name == "env_snapshot":
-            return self.rpc.call("env.snapshot", ["--workspace", required(args, "workspace")])
+            call_args = ["--workspace", required(args, "workspace")]
+            if args.get("container"):
+                call_args.extend(["--container", str(args["container"])])
+                call_args.extend(["--workspace-mount", str(args.get("workspace_mount", "/app"))])
+            return self.rpc.call("env.snapshot", call_args)
         if name == "workspace_list":
             call_args = ["--workspace", required(args, "workspace")]
             add_optional(call_args, args, "generation", "--generation")
