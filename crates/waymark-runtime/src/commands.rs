@@ -1233,9 +1233,10 @@ if starts_with(line, "ERROR"):
     StoneHelpEntry {
         name: "format",
         signature: "format(template: str, ...values: Any) -> str",
-        use_when: "Use for small positional text templates, including simple fixed decimal specs.",
+        use_when: "Use for small positional text templates, numbered placeholders, and simple fixed decimal specs.",
         examples: &[
             r#"line = format("{}:{}", name, count)"#,
+            r#"line = format("{1}:{0}", name, count)"#,
             r#"amount = format("{:.2f}", total)"#,
         ],
         avoid: &["Use f-strings when they are clearer and do not need format specs."],
@@ -1425,7 +1426,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "Functions: def name(arg) works; optional type annotations like def name(arg: str) -> str are checked; immutable default values are supported.",
             "try/except catches runtime evaluation errors; supported handlers are except:, except Exception:, and except Exception as e:.",
             "Lambdas: expression-only callbacks work in sort/map/filter, e.g. lambda r: r[\"name\"].",
-            "String methods include strip/lstrip/rstrip, isdigit/isalpha, count, split/splitlines, replace, join, lower/upper, zfill, startswith, and endswith; split accepts optional maxsplit and default whitespace splitting.",
+            "String methods include strip/lstrip/rstrip, isdigit/isalpha/isalnum, count, split/rsplit/splitlines, replace, join, lower/upper, zfill, startswith, and endswith; split and rsplit accept optional maxsplit and default whitespace splitting.",
             "File handles support read(), readlines()/splitlines(), write(text), and close().",
             "List variables support append(value), extend(values), count(value), mutating sort(key=..., reverse=...), and set-style add(value) for unique append.",
             "Use emit(value) when you want structured data returned to the caller.",
@@ -1436,6 +1437,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
         summary: "Common Python habits that fail in Stone, with replacements.",
         bullets: &[
             "No imports/modules/os/pathlib/glob/json; use find/read_json/json_loads/json_dumps.",
+            "No isinstance(value, type); use type(value) == \"list\"/\"str\"/\"int\"/\"float\"/\"record\" or direct structural checks.",
             "Lambda is expression-only; use explicit loops when callback logic needs statements or mutation.",
             "No classes/decorators/async/nested functions.",
             "No mutable default args, *args, **kwargs, or keyword calls to user functions.",

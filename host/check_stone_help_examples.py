@@ -189,6 +189,11 @@ def check_examples(waymark_bin: Path, entries: list[dict[str, Any]]) -> list[str
     failures: list[str] = []
     for entry in entries:
         name = entry["name"]
+        use_when = entry.get("use_when")
+        if isinstance(use_when, str) and "Gateway mode" in use_when:
+            # Gateway transaction helpers require runtime config that is not
+            # active in ordinary `waymark eval`; coverage is checked above.
+            continue
         for index, example in enumerate(entry.get("examples", [])):
             if not isinstance(example, str) or not example.strip():
                 failures.append(f"help({name!r}) example {index} is empty or non-string")

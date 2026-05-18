@@ -4299,8 +4299,9 @@ impl Evaluator<'_> {
 
             let receiver = receiver.into_nu_value("method call")?;
             match method {
-                "strip" | "lstrip" | "rstrip" | "isdigit" | "isalpha" | "split" | "splitlines"
-                | "replace" | "join" | "lower" | "upper" | "zfill" | "startswith" | "endswith" => {
+                "strip" | "lstrip" | "rstrip" | "isdigit" | "isalpha" | "isalnum" | "split"
+                | "rsplit" | "splitlines" | "replace" | "join" | "lower" | "upper" | "zfill"
+                | "startswith" | "endswith" => {
                     string_method_builtin(&receiver, method, &args).map(RuntimeValue::Nu)
                 }
                 "count" => self.eval_count_method(receiver, &args),
@@ -5467,6 +5468,12 @@ fn stone_error(kind: &str, message: impl Into<String>) -> ShellError {
 }
 
 fn unknown_stone_call_error(name: &str) -> ShellError {
+    if name == "isinstance" {
+        return stone_error(
+            "function call",
+            "isinstance(value, type) is not supported because Stone has no Python class model; use type(value) == \"list\"/\"str\"/\"int\"/\"float\"/\"record\" or direct structural checks",
+        );
+    }
     stone_error(
         "function call",
         format!("unknown Stone function `{name}`; use help() for available Stone functions"),
@@ -5734,6 +5741,20 @@ emit({
             text.contains("unknown Stone function"),
             "unexpected error: {text}"
         );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn isinstance_error_suggests_stone_type_checks() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("isinstance-call")?;
+        let program = lower_source(r#"emit(isinstance(["x"], list))"#)?;
+        let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("isinstance should stay unsupported with a targeted hint");
+        let text = format!("{err:?}");
+        assert!(text.contains("type(value)"), "unexpected error: {text}");
+        assert!(text.contains("list"), "unexpected error: {text}");
 
         cleanup_dir(&root);
         Ok(())
@@ -6562,6 +6583,10 @@ emit({
     "text_count": "banana".count("an"),
     "alpha": "abcXYZ".isalpha(),
     "mixed_alpha": "abc123".isalpha(),
+    "alnum": "abc123".isalnum(),
+    "mixed_alnum": "abc-123".isalnum(),
+    "rsplit": "a/b/c".rsplit("/", 1),
+    "rsplit_words": " alpha  beta gamma ".rsplit(None, 1),
     "lines": lines,
 })
 "#,
@@ -6577,6 +6602,10 @@ emit({
                 "text_count": 2,
                 "alpha": true,
                 "mixed_alpha": false,
+                "alnum": true,
+                "mixed_alnum": false,
+                "rsplit": ["a/b", "c"],
+                "rsplit_words": ["alpha beta", "gamma"],
                 "lines": ["alpha", "beta"],
             })
         );
@@ -6990,6 +7019,7 @@ emit({
     "startswith": startswith("abcdef", "def"),
     "set_generator": set(part[0] for part in items),
     "format": format("{}:{} {{ok}} {:.2f}", "port", 8080, 3),
+    "format_index": format("{1}/{0}/{1:.1f}", "x", 2),
     "max": max(1, 7, 3),
     "repr": repr(["ok", 2]),
 })
@@ -7011,6 +7041,7 @@ emit({
                 "startswith": false,
                 "set_generator": ["a", "b", "g"],
                 "format": "port:8080 {ok} 3.00",
+                "format_index": "2/x/2.0",
                 "max": 7,
                 "repr": "[\"ok\",2]",
             })

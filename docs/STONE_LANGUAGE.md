@@ -172,10 +172,12 @@ Supported handlers are `except:`, `except Exception:`, and
 - `split(text, separator=None, maxsplit=None)`, `join(items, separator="")`,
   `slice(value, start=None, end=None)`, `starts_with(text, prefix)`, and
   `format(template, ...)`: small text/list helpers for scripts and dynamic
-  helper callbacks. `format` supports `{}` and simple fixed decimal specs like
-  `{:.2f}`. String method forms such as `"a,b".split(",")`,
-  `line.split(":", 1)`, `line.split(":", maxsplit=1)`, `line.strip()`,
+  helper callbacks. `format` supports `{}`, numbered placeholders such as
+  `{0}`, and simple fixed decimal specs like `{:.2f}`. String method forms such
+  as `"a,b".split(",")`, `line.split(":", 1)`,
+  `line.split(":", maxsplit=1)`, `line.rsplit("/", 1)`, `line.strip()`,
   `line.lstrip()`, `line.rstrip()`, `text.isdigit()`, `text.isalpha()`,
+  `text.isalnum()`,
   `text.count("x")`, `",".join(items)`, `open(path).readlines()`,
   `items.extend(other)`, `items.count(value)`, and mutating
   `items.sort(key=..., reverse=...)` are also supported.

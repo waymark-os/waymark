@@ -1089,6 +1089,47 @@ fn split_text(
     ))
 }
 
+fn rsplit_text(
+    text: &str,
+    separator: Option<&Value>,
+    maxsplit: Option<usize>,
+) -> Result<Value, ShellError> {
+    let separator = match separator {
+        Some(Value::Nothing { .. }) => None,
+        other => other,
+    };
+    let split_from_right = separator.is_some() && maxsplit.is_some();
+    let mut parts: Vec<String> = match separator {
+        None => match maxsplit {
+            None => text.split_whitespace().map(str::to_owned).collect(),
+            Some(limit) => split_whitespace_right_limited(text, limit),
+        },
+        Some(separator) => {
+            let separator = value_to_string(separator, "rsplit")?;
+            if separator.is_empty() {
+                return Err(stone_error("rsplit", "empty separator is not supported"));
+            }
+            match maxsplit {
+                None => text.split(&separator).map(str::to_owned).collect(),
+                Some(limit) => text
+                    .rsplitn(limit + 1, &separator)
+                    .map(str::to_owned)
+                    .collect(),
+            }
+        }
+    };
+    if split_from_right {
+        parts.reverse();
+    }
+    Ok(Value::list(
+        parts
+            .into_iter()
+            .map(|part| Value::string(part, Span::unknown()))
+            .collect(),
+        Span::unknown(),
+    ))
+}
+
 fn split_whitespace_limited(text: &str, limit: usize) -> Vec<String> {
     let mut rest = text.trim_start_matches(char::is_whitespace);
     if rest.is_empty() {
@@ -1113,6 +1154,25 @@ fn split_whitespace_limited(text: &str, limit: usize) -> Vec<String> {
     }
     parts.push(rest.to_owned());
     parts
+}
+
+fn split_whitespace_right_limited(text: &str, limit: usize) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if limit == 0 {
+        return vec![trimmed.to_owned()];
+    }
+    let fields = trimmed.split_whitespace().collect::<Vec<_>>();
+    if fields.len() <= limit + 1 {
+        return fields.into_iter().map(str::to_owned).collect();
+    }
+    let split_at = fields.len() - limit;
+    let head = fields[..split_at].join(" ");
+    std::iter::once(head)
+        .chain(fields[split_at..].iter().map(|part| (*part).to_owned()))
+        .collect()
 }
 
 pub(crate) fn sort_key_for_value(value: &Value, field: Option<&str>) -> Result<Value, ShellError> {
@@ -1251,6 +1311,15 @@ pub(crate) fn string_method_builtin(
                 Span::unknown(),
             ))
         }
+        "isalnum" => {
+            let [] = args else {
+                return Err(stone_error("isalnum", "isalnum() takes no arguments"));
+            };
+            Ok(Value::bool(
+                !text.is_empty() && text.chars().all(|ch| ch.is_alphanumeric()),
+                Span::unknown(),
+            ))
+        }
         "count" => {
             let [needle] = args else {
                 return Err(stone_error(
@@ -1283,6 +1352,20 @@ pub(crate) fn string_method_builtin(
                 }
             };
             split_text(text, separator, split_maxsplit(maxsplit)?)
+        }
+        "rsplit" => {
+            let (separator, maxsplit) = match args {
+                [] => (None, None),
+                [separator] => (Some(separator), None),
+                [separator, maxsplit] => (Some(separator), Some(maxsplit)),
+                _ => {
+                    return Err(stone_error(
+                        "rsplit",
+                        "rsplit() takes separator and optional maxsplit",
+                    ));
+                }
+            };
+            rsplit_text(text, separator, split_maxsplit(maxsplit)?)
         }
         "splitlines" => {
             let [] = args else {
@@ -1481,6 +1564,8 @@ fn format_template(template: &str, args: &[Value]) -> Result<String, ShellError>
     let mut output = String::new();
     let mut chars = template.chars().peekable();
     let mut arg_index = 0;
+    let mut used_explicit_index = false;
+    let mut used_implicit_index = false;
     while let Some(ch) = chars.next() {
         match ch {
             '{' if chars.peek() == Some(&'{') => {
@@ -1504,14 +1589,32 @@ fn format_template(template: &str, args: &[Value]) -> Result<String, ShellError>
                 if !closed {
                     return Err(stone_error("format", "format() found an unmatched `{`"));
                 }
-                let Some(value) = args.get(arg_index) else {
+                let (explicit_index, spec) = split_format_index_and_spec(&spec)?;
+                let value_index = match explicit_index {
+                    Some(index) => {
+                        used_explicit_index = true;
+                        index
+                    }
+                    None => {
+                        used_implicit_index = true;
+                        let index = arg_index;
+                        arg_index += 1;
+                        index
+                    }
+                };
+                if used_explicit_index && used_implicit_index {
+                    return Err(stone_error(
+                        "format",
+                        "format() cannot mix numbered placeholders like {0} with automatic {} placeholders",
+                    ));
+                }
+                let Some(value) = args.get(value_index) else {
                     return Err(stone_error(
                         "format",
                         "format() has fewer arguments than placeholders",
                     ));
                 };
-                output.push_str(&format_value(value, &spec)?);
-                arg_index += 1;
+                output.push_str(&format_value(value, spec)?);
             }
             '}' => {
                 return Err(stone_error(
@@ -1522,13 +1625,31 @@ fn format_template(template: &str, args: &[Value]) -> Result<String, ShellError>
             _ => output.push(ch),
         }
     }
-    if arg_index != args.len() {
+    if !used_explicit_index && arg_index != args.len() {
         return Err(stone_error(
             "format",
             "format() received more arguments than placeholders",
         ));
     }
     Ok(output)
+}
+
+fn split_format_index_and_spec(spec: &str) -> Result<(Option<usize>, &str), ShellError> {
+    if spec.is_empty() || spec.starts_with(':') {
+        return Ok((None, spec));
+    }
+    let (index_text, rest) = match spec.split_once(':') {
+        Some((index, rest)) => (index, Some(rest)),
+        None => (spec, None),
+    };
+    if !index_text.chars().all(|ch| ch.is_ascii_digit()) {
+        return Ok((None, spec));
+    }
+    let index = index_text
+        .parse::<usize>()
+        .map_err(|_| stone_error("format", "format() placeholder index is too large"))?;
+    let spec = rest.map(|_| &spec[index_text.len()..]).unwrap_or("");
+    Ok((Some(index), spec))
 }
 
 fn format_value(value: &Value, spec: &str) -> Result<String, ShellError> {
@@ -1541,7 +1662,9 @@ fn format_value(value: &Value, spec: &str) -> Result<String, ShellError> {
     }
     Err(stone_error(
         "format",
-        format!("unsupported format spec `{{{spec}}}`; supported specs are {{}} and {{:.Nf}}"),
+        format!(
+            "unsupported format spec `{{{spec}}}`; supported specs are {{}}, {{N}}, and {{:.Nf}}"
+        ),
     ))
 }
 
