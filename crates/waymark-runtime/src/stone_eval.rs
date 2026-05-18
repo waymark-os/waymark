@@ -14,6 +14,7 @@ use nu_protocol::{
 use serde_json::{json, Value as JsonValue};
 
 use crate::commands::{stone_help_overview, stone_help_topic};
+use crate::gateway_env;
 use crate::json::{json_to_nu_value, nu_to_json_value};
 use crate::stone_ast::{
     AssignTarget, AugOp, BoolOp, Call, CompareOp, ComprehensionClause, ExceptHandler, Expr,
@@ -1841,6 +1842,11 @@ impl Evaluator<'_> {
             "run" => self.eval_run_call(call),
             "resolve_command" => self.eval_resolve_command_call(call),
             "state" => self.eval_state_call(call),
+            "env_state" | "env_diff" => self.eval_env_state_call(call),
+            "env_finish" => self.eval_env_finish_call(call),
+            "env_restore" => self.eval_env_restore_call(call),
+            "env_commit" => self.eval_env_commit_call(call),
+            "env_rollback" => self.eval_env_rollback_call(call),
             "last_result" => self.eval_last_result_call(call),
             "start_daemon" => self.eval_start_daemon_call(call),
             "starts_with" | "startswith" => self.eval_starts_with_call(call),
@@ -3537,7 +3543,119 @@ impl Evaluator<'_> {
             .engine_state
             .cwd_as_string(Some(self.stack))
             .map_err(|err| stone_error("state", err.to_string()))?;
-        Ok(RuntimeValue::Nu(runtime_state_record(Path::new(&cwd))))
+        let state = runtime_state_record(Path::new(&cwd));
+        if !gateway_env::enabled() {
+            return Ok(RuntimeValue::Nu(state));
+        }
+
+        let span = Span::unknown();
+        let mut record = match state {
+            Value::Record { val, .. } => (*val).clone(),
+            other => {
+                let mut record = Record::new();
+                record.push("runtime", other);
+                record
+            }
+        };
+        record.push("gateway", gateway_env::env_state(50)?);
+        Ok(RuntimeValue::Nu(Value::record(record, span)))
+    }
+
+    fn eval_env_state_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 1 {
+            return Err(stone_error(
+                &call.name,
+                format!("{}() accepts at most one sample_limit argument", call.name),
+            ));
+        }
+        let mut sample_limit = 100_u32;
+        if let Some(value) = positional.first() {
+            sample_limit = u32::try_from(value_to_u64(value, "env_state sample_limit")?)
+                .map_err(|_| stone_error("env_state", "sample_limit is too large"))?;
+        }
+        for (name, value) in named {
+            match name.as_str() {
+                "sample_limit" => {
+                    sample_limit =
+                        u32::try_from(value_to_u64(&value, "env_state sample_limit")?)
+                            .map_err(|_| stone_error("env_state", "sample_limit is too large"))?;
+                }
+                _ => {
+                    return Err(stone_error(
+                        &call.name,
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        gateway_env::env_state(sample_limit).map(RuntimeValue::Nu)
+    }
+
+    fn eval_env_finish_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.positional.is_empty() || !call.named.is_empty() {
+            return Err(stone_error("env_finish", "env_finish() takes no arguments"));
+        }
+        gateway_env::env_finish().map(RuntimeValue::Nu)
+    }
+
+    fn eval_env_restore_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        let mut paths = Vec::new();
+        for value in positional {
+            collect_env_restore_paths(&value, &mut paths)?;
+        }
+        for (name, value) in named {
+            match name.as_str() {
+                "paths" => collect_env_restore_paths(&value, &mut paths)?,
+                _ => {
+                    return Err(stone_error(
+                        "env_restore",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        gateway_env::env_restore(paths).map(RuntimeValue::Nu)
+    }
+
+    fn eval_env_commit_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 1 {
+            return Err(stone_error(
+                "env_commit",
+                "env_commit() accepts at most one message argument",
+            ));
+        }
+        let mut message = positional
+            .first()
+            .map(|value| value_to_string(value, "env_commit message"))
+            .transpose()?
+            .unwrap_or_else(|| "agent commit".to_string());
+        let mut allow_risky = false;
+        for (name, value) in named {
+            match name.as_str() {
+                "message" => message = value_to_string(&value, "env_commit message")?,
+                "allow_risky" => allow_risky = value_to_bool(&value, "env_commit allow_risky")?,
+                _ => {
+                    return Err(stone_error(
+                        "env_commit",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        gateway_env::env_commit(message, allow_risky).map(RuntimeValue::Nu)
+    }
+
+    fn eval_env_rollback_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.positional.is_empty() || !call.named.is_empty() {
+            return Err(stone_error(
+                "env_rollback",
+                "env_rollback() takes no arguments",
+            ));
+        }
+        gateway_env::env_rollback().map(RuntimeValue::Nu)
     }
 
     fn eval_last_result_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -4685,6 +4803,12 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "edit_file",
     "echo",
     "emit",
+    "env_commit",
+    "env_diff",
+    "env_finish",
+    "env_restore",
+    "env_rollback",
+    "env_state",
     "fail",
     "filter",
     "find",
@@ -5347,6 +5471,21 @@ fn unknown_stone_call_error(name: &str) -> ShellError {
         "function call",
         format!("unknown Stone function `{name}`; use help() for available Stone functions"),
     )
+}
+
+fn collect_env_restore_paths(value: &Value, paths: &mut Vec<String>) -> Result<(), ShellError> {
+    match value {
+        Value::List { vals, .. } => {
+            for value in vals {
+                collect_env_restore_paths(value, paths)?;
+            }
+            Ok(())
+        }
+        _ => {
+            paths.push(value_to_path_string(value, "env_restore paths")?);
+            Ok(())
+        }
+    }
 }
 
 fn file_method_error(method: &str) -> ShellError {

@@ -157,6 +157,43 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "effects": ["read_env", "read_file", "process"],
         "example": "snapshot = state()",
     },
+    "env_state": {
+        "name": "env_state",
+        "signature": "env_state(sample_limit: int = 100) -> record",
+        "effects": ["read_env", "read_file"],
+        "example": "changes = env_state(sample_limit=50)",
+    },
+    "env_diff": {
+        "name": "env_diff",
+        "signature": "env_diff(sample_limit: int = 100) -> record",
+        "effects": ["read_env", "read_file"],
+        "example": "changes = env_diff(sample_limit=50)",
+        "alias_for": "env_state",
+    },
+    "env_finish": {
+        "name": "env_finish",
+        "signature": "env_finish() -> record",
+        "effects": ["read_env", "read_file"],
+        "example": "finish = env_finish()",
+    },
+    "env_restore": {
+        "name": "env_restore",
+        "signature": "env_restore(paths: list[str] | str = []) -> record",
+        "effects": ["write_file", "remove_file"],
+        "example": 'env_restore(["tmp.txt", "build.log"])',
+    },
+    "env_commit": {
+        "name": "env_commit",
+        "signature": "env_commit(message: str = 'agent commit', allow_risky: bool = False) -> record",
+        "effects": ["write_file"],
+        "example": 'env_commit(message="solve task")',
+    },
+    "env_rollback": {
+        "name": "env_rollback",
+        "signature": "env_rollback() -> record",
+        "effects": ["write_file", "remove_file"],
+        "example": "env_rollback()",
+    },
     "last_result": {
         "name": "last_result",
         "signature": "last_result() -> record | None",
@@ -246,6 +283,12 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
     ),
     "resolve_command": ("name",),
     "state": (),
+    "env_state": ("sample_limit",),
+    "env_diff": ("sample_limit",),
+    "env_finish": (),
+    "env_restore": ("paths",),
+    "env_commit": ("message", "allow_risky"),
+    "env_rollback": (),
     "last_result": (),
     "rm": ("path",),
     "start_daemon": ("argv", "cwd", "env", "stdout", "stderr"),
@@ -277,6 +320,7 @@ Stone_CALL_ALIASES: dict[str, str] = {
 }
 
 Stone_ONE_POSITIONAL_THEN_KEYWORDS = {
+    "env_commit",
     "run",
     "start_daemon",
     "daemon_status",
