@@ -96,7 +96,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "asset-image"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "attribute-derive"
@@ -2445,7 +2445,7 @@ dependencies = [
 
 [[package]]
 name = "waymark"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "nu-protocol",
  "serde_json",
@@ -2472,7 +2472,7 @@ dependencies = [
 
 [[package]]
 name = "waymark-runtime"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "asset-image",
  "libc",
@@ -2493,7 +2493,7 @@ dependencies = [
 
 [[package]]
 name = "waymark-runtime-support"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "web-time"

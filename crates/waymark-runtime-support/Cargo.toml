@@ -1,5 +1,6 @@
 [package]
 name = "waymark-runtime-support"
+version.workspace = true
 edition = "2021"
 
 [dependencies]

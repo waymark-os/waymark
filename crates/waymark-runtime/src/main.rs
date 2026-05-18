@@ -13,6 +13,23 @@ use waymark_runtime::{pipeline_input_from_bytes, FrontendKind, StoneGuest};
 use waymark_runtime_support::{configure_process_environment, default_start_dir};
 
 fn main() -> ExitCode {
+    let program_name = std::env::args()
+        .next()
+        .and_then(|path| {
+            Path::new(&path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "waymark".to_owned());
+    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("{}", version_text(&program_name));
+        return ExitCode::SUCCESS;
+    }
+
     let start_dir = default_start_dir();
     configure_process_environment(&start_dir);
 
@@ -24,15 +41,6 @@ fn main() -> ExitCode {
         }
     };
 
-    let program_name = std::env::args()
-        .next()
-        .and_then(|path| {
-            Path::new(&path)
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| "waymark".to_owned());
-    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     let eval_mode = args.first().is_some_and(|arg| arg == "eval");
     if eval_mode {
         args.remove(0);
@@ -407,17 +415,22 @@ fn usage(program_name: &str) -> String {
          {program_name} eval [--stdin] [--stone|--nu] <script.stone|script.nu> | \
          {program_name} eval [--stone|--nu] --stdin-script | \
          {program_name} help | \
+         {program_name} --version | \
          {program_name} --task [task.json] | \
          {program_name} --task-server | \
          {program_name} --task-server-vsock [port]"
     )
 }
 
+fn version_text(program_name: &str) -> String {
+    format!("{program_name} {}", env!("CARGO_PKG_VERSION"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         frontend_for_script_path, is_trailing_hermit_boot_arg, normalize_exit_code, remove_flag,
-        remove_optional_value, strip_trailing_hermit_boot_args, usage,
+        remove_optional_value, strip_trailing_hermit_boot_args, usage, version_text,
     };
     use waymark_runtime::FrontendKind;
 
@@ -537,8 +550,17 @@ mod tests {
 
         assert!(text.contains("waymark-runtime eval"));
         assert!(text.contains("--stdin-script"));
+        assert!(text.contains("--version"));
         assert!(text.contains("--task [task.json]"));
         assert!(text.contains("--task-server"));
         assert!(text.contains("--task-server-vsock [port]"));
+    }
+
+    #[test]
+    fn version_text_uses_package_version() {
+        assert_eq!(
+            version_text("waymark"),
+            format!("waymark {}", env!("CARGO_PKG_VERSION"))
+        );
     }
 }

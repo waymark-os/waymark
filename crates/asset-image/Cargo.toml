@@ -1,5 +1,6 @@
 [package]
 name = "asset-image"
+version.workspace = true
 edition = "2021"
 license.workspace = true
 

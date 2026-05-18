@@ -1,5 +1,6 @@
 [package]
 name = "waymark-runtime"
+version.workspace = true
 edition = "2021"
 license.workspace = true
 
