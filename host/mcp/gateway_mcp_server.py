@@ -103,13 +103,14 @@ TOOLS: list[dict[str, Any]] = [
                 "workspace": {"type": "string"},
                 "dry_run": {"type": "boolean"},
                 "image": {"type": "string"},
+                "container": {"type": "string"},
                 "argv": {"type": "array", "items": {"type": "string"}},
                 "workspace_mount": {"type": "string"},
                 "workdir": {"type": "string"},
                 "env": {"type": "object", "additionalProperties": {"type": "string"}},
                 "user": {"type": "string"},
             },
-            "required": ["image", "argv"],
+            "required": ["argv"],
         },
     },
     {
@@ -311,11 +312,13 @@ class GatewayMcp:
         call_args = [
             "--tx",
             str(tx),
-            "--image",
-            required(args, "image"),
             "--workspace-mount",
             str(args.get("workspace_mount", "/app")),
         ]
+        if args.get("container"):
+            call_args.extend(["--container", str(args["container"])])
+        else:
+            call_args.extend(["--image", required(args, "image")])
         if args.get("workdir"):
             call_args.extend(["--workdir", str(args["workdir"])])
         if args.get("user"):
