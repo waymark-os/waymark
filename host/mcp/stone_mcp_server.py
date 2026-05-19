@@ -1165,6 +1165,19 @@ def sparse(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def stone_help(backend: StoneBackend, name: str | None = None) -> dict[str, Any]:
+    if blind_surface_enabled():
+        if name is None:
+            return {"ok": True, "value": visible_help_table()}
+        normalized = Stone_CALL_ALIASES.get(str(name), str(name))
+        if normalized in BLIND_HELP_NAMES:
+            return {
+                "ok": False,
+                "error": {
+                    "kind": "hidden_call",
+                    "code": "stone_call_hidden_blind_surface",
+                    "message": f"{normalized} is hidden in blind agent surface mode",
+                },
+            }
     source = "emit(help())\n" if not name else f"emit(help({stone_literal(name)}))\n"
     result = backend.eval(source)
     if result.get("ok") is True:
@@ -1180,6 +1193,15 @@ def stone_help(backend: StoneBackend, name: str | None = None) -> dict[str, Any]
 
 def stone_call(backend: StoneBackend, name: str, args: Any, cwd: str | None = None) -> dict[str, Any]:
     name = Stone_CALL_ALIASES.get(name, name)
+    if blind_surface_enabled() and name in BLIND_STONE_CALLS:
+        return {
+            "ok": False,
+            "error": {
+                "kind": "hidden_call",
+                "code": "stone_call_hidden_blind_surface",
+                "message": f"{name} is hidden in blind agent surface mode",
+            },
+        }
     try:
         args = parse_stone_call_args(args)
     except ValueError as err:
@@ -1705,6 +1727,50 @@ TOOLS = [
     },
 ]
 
+BLIND_STONE_CALLS = {"env_state", "env_diff", "env_restore", "env_rollback"}
+BLIND_HELP_NAMES = {"env_state", "env_diff", "env_restore", "env_rollback"}
+BLIND_RESULT_KEYS = {"effects", "env_state", "env_diff", "env_warnings", "next_actions"}
+
+
+def agent_surface_mode() -> str:
+    mode = os.environ.get("WAYMARK_GATEWAY_AGENT_SURFACE", "full").strip().lower()
+    return mode if mode in {"full", "blind"} else "full"
+
+
+def blind_surface_enabled() -> bool:
+    return agent_surface_mode() == "blind"
+
+
+def visible_tools() -> list[dict[str, Any]]:
+    if not blind_surface_enabled():
+        return TOOLS
+    return TOOLS
+
+
+def visible_help_table() -> dict[str, dict[str, Any]]:
+    if not blind_surface_enabled():
+        return HELP_TABLE
+    return {name: value for name, value in HELP_TABLE.items() if name not in BLIND_HELP_NAMES}
+
+
+def sanitize_for_agent(value: Any) -> Any:
+    if not blind_surface_enabled():
+        return value
+    if isinstance(value, dict):
+        return {
+            key: sanitize_for_agent(item)
+            for key, item in value.items()
+            if key not in BLIND_RESULT_KEYS
+        }
+    if isinstance(value, list):
+        return [sanitize_for_agent(item) for item in value]
+    return value
+
+
+def hidden_blind_source(source: str) -> bool:
+    hidden = ("env_state", "env_diff", "env_restore", "env_rollback")
+    return any(name in source for name in hidden)
+
 
 class McpServer:
     def __init__(
@@ -1776,7 +1842,7 @@ class McpServer:
                     "capabilities": {"tools": {}},
                 }
             elif method == "tools/list":
-                result = {"tools": TOOLS}
+                result = {"tools": visible_tools()}
             elif method == "tools/call":
                 result = self.call_tool(request.get("params", {}))
             else:
@@ -1791,10 +1857,20 @@ class McpServer:
         args = params.get("arguments") or {}
         started = time.monotonic()
         if name == "stone_eval":
-            result = self.backend.eval(str(args.get("source", "")), args.get("cwd"))
-            result = apply_large_result_policy(
-                result, allow_large_output=bool(args.get("allow_large_output"))
-            )
+            if blind_surface_enabled() and hidden_blind_source(str(args.get("source", ""))):
+                result = {
+                    "ok": False,
+                    "error": {
+                        "kind": "hidden_call",
+                        "code": "stone_eval_hidden_blind_surface",
+                        "message": "restore, rollback, and change-inspection builtins are hidden in blind agent surface mode",
+                    },
+                }
+            else:
+                result = self.backend.eval(str(args.get("source", "")), args.get("cwd"))
+                result = apply_large_result_policy(
+                    result, allow_large_output=bool(args.get("allow_large_output"))
+                )
         elif name == "stone_help":
             result = stone_help(self.backend, args.get("name"))
         elif name == "stone_call":
@@ -1816,6 +1892,7 @@ class McpServer:
                 },
             }
         duration_ms = int((time.monotonic() - started) * 1000)
+        result = sanitize_for_agent(result)
         self.trace.record_tool_call(str(name), args if isinstance(args, dict) else {}, result, duration_ms)
         text = json.dumps(result, indent=2, sort_keys=True)
         return {"content": [{"type": "text", "text": text}], "structuredContent": result}
