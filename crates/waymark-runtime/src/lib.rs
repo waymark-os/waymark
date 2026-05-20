@@ -30,7 +30,6 @@ mod stone_file_ops;
 mod stone_frontend;
 mod stone_hash;
 mod stone_helpers;
-mod stone_run;
 mod stone_vm;
 #[cfg(test)]
 mod stone_vm_tests;

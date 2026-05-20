@@ -51,13 +51,19 @@ use crate::stone_helpers::{
     StoneHelperRegistry, StoneRunEvent,
 };
 #[cfg(all(not(target_os = "hermit"), test))]
-use crate::stone_run::cleanup_stale_run_temp_files;
+use crate::linux_tools::process::cleanup_stale_run_temp_files;
 #[cfg(not(target_os = "hermit"))]
-use crate::stone_run::{
-    daemon_status_call_values, resolve_command_call_values, run_call_values,
-    run_terminate_call_values, run_wait_call_values, start_daemon_call_values,
-    stop_daemon_call_values, wait_port_call_values,
+use crate::linux_tools::{
+    daemon::{
+        daemon_status_call_values, start_daemon_call_values, stop_daemon_call_values,
+        wait_port_call_values,
+    },
+    process::{
+        resolve_command_call_values, run_call_values, run_terminate_call_values,
+        run_wait_call_values,
+    },
 };
+#[cfg(not(target_os = "hermit"))]
 use crate::stone_vm::{
     match_hot_jsonl_aggregation_body, match_outer_jsonl_file_loop_body, try_lower_generic_loop,
     try_lower_hot_loop, ConstId, GenericLoopIter, GenericLoopOp, GenericLoopPlan, HotLoopIter,

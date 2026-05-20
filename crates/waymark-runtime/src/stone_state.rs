@@ -7,7 +7,9 @@ use std::time::Duration;
 use nu_protocol::{Record, Span, Value};
 
 #[cfg(not(target_os = "hermit"))]
-use crate::stone_run::{bounded_command_output, bounded_command_stdout, resolve_command};
+use crate::linux_tools::process::{
+    bounded_command_output, bounded_command_stdout, resolve_command,
+};
 
 pub(crate) fn runtime_state_record(cwd: &Path) -> Value {
     let span = Span::unknown();
