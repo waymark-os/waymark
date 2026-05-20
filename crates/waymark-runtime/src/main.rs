@@ -76,8 +76,11 @@ fn main() -> ExitCode {
         None => None,
     };
 
-    if stone && nu {
-        emit_json_error("usage error", "--stone and --nu are mutually exclusive");
+    if nu {
+        emit_json_error(
+            "usage error",
+            "the Nu frontend has been removed; use Stone syntax",
+        );
         return ExitCode::from(2);
     }
 
@@ -223,16 +226,10 @@ fn main() -> ExitCode {
 
     let explicit_frontend = if stone {
         Some(FrontendKind::Stone)
-    } else if nu {
-        Some(FrontendKind::Nu)
     } else {
         None
     };
-    let default_inline_frontend = if eval_mode {
-        FrontendKind::Stone
-    } else {
-        FrontendKind::Nu
-    };
+    let default_inline_frontend = FrontendKind::Stone;
 
     let execution = if args.first().is_some_and(|arg| arg == "-c") {
         args.remove(0);
@@ -353,14 +350,8 @@ fn read_script_file(path: &str) -> io::Result<String> {
 }
 
 fn frontend_for_script_path(path: &str) -> FrontendKind {
-    if Path::new(path)
-        .extension()
-        .is_some_and(|extension| extension == "stone")
-    {
-        FrontendKind::Stone
-    } else {
-        FrontendKind::Nu
-    }
+    let _ = path;
+    FrontendKind::Stone
 }
 
 fn remove_flag(args: &mut Vec<String>, flag: &str) -> bool {
@@ -411,9 +402,9 @@ fn is_trailing_hermit_boot_arg(arg: &str) -> bool {
 
 fn usage(program_name: &str) -> String {
     format!(
-        "usage: {program_name} eval [--stdin] [--stone|--nu] -c <command> | \
-         {program_name} eval [--stdin] [--stone|--nu] <script.stone|script.nu> | \
-         {program_name} eval [--stone|--nu] --stdin-script | \
+        "usage: {program_name} eval [--stdin] [--stone] -c <command> | \
+         {program_name} eval [--stdin] [--stone] <script.stone> | \
+         {program_name} eval [--stone] --stdin-script | \
          {program_name} help | \
          {program_name} --version | \
          {program_name} --task [task.json] | \
@@ -450,9 +441,12 @@ mod tests {
             frontend_for_script_path("script.stone"),
             FrontendKind::Stone
         );
-        assert_eq!(frontend_for_script_path("/tmp/script.nu"), FrontendKind::Nu);
-        assert_eq!(frontend_for_script_path("/tmp/script"), FrontendKind::Nu);
-        assert_eq!(frontend_for_script_path("/tmp/STONE"), FrontendKind::Nu);
+        assert_eq!(
+            frontend_for_script_path("/tmp/script.nu"),
+            FrontendKind::Stone
+        );
+        assert_eq!(frontend_for_script_path("/tmp/script"), FrontendKind::Stone);
+        assert_eq!(frontend_for_script_path("/tmp/STONE"), FrontendKind::Stone);
     }
 
     #[test]

@@ -12,9 +12,8 @@ and inside agent sandboxes that provide the expected filesystem and process
 interfaces.
 
 Waymark Shell is still a preview implementation. The current runtime deliberately
-reuses selected Nushell components for typed values, command registration, JSON
-conversion, and the compatibility frontend while Stone and the public `waymark`
-surface evolve.
+reuses selected Nushell components for typed values and JSON conversion while
+Stone and the public `waymark` surface evolve.
 
 ## Design Philosophy
 

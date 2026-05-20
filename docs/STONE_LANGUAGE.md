@@ -14,8 +14,7 @@ waymark eval script.stone
 waymark eval --stdin-script < script.stone
 ```
 
-Use `--nu` only for the compatibility frontend. Stone is the default for
-`waymark eval -c`, `.stone` files, and `--stdin-script`.
+Stone is the frontend for `waymark eval -c`, script files, and `--stdin-script`.
 
 ## Session Semantics
 

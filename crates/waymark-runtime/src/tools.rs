@@ -381,7 +381,6 @@ pub struct SearchRequest {
 pub struct RunRequest {
     pub source: String,
     pub frontend: RunFrontend,
-    pub allow_nu: bool,
     pub timeout_ms: Option<u64>,
 }
 
@@ -397,7 +396,6 @@ pub struct RunLinuxRequest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunFrontend {
     Stone,
-    Nu,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1776,14 +1774,6 @@ pub fn run_external_unsupported() -> ToolResult {
 
 pub fn run_tool(guest: &mut StoneGuest, limits: &ToolLimits, request: RunRequest) -> ToolResult {
     let started = Instant::now();
-    if request.frontend == RunFrontend::Nu && !request.allow_nu {
-        return elapsed_error(
-            "unsupported",
-            "nu_frontend_disabled",
-            "nu run tools must be explicitly enabled",
-            started,
-        );
-    }
     if request
         .timeout_ms
         .is_some_and(|timeout_ms| timeout_ms > limits.max_tool_ms)
@@ -1801,7 +1791,6 @@ pub fn run_tool(guest: &mut StoneGuest, limits: &ToolLimits, request: RunRequest
 
     let frontend = match request.frontend {
         RunFrontend::Stone => FrontendKind::Stone,
-        RunFrontend::Nu => FrontendKind::Nu,
     };
     let response = guest.command_response_with_frontend(
         frontend,
@@ -1941,13 +1930,12 @@ fn parse_run_request(input: &JsonValue) -> Result<RunRequest, ToolResult> {
         .unwrap_or("stone")
     {
         "stone" => RunFrontend::Stone,
-        "nu" => RunFrontend::Nu,
+        "nu" => return Err(invalid_input("run frontend `nu` is no longer supported")),
         other => return Err(invalid_input(format!("unsupported run frontend {other:?}"))),
     };
     Ok(RunRequest {
         source: required_string(input, "source")?,
         frontend,
-        allow_nu: optional_bool(input, "allow_nu")?.unwrap_or(false),
         timeout_ms: optional_u64(input, "timeout_ms")?,
     })
 }
@@ -3082,7 +3070,7 @@ mod tests {
     }
 
     #[test]
-    fn run_tool_rejects_external_execution_through_existing_command() {
+    fn run_tool_rejects_removed_nu_frontend() {
         let root = temp_root("run-external");
         fs::create_dir_all(root.join("work")).unwrap();
         let policy = WorkspacePolicy::for_host_root(&root);
@@ -3101,26 +3089,8 @@ mod tests {
                 }
             }),
         );
-        assert_eq!(disabled.kind, "unsupported");
-        assert_eq!(disabled.error.unwrap().code, "nu_frontend_disabled");
-
-        let rejected = dispatch_tool_json(
-            &mut guest,
-            &policy,
-            &limits,
-            &json!({
-                "tool": "run",
-                "input": {
-                    "frontend": "nu",
-                    "allow_nu": true,
-                    "source": "run-external echo"
-                }
-            }),
-        )
-        .to_json();
-        assert_eq!(rejected["ok"], json!(false));
-        assert_eq!(rejected["kind"], json!("unsupported"));
-        assert_eq!(rejected["error"]["code"], json!("external_not_supported"));
+        assert_eq!(disabled.kind, "invalid_input");
+        assert_eq!(disabled.error.unwrap().code, "invalid_input");
 
         let _ = fs::remove_dir_all(root);
     }

@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::sync::Arc;
-
-use nu_engine::eval_block;
-use nu_parser::parse;
 use nu_protocol::{
-    ast::Block,
-    debugger::WithoutDebug,
-    engine::{EngineState, Stack, StateDelta, StateWorkingSet},
-    shell_error::generic::GenericError,
+    engine::{EngineState, Stack},
     PipelineData, ShellError,
 };
 
@@ -22,25 +15,6 @@ pub trait Frontend {
         source: &str,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError>;
-}
-
-#[derive(Debug, Default)]
-pub struct NuFrontend;
-
-impl Frontend for NuFrontend {
-    fn eval(
-        &self,
-        engine_state: &mut EngineState,
-        stack: &mut Stack,
-        source: &str,
-        input: PipelineData,
-    ) -> Result<PipelineData, ShellError> {
-        let (block, delta) = parse_nu_block(engine_state, source)?;
-        engine_state.merge_delta(delta)?;
-        let pipeline = eval_block::<WithoutDebug>(engine_state, stack, &block, input)?;
-
-        Ok(pipeline.body)
-    }
 }
 
 #[derive(Debug, Default)]
@@ -58,28 +32,6 @@ impl Frontend for StoneFrontend {
     }
 }
 
-fn parse_nu_block(
-    engine_state: &EngineState,
-    source: &str,
-) -> Result<(Arc<Block>, StateDelta), ShellError> {
-    let mut working_set = StateWorkingSet::new(engine_state);
-    let block = parse(&mut working_set, None, source.as_bytes(), false);
-
-    if let Some(err) = working_set.parse_errors.first() {
-        return Err(ShellError::Generic(
-            GenericError::new_internal("parse error", err.to_string()).with_code("parse_error"),
-        ));
-    }
-
-    if let Some(err) = working_set.compile_errors.first() {
-        return Err(ShellError::Generic(
-            GenericError::new_internal("compile error", err.to_string()).with_code("compile_error"),
-        ));
-    }
-
-    Ok((block, working_set.render()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Frontend, StoneFrontend};
@@ -92,7 +44,6 @@ mod tests {
     fn stone_frontend_executes_simple_stone_script() {
         let frontend = StoneFrontend;
         let mut engine_state = EngineState::new();
-        crate::register_engine_commands(&mut engine_state).expect("register commands");
         let mut stack = Stack::new();
 
         let output = frontend

@@ -10317,8 +10317,7 @@ emit({
         let root = test_root(name);
         fs::create_dir_all(&root).expect("create root");
 
-        let mut engine_state = EngineState::new();
-        super::super::register_engine_commands(&mut engine_state)?;
+        let engine_state = EngineState::new();
 
         let mut stack = Stack::new();
         stack.set_cwd(&root)?;

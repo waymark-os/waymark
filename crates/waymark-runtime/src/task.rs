@@ -55,11 +55,6 @@ impl StoneGuest {
         match spec.resolve() {
             Ok(resolved) => {
                 let response = match resolved.frontend {
-                    TaskFrontend::Nu => self.command_response_with_frontend(
-                        FrontendKind::Nu,
-                        &resolved.script,
-                        resolved.input,
-                    ),
                     TaskFrontend::Stone => self.command_response_with_frontend(
                         FrontendKind::Stone,
                         &resolved.script,
@@ -224,7 +219,6 @@ struct ResolvedTask {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TaskFrontend {
-    Nu,
     Stone,
     Agent,
 }
@@ -438,7 +432,7 @@ fn check_version(root: &JsonValue) -> Result<(), String> {
 fn frontend_kind(root: &JsonValue) -> Result<TaskFrontend, String> {
     match optional_string(root, &["runtime", "frontend"]).unwrap_or("stone") {
         "stone" => Ok(TaskFrontend::Stone),
-        "nu" => Ok(TaskFrontend::Nu),
+        "nu" => Err("runtime.frontend `nu` is no longer supported; use `stone`".into()),
         "agent" => Ok(TaskFrontend::Agent),
         other => Err(format!("unsupported runtime.frontend `{other}`")),
     }
@@ -704,24 +698,6 @@ mod tests {
 
         assert_eq!(response["ok"], json!(true));
         assert_eq!(response["value"], json!("hello"));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn runs_checked_in_nu_compat_smoke_task() {
-        let root = temp_dir("nu-compat-smoke");
-        let task = serde_json::from_str::<JsonValue>(include_str!(
-            "../../../examples/tasks/nu-compat-smoke.json"
-        ))
-        .expect("parse checked-in task");
-
-        let mut guest = StoneGuest::new(root.clone()).expect("guest");
-        let response = guest.task_response_from_value(task);
-
-        assert_eq!(response["ok"], json!(true));
-        assert_eq!(response["kind"], json!("success"));
-        assert_eq!(response["value"], json!(["a.txt", "b.txt"]));
 
         let _ = fs::remove_dir_all(root);
     }

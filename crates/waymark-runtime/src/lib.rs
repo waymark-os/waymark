@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::{env, io};
 
 use nu_protocol::{
-    engine::{EngineState, Stack, StateWorkingSet},
+    engine::{EngineState, Stack},
     shell_error::generic::GenericError,
     IntoPipelineData, PipelineData, ShellError, Span, Value,
 };
@@ -37,7 +37,7 @@ mod task;
 pub mod tools;
 mod vsock;
 
-pub use frontend::{Frontend, NuFrontend, StoneFrontend};
+pub use frontend::{Frontend, StoneFrontend};
 pub use server::{run_task_server, run_task_server_stream};
 pub use stone_ast::{
     lower_source as lower_stone_source, Call as StoneCall, Expr as StoneExpr,
@@ -59,8 +59,7 @@ const MAX_LAST_RESULT_JSON_BYTES: usize = 1024 * 1024;
 
 impl StoneGuest {
     pub fn new(start_dir: PathBuf) -> Result<Self, ShellError> {
-        let mut engine_state = EngineState::new();
-        register_engine_commands(&mut engine_state)?;
+        let engine_state = EngineState::new();
 
         let mut stack = Stack::new();
         seed_environment(&engine_state, &mut stack, &start_dir)?;
@@ -83,7 +82,7 @@ impl StoneGuest {
         source: &str,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        self.evaluate_with_frontend(FrontendKind::Nu, source, input)
+        self.evaluate_stone_with_input(source, input)
     }
 
     pub fn evaluate_stone(&mut self, source: &str) -> Result<PipelineData, ShellError> {
@@ -103,7 +102,7 @@ impl StoneGuest {
     }
 
     pub fn run_command_with_input(&mut self, source: &str, input: PipelineData) -> i32 {
-        self.run_command_with_frontend(FrontendKind::Nu, source, input)
+        self.run_stone_command_with_input(source, input)
     }
 
     pub fn run_stone_command_with_input(&mut self, source: &str, input: PipelineData) -> i32 {
@@ -142,7 +141,7 @@ impl StoneGuest {
     }
 
     pub fn command_response_with_input(&mut self, source: &str, input: PipelineData) -> JsonValue {
-        self.command_response_with_frontend(FrontendKind::Nu, source, input)
+        self.stone_command_response_with_input(source, input)
     }
 
     pub fn stone_command_response(&mut self, source: &str) -> JsonValue {
@@ -354,19 +353,8 @@ impl TaskScope {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrontendKind {
-    Nu,
     Stone,
     Python,
-}
-
-fn register_engine_commands(engine_state: &mut EngineState) -> Result<(), ShellError> {
-    let delta = {
-        let mut working_set = StateWorkingSet::new(engine_state);
-        commands::register_commands(&mut working_set);
-        working_set.render()
-    };
-
-    engine_state.merge_delta(delta)
 }
 
 fn seed_environment(
@@ -418,9 +406,6 @@ impl StoneGuest {
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         match frontend {
-            FrontendKind::Nu => {
-                NuFrontend.eval(&mut self.engine_state, &mut self.stack, source, input)
-            }
             FrontendKind::Stone => stone_frontend::eval_stone_source_with_output_and_session(
                 &self.engine_state,
                 &mut self.stack,
@@ -505,7 +490,7 @@ mod tests {
         fs::create_dir_all(&start_dir).expect("create start dir");
 
         let mut guest = StoneGuest::new(start_dir.clone())?;
-        let output = pipeline_to_string(guest.evaluate("pwd")?)?;
+        let output = pipeline_to_string(guest.evaluate("pwd()")?)?;
         assert_eq!(output.trim(), start_dir.display().to_string());
 
         cleanup_dir(&start_dir);
@@ -518,9 +503,9 @@ mod tests {
         fs::create_dir_all(&start_dir).expect("create start dir");
 
         let mut guest = StoneGuest::new(start_dir.clone())?;
-        assert_eq!(guest.run_command("echo hello | save note.txt"), 0);
+        assert_eq!(guest.run_command(r#"save("hello", "note.txt")"#), 0);
 
-        let output = pipeline_to_string(guest.evaluate("open note.txt")?)?;
+        let output = pipeline_to_string(guest.evaluate(r#"cat("note.txt")"#)?)?;
         assert_eq!(output, "hello");
 
         cleanup_dir(&start_dir);
@@ -584,7 +569,7 @@ emit({"content": cat("answer.txt"), "replacements": result["replacements"]})"#,
         fs::create_dir_all(&start_dir).expect("create start dir");
 
         let mut guest = StoneGuest::new(start_dir.clone())?;
-        let response = guest.command_response("pwd");
+        let response = guest.command_response("pwd()");
         assert_eq!(response["ok"], json!(true));
         assert_eq!(response["cwd"], json!(start_dir.display().to_string()));
         assert_eq!(response["value"], json!(start_dir.display().to_string()));
@@ -635,17 +620,17 @@ emit(names)"#,
         fs::create_dir_all(&start_dir).expect("create start dir");
 
         let mut guest = StoneGuest::new(start_dir.clone())?;
-        let overview = guest.command_response("help");
+        let overview = guest.command_response("help()");
         assert_eq!(overview["ok"], json!(true));
         assert!(overview["value"]["builtins"].is_array());
         assert!(overview["value"]["syntax"].is_array());
 
-        let topic = guest.command_response("help emit");
+        let topic = guest.command_response(r#"help("emit")"#);
         assert_eq!(topic["ok"], json!(true));
         assert_eq!(topic["value"]["found"], json!(true));
         assert_eq!(topic["value"]["name"], json!("emit"));
 
-        let missing = guest.command_response("help no_such_topic");
+        let missing = guest.command_response(r#"help("no_such_topic")"#);
         assert_eq!(missing["ok"], json!(true));
         assert_eq!(missing["value"]["found"], json!(false));
         assert!(missing["value"]["available"].is_array());
@@ -660,22 +645,22 @@ emit(names)"#,
         fs::create_dir_all(&start_dir).expect("create start dir");
 
         let mut guest = StoneGuest::new(start_dir.clone())?;
-        let mkdir = guest.command_response("mkdir nested nested/deeper");
+        let mkdir = guest.command_response(r#"mkdir("nested", "nested/deeper")"#);
         assert_eq!(mkdir["ok"], json!(true));
         assert!(start_dir.join("nested/deeper").is_dir());
 
         fs::write(start_dir.join("nested/file.txt"), "remove me").expect("write file");
-        let rm_file = guest.command_response("rm nested/file.txt");
+        let rm_file = guest.command_response(r#"rm("nested/file.txt")"#);
         assert_eq!(rm_file["ok"], json!(true));
         assert!(!start_dir.join("nested/file.txt").exists());
 
-        let rm_dir = guest.command_response("rm nested");
+        let rm_dir = guest.command_response(r#"rm("nested")"#);
         assert_eq!(rm_dir["ok"], json!(true));
         assert!(!start_dir.join("nested").exists());
 
-        let missing_arg = guest.command_response("mkdir");
+        let missing_arg = guest.command_response("mkdir()");
         assert_eq!(missing_arg["ok"], json!(false));
-        assert_eq!(missing_arg["error"]["code"], json!("missing_parameter"));
+        assert_eq!(missing_arg["error"]["code"], json!("stone_script_error"));
 
         cleanup_dir(&start_dir);
         Ok(())
@@ -688,37 +673,17 @@ emit(names)"#,
 
         let mut guest = StoneGuest::new(start_dir.clone())?;
         let json_text =
-            guest.command_response(r#"'{"name":"Ada","count":2}' | from_json | to_json"#);
+            guest.command_response(r#"to_json(json_loads('{"name":"Ada","count":2}'))"#);
         assert_eq!(json_text["ok"], json!(true));
         assert_eq!(json_text["value"], json!(r#"{"count":2,"name":"Ada"}"#));
 
         let jsonl_text =
-            guest.command_response(r#"'[{"name":"Ada"},{"name":"Grace"}]' | from_json | to_jsonl"#);
+            guest.command_response(r#"to_jsonl(json_loads('[{"name":"Ada"},{"name":"Grace"}]'))"#);
         assert_eq!(jsonl_text["ok"], json!(true));
         assert_eq!(
             jsonl_text["value"],
             json!("{\"name\":\"Ada\"}\n{\"name\":\"Grace\"}\n")
         );
-
-        cleanup_dir(&start_dir);
-        Ok(())
-    }
-
-    #[test]
-    fn open_raw_and_binary_text_paths_preserve_bytes() -> Result<(), ShellError> {
-        let start_dir = test_root("open-raw");
-        fs::create_dir_all(&start_dir).expect("create start dir");
-        fs::write(start_dir.join("bytes.bin"), [0_u8, 159, 146, 150]).expect("write bytes");
-
-        let mut guest = StoneGuest::new(start_dir.clone())?;
-        let raw = guest.command_response("open --raw bytes.bin");
-        assert_eq!(raw["ok"], json!(true));
-        assert_eq!(raw["value"]["$type"], json!("binary"));
-        assert_eq!(raw["value"]["hex"], json!("009f9296"));
-
-        let decoded = guest.command_response("open bytes.bin");
-        assert_eq!(decoded["ok"], json!(true));
-        assert_eq!(decoded["value"]["$type"], json!("binary"));
 
         cleanup_dir(&start_dir);
         Ok(())
@@ -916,14 +881,14 @@ emit(double(3))"#,
         fs::create_dir_all(&start_dir).expect("create start dir");
         fs::write(
             start_dir.join("input.json"),
-            br#"{"name":"nu","items":[1,true,null]}"#,
+            br#"{"name":"stone","items":[1,true,null]}"#,
         )
         .expect("write json");
 
         let mut guest = StoneGuest::new(start_dir.clone())?;
-        let response = guest.command_response("open input.json");
+        let response = guest.command_response(r#"read_json("input.json")"#);
         assert_eq!(response["ok"], json!(true));
-        assert_eq!(response["value"]["name"], json!("nu"));
+        assert_eq!(response["value"]["name"], json!("stone"));
         assert_eq!(response["value"]["items"], json!([1, true, null]));
 
         cleanup_dir(&start_dir);
@@ -937,10 +902,8 @@ emit(double(3))"#,
 
         let mut guest = StoneGuest::new(start_dir.clone())?;
         let response = guest.command_response(
-            "'[{\"name\":\"b\",\"size\":1},{\"name\":\"a\",\"size\":2}]' \
-             | from_json \
-             | sort name \
-             | get name",
+            r#"rows = json_loads('[{"name":"b","size":1},{"name":"a","size":2}]')
+emit(map(lambda row: row["name"], sort(rows, key="name")))"#,
         );
         assert_eq!(response["ok"], json!(true));
         assert_eq!(response["value"], json!(["a", "b"]));
@@ -956,16 +919,14 @@ emit(double(3))"#,
 
         let mut guest = StoneGuest::new(start_dir.clone())?;
         let filtered = guest.command_response(
-            "'[{\"name\":\"a\",\"kind\":\"file\"},{\"name\":\"b\",\"kind\":\"dir\"},{\"name\":\"c\",\"kind\":\"dir\"}]' \
-             | from_json \
-             | where kind 'dir' \
-             | get name \
-             | first",
+            r#"rows = json_loads('[{"name":"a","kind":"file"},{"name":"b","kind":"dir"},{"name":"c","kind":"dir"}]')
+dirs = where(rows, "kind", "dir")
+emit(first(map(lambda row: row["name"], dirs)))"#,
         );
         assert_eq!(filtered["ok"], json!(true));
         assert_eq!(filtered["value"], json!("b"));
 
-        let tail = guest.command_response("'[3,1,2]' | from_json | sort | last 2");
+        let tail = guest.command_response("last(sort([3, 1, 2]), 2)");
         assert_eq!(tail["ok"], json!(true));
         assert_eq!(tail["value"], json!([2, 3]));
 
@@ -980,11 +941,11 @@ emit(double(3))"#,
 
         let mut guest = StoneGuest::new(start_dir.clone())?;
         let response = guest.command_response_with_input(
-            "get name",
-            pipeline_input_from_bytes(br#"{"name":"nu","kind":"shell"}"#.to_vec()),
+            r#"get("name")"#,
+            pipeline_input_from_bytes(br#"{"name":"stone","kind":"shell"}"#.to_vec()),
         );
         assert_eq!(response["ok"], json!(true));
-        assert_eq!(response["value"], json!("nu"));
+        assert_eq!(response["value"], json!("stone"));
 
         cleanup_dir(&start_dir);
         Ok(())
@@ -997,7 +958,9 @@ emit(double(3))"#,
 
         let mut guest = StoneGuest::new(start_dir.clone())?;
         let response = guest.command_response_with_input(
-            "save note.txt; open note.txt",
+            r#"text = emit()
+save(text, "note.txt")
+cat("note.txt")"#,
             pipeline_input_from_bytes(b"hello from stdin".to_vec()),
         );
         assert_eq!(response["ok"], json!(true));
@@ -1026,7 +989,11 @@ emit(double(3))"#,
             ),
             None,
         );
-        let response = guest.command_response_with_input("get name", input);
+        let response = guest.command_response_with_input(
+            r#"rows = emit()
+emit(map(lambda row: row["name"], rows))"#,
+            input,
+        );
         assert_eq!(response["ok"], json!(true));
         assert_eq!(response["value"], json!(["a", "b"]));
 
@@ -1065,7 +1032,12 @@ emit(double(3))"#,
             ),
             None,
         );
-        let response = guest.command_response_with_input("where kind 'dir' | get name", input);
+        let response = guest.command_response_with_input(
+            r#"rows = emit()
+dirs = where(rows, "kind", "dir")
+emit(map(lambda row: row["name"], dirs))"#,
+            input,
+        );
         assert_eq!(response["ok"], json!(true));
         assert_eq!(response["value"], json!(["b"]));
 
@@ -1094,7 +1066,11 @@ emit(double(3))"#,
             ),
             None,
         );
-        let first = guest.command_response_with_input("first", first_input);
+        let first = guest.command_response_with_input(
+            r#"values = emit()
+first(values)"#,
+            first_input,
+        );
         assert_eq!(first["ok"], json!(true));
         assert_eq!(first["value"], json!(1));
 
@@ -1111,7 +1087,11 @@ emit(double(3))"#,
             ),
             None,
         );
-        let last = guest.command_response_with_input("last 2", last_input);
+        let last = guest.command_response_with_input(
+            r#"values = emit()
+last(values, 2)"#,
+            last_input,
+        );
         assert_eq!(last["ok"], json!(true));
         assert_eq!(last["value"], json!([2, 3]));
 
@@ -1125,8 +1105,8 @@ emit(double(3))"#,
         fs::create_dir_all(&start_dir).expect("create start dir");
 
         let mut guest = StoneGuest::new(start_dir.clone())?;
-        let response = guest
-            .command_response("'[{\"name\":\"a\"},{\"name\":\"b\"}]' | from_json | get 1.name");
+        let response =
+            guest.command_response(r#"json_loads('[{"name":"a"},{"name":"b"}]')[1]["name"]"#);
         assert_eq!(response["ok"], json!(true));
         assert_eq!(response["value"], json!("b"));
 
@@ -1140,15 +1120,13 @@ emit(double(3))"#,
         fs::create_dir_all(&start_dir).expect("create start dir");
 
         let mut guest = StoneGuest::new(start_dir.clone())?;
-        let response = guest.command_response("1 | from_json");
+        let response = guest.command_response("from_json(1)");
         assert_eq!(response["ok"], json!(false));
-        assert_eq!(response["error"]["kind"], json!("type_mismatch"));
-        assert_eq!(response["error"]["code"], json!("type_mismatch"));
-        assert_eq!(
-            response["error"]["detail"],
-            json!("expected string or binary JSON input, got int")
-        );
-        assert!(response["error"]["span"].is_object());
+        assert_eq!(response["error"]["kind"], json!("generic"));
+        assert_eq!(response["error"]["code"], json!("stone_script_error"));
+        assert!(response["error"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("expected string")));
 
         cleanup_dir(&start_dir);
         Ok(())
@@ -1162,8 +1140,8 @@ emit(double(3))"#,
         let mut guest = StoneGuest::new(start_dir.clone())?;
         let response = guest.command_response("'oops' | first");
         assert_eq!(response["ok"], json!(false));
-        assert_eq!(response["error"]["kind"], json!("parse"));
-        assert_eq!(response["error"]["code"], json!("parse_error"));
+        assert_eq!(response["error"]["kind"], json!("generic"));
+        assert_eq!(response["error"]["code"], json!("stone_script_error"));
         assert!(response["error"]["location"].is_string());
 
         cleanup_dir(&start_dir);
@@ -1176,16 +1154,14 @@ emit(double(3))"#,
         fs::create_dir_all(&start_dir).expect("create start dir");
 
         let mut guest = StoneGuest::new(start_dir.clone())?;
-        assert_eq!(guest.run_command("echo hello | save note.txt"), 0);
-
-        let response = guest.command_response("echo again | save note.txt");
+        let response = guest.command_response(r#"read_file("missing.txt")"#);
         assert_eq!(response["ok"], json!(false));
         assert_eq!(response["error"]["kind"], json!("io"));
         assert_eq!(response["error"]["code"], json!("io_error"));
-        assert_eq!(response["error"]["io_kind"], json!("already_exists"));
+        assert_eq!(response["error"]["io_kind"], json!("not_found"));
         assert_eq!(
             response["error"]["path"],
-            json!(start_dir.join("note.txt").display().to_string())
+            json!(start_dir.join("missing.txt").display().to_string())
         );
 
         cleanup_dir(&start_dir);

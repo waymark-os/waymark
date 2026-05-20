@@ -49,11 +49,6 @@ pub(crate) fn pipeline_to_json_value(
     Ok(nu_to_json_value(&value))
 }
 
-pub(crate) fn pipeline_to_json_text(data: PipelineData, span: Span) -> Result<String, ShellError> {
-    let json = pipeline_to_json_value(data, span)?;
-    serde_json::to_string(&json).map_err(json_encode_error)
-}
-
 pub(crate) fn parse_json_bytes(bytes: &[u8], span: Span) -> Result<Value, ShellError> {
     let json = serde_json::from_slice::<JsonValue>(bytes).map_err(|err| {
         ShellError::Generic(GenericError::new("Invalid JSON", err.to_string(), span))
@@ -154,13 +149,6 @@ fn record_to_json(record: &Record) -> JsonValue {
         map.insert(key.clone(), nu_to_json_value(value));
     }
     JsonValue::Object(map)
-}
-
-fn json_encode_error(err: serde_json::Error) -> ShellError {
-    ShellError::Generic(GenericError::new_internal(
-        "Failed to encode JSON",
-        err.to_string(),
-    ))
 }
 
 fn shell_error_json(err: &ShellError) -> JsonValue {
@@ -310,12 +298,12 @@ fn to_snake_case(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use nu_protocol::{IntoPipelineData, Record, ShellError, Span, Value};
+    use nu_protocol::{Record, ShellError, Span, Value};
     use serde_json::json;
 
     use super::{
         encode_hex, error_response, json_to_nu_value, nu_to_json_value, parse_json_bytes,
-        pipeline_to_json_text, success_response, success_response_with_output, to_snake_case,
+        success_response, success_response_with_output, to_snake_case,
     };
 
     #[test]
@@ -421,15 +409,6 @@ mod tests {
         let err = parse_json_bytes(b"{not-json", Span::unknown()).expect_err("invalid json");
 
         assert!(err.to_string().contains("Invalid JSON"));
-    }
-
-    #[test]
-    fn pipeline_json_text_encodes_pipeline_values() {
-        let span = Span::unknown();
-        let text = pipeline_to_json_text(Value::string("hello", span).into_pipeline_data(), span)
-            .expect("json text");
-
-        assert_eq!(text, "\"hello\"");
     }
 
     #[test]
