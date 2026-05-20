@@ -127,26 +127,57 @@ pub(crate) fn run_command(
     cwd: &Path,
     env_overrides: &[(String, String)],
     stdin: Option<&str>,
-    _timeout: Duration,
+    timeout: Duration,
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
 ) -> Result<Record, ShellError> {
-    if stdin.is_some() {
-        return Err(stone_error(
-            "gateway run",
-            "Gateway linux.exec does not support stdin yet",
-        ));
-    }
     let config = required_config()?;
     let workdir = container_path(&config, cwd)?;
     let mut options = LinuxExecOptions::new(config.tx.clone(), config.image.clone(), argv.to_vec())
         .workspace_mount(config.workspace_mount.clone())
-        .workdir(workdir);
+        .workdir(workdir)
+        .timeout_ms(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX));
+    if let Some(stdin) = stdin {
+        options = options.stdin(stdin.to_string());
+    }
     for (key, value) in env_overrides {
         options = options.env(key.clone(), value.clone());
     }
     let output = with_client(&config, |client| client.linux_exec(options))?;
     let span = Span::unknown();
+    let mut record = linux_exec_record(output, span, max_stdout_bytes, max_stderr_bytes)?;
+    record.push("cwd", Value::string(cwd.display().to_string(), span));
+    record.push(
+        "argv",
+        Value::list(
+            argv.iter()
+                .map(|arg| Value::string(arg.clone(), span))
+                .collect(),
+            span,
+        ),
+    );
+    Ok(record)
+}
+
+pub(crate) fn run_wait(run_id: &str, timeout: Duration) -> Result<Record, ShellError> {
+    let config = required_config()?;
+    let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    let output = with_client(&config, |client| client.linux_exec_wait(run_id, timeout_ms))?;
+    linux_exec_record(output, Span::unknown(), usize::MAX, usize::MAX)
+}
+
+pub(crate) fn run_terminate(run_id: &str) -> Result<Record, ShellError> {
+    let config = required_config()?;
+    let output = with_client(&config, |client| client.linux_exec_terminate(run_id))?;
+    linux_exec_record(output, Span::unknown(), usize::MAX, usize::MAX)
+}
+
+fn linux_exec_record(
+    output: waymark_gateway_client::proto::LinuxExecResponse,
+    span: Span,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+) -> Result<Record, ShellError> {
     let stdout = truncate_text(output.stdout, max_stdout_bytes);
     let stderr = truncate_text(output.stderr, max_stderr_bytes);
     let mut record = Record::new();
@@ -154,7 +185,11 @@ pub(crate) fn run_command(
     record.push(
         "kind",
         Value::string(
-            if output.status == 0 {
+            if output.still_running {
+                "still_running"
+            } else if output.timed_out {
+                "timeout"
+            } else if output.status == 0 {
                 "success"
             } else {
                 "exec_failed"
@@ -167,19 +202,13 @@ pub(crate) fn run_command(
         "duration_ms",
         Value::int(i64::try_from(output.duration_ms).unwrap_or(i64::MAX), span),
     );
-    record.push("cwd", Value::string(cwd.display().to_string(), span));
-    record.push(
-        "argv",
-        Value::list(
-            argv.iter()
-                .map(|arg| Value::string(arg.clone(), span))
-                .collect(),
-            span,
-        ),
-    );
     record.push("stdout", Value::string(stdout.text, span));
     record.push("stderr", Value::string(stderr.text, span));
-    record.push("timed_out", Value::bool(false, span));
+    record.push("timed_out", Value::bool(output.timed_out, span));
+    record.push("still_running", Value::bool(output.still_running, span));
+    if !output.run_id.is_empty() {
+        record.push("run_id", Value::string(output.run_id, span));
+    }
     let mut truncated = Record::new();
     truncated.push("stdout", Value::bool(stdout.truncated, span));
     truncated.push("stderr", Value::bool(stderr.truncated, span));

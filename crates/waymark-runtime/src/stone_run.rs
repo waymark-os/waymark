@@ -387,6 +387,67 @@ pub(crate) fn stop_daemon_call_values(
     ))
 }
 
+pub(crate) fn run_wait_call_values(
+    positional: &[Value],
+    named: &[(String, Value)],
+) -> Result<Value, ShellError> {
+    if positional.is_empty() || positional.len() > 2 {
+        return Err(stone_error(
+            "run_wait",
+            "run_wait() requires run_id and optional timeout_ms",
+        ));
+    }
+    let run_id = value_to_string(&positional[0], "run_wait run_id")?;
+    let mut timeout_ms: i64 = if positional.len() == 2 {
+        value_to_i64(&positional[1], "run_wait timeout_ms")?
+    } else {
+        30_000
+    };
+    for (name, value) in named {
+        match name.as_str() {
+            "timeout_ms" => timeout_ms = value_to_i64(value, "run_wait timeout_ms")?,
+            other => {
+                return Err(stone_error(
+                    "run_wait",
+                    format!("unsupported keyword `{other}`; expected timeout_ms"),
+                ))
+            }
+        }
+    }
+    if timeout_ms <= 0 {
+        return Err(stone_error("run_wait", "timeout_ms must be positive"));
+    }
+    if gateway_runtime::enabled() {
+        return gateway_runtime::run_wait(&run_id, Duration::from_millis(timeout_ms as u64))
+            .map(|record| Value::record(record, Span::unknown()));
+    }
+    Err(stone_error(
+        "run_wait",
+        "run_wait() is only available for Gateway-backed run() calls",
+    ))
+}
+
+pub(crate) fn run_terminate_call_values(
+    positional: &[Value],
+    named: &[(String, Value)],
+) -> Result<Value, ShellError> {
+    if positional.len() != 1 || !named.is_empty() {
+        return Err(stone_error(
+            "run_terminate",
+            "run_terminate() requires exactly one run_id argument",
+        ));
+    }
+    let run_id = value_to_string(&positional[0], "run_terminate run_id")?;
+    if gateway_runtime::enabled() {
+        return gateway_runtime::run_terminate(&run_id)
+            .map(|record| Value::record(record, Span::unknown()));
+    }
+    Err(stone_error(
+        "run_terminate",
+        "run_terminate() is only available for Gateway-backed run() calls",
+    ))
+}
+
 pub(crate) fn wait_port_call_values(
     positional: &[Value],
     named: &[(String, Value)],

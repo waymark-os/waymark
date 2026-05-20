@@ -61,6 +61,34 @@ Without `--exec`, this only prepares `CODEX_HOME`, optionally verifies
 `codex mcp list`, and prints a JSON summary. Add `--exec` to run
 `codex exec` with the generated config.
 
+## Dogfood Waymark
+
+Use the dogfood launcher when working on Waymark itself. It creates a persistent
+Codex home and Stone trace under `target/dogfood/`, with the Stone MCP server
+pointed at this repository as the warm workspace. By default it copies Codex
+auth files from `$CODEX_HOME` or `~/.codex` into the dogfood home, then writes a
+Waymark-specific MCP config there.
+
+```sh
+python3 host/mcp/dogfood_waymark.py --build
+```
+
+Check that Codex sees the Stone server:
+
+```sh
+python3 host/mcp/dogfood_waymark.py --check
+```
+
+Run a Waymark self-improvement task through the Stone MCP adapter:
+
+```sh
+python3 host/mcp/dogfood_waymark.py --exec --task 'Inspect docs and make one small safe improvement.'
+```
+
+The default dogfood prompt tells Codex to use Stone first, reuse warm-session
+bindings, summarize large values with `len`/`head`/`tail`, and use
+`escape_linux` only with an explicit reason.
+
 ## Smoke
 
 Protocol smoke:

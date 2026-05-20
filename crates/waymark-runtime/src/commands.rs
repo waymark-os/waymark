@@ -1272,6 +1272,22 @@ if starts_with(line, "ERROR"):
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "run_wait",
+        signature: "run_wait(run_id: str, timeout_ms: int = 30000) -> record",
+        use_when: "Use after Gateway-backed run() returns timed_out=true, still_running=true, and a run_id.",
+        examples: &[r#"next = run_wait(result.run_id, timeout_ms=60000)"#],
+        avoid: &["Do not call for normal completed run() results without a run_id."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "run_terminate",
+        signature: "run_terminate(run_id: str) -> record",
+        use_when: "Use to stop a Gateway-backed run() that returned still_running=true when the command should not continue.",
+        examples: &[r#"stopped = run_terminate(result.run_id)"#],
+        avoid: &["Prefer run_wait() if the command is expected to finish soon."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "resolve_command",
         signature: "resolve_command(name: str) -> record",
         use_when: "Use to explain how Stone would resolve an external executable name without starting a process.",

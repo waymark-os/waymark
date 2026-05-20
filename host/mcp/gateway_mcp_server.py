@@ -331,6 +331,8 @@ class GatewayMcp:
             call_args.extend(["--workdir", str(args["workdir"])])
         if args.get("user"):
             call_args.extend(["--user", str(args["user"])])
+        if args.get("stdin") is not None:
+            call_args.extend(["--stdin", str(args["stdin"])])
         env = args.get("env")
         if isinstance(env, dict):
             for key, value in sorted(env.items()):

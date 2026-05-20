@@ -53,7 +53,8 @@ use crate::stone_run::cleanup_stale_run_temp_files;
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_run::{
     daemon_status_call_values, resolve_command_call_values, run_call_values,
-    start_daemon_call_values, stop_daemon_call_values, wait_port_call_values,
+    run_terminate_call_values, run_wait_call_values, start_daemon_call_values,
+    stop_daemon_call_values, wait_port_call_values,
 };
 use crate::stone_vm::{
     match_hot_jsonl_aggregation_body, match_outer_jsonl_file_loop_body, try_lower_generic_loop,
@@ -1840,6 +1841,8 @@ impl Evaluator<'_> {
             "read_jsonl" => self.eval_read_jsonl_call(call),
             "round" => self.eval_round_call(call),
             "run" => self.eval_run_call(call),
+            "run_wait" => self.eval_run_wait_call(call),
+            "run_terminate" => self.eval_run_terminate_call(call),
             "resolve_command" => self.eval_resolve_command_call(call),
             "state" => self.eval_state_call(call),
             "env_state" | "env_diff" => self.eval_env_state_call(call),
@@ -3422,6 +3425,40 @@ impl Evaluator<'_> {
         }
     }
 
+    fn eval_run_wait_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        #[cfg(target_os = "hermit")]
+        {
+            let _ = call;
+            return Err(stone_error(
+                "run_wait",
+                "run_wait() requires the Linux/POSIX adapter and is unavailable on Hermit",
+            ));
+        }
+
+        #[cfg(not(target_os = "hermit"))]
+        {
+            let (positional, named) = self.eval_call_values(call)?;
+            run_wait_call_values(&positional, &named).map(RuntimeValue::Nu)
+        }
+    }
+
+    fn eval_run_terminate_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        #[cfg(target_os = "hermit")]
+        {
+            let _ = call;
+            return Err(stone_error(
+                "run_terminate",
+                "run_terminate() requires the Linux/POSIX adapter and is unavailable on Hermit",
+            ));
+        }
+
+        #[cfg(not(target_os = "hermit"))]
+        {
+            let (positional, named) = self.eval_call_values(call)?;
+            run_terminate_call_values(&positional, &named).map(RuntimeValue::Nu)
+        }
+    }
+
     #[cfg(not(target_os = "hermit"))]
     fn attach_run_helper_observations(
         &mut self,
@@ -4846,6 +4883,8 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "round",
     "rm",
     "run",
+    "run_terminate",
+    "run_wait",
     "slice",
     "split",
     "resolve_command",

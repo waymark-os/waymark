@@ -281,6 +281,8 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
         "max_stdout_bytes",
         "max_stderr_bytes",
     ),
+    "run_wait": ("run_id", "timeout_ms"),
+    "run_terminate": ("run_id",),
     "resolve_command": ("name",),
     "state": (),
     "env_state": ("sample_limit",),
@@ -322,6 +324,7 @@ Stone_CALL_ALIASES: dict[str, str] = {
 Stone_ONE_POSITIONAL_THEN_KEYWORDS = {
     "env_commit",
     "run",
+    "run_wait",
     "start_daemon",
     "daemon_status",
     "stop_daemon",
