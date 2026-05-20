@@ -294,9 +294,9 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
     },
     "wait_port": {
         "name": "wait_port",
-        "signature": 'wait_port(port: int, host: str = "127.0.0.1", timeout_ms: int = 30000) -> record',
+        "signature": 'wait_port(port: int, host: str = "127.0.0.1", timeout_ms: int = 30000, protocol: str = "tcp") -> record',
         "effects": ["network"],
-        "example": "ready = wait_port(8888, timeout_ms=30000)",
+        "example": 'ready = wait_port(8888, protocol="tcp", timeout_ms=30000)',
     },
     "stat": {
         "name": "stat",
@@ -375,7 +375,7 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
     "start_daemon": ("argv", "cwd", "env", "stdout", "stderr"),
     "daemon_status": ("daemon", "port", "host", "log", "max_log_bytes"),
     "stop_daemon": ("daemon", "timeout_ms"),
-    "wait_port": ("port", "host", "timeout_ms"),
+    "wait_port": ("port", "host", "timeout_ms", "protocol"),
     "search": ("root", "needle"),
     "stat": ("path", "follow_symlinks"),
     "tail": ("values", "count"),

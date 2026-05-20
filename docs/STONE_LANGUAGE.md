@@ -189,6 +189,10 @@ Supported handlers are `except:`, `except Exception:`, and
   Linux command execution for `set -e`-style scripts. It returns the same
   structured record as `run()` on success, and raises a Stone error with the run
   record attached when the external process exits nonzero or times out.
+- `wait_port(port, host="127.0.0.1", timeout_ms=30000, protocol="tcp")`:
+  wait for a TCP port to accept connections, or for a UDP endpoint to accept a
+  datagram send probe. UDP has no connection handshake, so use a real protocol
+  client for final validation.
 - `pwd()`, `cd(path)`: inspect or change the current Stone working directory
   for the current session.
 - `state()`: typed runtime snapshot with `cwd`, git summary, and common tool

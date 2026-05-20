@@ -1412,10 +1412,16 @@ if not info.ok:
     },
     StoneHelpEntry {
         name: "wait_port",
-        signature: "wait_port(port: int, host: str = \"127.0.0.1\", timeout_ms: int = 30000) -> record",
-        use_when: "Use after start_daemon() when service readiness is represented by a TCP port accepting connections.",
-        examples: &[r#"ready = wait_port(9, host="127.0.0.1", timeout_ms=1)"#],
-        avoid: &["If wait_port() times out, call daemon_status() with a log path before retrying blindly."],
+        signature: "wait_port(port: int, host: str = \"127.0.0.1\", timeout_ms: int = 30000, protocol: str = \"tcp\") -> record",
+        use_when: "Use after start_daemon() when service readiness is represented by a TCP port accepting connections or a UDP endpoint accepting datagrams.",
+        examples: &[
+            r#"ready = wait_port(9, host="127.0.0.1", timeout_ms=1)"#,
+            r#"udp_ready = wait_port(9, protocol="udp", timeout_ms=1)"#,
+        ],
+        avoid: &[
+            "If wait_port() times out, call daemon_status() with a log path before retrying blindly.",
+            "UDP has no connection handshake; protocol=\"udp\" only verifies that Stone can send a datagram to the endpoint.",
+        ],
         aliases: &[],
     },
 ];

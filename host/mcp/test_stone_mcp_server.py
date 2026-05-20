@@ -504,7 +504,10 @@ class StoneMcpServerTests(unittest.TestCase):
             "daemon_status",
             {"daemon": {"pid": 123}, "port": 8888, "log": "server.err"},
         )
-        wait = server.stone_call_source("wait_port", {"port": 8888, "timeout_ms": 30000})
+        wait = server.stone_call_source(
+            "wait_port",
+            {"port": 8888, "protocol": "udp", "timeout_ms": 30000},
+        )
         stop = server.stone_call_source("stop_daemon", {"daemon": 123, "timeout_ms": 1000})
 
         self.assertEqual(
@@ -515,7 +518,7 @@ class StoneMcpServerTests(unittest.TestCase):
             status,
             'emit(daemon_status({"pid": 123}, port=8888, log="server.err"))\n',
         )
-        self.assertEqual(wait, "emit(wait_port(8888, timeout_ms=30000))\n")
+        self.assertEqual(wait, 'emit(wait_port(8888, protocol="udp", timeout_ms=30000))\n')
         self.assertEqual(stop, "emit(stop_daemon(123, timeout_ms=1000))\n")
 
     def test_stone_call_supports_resolve_command(self) -> None:

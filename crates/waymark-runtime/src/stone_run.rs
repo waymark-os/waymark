@@ -464,10 +464,20 @@ pub(crate) fn wait_port_call_values(
     };
     let port = value_to_port(port_value, "wait_port port")?;
     let mut host = "127.0.0.1".to_owned();
+    let mut protocol = "tcp".to_owned();
     let mut timeout_ms: i64 = 30_000;
     for (name, value) in named {
         match name.as_str() {
             "host" => host = value_to_string(value, "wait_port host")?,
+            "protocol" => {
+                protocol = value_to_string(value, "wait_port protocol")?.to_lowercase();
+                if protocol != "tcp" && protocol != "udp" {
+                    return Err(stone_error(
+                        "wait_port",
+                        "protocol must be \"tcp\" or \"udp\"",
+                    ));
+                }
+            }
             "timeout_ms" => {
                 timeout_ms = value_to_i64(value, "wait_port timeout_ms")?;
                 if timeout_ms <= 0 {
@@ -477,7 +487,9 @@ pub(crate) fn wait_port_call_values(
             other => {
                 return Err(stone_error(
                     "wait_port",
-                    format!("unsupported keyword `{other}`; expected host or timeout_ms"),
+                    format!(
+                        "unsupported keyword `{other}`; expected host, protocol, or timeout_ms"
+                    ),
                 ));
             }
         }
@@ -485,6 +497,7 @@ pub(crate) fn wait_port_call_values(
     Ok(wait_port_record(
         &host,
         port,
+        &protocol,
         Duration::from_millis(timeout_ms as u64),
     ))
 }
@@ -1816,12 +1829,12 @@ fn stop_daemon_record(pid: u32, timeout: Duration) -> Value {
 }
 
 #[cfg(not(target_os = "hermit"))]
-fn wait_port_record(host: &str, port: u16, timeout: Duration) -> Value {
+fn wait_port_record(host: &str, port: u16, protocol: &str, timeout: Duration) -> Value {
     let span = Span::unknown();
     let started = Instant::now();
     let mut open = false;
     while started.elapsed() < timeout {
-        if tcp_port_open(host, port, Duration::from_millis(200)) {
+        if port_ready(host, port, protocol, Duration::from_millis(200)) {
             open = true;
             break;
         }
@@ -1836,13 +1849,17 @@ fn wait_port_record(host: &str, port: u16, timeout: Duration) -> Value {
     );
     record.push("host", Value::string(host.to_owned(), span));
     record.push("port", Value::int(i64::from(port), span));
+    record.push("protocol", Value::string(protocol.to_owned(), span));
     record.push("duration_ms", Value::int(duration_ms, span));
     if !open {
         record.push(
             "explanation",
             daemon_explanation(
                 "port_wait_timeout",
-                format!("Port {host}:{port} did not accept TCP connections before the timeout."),
+                format!(
+                    "{protocol_upper} port {host}:{port} did not become ready before the timeout.",
+                    protocol_upper = protocol.to_uppercase()
+                ),
                 &[
                     "Confirm the daemon is still running with daemon_status().",
                     "Check that the service binds the expected host and port.",
@@ -1860,10 +1877,12 @@ fn wait_port_record(host: &str, port: u16, timeout: Duration) -> Value {
             "run.after_timeout"
         },
         "service.wait_port.after_result",
-        if open {
+        if open && protocol == "tcp" {
             "The TCP port accepted a connection; validate protocol behavior with a fresh client next."
+        } else if open {
+            "Stone sent a UDP readiness probe; validate protocol behavior with a real client next."
         } else {
-            "The TCP port did not become ready before the wait timeout."
+            "The port did not become ready before the wait timeout."
         },
         &[
             "Confirm the daemon is still running with daemon_status().",
@@ -1888,11 +1907,39 @@ fn process_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(target_os = "hermit"))]
+fn port_ready(host: &str, port: u16, protocol: &str, timeout: Duration) -> bool {
+    match protocol {
+        "tcp" => tcp_port_open(host, port, timeout),
+        "udp" => udp_port_probe(host, port, timeout),
+        _ => false,
+    }
+}
+
+#[cfg(not(target_os = "hermit"))]
 fn tcp_port_open(host: &str, port: u16, timeout: Duration) -> bool {
     let Ok(mut addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(host, port)) else {
         return false;
     };
     addrs.any(|addr| std::net::TcpStream::connect_timeout(&addr, timeout).is_ok())
+}
+
+#[cfg(not(target_os = "hermit"))]
+fn udp_port_probe(host: &str, port: u16, timeout: Duration) -> bool {
+    let Ok(mut addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(host, port)) else {
+        return false;
+    };
+    addrs.any(|addr| {
+        let bind_addr = if addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let Ok(socket) = std::net::UdpSocket::bind(bind_addr) else {
+            return false;
+        };
+        let _ = socket.set_write_timeout(Some(timeout));
+        socket.connect(addr).is_ok() && socket.send(&[]).is_ok()
+    })
 }
 
 #[cfg(not(target_os = "hermit"))]

@@ -9668,14 +9668,14 @@ emit({
     #[test]
     fn evaluates_daemon_builtins() -> Result<(), ShellError> {
         let (engine_state, mut stack, root) = test_engine("daemon-builtins")?;
-        let program = lower_source(
-            r#"daemon = start_daemon(
+        let source = r#"daemon = start_daemon(
     ["sh", "-c", "while true; do sleep 1; done"],
     stdout="daemon.out",
     stderr="daemon.err",
 )
 status = daemon_status(daemon, log="daemon.err")
 closed = wait_port(9, timeout_ms=20)
+udp = wait_port(9, protocol="udp", timeout_ms=20)
 stopped = stop_daemon(daemon, timeout_ms=1000)
 after = daemon_status(daemon)
 emit({
@@ -9685,11 +9685,14 @@ emit({
     "status_ok": status["ok"],
     "closed_ok": closed["ok"],
     "closed_kind": closed["kind"],
+    "closed_protocol": closed["protocol"],
+    "udp_protocol": udp["protocol"],
     "stopped": stopped["ok"],
     "after_running": after["running"],
 })
-"#,
-        )?;
+"#
+        .to_owned();
+        let program = lower_source(&source)?;
         let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
         assert_eq!(
             json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
@@ -9700,6 +9703,8 @@ emit({
                 "status_ok": true,
                 "closed_ok": false,
                 "closed_kind": "timeout",
+                "closed_protocol": "tcp",
+                "udp_protocol": "udp",
                 "stopped": true,
                 "after_running": false,
             })
