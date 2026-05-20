@@ -298,6 +298,63 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "effects": ["network"],
         "example": 'ready = wait_port(8888, protocol="tcp", timeout_ms=30000)',
     },
+    "wait_for": {
+        "name": "wait_for",
+        "signature": "wait_for(predicate: lambda, timeout_ms: int = 30000, interval_ms: int = 100, ignore_errors: bool = False) -> record",
+        "effects": ["read_file", "process", "network"],
+        "example": 'ready = wait_for(lambda: read_file("server.log").find("READY") >= 0, timeout_ms=30000, ignore_errors=True)',
+        "call_form": "stone_eval",
+        "args": [
+            {
+                "name": "source",
+                "type": "Stone source",
+                "required": True,
+                "example": 'ready = wait_for(lambda: True, timeout_ms=1000)',
+            }
+        ],
+        "returns": {
+            "type": "WaitForResult",
+            "fields": ["ok", "kind", "attempts", "duration_ms", "value", "error"],
+        },
+        "example_call": {
+            "tool": "stone_eval",
+            "source": 'ready = wait_for(lambda: read_file("server.log").find("READY") >= 0, timeout_ms=30000, ignore_errors=True)\nemit(ready)',
+        },
+    },
+    "ps": {
+        "name": "ps",
+        "signature": "ps(interval_ms: int = 0) -> list[record]",
+        "effects": ["process"],
+        "example": "procs = ps()",
+        "args": [
+            {"name": "interval_ms", "type": "int", "required": False, "example": 0},
+        ],
+        "returns": {
+            "type": "list[ProcessRecord]",
+            "fields": [
+                "pid",
+                "ppid",
+                "name",
+                "command",
+                "status",
+                "cwd",
+                "cpu_percent",
+                "memory_bytes",
+                "virtual_bytes",
+                "owner_uid",
+            ],
+        },
+    },
+    "sysinfo": {
+        "name": "sysinfo",
+        "signature": 'sysinfo(section: "os" | "cpu" | "cpu_long" | "mem" | "disks" | "net" | "temp" | "users" | "all" = "all") -> record | list',
+        "effects": ["read_env", "read_file", "process", "network"],
+        "example": 'host = sysinfo("os")',
+        "args": [
+            {"name": "section", "type": "str", "required": False, "example": "os"},
+        ],
+        "returns": {"type": "record | list"},
+    },
     "stat": {
         "name": "stat",
         "signature": "stat(path: str, follow_symlinks: bool = False) -> record",
@@ -376,6 +433,8 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
     "daemon_status": ("daemon", "port", "host", "log", "max_log_bytes"),
     "stop_daemon": ("daemon", "timeout_ms"),
     "wait_port": ("port", "host", "timeout_ms", "protocol"),
+    "ps": ("interval_ms",),
+    "sysinfo": ("section",),
     "search": ("root", "needle"),
     "stat": ("path", "follow_symlinks"),
     "tail": ("values", "count"),
@@ -391,12 +450,15 @@ Stone_CALL_ALIASES: dict[str, str] = {
     "delete_file": "rm",
     "edit_file": "edit",
     "stone_help": "help",
+    "process_list": "ps",
     "list": "ls",
     "list_builtins": "help",
     "remove_dir": "rm",
     "remove_directory": "rm",
     "read": "read_file",
     "remove_file": "rm",
+    "sys": "sysinfo",
+    "sys_info": "sysinfo",
     "write": "write_file",
 }
 

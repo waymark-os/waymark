@@ -16,8 +16,22 @@ use serde_json::{json, Value as JsonValue};
 
 use crate::commands::{stone_help_overview, stone_help_topic};
 use crate::gateway_env;
+use crate::gateway_runtime;
 use crate::json::{json_to_nu_value, nu_to_json_value};
 use crate::linux_tools::posix_tools;
+#[cfg(all(not(target_os = "hermit"), test))]
+use crate::linux_tools::process::cleanup_stale_run_temp_files;
+#[cfg(not(target_os = "hermit"))]
+use crate::linux_tools::{
+    daemon::{
+        daemon_status_call_values, start_daemon_call_values, stop_daemon_call_values,
+        wait_port_call_values,
+    },
+    process::{
+        resolve_command_call_values, run_call_values, run_terminate_call_values,
+        run_wait_call_values,
+    },
+};
 use crate::stone_ast::{
     AssignTarget, AugOp, BoolOp, Call, CompareOp, ComprehensionClause, ExceptHandler, Expr,
     FormattedStringPart, FunctionDef, Program, Stmt, StoneFormatSpec, StoneType,
@@ -49,19 +63,6 @@ use crate::stone_helpers::{
     helper_error_observation, stone_helper_observations_from_value, stone_helper_registry,
     stone_run_event_from_record, stone_run_event_value, StoneHelperHandlerKind, StoneHelperHook,
     StoneHelperRegistry, StoneRunEvent,
-};
-#[cfg(all(not(target_os = "hermit"), test))]
-use crate::linux_tools::process::cleanup_stale_run_temp_files;
-#[cfg(not(target_os = "hermit"))]
-use crate::linux_tools::{
-    daemon::{
-        daemon_status_call_values, start_daemon_call_values, stop_daemon_call_values,
-        wait_port_call_values,
-    },
-    process::{
-        resolve_command_call_values, run_call_values, run_terminate_call_values,
-        run_wait_call_values,
-    },
 };
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_vm::{
@@ -3607,6 +3608,17 @@ impl Evaluator<'_> {
         #[cfg(not(target_os = "hermit"))]
         {
             let (positional, named) = self.eval_call_values(call)?;
+            if gateway_runtime::enabled() {
+                if positional.len() != 1 || !named.is_empty() {
+                    return Err(stone_error(
+                        "resolve_command",
+                        "resolve_command() requires exactly one command name",
+                    ));
+                }
+                let name = value_to_string(&positional[0], "resolve_command")?;
+                let cwd = self.current_cwd_path("resolve_command")?;
+                return gateway_runtime::resolve_command_record(&name, &cwd).map(RuntimeValue::Nu);
+            }
             resolve_command_call_values(&positional, &named).map(RuntimeValue::Nu)
         }
     }
@@ -3660,6 +3672,10 @@ impl Evaluator<'_> {
                 }
             }
         }
+        if gateway_runtime::enabled() {
+            let cwd = self.current_cwd_path(&call.name)?;
+            return gateway_runtime::ps_record(interval_ms, &cwd).map(RuntimeValue::Nu);
+        }
         Ok(RuntimeValue::Nu(posix_tools::ps_record(interval_ms)))
     }
 
@@ -3675,6 +3691,10 @@ impl Evaluator<'_> {
             .first()
             .map(|value| value_to_string(value, &call.name))
             .transpose()?;
+        if gateway_runtime::enabled() {
+            let cwd = self.current_cwd_path(&call.name)?;
+            return gateway_runtime::sysinfo_record(section.as_deref(), &cwd).map(RuntimeValue::Nu);
+        }
         posix_tools::sysinfo_record(section.as_deref())
             .map(RuntimeValue::Nu)
             .map_err(|err| stone_error(&call.name, err))
@@ -3870,7 +3890,8 @@ impl Evaluator<'_> {
         #[cfg(not(target_os = "hermit"))]
         {
             let (positional, named) = self.eval_call_values(call)?;
-            wait_port_call_values(&positional, &named).map(RuntimeValue::Nu)
+            let cwd = self.current_cwd_path("wait_port")?;
+            wait_port_call_values(&positional, &named, Some(&cwd)).map(RuntimeValue::Nu)
         }
     }
 

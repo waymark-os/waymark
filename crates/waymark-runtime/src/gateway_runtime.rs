@@ -5,8 +5,11 @@ use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
 use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, Value};
+use serde_json::Value as JsonValue;
 use waymark_gateway_client::proto::{WorkspaceEntry, WorkspaceEntryKind};
-use waymark_gateway_client::{GatewayRpcClient, LinuxExecOptions};
+use waymark_gateway_client::{GatewayRpcClient, LinuxExecOptions, LinuxProbeOptions};
+
+use crate::json::json_to_nu_value;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
@@ -172,6 +175,286 @@ pub(crate) fn run_terminate(run_id: &str) -> Result<Record, ShellError> {
     linux_exec_record(output, Span::unknown(), usize::MAX, usize::MAX)
 }
 
+pub(crate) fn start_daemon(
+    argv: &[String],
+    cwd: &Path,
+    env_overrides: &[(String, String)],
+) -> Result<Value, ShellError> {
+    let span = Span::unknown();
+    let output = run_command(
+        argv,
+        cwd,
+        env_overrides,
+        None,
+        Duration::from_millis(1),
+        usize::MAX,
+        usize::MAX,
+    )?;
+    let still_running = record_bool(&output, "still_running").unwrap_or(false);
+    let mut record = Record::new();
+    record.push("ok", Value::bool(still_running, span));
+    record.push(
+        "kind",
+        Value::string(if still_running { "started" } else { "exited" }, span),
+    );
+    record.push("pid", Value::nothing(span));
+    if let Some(run_id) = record_string(&output, "run_id") {
+        record.push("run_id", Value::string(run_id, span));
+    }
+    record.push("cwd", Value::string(cwd.display().to_string(), span));
+    record.push(
+        "argv",
+        Value::list(
+            argv.iter()
+                .map(|arg| Value::string(arg.clone(), span))
+                .collect(),
+            span,
+        ),
+    );
+    record.push(
+        "stdout",
+        output
+            .get("stdout")
+            .cloned()
+            .unwrap_or_else(|| Value::string("", span)),
+    );
+    record.push(
+        "stderr",
+        output
+            .get("stderr")
+            .cloned()
+            .unwrap_or_else(|| Value::string("", span)),
+    );
+    record.push("stdout_path", Value::nothing(span));
+    record.push("stderr_path", Value::nothing(span));
+    record.push(
+        "explanation",
+        Value::string(
+            "Gateway started the daemon through linux.exec; use daemon_status() or stop_daemon() with the returned run_id.",
+            span,
+        ),
+    );
+    Ok(Value::record(record, span))
+}
+
+pub(crate) fn daemon_status(run_id: &str, timeout: Duration) -> Result<Value, ShellError> {
+    let span = Span::unknown();
+    let output = run_wait(run_id, timeout)?;
+    let running = record_bool(&output, "still_running").unwrap_or(false);
+    let ok = running || record_bool(&output, "ok").unwrap_or(false);
+    let mut record = Record::new();
+    record.push("ok", Value::bool(ok, span));
+    record.push("running", Value::bool(running, span));
+    record.push("run_id", Value::string(run_id.to_string(), span));
+    record.push("pid", Value::nothing(span));
+    record.push(
+        "stdout",
+        output
+            .get("stdout")
+            .cloned()
+            .unwrap_or_else(|| Value::string("", span)),
+    );
+    record.push(
+        "stderr",
+        output
+            .get("stderr")
+            .cloned()
+            .unwrap_or_else(|| Value::string("", span)),
+    );
+    record.push(
+        "exit_code",
+        output
+            .get("exit_code")
+            .cloned()
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    record.push(
+        "timed_out",
+        output
+            .get("timed_out")
+            .cloned()
+            .unwrap_or_else(|| Value::bool(false, span)),
+    );
+    Ok(Value::record(record, span))
+}
+
+pub(crate) fn stop_daemon(run_id: &str) -> Result<Value, ShellError> {
+    let span = Span::unknown();
+    let output = run_terminate(run_id)?;
+    let mut record = Record::new();
+    record.push("ok", Value::bool(true, span));
+    record.push("kind", Value::string("stopped", span));
+    record.push("run_id", Value::string(run_id.to_string(), span));
+    record.push("pid", Value::nothing(span));
+    record.push(
+        "stdout",
+        output
+            .get("stdout")
+            .cloned()
+            .unwrap_or_else(|| Value::string("", span)),
+    );
+    record.push(
+        "stderr",
+        output
+            .get("stderr")
+            .cloned()
+            .unwrap_or_else(|| Value::string("", span)),
+    );
+    record.push(
+        "exit_code",
+        output
+            .get("exit_code")
+            .cloned()
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    Ok(Value::record(record, span))
+}
+
+pub(crate) fn ps_record(interval_ms: u64, cwd: &Path) -> Result<Value, ShellError> {
+    let _ = cwd;
+    let config = required_config()?;
+    let target = probe_options(&config);
+    let output = with_client(&config, |client| client.linux_ps(target, interval_ms))?;
+    let span = Span::unknown();
+    Ok(Value::list(
+        output
+            .processes
+            .into_iter()
+            .map(|process| {
+                let mut record = Record::with_capacity(10);
+                record.push("pid", Value::int(process.pid, span));
+                record.push("ppid", Value::int(process.ppid, span));
+                record.push("name", Value::string(process.name, span));
+                record.push("command", Value::string(process.command, span));
+                record.push("status", Value::string(process.status, span));
+                record.push("cwd", Value::string(process.cwd, span));
+                record.push("cpu_percent", Value::float(process.cpu_percent, span));
+                record.push("memory_bytes", Value::int(process.memory_bytes, span));
+                record.push("virtual_bytes", Value::int(process.virtual_bytes, span));
+                record.push("owner_uid", Value::int(process.owner_uid, span));
+                Value::record(record, span)
+            })
+            .collect(),
+        span,
+    ))
+}
+
+pub(crate) fn resolve_command_record(name: &str, cwd: &Path) -> Result<Value, ShellError> {
+    let _ = cwd;
+    let config = required_config()?;
+    let target = probe_options(&config);
+    let output = with_client(&config, |client| client.linux_resolve_command(target, name))?;
+    let span = Span::unknown();
+    let mut record = Record::new();
+    record.push("ok", Value::bool(output.ok, span));
+    record.push("name", Value::string(output.name.clone(), span));
+    record.push(
+        "path",
+        if output.path.is_empty() {
+            Value::nothing(span)
+        } else {
+            Value::string(output.path, span)
+        },
+    );
+    record.push(
+        "matches",
+        Value::list(
+            output
+                .matches
+                .iter()
+                .map(|path| Value::string(path.clone(), span))
+                .collect(),
+            span,
+        ),
+    );
+    record.push(
+        "searched",
+        Value::list(
+            output
+                .searched
+                .iter()
+                .map(|path| Value::string(path.clone(), span))
+                .collect(),
+            span,
+        ),
+    );
+    let mut explanation = Record::new();
+    explanation.push(
+        "kind",
+        Value::string(
+            if output.ok {
+                "resolved_executable"
+            } else {
+                "executable_not_found"
+            },
+            span,
+        ),
+    );
+    explanation.push(
+        "summary",
+        Value::string(
+            if output.ok {
+                format!(
+                    "Executable `{}` resolves to `{}`.",
+                    output.name, output.matches[0]
+                )
+            } else {
+                format!("Executable `{}` was not found in PATH.", output.name)
+            },
+            span,
+        ),
+    );
+    record.push("explanation", Value::record(explanation, span));
+    Ok(Value::record(record, span))
+}
+
+pub(crate) fn sysinfo_record(section: Option<&str>, cwd: &Path) -> Result<Value, ShellError> {
+    let _ = cwd;
+    let config = required_config()?;
+    let target = probe_options(&config);
+    let output = with_client(&config, |client| {
+        client.linux_sysinfo(target, section.unwrap_or("all"))
+    })?;
+    let parsed: JsonValue = serde_json::from_str(&output.json).map_err(|err| {
+        stone_error(
+            "sysinfo",
+            format!("Gateway returned invalid sysinfo JSON: {err}"),
+        )
+    })?;
+    Ok(json_to_nu_value(parsed, Span::unknown()))
+}
+
+pub(crate) fn wait_port_record(
+    host: &str,
+    port: u16,
+    protocol: &str,
+    timeout: Duration,
+    cwd: &Path,
+) -> Result<Value, ShellError> {
+    let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    let _ = cwd;
+    let config = required_config()?;
+    let target = probe_options(&config);
+    let output = with_client(&config, |client| {
+        client.linux_wait_port(target, host, u32::from(port), protocol, timeout_ms)
+    })?;
+    let span = Span::unknown();
+    let mut record = Record::new();
+    record.push("ok", Value::bool(output.ok, span));
+    record.push("kind", Value::string(output.kind, span));
+    record.push("host", Value::string(output.host, span));
+    record.push("port", Value::int(i64::from(output.port), span));
+    record.push("protocol", Value::string(output.protocol, span));
+    record.push(
+        "duration_ms",
+        Value::int(i64::try_from(output.duration_ms).unwrap_or(i64::MAX), span),
+    );
+    if !output.error.is_empty() {
+        record.push("error", Value::string(output.error, span));
+    }
+    Ok(Value::record(record, span))
+}
+
 fn linux_exec_record(
     output: waymark_gateway_client::proto::LinuxExecResponse,
     span: Span,
@@ -217,6 +500,25 @@ fn linux_exec_record(
         record.push("env_diff", Value::string(diff.text, span));
     }
     Ok(record)
+}
+
+fn record_bool(record: &Record, key: &str) -> Option<bool> {
+    let Value::Bool { val, .. } = record.get(key)? else {
+        return None;
+    };
+    Some(*val)
+}
+
+fn record_string(record: &Record, key: &str) -> Option<String> {
+    let Value::String { val, .. } = record.get(key)? else {
+        return None;
+    };
+    Some(val.clone())
+}
+
+fn probe_options(config: &GatewayRuntimeConfig) -> LinuxProbeOptions {
+    LinuxProbeOptions::new(config.tx.clone(), config.image.clone())
+        .workspace_mount(config.workspace_mount.clone())
 }
 
 fn config_from_process_env() -> Option<GatewayRuntimeConfig> {

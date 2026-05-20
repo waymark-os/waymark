@@ -372,6 +372,21 @@ class StoneMcpServerTests(unittest.TestCase):
         self.assertEqual(result["value"]["args"][0]["name"], "argv")
         self.assertEqual(result["value"]["example_call"], {"name": "must_run", "args": [["printf", "ok"]]})
 
+    def test_stone_signature_includes_recent_system_helpers(self) -> None:
+        ps = server.stone_signature("ps")
+        sysinfo = server.stone_signature("sys")
+        wait_for = server.stone_signature("wait_for")
+
+        self.assertTrue(ps["ok"], ps)
+        self.assertEqual(ps["value"]["name"], "ps")
+        self.assertEqual(ps["value"]["args"][0]["name"], "interval_ms")
+        self.assertTrue(sysinfo["ok"], sysinfo)
+        self.assertEqual(sysinfo["value"]["name"], "sysinfo")
+        self.assertEqual(sysinfo["value"]["alias_for"], "sysinfo")
+        self.assertEqual(sysinfo["value"]["args"][0]["name"], "section")
+        self.assertTrue(wait_for["ok"], wait_for)
+        self.assertEqual(wait_for["value"]["call_form"], "stone_eval")
+
     def test_stone_call_generates_emit_wrapped_builtin_call(self) -> None:
         backend = FakeBackend()
 
@@ -526,6 +541,17 @@ class StoneMcpServerTests(unittest.TestCase):
 
         self.assertEqual(source, 'emit(resolve_command("python3"))\n')
 
+    def test_stone_call_supports_recent_system_helpers(self) -> None:
+        ps = server.stone_call_source("ps", {"interval_ms": 0})
+        sysinfo = server.stone_call_source("sysinfo", {"section": "os"})
+        backend = FakeBackend()
+        sys_alias = server.stone_call(backend, "sys", {"section": "mem"})
+
+        self.assertEqual(ps, "emit(ps(0))\n")
+        self.assertEqual(sysinfo, 'emit(sysinfo("os"))\n')
+        self.assertTrue(sys_alias["ok"], sys_alias)
+        self.assertEqual(backend.calls, [('emit(sysinfo("mem"))\n', None)])
+
     def test_stone_call_accepts_json_string_args(self) -> None:
         backend = FakeBackend()
 
@@ -650,7 +676,7 @@ class StoneMcpServerTests(unittest.TestCase):
         self.assertEqual(result["error"]["code"], "stone_call_unknown")
 
     def test_stone_call_supports_help_table_builtins_that_are_simple_calls(self) -> None:
-        unsupported_by_design = {"open"}
+        unsupported_by_design = {"open", "wait_for"}
         missing = set(server.HELP_TABLE) - set(server.Stone_CALL_ARG_ORDER) - unsupported_by_design
 
         self.assertEqual(missing, set())

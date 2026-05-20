@@ -297,6 +297,9 @@ pub(crate) fn start_daemon_call_values(
         Some(path) => resolve_path(&path)?,
         None => default_cwd,
     };
+    if gateway_runtime::enabled() {
+        return gateway_runtime::start_daemon(&argv, &cwd_path, &env_overrides);
+    }
     let stdout_path = match stdout {
         Some(path) => resolve_path(&path)?,
         None => daemon_temp_path("stdout"),
@@ -319,6 +322,22 @@ pub(crate) fn daemon_status_call_values(
             "daemon_status() requires exactly one daemon handle or pid",
         ));
     };
+    if gateway_runtime::enabled() {
+        if !named.iter().all(|(name, _)| name == "max_log_bytes") {
+            for (name, _) in named {
+                if name != "max_log_bytes" {
+                    return Err(stone_error(
+                        "daemon_status",
+                        format!(
+                            "unsupported keyword `{name}` in Gateway mode; expected max_log_bytes"
+                        ),
+                    ));
+                }
+            }
+        }
+        let run_id = value_to_daemon_run_id(daemon, "daemon_status")?;
+        return gateway_runtime::daemon_status(&run_id, Duration::from_millis(1));
+    }
     let pid = value_to_daemon_pid(daemon, "daemon_status")?;
     let mut host = "127.0.0.1".to_owned();
     let mut port: Option<u16> = None;
@@ -367,6 +386,16 @@ pub(crate) fn stop_daemon_call_values(
             "stop_daemon() requires exactly one daemon handle or pid",
         ));
     };
+    if gateway_runtime::enabled() {
+        if !named.is_empty() {
+            return Err(stone_error(
+                "stop_daemon",
+                "stop_daemon() Gateway mode does not support keyword arguments",
+            ));
+        }
+        let run_id = value_to_daemon_run_id(daemon, "stop_daemon")?;
+        return gateway_runtime::stop_daemon(&run_id);
+    }
     let pid = value_to_daemon_pid(daemon, "stop_daemon")?;
     let mut timeout_ms: i64 = 5000;
     for (name, value) in named {
@@ -455,6 +484,7 @@ pub(crate) fn run_terminate_call_values(
 pub(crate) fn wait_port_call_values(
     positional: &[Value],
     named: &[(String, Value)],
+    gateway_cwd: Option<&Path>,
 ) -> Result<Value, ShellError> {
     let [port_value] = positional else {
         return Err(stone_error(
@@ -494,12 +524,11 @@ pub(crate) fn wait_port_call_values(
             }
         }
     }
-    Ok(wait_port_record(
-        &host,
-        port,
-        &protocol,
-        Duration::from_millis(timeout_ms as u64),
-    ))
+    let timeout = Duration::from_millis(timeout_ms as u64);
+    if let Some(cwd) = gateway_cwd.filter(|_| gateway_runtime::enabled()) {
+        return gateway_runtime::wait_port_record(&host, port, &protocol, timeout, cwd);
+    }
+    Ok(wait_port_record(&host, port, &protocol, timeout))
 }
 
 #[cfg(not(target_os = "hermit"))]
@@ -572,6 +601,29 @@ fn value_to_daemon_pid(value: &Value, context: &str) -> Result<u32, ShellError> 
         return Err(stone_error(context, "pid must be positive"));
     }
     u32::try_from(raw_pid).map_err(|_| stone_error(context, "pid is too large"))
+}
+
+#[cfg(not(target_os = "hermit"))]
+fn value_to_daemon_run_id(value: &Value, context: &str) -> Result<String, ShellError> {
+    match value {
+        Value::Record { val, .. } => {
+            let Some(run_id) = val.get("run_id") else {
+                return Err(stone_error(
+                    context,
+                    "daemon record is missing `run_id`; pass the Gateway start_daemon() result",
+                ));
+            };
+            value_to_string(run_id, context)
+        }
+        Value::String { val, .. } | Value::Glob { val, .. } => Ok(val.clone()),
+        other => Err(stone_error(
+            context,
+            format!(
+                "expected daemon record or run_id string, got {}",
+                other.get_type()
+            ),
+        )),
+    }
 }
 
 #[cfg(not(target_os = "hermit"))]
