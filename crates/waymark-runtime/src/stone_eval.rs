@@ -17,6 +17,7 @@ use serde_json::{json, Value as JsonValue};
 use crate::commands::{stone_help_overview, stone_help_topic};
 use crate::gateway_env;
 use crate::json::{json_to_nu_value, nu_to_json_value};
+use crate::linux_tools::posix_tools;
 use crate::stone_ast::{
     AssignTarget, AugOp, BoolOp, Call, CompareOp, ComprehensionClause, ExceptHandler, Expr,
     FormattedStringPart, FunctionDef, Program, Stmt, StoneFormatSpec, StoneType,
@@ -1846,6 +1847,8 @@ impl Evaluator<'_> {
             "run_wait" => self.eval_run_wait_call(call),
             "run_terminate" => self.eval_run_terminate_call(call),
             "resolve_command" => self.eval_resolve_command_call(call),
+            "ps" | "process_list" => self.eval_ps_call(call),
+            "sys" | "sys_info" | "sysinfo" => self.eval_sys_call(call),
             "state" => self.eval_state_call(call),
             "env_state" | "env_diff" => self.eval_env_state_call(call),
             "env_finish" => self.eval_env_finish_call(call),
@@ -3628,6 +3631,49 @@ impl Evaluator<'_> {
         Ok(RuntimeValue::Nu(Value::record(record, span)))
     }
 
+    fn eval_ps_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 1 {
+            return Err(stone_error(
+                &call.name,
+                format!("{}() accepts at most one interval_ms argument", call.name),
+            ));
+        }
+        let mut interval_ms = 0_u64;
+        if let Some(value) = positional.first() {
+            interval_ms = value_to_u64(value, "ps interval_ms")?;
+        }
+        for (name, value) in named {
+            match name.as_str() {
+                "interval_ms" => interval_ms = value_to_u64(&value, "ps interval_ms")?,
+                _ => {
+                    return Err(stone_error(
+                        &call.name,
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        Ok(RuntimeValue::Nu(posix_tools::ps_record(interval_ms)))
+    }
+
+    fn eval_sys_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 1 || !named.is_empty() {
+            return Err(stone_error(
+                &call.name,
+                format!("{}() accepts at most one section argument", call.name),
+            ));
+        }
+        let section = positional
+            .first()
+            .map(|value| value_to_string(value, &call.name))
+            .transpose()?;
+        posix_tools::sysinfo_record(section.as_deref())
+            .map(RuntimeValue::Nu)
+            .map_err(|err| stone_error(&call.name, err))
+    }
+
     fn eval_env_state_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let (positional, named) = self.eval_call_values(call)?;
         if positional.len() > 1 {
@@ -5001,6 +5047,8 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "parse_float",
     "parse_int",
     "print",
+    "process_list",
+    "ps",
     "pwd",
     "cd",
     "range",
@@ -5018,6 +5066,9 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "split",
     "resolve_command",
     "state",
+    "sys",
+    "sys_info",
+    "sysinfo",
     "starts_with",
     "startswith",
     "tail",
@@ -9901,6 +9952,40 @@ emit({
                 "after_running": false,
             })
         );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "hermit"))]
+    #[test]
+    fn evaluates_posix_system_builtins() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("posix-system-builtins")?;
+        let program = lower_source(
+            r#"info = sysinfo("os")
+mem = sysinfo("mem")
+cpu = sys("cpu")
+procs = ps()
+emit({
+    "os": info["os"],
+    "arch_is_string": type(info["arch"]) == "str",
+    "cpu_count_positive": info["cpu_count"] > 0,
+    "mem_has_total": "total" in mem,
+    "cpu_is_list": type(cpu) == "list",
+    "has_self": len(where(procs, lambda p: p["pid"] == info["current_pid"])) > 0,
+    "process_fields": len(procs) == 0 or ("command" in procs[0] and "memory_bytes" in procs[0]),
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value["os"], json_value!(std::env::consts::OS));
+        assert_eq!(value["arch_is_string"], json_value!(true));
+        assert_eq!(value["cpu_count_positive"], json_value!(true));
+        assert_eq!(value["mem_has_total"], json_value!(true));
+        assert_eq!(value["cpu_is_list"], json_value!(true));
+        assert_eq!(value["has_self"], json_value!(true));
+        assert_eq!(value["process_fields"], json_value!(true));
+
         cleanup_dir(&root);
         Ok(())
     }

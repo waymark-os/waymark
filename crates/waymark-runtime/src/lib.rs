@@ -20,6 +20,7 @@ mod frontend;
 mod gateway_env;
 mod gateway_runtime;
 mod json;
+mod linux_tools;
 mod server;
 mod stone_ast;
 mod stone_builtins;

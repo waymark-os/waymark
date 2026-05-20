@@ -198,6 +198,11 @@ Supported handlers are `except:`, `except Exception:`, and
   `attempts`, `duration_ms`, and the last observed value or error.
 - `pwd()`, `cd(path)`: inspect or change the current Stone working directory
   for the current session.
+- `ps(interval_ms=0)`: typed process list with pid, parent pid, command,
+  status, cwd, CPU, memory, virtual memory, and owner uid fields.
+- `sysinfo(section="all")`: typed host system snapshot. Sections include
+  `"os"`, `"cpu"`, `"cpu_long"`, `"mem"`, `"disks"`, `"net"`, `"temp"`,
+  and `"users"`. `sys()` is an alias.
 - `state()`: typed runtime snapshot with `cwd`, git summary, and common tool
   availability/version probes.
 - `last_result()`: previous Waymark command response as typed data, or `None`

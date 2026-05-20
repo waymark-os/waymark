@@ -676,6 +676,35 @@ if not info.ok:
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "ps",
+        signature: "ps(interval_ms: int = 0) -> list[record]",
+        use_when: "Use to inspect live processes as typed records without scraping /proc or shelling out to ps.",
+        examples: &[
+            r#"procs = ps()"#,
+            r#"python = where(ps(), lambda p: p["command"].find("python") >= 0)"#,
+        ],
+        avoid: &[
+            "Do not parse `ps aux` text when process id, command, status, cwd, CPU, and memory fields are needed.",
+            "Pass a nonzero interval_ms only when cpu_percent matters; it samples over that interval.",
+        ],
+        aliases: &["process_list"],
+    },
+    StoneHelpEntry {
+        name: "sysinfo",
+        signature: r#"sysinfo(section: "os" | "cpu" | "cpu_long" | "mem" | "disks" | "net" | "temp" | "users" | "all" = "all") -> record | list"#,
+        use_when: "Use to inspect typed host system facts without shelling out to uname, free, df, ip, or sysctl-style commands.",
+        examples: &[
+            r#"host = sysinfo("os")"#,
+            r#"mem = sysinfo("mem")"#,
+            r#"emit({"os": sysinfo("os").os, "cpus": len(sysinfo("cpu"))})"#,
+        ],
+        avoid: &[
+            "Do not parse platform command text when a sysinfo section has the needed fields.",
+            "Use sysinfo(\"cpu_long\") only when sampled CPU usage is needed; it waits briefly to sample.",
+        ],
+        aliases: &["sys", "sys_info"],
+    },
+    StoneHelpEntry {
         name: "state",
         signature: "state() -> record",
         use_when: "Use to retrieve cheap agent-facing runtime state such as cwd, git status, common tool availability, and Gateway transaction state when active.",
@@ -950,6 +979,7 @@ pub(crate) fn stone_help_topic(name: &str, span: Span) -> Value {
         "from_json" => "json_loads",
         "to_json" => "json_dumps",
         "env_diff" => "env_state",
+        "sys" | "sys_info" => "sysinfo",
         "sorted" => "sort",
         "gotchas" | "constraints" => "unsupported",
         other => other,
