@@ -1424,6 +1424,20 @@ if not info.ok:
         ],
         aliases: &[],
     },
+    StoneHelpEntry {
+        name: "wait_for",
+        signature: "wait_for(predicate: lambda, timeout_ms: int = 30000, interval_ms: int = 100, ignore_errors: bool = False) -> record",
+        use_when: "Use after start_daemon() or asynchronous setup when readiness is represented by an arbitrary Stone predicate, such as log text, file contents, or structured status.",
+        examples: &[
+            r#"ready = wait_for(lambda: True, timeout_ms=1000)"#,
+            r#"ready = wait_for(lambda: read_file("missing.log").find("READY") >= 0, timeout_ms=10, interval_ms=5, ignore_errors=True)"#,
+        ],
+        avoid: &[
+            "Use wait_port() instead when readiness is just a TCP or UDP port probe.",
+            "Keep ignore_errors=False unless transient predicate errors are expected, such as a log file that may not exist yet.",
+        ],
+        aliases: &[],
+    },
 ];
 
 const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[

@@ -801,10 +801,10 @@ fn lower_slice(slice: py::ExprSlice) -> Result<Expr, ShellError> {
 
 fn lower_lambda(lambda: py::ExprLambda) -> Result<Expr, ShellError> {
     let Some(parameters) = lambda.parameters else {
-        return Err(unsupported_message(
-            "lambda",
-            "lambda parameters are required",
-        ));
+        return Ok(Expr::Lambda {
+            params: Vec::new(),
+            body: Box::new(lower_expr(*lambda.body)?),
+        });
     };
     if parameters.vararg.is_some()
         || parameters.kwarg.is_some()

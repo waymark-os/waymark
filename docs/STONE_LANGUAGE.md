@@ -193,6 +193,10 @@ Supported handlers are `except:`, `except Exception:`, and
   wait for a TCP port to accept connections, or for a UDP endpoint to accept a
   datagram send probe. UDP has no connection handshake, so use a real protocol
   client for final validation.
+- `wait_for(lambda: condition, timeout_ms=30000, interval_ms=100,
+  ignore_errors=False)`: poll an arbitrary zero-argument predicate until it is
+  truthy or the timeout expires. Returns a structured record with `ok`, `kind`,
+  `attempts`, `duration_ms`, and the last observed value or error.
 - `pwd()`, `cd(path)`: inspect or change the current Stone working directory
   for the current session.
 - `state()`: typed runtime snapshot with `cwd`, git summary, and common tool

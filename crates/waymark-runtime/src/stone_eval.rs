@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use nu_protocol::{
@@ -1857,6 +1858,7 @@ impl Evaluator<'_> {
             "daemon_status" => self.eval_daemon_status_call(call),
             "stop_daemon" => self.eval_stop_daemon_call(call),
             "wait_port" => self.eval_wait_port_call(call),
+            "wait_for" => self.eval_wait_for_call(call),
             "sort" | "sorted" => self.eval_sort_call(call),
             "set" => self.eval_set_call(call),
             "unique" => self.eval_unique_call(call),
@@ -3820,6 +3822,104 @@ impl Evaluator<'_> {
         }
     }
 
+    fn eval_wait_for_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if call.positional.is_empty() || call.positional.len() > 3 {
+            return Err(stone_error(
+                "wait_for",
+                "wait_for() requires predicate and optional timeout_ms, interval_ms",
+            ));
+        }
+        let predicate = self.eval_callable_expr(&call.positional[0])?;
+        if !predicate.params.is_empty() {
+            return Err(stone_error(
+                "wait_for",
+                "wait_for() predicate must be a zero-argument lambda/callable",
+            ));
+        }
+
+        let mut timeout_ms: i64 = match call.positional.get(1) {
+            Some(value) => self
+                .eval_expr_value(value, PipelineData::empty())?
+                .into_nu_value("wait_for timeout_ms")
+                .and_then(|value| value_to_i64(&value, "wait_for timeout_ms"))?,
+            None => 30_000,
+        };
+        let mut interval_ms: i64 = match call.positional.get(2) {
+            Some(value) => self
+                .eval_expr_value(value, PipelineData::empty())?
+                .into_nu_value("wait_for interval_ms")
+                .and_then(|value| value_to_i64(&value, "wait_for interval_ms"))?,
+            None => 100,
+        };
+        let mut ignore_errors = false;
+        for (name, argument) in &call.named {
+            let value = self
+                .eval_expr_value(argument, PipelineData::empty())?
+                .into_nu_value("wait_for")?;
+            match name.as_str() {
+                "timeout_ms" => timeout_ms = value_to_i64(&value, "wait_for timeout_ms")?,
+                "interval_ms" => interval_ms = value_to_i64(&value, "wait_for interval_ms")?,
+                "ignore_errors" => ignore_errors = value_to_bool(&value, "wait_for ignore_errors")?,
+                other => {
+                    return Err(stone_error(
+                        "wait_for",
+                        format!(
+                            "unsupported keyword `{other}`; expected timeout_ms, interval_ms, or ignore_errors"
+                        ),
+                    ));
+                }
+            }
+        }
+        if timeout_ms <= 0 {
+            return Err(stone_error("wait_for", "timeout_ms must be positive"));
+        }
+        if interval_ms <= 0 {
+            return Err(stone_error("wait_for", "interval_ms must be positive"));
+        }
+
+        let started = Instant::now();
+        let timeout = Duration::from_millis(timeout_ms as u64);
+        let interval = Duration::from_millis(interval_ms as u64);
+        let mut attempts: i64 = 0;
+        loop {
+            attempts += 1;
+            let last_value;
+            let last_error;
+            match self.invoke_callable(&predicate, Vec::new()) {
+                Ok(value) => {
+                    let value = value.into_nu_value("wait_for predicate")?;
+                    if value_truthy(&value) {
+                        return Ok(RuntimeValue::Nu(wait_for_record(
+                            true,
+                            attempts,
+                            started.elapsed(),
+                            Some(value),
+                            None,
+                        )));
+                    }
+                    last_value = Some(value);
+                    last_error = None;
+                }
+                Err(err) if ignore_errors => {
+                    last_error = Some(format!("{err:?}"));
+                    last_value = None;
+                }
+                Err(err) => return Err(err),
+            }
+            if started.elapsed() >= timeout {
+                return Ok(RuntimeValue::Nu(wait_for_record(
+                    false,
+                    attempts,
+                    started.elapsed(),
+                    last_value,
+                    last_error,
+                )));
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            thread::sleep(interval.min(remaining));
+        }
+    }
+
     fn eval_list_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let name = call.name.as_str();
         if !call.named.is_empty() {
@@ -4927,6 +5027,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "daemon_status",
     "stop_daemon",
     "wait_port",
+    "wait_for",
     "save",
     "search",
     "sha1",
@@ -5584,6 +5685,57 @@ fn must_run_failure_error(record: Record) -> ShellError {
     )
 }
 
+fn wait_for_record(
+    ok: bool,
+    attempts: i64,
+    elapsed: Duration,
+    value: Option<Value>,
+    error: Option<String>,
+) -> Value {
+    let span = Span::unknown();
+    let duration_ms = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
+    let mut record = Record::new();
+    record.push("ok", Value::bool(ok, span));
+    record.push(
+        "kind",
+        Value::string(if ok { "ready" } else { "timeout" }, span),
+    );
+    record.push("attempts", Value::int(attempts, span));
+    record.push("duration_ms", Value::int(duration_ms, span));
+    if ok {
+        record.push("value", value.unwrap_or_else(|| Value::bool(true, span)));
+    } else {
+        if let Some(value) = value {
+            record.push("last_value", value);
+        }
+        if let Some(error) = error {
+            record.push("last_error", Value::string(error, span));
+        }
+        let mut explanation = Record::new();
+        explanation.push("kind", Value::string("wait_for_timeout", span));
+        explanation.push(
+            "summary",
+            Value::string(
+                "wait_for() predicate did not become truthy before the timeout.",
+                span,
+            ),
+        );
+        explanation.push(
+            "next_steps",
+            Value::list(
+                vec![
+                    Value::string("Inspect the condition inputs, such as logs, files, process status, or service health.", span),
+                    Value::string("If startup is expected to be slow, rerun with a larger timeout_ms.", span),
+                    Value::string("If the predicate can fail while resources are still appearing, use ignore_errors=True deliberately.", span),
+                ],
+                span,
+            ),
+        );
+        record.push("explanation", Value::record(explanation, span));
+    }
+    Value::record(record, span)
+}
+
 fn unknown_stone_call_error(name: &str) -> ShellError {
     if name == "isinstance" {
         return stone_error(
@@ -6074,6 +6226,46 @@ emit(inc(5))
         assert_eq!(
             json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
             json_value!(15)
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn evaluates_wait_for_predicate_builtin() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("wait-for-builtin")?;
+        let program = lower_source(
+            r#"ready = wait_for(lambda: True, timeout_ms=1000, interval_ms=5)
+timed = wait_for(lambda: False, timeout_ms=10, interval_ms=5)
+missing = wait_for(lambda: read_file("missing.log").find("READY") >= 0, timeout_ms=10, interval_ms=5, ignore_errors=True)
+emit({
+    "ready_ok": ready.ok,
+    "ready_kind": ready.kind,
+    "ready_value": ready.value,
+    "timed_ok": timed.ok,
+    "timed_kind": timed.kind,
+    "timed_last_value": timed.last_value,
+    "missing_ok": missing.ok,
+    "missing_kind": missing.kind,
+    "missing_has_error": "last_error" in missing,
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "ready_ok": true,
+                "ready_kind": "ready",
+                "ready_value": true,
+                "timed_ok": false,
+                "timed_kind": "timeout",
+                "timed_last_value": false,
+                "missing_ok": false,
+                "missing_kind": "timeout",
+                "missing_has_error": true,
+            })
         );
 
         cleanup_dir(&root);
