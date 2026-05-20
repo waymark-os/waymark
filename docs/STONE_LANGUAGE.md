@@ -185,6 +185,10 @@ Supported handlers are `except:`, `except Exception:`, and
   `tuple()` is an agent-compatibility alias for `list()`.
 - `run(argv, cwd=None, stdin=None, timeout_ms=None, env=None)`: Linux command
   execution with structured stdout, stderr, status, and helper observations.
+- `must_run(argv, cwd=None, stdin=None, timeout_ms=None, env=None)`: checked
+  Linux command execution for `set -e`-style scripts. It returns the same
+  structured record as `run()` on success, and raises a Stone error with the run
+  record attached when the external process exits nonzero or times out.
 - `pwd()`, `cd(path)`: inspect or change the current Stone working directory
   for the current session.
 - `state()`: typed runtime snapshot with `cwd`, git summary, and common tool

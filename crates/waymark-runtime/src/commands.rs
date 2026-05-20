@@ -1272,10 +1272,27 @@ if starts_with(line, "ERROR"):
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "must_run",
+        signature: r#"must_run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576) -> record"#,
+        use_when: "Use for set -e style process steps: it returns the same run record on success and raises a Stone error when the external process exits nonzero or times out.",
+        examples: &[
+            r#"must_run(["mkdir", "-p", "target/out"])"#,
+            r#"step = must_run(["printf", "ok"], timeout_ms=5000)"#,
+            r#"must_run(["sh", "-c", "printf input"], stdout="suppress", stderr="capture", max_stderr_bytes=12000)"#,
+        ],
+        avoid: &[
+            "Use run() instead when a nonzero exit is expected and should be handled as data.",
+            "Do not use must_run for normal file/JSON/CSV work.",
+            "Do not pass shell strings; pass argv lists.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "run_wait",
         signature: "run_wait(run_id: str, timeout_ms: int = 30000) -> record",
         use_when: "Use after Gateway-backed run() returns timed_out=true, still_running=true, and a run_id.",
-        examples: &[r#"next = run_wait(result.run_id, timeout_ms=60000)"#],
+        examples: &[r#"if result.get("run_id", None) is not None:
+    next = run_wait(result.run_id, timeout_ms=60000)"#],
         avoid: &["Do not call for normal completed run() results without a run_id."],
         aliases: &[],
     },
@@ -1283,7 +1300,8 @@ if starts_with(line, "ERROR"):
         name: "run_terminate",
         signature: "run_terminate(run_id: str) -> record",
         use_when: "Use to stop a Gateway-backed run() that returned still_running=true when the command should not continue.",
-        examples: &[r#"stopped = run_terminate(result.run_id)"#],
+        examples: &[r#"if result.get("run_id", None) is not None:
+    stopped = run_terminate(result.run_id)"#],
         avoid: &["Prefer run_wait() if the command is expected to finish soon."],
         aliases: &[],
     },

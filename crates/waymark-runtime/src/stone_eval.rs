@@ -1841,6 +1841,7 @@ impl Evaluator<'_> {
             "read_jsonl" => self.eval_read_jsonl_call(call),
             "round" => self.eval_round_call(call),
             "run" => self.eval_run_call(call),
+            "must_run" => self.eval_must_run_call(call),
             "run_wait" => self.eval_run_wait_call(call),
             "run_terminate" => self.eval_run_terminate_call(call),
             "resolve_command" => self.eval_resolve_command_call(call),
@@ -3408,21 +3409,48 @@ impl Evaluator<'_> {
 
         #[cfg(not(target_os = "hermit"))]
         {
-            let (positional, named) = self.eval_call_values(call)?;
-            let default_cwd = self.current_cwd_path("run")?;
-            let invocation = run_call_values(&positional, &named, default_cwd, |path| {
-                self.resolve_script_path(path)
-            })?;
-            let mut record = invocation.record;
-            self.attach_run_helper_observations(
-                &mut record,
-                &invocation.argv,
-                &invocation.cwd,
-                &invocation.env_overrides,
-                Span::unknown(),
-            );
+            let record = self.eval_run_record(call, "run")?;
             Ok(RuntimeValue::Nu(Value::record(record, Span::unknown())))
         }
+    }
+
+    fn eval_must_run_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        #[cfg(target_os = "hermit")]
+        {
+            let _ = call;
+            return Err(stone_error(
+                "must_run",
+                "must_run() requires the Linux/POSIX adapter and is unavailable on Hermit",
+            ));
+        }
+
+        #[cfg(not(target_os = "hermit"))]
+        {
+            let record = self.eval_run_record(call, "must_run")?;
+            if run_record_ok(&record) {
+                Ok(RuntimeValue::Nu(Value::record(record, Span::unknown())))
+            } else {
+                Err(must_run_failure_error(record))
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "hermit"))]
+    fn eval_run_record(&mut self, call: &Call, context: &str) -> Result<Record, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        let default_cwd = self.current_cwd_path(context)?;
+        let invocation = run_call_values(context, &positional, &named, default_cwd, |path| {
+            self.resolve_script_path(path)
+        })?;
+        let mut record = invocation.record;
+        self.attach_run_helper_observations(
+            &mut record,
+            &invocation.argv,
+            &invocation.cwd,
+            &invocation.env_overrides,
+            Span::unknown(),
+        );
+        Ok(record)
     }
 
     fn eval_run_wait_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -4868,6 +4896,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "md5",
     "min",
     "mkdir",
+    "must_run",
     "open",
     "parse_float",
     "parse_int",
@@ -5503,6 +5532,55 @@ fn stone_error(kind: &str, message: impl Into<String>) -> ShellError {
     ShellError::Generic(
         GenericError::new_internal(format!("Stone {kind} error"), message.into())
             .with_code("stone_script_error"),
+    )
+}
+
+fn run_record_ok(record: &Record) -> bool {
+    matches!(record.get("ok"), Some(Value::Bool { val: true, .. }))
+}
+
+fn must_run_failure_error(record: Record) -> ShellError {
+    let argv = record
+        .get("argv")
+        .map(|value| nu_to_json_value(value).to_string())
+        .unwrap_or_else(|| "[]".to_owned());
+    let kind = record
+        .get("kind")
+        .and_then(|value| match value {
+            Value::String { val, .. } => Some(val.as_str()),
+            _ => None,
+        })
+        .unwrap_or("failed");
+    let exit_code = record
+        .get("exit_code")
+        .map(|value| nu_to_json_value(value).to_string())
+        .unwrap_or_else(|| "null".to_owned());
+    let summary = record
+        .get("explanation")
+        .and_then(|value| match value {
+            Value::Record { val, .. } => val.get("summary"),
+            _ => None,
+        })
+        .and_then(|value| match value {
+            Value::String { val, .. } => Some(val.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| format!("external command failed with kind `{kind}`"));
+    let detail = Value::record(record, Span::unknown());
+    ShellError::Generic(
+        GenericError::new(
+            "Checked run failed",
+            format!("must_run command failed: argv={argv}, exit_code={exit_code}; {summary}"),
+            Span::unknown(),
+        )
+        .with_code("stone_must_run_failed")
+        .with_help(
+            "Use run(...) instead when a nonzero exit is expected and should be handled as data.",
+        )
+        .with_inner(vec![ShellError::Generic(
+            GenericError::new_internal("must_run result", nu_to_json_value(&detail).to_string())
+                .with_code("stone_must_run_detail"),
+        )]),
     )
 }
 
@@ -8681,6 +8759,31 @@ emit({
             )
         );
         assert_eq!(value["quiet_step_count"], json_value!(4));
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "hermit"))]
+    #[test]
+    fn evaluates_must_run_builtin_checks_process_result() -> Result<(), ShellError> {
+        let (engine_state, mut stack, _root) = test_engine("must-run-builtin")?;
+        let program = lower_source(
+            r#"ok = must_run(["sh", "-c", "printf hello"])
+emit({"ok": ok.ok, "stdout": ok.stdout, "kind": ok.kind})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(true));
+        assert_eq!(value["stdout"], json_value!("hello"));
+        assert_eq!(value["kind"], json_value!("success"));
+
+        let program = lower_source(r#"must_run(["sh", "-c", "printf nope >&2; exit 7"])"#)?;
+        let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("must_run should raise on nonzero process exit");
+        let text = format!("{error:?}");
+        assert!(text.contains("stone_must_run_failed"), "{text}");
+        assert!(text.contains("exit_code=7"), "{text}");
+        assert!(text.contains("nope"), "{text}");
         Ok(())
     }
 

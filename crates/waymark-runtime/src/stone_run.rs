@@ -118,6 +118,7 @@ pub(crate) struct StoneRunInvocation {
 }
 
 pub(crate) fn run_call_values(
+    context: &str,
     positional: &[Value],
     named: &[(String, Value)],
     default_cwd: PathBuf,
@@ -125,13 +126,16 @@ pub(crate) fn run_call_values(
 ) -> Result<StoneRunInvocation, ShellError> {
     if positional.is_empty() || positional.len() > 4 {
         return Err(stone_error(
-            "run",
-            "run() expects run(argv, cwd? = None, stdin? = None, timeout_ms? = None)",
+            context,
+            format!("{context}() expects {context}(argv, cwd? = None, stdin? = None, timeout_ms? = None)"),
         ));
     }
-    let argv = value_to_string_list(&positional[0], "run")?;
+    let argv = value_to_string_list(&positional[0], context)?;
     if argv.is_empty() {
-        return Err(stone_error("run", "run() argv list cannot be empty"));
+        return Err(stone_error(
+            context,
+            format!("{context}() argv list cannot be empty"),
+        ));
     }
 
     let mut cwd: Option<String> = None;
@@ -147,26 +151,26 @@ pub(crate) fn run_call_values(
         match index {
             1 => match value {
                 Value::Int { .. } | Value::Float { .. } => {
-                    timeout_ms = value_to_i64(value, "run timeout_ms")?;
+                    timeout_ms = value_to_i64(value, &format!("{context} timeout_ms"))?;
                     if timeout_ms <= 0 {
-                        return Err(stone_error("run", "timeout_ms must be positive"));
+                        return Err(stone_error(context, "timeout_ms must be positive"));
                     }
                 }
-                _ => cwd = Some(value_to_string(value, "run cwd")?),
+                _ => cwd = Some(value_to_string(value, &format!("{context} cwd"))?),
             },
             2 => match value {
                 Value::Int { .. } | Value::Float { .. } => {
-                    timeout_ms = value_to_i64(value, "run timeout_ms")?;
+                    timeout_ms = value_to_i64(value, &format!("{context} timeout_ms"))?;
                     if timeout_ms <= 0 {
-                        return Err(stone_error("run", "timeout_ms must be positive"));
+                        return Err(stone_error(context, "timeout_ms must be positive"));
                     }
                 }
-                _ => stdin = Some(value_to_string(value, "run stdin")?),
+                _ => stdin = Some(value_to_string(value, &format!("{context} stdin"))?),
             },
             3 => {
-                timeout_ms = value_to_i64(value, "run timeout_ms")?;
+                timeout_ms = value_to_i64(value, &format!("{context} timeout_ms"))?;
                 if timeout_ms <= 0 {
-                    return Err(stone_error("run", "timeout_ms must be positive"));
+                    return Err(stone_error(context, "timeout_ms must be positive"));
                 }
             }
             _ => unreachable!("run positional arity checked above"),
@@ -175,30 +179,30 @@ pub(crate) fn run_call_values(
 
     for (name, value) in named {
         match name.as_str() {
-            "cwd" => cwd = Some(value_to_string(value, "run cwd")?),
-            "stdin" => stdin = Some(value_to_string(value, "run stdin")?),
-            "env" => env_overrides = value_to_string_pairs(value, "run env")?,
+            "cwd" => cwd = Some(value_to_string(value, &format!("{context} cwd"))?),
+            "stdin" => stdin = Some(value_to_string(value, &format!("{context} stdin"))?),
+            "env" => env_overrides = value_to_string_pairs(value, &format!("{context} env"))?,
             "timeout_ms" => {
-                timeout_ms = value_to_i64(value, "run timeout_ms")?;
+                timeout_ms = value_to_i64(value, &format!("{context} timeout_ms"))?;
                 if timeout_ms <= 0 {
-                    return Err(stone_error("run", "timeout_ms must be positive"));
+                    return Err(stone_error(context, "timeout_ms must be positive"));
                 }
             }
             "max_stdout_bytes" => {
-                max_stdout_bytes = value_to_limit(value, "run max_stdout_bytes")?;
+                max_stdout_bytes = value_to_limit(value, &format!("{context} max_stdout_bytes"))?;
             }
             "max_stderr_bytes" => {
-                max_stderr_bytes = value_to_limit(value, "run max_stderr_bytes")?;
+                max_stderr_bytes = value_to_limit(value, &format!("{context} max_stderr_bytes"))?;
             }
             "stdout" => {
-                stdout_target = value_to_run_stdout_target(value, "run stdout")?;
+                stdout_target = value_to_run_stdout_target(value, &format!("{context} stdout"))?;
             }
             "stderr" => {
-                stderr_target = value_to_run_stderr_target(value, "run stderr")?;
+                stderr_target = value_to_run_stderr_target(value, &format!("{context} stderr"))?;
             }
             other => {
                 return Err(stone_error(
-                    "run",
+                    context,
                     format!(
                         "unsupported keyword `{other}`; expected cwd, env, stdin, timeout_ms, max_stdout_bytes, max_stderr_bytes, stdout, or stderr"
                     ),
