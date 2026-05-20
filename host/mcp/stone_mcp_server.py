@@ -144,6 +144,74 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "signature": 'run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576) -> record',
         "effects": ["process", "unknown"],
         "example": 'result = run(["cargo", "test"], cwd=".", stdout="suppress", stderr="capture", max_stderr_bytes=12000)',
+        "call_form": "stone_call",
+        "args": [
+            {"name": "argv", "type": "list[str]", "required": True, "example": ["cargo", "test"]},
+            {"name": "cwd", "type": "str?", "required": False, "example": "."},
+            {"name": "stdin", "type": "str?", "required": False},
+            {"name": "timeout_ms", "type": "int?", "required": False, "example": 5000},
+            {"name": "env", "type": "record?", "required": False},
+            {"name": "stdout", "type": "str", "required": False, "example": "capture"},
+            {"name": "stderr", "type": "str", "required": False, "example": "capture"},
+            {"name": "max_stdout_bytes", "type": "int", "required": False, "example": 1048576},
+            {"name": "max_stderr_bytes", "type": "int", "required": False, "example": 1048576},
+        ],
+        "returns": {
+            "type": "RunResult",
+            "fields": [
+                "argv",
+                "cwd",
+                "stdout",
+                "stderr",
+                "exit_code",
+                "ok",
+                "timed_out",
+                "duration_ms",
+                "explanation",
+            ],
+        },
+        "example_call": {"name": "run", "args": [["cargo", "test"]]},
+        "also_accepts": [
+            {"name": "run", "args": {"argv": ["cargo", "test"]}},
+            {"name": "run", "args": ["cargo", "test"]},
+        ],
+    },
+    "must_run": {
+        "name": "must_run",
+        "signature": 'must_run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576) -> record',
+        "effects": ["process", "unknown"],
+        "example": 'result = must_run(["printf", "ok"], timeout_ms=5000)',
+        "call_form": "stone_call",
+        "args": [
+            {"name": "argv", "type": "list[str]", "required": True, "example": ["printf", "ok"]},
+            {"name": "cwd", "type": "str?", "required": False, "example": "."},
+            {"name": "stdin", "type": "str?", "required": False},
+            {"name": "timeout_ms", "type": "int?", "required": False, "example": 120000},
+            {"name": "env", "type": "record?", "required": False},
+            {"name": "stdout", "type": "str", "required": False, "example": "capture"},
+            {"name": "stderr", "type": "str", "required": False, "example": "capture"},
+            {"name": "max_stdout_bytes", "type": "int", "required": False, "example": 1048576},
+            {"name": "max_stderr_bytes", "type": "int", "required": False, "example": 1048576},
+        ],
+        "returns": {
+            "type": "RunResult",
+            "fields": [
+                "argv",
+                "cwd",
+                "stdout",
+                "stderr",
+                "exit_code",
+                "ok",
+                "timed_out",
+                "duration_ms",
+                "explanation",
+            ],
+        },
+        "example_call": {"name": "must_run", "args": [["printf", "ok"]]},
+        "also_accepts": [
+            {"name": "must_run", "args": {"argv": ["printf", "ok"]}},
+            {"name": "must_run", "args": ["printf", "ok"]},
+        ],
     },
     "resolve_command": {
         "name": "resolve_command",
@@ -265,6 +333,17 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
     "list_dir": ("path",),
     "ls": ("path",),
     "mkdir": ("path",),
+    "must_run": (
+        "argv",
+        "cwd",
+        "stdin",
+        "timeout_ms",
+        "env",
+        "stdout",
+        "stderr",
+        "max_stdout_bytes",
+        "max_stderr_bytes",
+    ),
     "read_csv": ("path", "limit"),
     "read_file": ("path", "max_bytes"),
     "read_json": ("path",),
@@ -323,6 +402,7 @@ Stone_CALL_ALIASES: dict[str, str] = {
 
 Stone_ONE_POSITIONAL_THEN_KEYWORDS = {
     "env_commit",
+    "must_run",
     "run",
     "run_wait",
     "start_daemon",
@@ -1184,7 +1264,7 @@ def stone_help(backend: StoneBackend, name: str | None = None) -> dict[str, Any]
     source = "emit(help())\n" if not name else f"emit(help({stone_literal(name)}))\n"
     result = backend.eval(source)
     if result.get("ok") is True:
-        return result
+        return enrich_stone_help_result(result, name)
     return {
         **result,
         "error": {
@@ -1192,6 +1272,70 @@ def stone_help(backend: StoneBackend, name: str | None = None) -> dict[str, Any]
             "hint": "stone_help delegates to shell help(); try stone_eval with help() for details.",
         },
     }
+
+
+def enrich_stone_help_result(result: dict[str, Any], name: str | None) -> dict[str, Any]:
+    if not name:
+        return result
+    signature = stone_signature_value(name)
+    if signature is None:
+        return result
+    value = result.get("value")
+    if not isinstance(value, dict):
+        return result
+    return {**result, "value": {**value, **signature}}
+
+
+def stone_signature_value(name: str) -> dict[str, Any] | None:
+    normalized = Stone_CALL_ALIASES.get(name, name)
+    entry = HELP_TABLE.get(normalized)
+    if entry is None:
+        return None
+    order = Stone_CALL_ARG_ORDER.get(normalized, ())
+    args = entry.get("args")
+    if args is None:
+        args = [
+            {"name": arg_name, "type": "Any", "required": index == 0}
+            for index, arg_name in enumerate(order)
+        ]
+    example_call = entry.get("example_call")
+    if example_call is None:
+        example_args = []
+        for item in args:
+            if not isinstance(item, dict) or "example" not in item:
+                break
+            example_args.append(item["example"])
+            if not item.get("required"):
+                break
+        example_call = {"name": normalized, "args": example_args}
+    value = {
+        "name": normalized,
+        "call_form": entry.get("call_form", "stone_call"),
+        "signature": entry.get("signature"),
+        "args": args,
+        "returns": entry.get("returns", {"type": "Any"}),
+        "example_call": example_call,
+    }
+    if "also_accepts" in entry:
+        value["also_accepts"] = entry["also_accepts"]
+    if normalized != name:
+        value["alias_for"] = normalized
+    return value
+
+
+def stone_signature(name: str) -> dict[str, Any]:
+    value = stone_signature_value(name)
+    if value is None:
+        return {
+            "ok": False,
+            "error": {
+                "kind": "unknown_call",
+                "code": "stone_signature_unknown",
+                "message": f"stone_signature does not know {name!r}",
+                "hint": "Use stone_help without a name to inspect supported operations.",
+            },
+        }
+    return {"ok": True, "value": value}
 
 
 def stone_call(backend: StoneBackend, name: str, args: Any, cwd: str | None = None) -> dict[str, Any]:
@@ -1271,9 +1415,9 @@ def parse_stone_call_args(args: Any) -> Any:
 def normalize_stone_call_args(name: str, args: Any) -> Any:
     if isinstance(args, dict):
         normalized = dict(args)
-        if name in {"run", "start_daemon"} and "argv" not in normalized and "command" in normalized:
+        if name in {"run", "must_run", "start_daemon"} and "argv" not in normalized and "command" in normalized:
             normalized["argv"] = normalized.pop("command")
-        if name == "run":
+        if name in {"run", "must_run"}:
             if "max_output_bytes" in normalized:
                 value = normalized.pop("max_output_bytes")
                 normalized.setdefault("max_stdout_bytes", value)
@@ -1353,7 +1497,7 @@ def stone_call_arguments(name: str, args: Any) -> tuple[list[Any], dict[str, Any
             for key, value in args.items()
             if key != first_key and value is not None
         }
-        if name in {"run", "start_daemon"} and isinstance(args[first_key], str):
+        if name in {"run", "must_run", "start_daemon"} and isinstance(args[first_key], str):
             raise ValueError(
                 f"{name} argv must be a list of strings, not a string; "
                 f'use {{"argv": ["{args[first_key]}"]}} or use stone_eval with {name}(["{args[first_key]}"])'
@@ -1361,13 +1505,16 @@ def stone_call_arguments(name: str, args: Any) -> tuple[list[Any], dict[str, Any
         return [args[first_key]], named
 
     if isinstance(args, list):
+        if name in {"run", "must_run", "start_daemon"} and args and isinstance(args[0], str):
+            if all(isinstance(item, str) for item in args):
+                return [args], {}
+            raise ValueError(
+                f"{name} argv must be a list of strings, not a mixed positional array; "
+                f'use {{"argv": ["{args[0]}"]}}, [["{args[0]}"]], '
+                f'or {name}(["{args[0]}"]) in stone_eval'
+            )
         if len(args) > len(order):
             raise ValueError(f"{name} accepts at most {len(order)} positional arguments")
-        if name in {"run", "start_daemon"} and args and isinstance(args[0], str):
-            raise ValueError(
-                f"{name} argv must be a list of strings, not a string; "
-                f'use [["{args[0]}"]] for positional stone_call args or {name}(["{args[0]}"]) in stone_eval'
-            )
         if name in Stone_ONE_POSITIONAL_THEN_KEYWORDS and len(args) > 1:
             named = {
                 key: value
@@ -1675,17 +1822,36 @@ TOOLS = [
         },
     },
     {
+        "name": "stone_signature",
+        "description": (
+            "Return the JSON call convention for a supported Stone builtin. "
+            "Use this before stone_call when argument nesting is ambiguous."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "stone_call",
         "description": (
             "Call a supported Stone builtin with JSON arguments. Large returned values "
             "are replaced with a head/tail peek by default; set allow_large_output=true "
-            "only when the full value is required."
+            "only when the full value is required. For run/must_run, args may be "
+            '{"argv":["cmd","arg"]}, [["cmd","arg"]] for positional call-form, '
+            'or the direct argv convenience ["cmd","arg"].'
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "name": {"type": "string"},
                 "args": {
+                    "description": (
+                        "Builtin arguments as a JSON object or positional array. "
+                        'For run/must_run, ["cmd","arg"] is treated as argv.'
+                    ),
                     "oneOf": [
                         {"type": "object"},
                         {"type": "array"},
@@ -1751,9 +1917,13 @@ def visible_tools() -> list[dict[str, Any]]:
 
 
 def visible_help_table() -> dict[str, dict[str, Any]]:
-    if not blind_surface_enabled():
-        return HELP_TABLE
-    return {name: value for name, value in HELP_TABLE.items() if name not in BLIND_HELP_NAMES}
+    table = HELP_TABLE
+    if blind_surface_enabled():
+        table = {name: value for name, value in HELP_TABLE.items() if name not in BLIND_HELP_NAMES}
+    return {
+        name: {**value, **(stone_signature_value(name) or {})}
+        for name, value in table.items()
+    }
 
 
 def sanitize_for_agent(value: Any) -> Any:
@@ -1876,6 +2046,8 @@ class McpServer:
                 )
         elif name == "stone_help":
             result = stone_help(self.backend, args.get("name"))
+        elif name == "stone_signature":
+            result = stone_signature(str(args.get("name", "")))
         elif name == "stone_call":
             result = stone_call(self.backend, str(args.get("name", "")), args.get("args"), args.get("cwd"))
             result = apply_large_result_policy(

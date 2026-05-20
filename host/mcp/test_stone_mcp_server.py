@@ -346,6 +346,32 @@ class StoneMcpServerTests(unittest.TestCase):
         )
         self.assertTrue(read_file["ok"])
 
+    def test_help_enriches_builtin_with_stone_call_signature(self) -> None:
+        backend = FakeBackend({"ok": True, "value": {"name": "run", "found": True}})
+
+        result = server.stone_help(backend, "run")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["value"]["call_form"], "stone_call")
+        self.assertEqual(result["value"]["args"][0]["name"], "argv")
+        self.assertEqual(result["value"]["args"][0]["type"], "list[str]")
+        self.assertEqual(result["value"]["example_call"], {"name": "run", "args": [["cargo", "test"]]})
+
+    def test_stone_signature_returns_stone_call_example(self) -> None:
+        result = server.stone_signature("run")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["value"]["call_form"], "stone_call")
+        self.assertEqual(result["value"]["example_call"], {"name": "run", "args": [["cargo", "test"]]})
+        self.assertIn({"name": "run", "args": ["cargo", "test"]}, result["value"]["also_accepts"])
+
+    def test_stone_signature_includes_must_run(self) -> None:
+        result = server.stone_signature("must_run")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["value"]["args"][0]["name"], "argv")
+        self.assertEqual(result["value"]["example_call"], {"name": "must_run", "args": [["printf", "ok"]]})
+
     def test_stone_call_generates_emit_wrapped_builtin_call(self) -> None:
         backend = FakeBackend()
 
@@ -428,6 +454,42 @@ class StoneMcpServerTests(unittest.TestCase):
             source,
             'emit(run(["bash", "-lc", "cat"], cwd="/app", stdin="input", timeout_ms=1000))\n',
         )
+
+    def test_stone_call_treats_direct_run_string_array_as_argv(self) -> None:
+        backend = FakeBackend()
+        argv = [
+            "aws",
+            "s3api",
+            "create-bucket",
+            "--bucket",
+            "sample-bucket",
+            "--region",
+            "us-west-2",
+            "--create-bucket-configuration",
+            "LocationConstraint=us-west-2",
+            "--debug",
+        ]
+
+        result = server.stone_call(backend, "run", argv)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(
+            backend.calls,
+            [
+                (
+                    'emit(run(["aws", "s3api", "create-bucket", "--bucket", "sample-bucket", "--region", "us-west-2", "--create-bucket-configuration", "LocationConstraint=us-west-2", "--debug"]))\n',
+                    None,
+                )
+            ],
+        )
+
+    def test_stone_call_supports_must_run_direct_argv(self) -> None:
+        backend = FakeBackend()
+
+        result = server.stone_call(backend, "must_run", ["cargo", "check"])
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(backend.calls, [('emit(must_run(["cargo", "check"]))\n', None)])
 
     def test_stone_call_supports_daemon_helpers(self) -> None:
         daemon = server.stone_call_source(
