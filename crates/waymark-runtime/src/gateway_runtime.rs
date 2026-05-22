@@ -23,6 +23,7 @@ pub(crate) struct GatewayRuntimeConfig {
     pub(crate) endpoint: GatewayEndpoint,
     pub(crate) tx: String,
     pub(crate) image: String,
+    pub(crate) container: Option<String>,
     pub(crate) workspace_mount: String,
 }
 
@@ -140,6 +141,9 @@ pub(crate) fn run_command(
         .workspace_mount(config.workspace_mount.clone())
         .workdir(workdir)
         .timeout_ms(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX));
+    if let Some(container) = &config.container {
+        options = options.container(container.clone());
+    }
     if let Some(stdin) = stdin {
         options = options.stdin(stdin.to_string());
     }
@@ -517,20 +521,29 @@ fn record_string(record: &Record, key: &str) -> Option<String> {
 }
 
 fn probe_options(config: &GatewayRuntimeConfig) -> LinuxProbeOptions {
-    LinuxProbeOptions::new(config.tx.clone(), config.image.clone())
-        .workspace_mount(config.workspace_mount.clone())
+    let options = LinuxProbeOptions::new(config.tx.clone(), config.image.clone())
+        .workspace_mount(config.workspace_mount.clone());
+    if let Some(container) = &config.container {
+        options.container(container.clone())
+    } else {
+        options
+    }
 }
 
 fn config_from_process_env() -> Option<GatewayRuntimeConfig> {
     let socket = std::env::var_os("WAYMARK_GATEWAY_SOCKET")?;
     let tx = std::env::var("WAYMARK_GATEWAY_TX").ok()?;
     let image = std::env::var("WAYMARK_GATEWAY_IMAGE").unwrap_or_default();
+    let container = std::env::var("WAYMARK_GATEWAY_CONTAINER")
+        .ok()
+        .filter(|value| !value.is_empty());
     let workspace_mount =
         std::env::var("WAYMARK_GATEWAY_WORKSPACE_MOUNT").unwrap_or_else(|_| "/app".to_string());
     Some(GatewayRuntimeConfig {
         endpoint: GatewayEndpoint::Unix(PathBuf::from(socket)),
         tx,
         image,
+        container,
         workspace_mount,
     })
 }
