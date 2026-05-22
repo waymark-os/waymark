@@ -563,10 +563,21 @@ class StoneMcpServerTests(unittest.TestCase):
     def test_stone_call_accepts_common_agent_alias_args(self) -> None:
         backend = FakeBackend()
 
+        found = server.stone_call(
+            backend,
+            "find",
+            {"path": "/app", "name": "*.py", "glob": "src/**/*.py", "max_depth": 3},
+            "/app",
+        )
         listed = server.stone_call(backend, "list", '{"path":"/app"}', "/app")
-        searched = server.stone_call(backend, "search", {"path": "/app", "needle": "foo"}, "/app")
+        searched = server.stone_call(backend, "search", {"path": "/app", "query": "foo"}, "/app")
         alias_read = server.stone_call(backend, "read", {"path": "/app/input.txt"}, "/app")
-        read = server.stone_call(backend, "read_file", {"path": "/app/big.txt", "limit": 500}, "/app")
+        read = server.stone_call(
+            backend,
+            "read_file",
+            {"path": "/app/big.txt", "limit": 500, "start_line": 2, "end_line": 4},
+            "/app",
+        )
         written = server.stone_call(
             backend,
             "write_file",
@@ -582,8 +593,15 @@ class StoneMcpServerTests(unittest.TestCase):
         )
         removed = server.stone_call(backend, "delete_file", {"path": "/app/tmp.txt"}, "/app")
         removed_dir = server.stone_call(backend, "delete_dir", {"path": "/app/tmp-dir"}, "/app")
+        removed_paths = server.stone_call(
+            backend,
+            "rm",
+            {"paths": ["/app/a.tmp", "/app/b.tmp"], "force": True},
+            "/app",
+        )
         statted = server.stone_call(backend, "stat", {"path": "/app/results.txt"}, "/app")
 
+        self.assertTrue(found["ok"], found)
         self.assertTrue(listed["ok"], listed)
         self.assertTrue(searched["ok"], searched)
         self.assertTrue(alias_read["ok"], alias_read)
@@ -593,23 +611,27 @@ class StoneMcpServerTests(unittest.TestCase):
         self.assertTrue(edited["ok"], edited)
         self.assertTrue(removed["ok"], removed)
         self.assertTrue(removed_dir["ok"], removed_dir)
+        self.assertTrue(removed_paths["ok"], removed_paths)
         self.assertTrue(statted["ok"], statted)
         self.assertEqual(edited["effects"], {"reads": ["/app/fix.py"], "writes": ["/app/fix.py"]})
         self.assertEqual(removed["effects"], {"removes": ["/app/tmp.txt"]})
         self.assertEqual(removed_dir["effects"], {"removes": ["/app/tmp-dir"]})
+        self.assertEqual(removed_paths["effects"], {"removes": ["/app/a.tmp", "/app/b.tmp"]})
         self.assertEqual(statted["effects"], {"reads": ["/app/results.txt"]})
         self.assertEqual(
             backend.calls,
             [
+                ('emit(find("/app", "*.py", max_depth=3, path_glob="src/**/*.py"))\n', None),
                 ('emit(ls("/app"))\n', None),
                 ('emit(search("/app", "foo"))\n', None),
                 ('emit(read_file("/app/input.txt"))\n', None),
-                ('emit(read_file("/app/big.txt", 500))\n', None),
+                ('emit(read_file("/app/big.txt", 500, start_line=2, end_line=4))\n', None),
                 ('emit(write_file("/app/out.txt", "ok"))\n', None),
                 ('emit(mkdir("/app/out"))\n', None),
                 ('emit(edit("/app/fix.py", "pass\\n", "return 1\\n"))\n', None),
                 ('emit(rm("/app/tmp.txt"))\n', None),
                 ('emit(rm("/app/tmp-dir"))\n', None),
+                ('emit(rm(["/app/a.tmp", "/app/b.tmp"], force=True))\n', None),
                 ('emit(stat("/app/results.txt"))\n', None),
             ],
         )

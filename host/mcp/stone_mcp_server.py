@@ -48,9 +48,9 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
     },
     "find": {
         "name": "find",
-        "signature": "find(root: str, name_glob: str = '*') -> list[record]",
+        "signature": "find(root: str, name_glob: str = '*', max_depth: int? = None) -> list[record]",
         "effects": ["read_dir"],
-        "example": 'files = find(".", "*.jsonl")',
+        "example": 'files = find(path=".", name="*.jsonl")',
     },
     "first": {
         "name": "first",
@@ -79,7 +79,7 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
     },
     "read_file": {
         "name": "read_file",
-        "signature": "read_file(path: str, max_bytes: int? = None) -> str",
+        "signature": "read_file(path: str, max_bytes: int? = None, start_line: int? = None, end_line: int? = None) -> str",
         "effects": ["read_file"],
         "example": 'text = read_file("README.md")',
         "alias_for": "read_text",
@@ -98,7 +98,7 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
     },
     "read_text": {
         "name": "read_text",
-        "signature": "read_text(path: str, max_bytes: int? = None) -> str",
+        "signature": "read_text(path: str, max_bytes: int? = None, start_line: int? = None, end_line: int? = None) -> str",
         "effects": ["read_file"],
         "example": 'text = read_text("README.md")',
     },
@@ -361,6 +361,12 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "effects": ["read_file"],
         "example": 'info = stat("results.txt")',
     },
+    "search": {
+        "name": "search",
+        "signature": "search(root: str, needle: str, regex: bool = False) -> list[record]",
+        "effects": ["read_dir", "read_file"],
+        "example": 'matches = search(path=".", query="needle")',
+    },
     "tail": {
         "name": "tail",
         "signature": "tail(values: list, count: int? = None) -> Any | list",
@@ -370,9 +376,9 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
     },
     "rm": {
         "name": "rm",
-        "signature": "rm(path: str, ...paths: str) -> None",
+        "signature": "rm(path: str | list[str], force: bool = False, recursive: bool = True) -> None",
         "effects": ["remove_file"],
-        "example": 'rm("tmp.txt")',
+        "example": 'rm(["tmp.txt", "out"], force=True)',
     },
 }
 
@@ -1497,6 +1503,18 @@ def normalize_stone_call_args(name: str, args: Any) -> Any:
                 normalized["path"] = normalized.pop("path_or_file")
         if name in {"find", "search"} and "root" not in normalized and "path" in normalized:
             normalized["root"] = normalized.pop("path")
+        if name == "find":
+            if "name_glob" not in normalized and "name" in normalized:
+                normalized["name_glob"] = normalized.pop("name")
+            if "path_glob" not in normalized and "glob" in normalized:
+                normalized["path_glob"] = normalized.pop("glob")
+        if name == "search" and "needle" not in normalized:
+            if "query" in normalized:
+                normalized["needle"] = normalized.pop("query")
+            elif "pattern" in normalized:
+                normalized["needle"] = normalized.pop("pattern")
+        if name == "rm" and "path" not in normalized and "paths" in normalized:
+            normalized["path"] = normalized.pop("paths")
         return normalized
     return args
 
@@ -1541,6 +1559,13 @@ def stone_call_resolved_args(name: str, args: Any, cwd: str | None) -> Any:
         if isinstance(args.get(key), str):
             resolved = dict(args)
             resolved[key] = str(resolve_workspace_path(resolved[key], cwd))
+            return resolved
+        if name == "rm" and isinstance(args.get(key), list):
+            resolved = dict(args)
+            resolved[key] = [
+                str(resolve_workspace_path(path, cwd)) if isinstance(path, str) else path
+                for path in resolved[key]
+            ]
             return resolved
     return args
 
@@ -1644,6 +1669,10 @@ def stone_call_effects(name: str, args: Any) -> dict[str, Any]:
         result["writes"] = [path]
     if "remove_file" in effects and path:
         result["removes"] = [path]
+    elif "remove_file" in effects:
+        paths = stone_call_path_args(name, args)
+        if paths:
+            result["removes"] = paths
     if "create_parent_dirs" in effects:
         result["creates_parent_dirs"] = True
     if effects and not result:
@@ -1659,6 +1688,18 @@ def stone_call_path_arg(name: str, args: Any) -> str | None:
     else:
         value = None
     return value if isinstance(value, str) else None
+
+
+def stone_call_path_args(name: str, args: Any) -> list[str]:
+    if isinstance(args, dict):
+        value = args.get("path") or args.get("root")
+    elif isinstance(args, list) and args:
+        value = args[0]
+    else:
+        value = None
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, str)]
+    return [value] if isinstance(value, str) else []
 
 
 def stone_describe(path: str, cwd: str | None = None) -> dict[str, Any]:

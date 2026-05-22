@@ -2107,14 +2107,22 @@ impl Evaluator<'_> {
     }
 
     fn eval_read_text_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        let ([path] | [path, _]) = call.positional.as_slice() else {
-            return Err(stone_error(
-                "read_text",
-                "read_text() requires a path and optional max_bytes",
-            ));
+        let (path_expr, max_bytes_expr) = match call.positional.as_slice() {
+            [] => (None, None),
+            [path] => (Some(path), None),
+            [path, max_bytes] => (Some(path), Some(max_bytes)),
+            _ => {
+                return Err(stone_error(
+                    "read_text",
+                    "read_text() requires a path and optional max_bytes",
+                ));
+            }
         };
+        let mut path_value = None;
         let mut max_bytes = 1_048_576;
-        if let Some(max_bytes_expr) = call.positional.get(1) {
+        let mut start_line: Option<usize> = None;
+        let mut end_line: Option<usize> = None;
+        if let Some(max_bytes_expr) = max_bytes_expr {
             let value = self
                 .eval_expr_value(max_bytes_expr, PipelineData::empty())?
                 .into_nu_value("read_text")?;
@@ -2131,22 +2139,45 @@ impl Evaluator<'_> {
                 .eval_expr_value(argument, PipelineData::empty())?
                 .into_nu_value("read_text")?;
             match name.as_str() {
+                "path" => {
+                    if path_expr.is_some() {
+                        return Err(stone_error(
+                            "read_text",
+                            "read_text() path was provided twice",
+                        ));
+                    }
+                    path_value = Some(value_to_path_string(&value, "read_text path")?);
+                }
                 "max_bytes" | "limit" => max_bytes = value_to_limit(&value, "read_text max_bytes")?,
+                "start_line" => start_line = Some(value_to_limit(&value, "read_text start_line")?),
+                "end_line" => end_line = Some(value_to_limit(&value, "read_text end_line")?),
                 other => {
                     return Err(stone_error(
                         "read_text",
-                        format!("unsupported keyword `{other}`; expected max_bytes or limit"),
+                        format!(
+                            "unsupported keyword `{other}`; expected path, max_bytes, limit, start_line, or end_line"
+                        ),
                     ));
                 }
             }
         }
 
-        let path = self
-            .eval_expr_value(path, PipelineData::empty())?
-            .into_nu_value("read_text")?;
-        let path = value_to_path_string(&path, "read_text")?;
+        if let Some(path_expr) = path_expr {
+            let value = self
+                .eval_expr_value(path_expr, PipelineData::empty())?
+                .into_nu_value("read_text")?;
+            path_value = Some(value_to_path_string(&value, "read_text")?);
+        }
+        let Some(path) = path_value else {
+            return Err(stone_error("read_text", "read_text() requires a path"));
+        };
         let target = self.resolve_script_path(&path)?;
         let text = stone_read_text(&target, max_bytes)?;
+        let text = if start_line.is_some() || end_line.is_some() {
+            slice_text_lines(&text, start_line, end_line)?
+        } else {
+            text
+        };
         Ok(RuntimeValue::Nu(Value::string(text, Span::unknown())))
     }
 
@@ -2396,10 +2427,19 @@ impl Evaluator<'_> {
     }
 
     fn eval_find_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        let [root, rest @ ..] = call.positional.as_slice() else {
+        let (root_expr, rest) = match call.positional.as_slice() {
+            [root, rest @ ..] => (Some(root), rest),
+            [] => (None, &[][..]),
+        };
+        if root_expr.is_none()
+            && !call
+                .named
+                .iter()
+                .any(|(name, _)| matches!(name.as_str(), "root" | "path"))
+        {
             return Err(stone_error(
                 "find",
-                "find() requires root and optional name_glob arguments",
+                "find() requires root/path and optional name_glob arguments",
             ));
         };
         if rest.len() > 1 {
@@ -2421,16 +2461,22 @@ impl Evaluator<'_> {
             name_glob,
             ..StoneFindOptions::default()
         };
+        let mut root_path = None;
         for (name, argument) in &call.named {
             let value = self
                 .eval_expr_value(argument, PipelineData::empty())?
                 .into_nu_value("find")?;
             match name.as_str() {
-                "name_glob" => options.name_glob = Some(value_to_string(&value, "find name_glob")?),
+                "root" | "path" => root_path = Some(value_to_path_string(&value, "find root")?),
+                "name" | "name_glob" => {
+                    options.name_glob = Some(value_to_string(&value, "find name_glob")?)
+                }
                 "name_contains" => {
                     options.name_contains = Some(value_to_string(&value, "find name_contains")?)
                 }
-                "path_glob" => options.path_glob = Some(value_to_string(&value, "find path_glob")?),
+                "glob" | "path_glob" => {
+                    options.path_glob = Some(value_to_string(&value, "find path_glob")?)
+                }
                 "type" => {
                     let kind = value_to_string(&value, "find type")?;
                     if !matches!(kind.as_str(), "file" | "dir" | "symlink" | "any") {
@@ -2441,6 +2487,7 @@ impl Evaluator<'_> {
                     }
                     options.kind_filter = Some(kind);
                 }
+                "max_depth" => options.max_depth = Some(value_to_limit(&value, "find max_depth")?),
                 "min_size" => options.min_size = Some(value_to_u64(&value, "find min_size")?),
                 "max_size" => options.max_size = Some(value_to_u64(&value, "find max_size")?),
                 "modified_after_ms" => {
@@ -2455,17 +2502,22 @@ impl Evaluator<'_> {
                     return Err(stone_error(
                         "find",
                         format!(
-                            "unsupported keyword `{other}`; expected name_glob, name_contains, path_glob, type, min_size, max_size, modified_after_ms, or modified_before_ms"
+                            "unsupported keyword `{other}`; expected root/path, name/name_glob, name_contains, glob/path_glob, type, max_depth, min_size, max_size, modified_after_ms, or modified_before_ms"
                         ),
                     ));
                 }
             }
         }
 
-        let root = self
-            .eval_expr_value(root, PipelineData::empty())?
-            .into_nu_value("find")?;
-        let root = value_to_path_string(&root, "find")?;
+        if let Some(root_expr) = root_expr {
+            let value = self
+                .eval_expr_value(root_expr, PipelineData::empty())?
+                .into_nu_value("find")?;
+            root_path = Some(value_to_path_string(&value, "find")?);
+        }
+        let Some(root) = root_path else {
+            return Err(stone_error("find", "find() requires a root/path argument"));
+        };
         let root = self.resolve_script_path(&root)?;
         let entries = find_records(root, options)?;
         Ok(RuntimeValue::Nu(Value::list(entries, Span::unknown())))
@@ -2791,22 +2843,50 @@ impl Evaluator<'_> {
     }
 
     fn eval_rm_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        if call.positional.is_empty() {
-            return Err(stone_error("rm", "rm() requires at least one path"));
-        }
-        if !call.named.is_empty() {
-            return Err(stone_error(
-                "rm",
-                "rm() keyword arguments are not supported",
-            ));
-        }
-        for argument in &call.positional {
-            let path = self
+        let mut force = false;
+        let mut path_values = Vec::new();
+        for (name, argument) in &call.named {
+            let value = self
                 .eval_expr_value(argument, PipelineData::empty())?
                 .into_nu_value("rm")?;
-            let path = value_to_path_string(&path, "rm")?;
-            let target = self.resolve_script_path(&path)?;
-            remove_path(&target)?;
+            match name.as_str() {
+                "path" | "paths" => path_values.push(value),
+                "force" | "missing_ok" => force = value_to_bool(&value, "rm force")?,
+                "recursive" | "recurse" => {
+                    let _ = value_to_bool(&value, "rm recursive")?;
+                }
+                other => {
+                    return Err(stone_error(
+                        "rm",
+                        format!(
+                            "unsupported keyword `{other}`; expected path, paths, force, missing_ok, recursive, or recurse"
+                        ),
+                    ));
+                }
+            }
+        }
+        for argument in &call.positional {
+            let value = self
+                .eval_expr_value(argument, PipelineData::empty())?
+                .into_nu_value("rm")?;
+            path_values.push(value);
+        }
+        if path_values.is_empty() {
+            return Err(stone_error("rm", "rm() requires at least one path"));
+        }
+        for value in path_values {
+            let values = match value {
+                Value::List { vals, .. } => vals,
+                other => vec![other],
+            };
+            for value in values {
+                let path = value_to_path_string(&value, "rm")?;
+                let target = self.resolve_script_path(&path)?;
+                if force && !target.exists() {
+                    continue;
+                }
+                remove_path(&target)?;
+            }
         }
         Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())))
     }
@@ -2892,35 +2972,63 @@ impl Evaluator<'_> {
     }
 
     fn eval_search_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        let [root, needle] = call.positional.as_slice() else {
-            return Err(stone_error(
-                "search",
-                "search() requires root and needle arguments",
-            ));
+        let (root_expr, needle_expr) = match call.positional.as_slice() {
+            [root, needle] => (Some(root), Some(needle)),
+            [] => (None, None),
+            _ => {
+                return Err(stone_error(
+                    "search",
+                    "search() requires root and needle arguments",
+                ));
+            }
         };
+        let mut root = None;
+        let mut needle = None;
         let mut regex = false;
         for (name, argument) in &call.named {
             let value = self
                 .eval_expr_value(argument, PipelineData::empty())?
                 .into_nu_value("search")?;
             match name.as_str() {
+                "root" | "path" => root = Some(value_to_path_string(&value, "search root")?),
+                "needle" | "query" | "pattern" => {
+                    needle = Some(value_to_string(&value, "search needle")?)
+                }
                 "regex" => regex = value_to_bool(&value, "search regex")?,
                 other => {
                     return Err(stone_error(
                         "search",
-                        format!("unsupported keyword `{other}`; expected regex"),
+                        format!(
+                            "unsupported keyword `{other}`; expected root/path, needle/query/pattern, or regex"
+                        ),
                     ));
                 }
             }
         }
-        let root = self
-            .eval_expr_value(root, PipelineData::empty())?
-            .into_nu_value("search")?;
-        let needle = self
-            .eval_expr_value(needle, PipelineData::empty())?
-            .into_nu_value("search")?;
-        let root = value_to_path_string(&root, "search")?;
-        let needle = value_to_string(&needle, "search needle")?;
+        if let Some(root_expr) = root_expr {
+            let value = self
+                .eval_expr_value(root_expr, PipelineData::empty())?
+                .into_nu_value("search")?;
+            root = Some(value_to_path_string(&value, "search")?);
+        }
+        if let Some(needle_expr) = needle_expr {
+            let value = self
+                .eval_expr_value(needle_expr, PipelineData::empty())?
+                .into_nu_value("search")?;
+            needle = Some(value_to_string(&value, "search needle")?);
+        }
+        let Some(root) = root else {
+            return Err(stone_error(
+                "search",
+                "search() requires a root/path argument",
+            ));
+        };
+        let Some(needle) = needle else {
+            return Err(stone_error(
+                "search",
+                "search() requires a needle/query/pattern argument",
+            ));
+        };
         if needle.is_empty() {
             return Err(stone_error("search", "needle must not be empty"));
         }
@@ -5142,6 +5250,44 @@ fn is_builtin_call(call: &Call) -> bool {
         return !call.positional.is_empty();
     }
     STONE_BUILTIN_NAMES.contains(&call.name.as_str())
+}
+
+fn slice_text_lines(
+    text: &str,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+) -> Result<String, ShellError> {
+    let start = start_line.unwrap_or(1);
+    if start == 0 {
+        return Err(stone_error(
+            "read_text",
+            "start_line is 1-based and must be positive",
+        ));
+    }
+    if let Some(end) = end_line {
+        if end == 0 {
+            return Err(stone_error(
+                "read_text",
+                "end_line is 1-based and must be positive",
+            ));
+        }
+        if end < start {
+            return Ok(String::new());
+        }
+    }
+
+    let mut output = String::new();
+    for (index, line) in text.split_inclusive('\n').enumerate() {
+        let line_number = index + 1;
+        if line_number < start {
+            continue;
+        }
+        if end_line.is_some_and(|end| line_number > end) {
+            break;
+        }
+        output.push_str(line);
+    }
+    Ok(output)
 }
 
 fn validate_json_dumps_separators(value: &Value) -> Result<(), ShellError> {
@@ -10082,6 +10228,47 @@ emit({
                 "old_count": 0,
             })
         );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn file_helpers_accept_common_agent_aliases() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("file-helper-aliases")?;
+        fs::create_dir_all(root.join("pkg/sub")).expect("create nested dirs");
+        fs::write(root.join("pkg/main.py"), "alpha\nneedle\nomega\n").expect("write main");
+        fs::write(root.join("pkg/sub/deep.py"), "needle\n").expect("write deep");
+        fs::write(root.join("a.tmp"), "").expect("write a");
+        fs::write(root.join("b.tmp"), "").expect("write b");
+
+        let program = lower_source(
+            r#"named = find(path=".", name="main.py")
+shallow = find(path=".", glob="**/*.py", max_depth=2)
+lines = read_text(path="pkg/main.py", start_line=2, end_line=2)
+matches = search(path=".", query="needle")
+rm(paths=["a.tmp", "b.tmp", "missing.tmp"], force=True)
+emit({
+    "named": [file["name"] for file in named],
+    "shallow": [file["name"] for file in shallow],
+    "lines": lines,
+    "matches": len(matches),
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "named": ["main.py"],
+                "shallow": ["main.py"],
+                "lines": "needle\n",
+                "matches": 2,
+            })
+        );
+        assert!(!root.join("a.tmp").exists());
+        assert!(!root.join("b.tmp").exists());
 
         cleanup_dir(&root);
         Ok(())

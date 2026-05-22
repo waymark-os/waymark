@@ -25,6 +25,7 @@ pub(crate) struct StoneFindOptions {
     pub(crate) name_glob: Option<String>,
     pub(crate) path_glob: Option<String>,
     pub(crate) kind_filter: Option<String>,
+    pub(crate) max_depth: Option<usize>,
     pub(crate) min_size: Option<u64>,
     pub(crate) max_size: Option<u64>,
     pub(crate) modified_after_ms: Option<i64>,
@@ -139,9 +140,9 @@ pub(crate) fn find_records(
     options: StoneFindOptions,
 ) -> Result<Vec<Value>, ShellError> {
     let mut entries = Vec::new();
-    let mut queue = VecDeque::from([root]);
+    let mut queue = VecDeque::from([(root, 0usize)]);
 
-    while let Some(path) = queue.pop_front() {
+    while let Some((path, depth)) = queue.pop_front() {
         if entries.len() >= STONE_MAX_FIND_ENTRIES {
             break;
         }
@@ -171,9 +172,9 @@ pub(crate) fn find_records(
                 Span::unknown(),
             ));
         }
-        if stat.is_dir {
+        if stat.is_dir && options.max_depth.is_none_or(|max_depth| depth < max_depth) {
             for entry in stone_file_adapter().list_dir(&path)? {
-                queue.push_back(entry.stat.path);
+                queue.push_back((entry.stat.path, depth.saturating_add(1)));
             }
         }
     }
