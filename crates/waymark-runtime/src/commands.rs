@@ -611,6 +611,9 @@ if starts_with(line, "ERROR"):
         examples: &[
             r#"result = run(["wc", "-l", "/app/input.txt"])"#,
             r#"result = run(["printf", "ok"], timeout_ms=5000)"#,
+            r#"result = run(["make", "build"])
+while result.still_running:
+    result = run_wait(result.run_id, timeout_ms=60000)"#,
             r#"result = run(["sh", "-c", "printf warning >&2"], stdout="suppress", stderr="capture", max_stderr_bytes=12000)"#,
             r#"if not result.ok:
     emit({"exit_code": result.exit_code, "stderr": result.stderr, "explanation": result.explanation})"#,
@@ -621,7 +624,9 @@ if starts_with(line, "ERROR"):
             "Do not use shell backgrounding, nohup, or `&` for long-lived services; use start_daemon().",
             "For noisy commands, suppress or cap output explicitly instead of flooding stdout/stderr.",
             "Do not ignore result.ok; inspect stderr, exit_code, timed_out, and explanation before retrying.",
-            "If result.timed_out is true, inspect partial output first; rerun with a larger timeout_ms only when the command is expected to be slow.",
+            "If result.still_running is true and result.run_id is present, use run_wait(result.run_id, timeout_ms=...) or run_terminate(result.run_id).",
+            "After run_wait returns still_running=false or done=true, do not call run_wait for that run_id again.",
+            "If result.timed_out is true without a run_id, inspect partial output first; rerun with a larger timeout_ms only when the command is expected to be slow.",
         ],
         aliases: &[],
     },
@@ -645,16 +650,19 @@ if starts_with(line, "ERROR"):
         name: "run_wait",
         signature: "run_wait(run_id: str, timeout_ms: int = 30000) -> record",
         use_when: "Use after Gateway-backed run() returns timed_out=true, still_running=true, and a run_id.",
-        examples: &[r#"if result.get("run_id", None) is not None:
-    next = run_wait(result.run_id, timeout_ms=60000)"#],
-        avoid: &["Do not call for normal completed run() results without a run_id."],
+        examples: &[r#"while result.still_running:
+    result = run_wait(result.run_id, timeout_ms=60000)"#],
+        avoid: &[
+            "Do not call for normal completed run() results without a run_id.",
+            "Do not call again after run_wait returns still_running=false or done=true; inspect the result and continue the task.",
+        ],
         aliases: &[],
     },
     StoneHelpEntry {
         name: "run_terminate",
         signature: "run_terminate(run_id: str) -> record",
         use_when: "Use to stop a Gateway-backed run() that returned still_running=true when the command should not continue.",
-        examples: &[r#"if result.get("run_id", None) is not None:
+        examples: &[r#"if result.still_running:
     stopped = run_terminate(result.run_id)"#],
         avoid: &["Prefer run_wait() if the command is expected to finish soon."],
         aliases: &[],
@@ -740,9 +748,9 @@ if not info.ok:
     StoneHelpEntry {
         name: "env_commit",
         signature: r#"env_commit(message: str = "agent commit", allow_risky: bool = False) -> record"#,
-        use_when: "Use in Gateway mode to publish reviewed, intended transaction changes as a new immutable generation.",
+        use_when: "Use in Gateway mode to publish intended transaction changes as a new immutable generation. In blind Gateway agent surface mode, Waymark authorizes intended commits because change inspection is hidden.",
         examples: &[r#"env_commit(message="solve task")"#],
-        avoid: &["Do not pass allow_risky=True unless you reviewed warnings for deletes, binary changes, or risky paths."],
+        avoid: &["Do not pass allow_risky=True in full surface mode unless you reviewed warnings for deletes, binary changes, or risky paths."],
         aliases: &[],
     },
     StoneHelpEntry {

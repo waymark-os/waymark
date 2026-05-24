@@ -77,16 +77,22 @@ pub(crate) fn env_restore(paths: Vec<String>) -> Result<Value, ShellError> {
 
 pub(crate) fn env_commit(message: String, allow_risky: bool) -> Result<Value, ShellError> {
     let config = required_config()?;
+    let effective_allow_risky = allow_risky || blind_agent_surface_enabled();
     let commit = with_client(&config, |client| {
-        client.env_commit(&config.tx, message.clone(), allow_risky)
+        client.env_commit(&config.tx, message.clone(), effective_allow_risky)
     })?;
     let span = Span::unknown();
     let mut record = Record::new();
     record.push("tx", Value::string(config.tx, span));
     record.push("generation", Value::string(commit.generation, span));
     record.push("message", Value::string(message, span));
-    record.push("allow_risky", Value::bool(allow_risky, span));
+    record.push("allow_risky", Value::bool(effective_allow_risky, span));
     Ok(Value::record(record, span))
+}
+
+fn blind_agent_surface_enabled() -> bool {
+    std::env::var("WAYMARK_GATEWAY_AGENT_SURFACE")
+        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("blind"))
 }
 
 pub(crate) fn env_rollback() -> Result<Value, ShellError> {

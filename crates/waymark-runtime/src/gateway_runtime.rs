@@ -11,6 +11,8 @@ use waymark_gateway_client::{GatewayRpcClient, LinuxExecOptions, LinuxProbeOptio
 
 use crate::json::json_to_nu_value;
 
+const DEFAULT_RUN_SYNC_BUDGET_MS: u64 = 90_000;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum GatewayEndpoint {
@@ -140,7 +142,7 @@ pub(crate) fn run_command(
     let mut options = LinuxExecOptions::new(config.tx.clone(), config.image.clone(), argv.to_vec())
         .workspace_mount(config.workspace_mount.clone())
         .workdir(workdir)
-        .timeout_ms(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX));
+        .timeout_ms(run_sync_timeout_ms(timeout));
     if let Some(container) = &config.container {
         options = options.container(container.clone());
     }
@@ -164,6 +166,16 @@ pub(crate) fn run_command(
         ),
     );
     Ok(record)
+}
+
+fn run_sync_timeout_ms(timeout: Duration) -> u64 {
+    let requested_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    let budget_ms = std::env::var("WAYMARK_GATEWAY_RUN_SYNC_BUDGET_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_RUN_SYNC_BUDGET_MS);
+    requested_ms.min(budget_ms)
 }
 
 pub(crate) fn run_wait(run_id: &str, timeout: Duration) -> Result<Record, ShellError> {
@@ -493,6 +505,20 @@ fn linux_exec_record(
     record.push("stderr", Value::string(stderr.text, span));
     record.push("timed_out", Value::bool(output.timed_out, span));
     record.push("still_running", Value::bool(output.still_running, span));
+    record.push("done", Value::bool(!output.still_running, span));
+    record.push(
+        "next_action",
+        Value::string(
+            if output.still_running {
+                "run_wait_or_run_terminate"
+            } else if output.status == 0 {
+                "inspect_result_or_commit"
+            } else {
+                "inspect_error_or_retry"
+            },
+            span,
+        ),
+    );
     if !output.run_id.is_empty() {
         record.push("run_id", Value::string(output.run_id, span));
     }

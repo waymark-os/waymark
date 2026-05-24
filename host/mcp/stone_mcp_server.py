@@ -143,7 +143,7 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "name": "run",
         "signature": 'run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576) -> record',
         "effects": ["process", "unknown"],
-        "example": 'result = run(["cargo", "test"], cwd=".", stdout="suppress", stderr="capture", max_stderr_bytes=12000)',
+        "example": 'result = run(["cargo", "test"], cwd="."); while result.still_running: result = run_wait(result.run_id, timeout_ms=60000)',
         "call_form": "stone_call",
         "args": [
             {"name": "argv", "type": "list[str]", "required": True, "example": ["cargo", "test"]},
@@ -166,6 +166,10 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
                 "exit_code",
                 "ok",
                 "timed_out",
+                "still_running",
+                "done",
+                "next_action",
+                "run_id",
                 "duration_ms",
                 "explanation",
             ],
@@ -175,6 +179,18 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
             {"name": "run", "args": {"argv": ["cargo", "test"]}},
             {"name": "run", "args": ["cargo", "test"]},
         ],
+    },
+    "run_wait": {
+        "name": "run_wait",
+        "signature": "run_wait(run_id: str, timeout_ms: int = 30000) -> record",
+        "effects": ["process", "unknown"],
+        "example": 'while result.still_running: result = run_wait(result.run_id, timeout_ms=60000)',
+    },
+    "run_terminate": {
+        "name": "run_terminate",
+        "signature": "run_terminate(run_id: str) -> record",
+        "effects": ["process", "unknown"],
+        "example": 'stopped = run_terminate(result.run_id)',
     },
     "must_run": {
         "name": "must_run",
@@ -574,14 +590,22 @@ def stone_run_trace(args: dict[str, Any], result: dict[str, Any]) -> dict[str, A
     if argv is not None:
         trace["argv"] = argv
     if isinstance(value, dict):
+        control = value.get("control") if isinstance(value.get("control"), dict) else {}
+        run_id = value.get("run_id", control.get("run_id"))
+        still_running = value.get("still_running", control.get("still_running"))
         trace.update(
             {
-                "ok": value.get("ok"),
-                "kind": value.get("kind"),
-                "exit_code": value.get("exit_code"),
+                "ok": value.get("ok", control.get("ok")),
+                "kind": value.get("kind", control.get("kind")),
+                "exit_code": value.get("exit_code", control.get("exit_code")),
+                "duration_ms": value.get("duration_ms", control.get("duration_ms")),
                 "stdout": bound_text(value.get("stdout"), 2048),
                 "stderr": bound_text(value.get("stderr"), 2048),
-                "timed_out": value.get("timed_out"),
+                "timed_out": value.get("timed_out", control.get("timed_out")),
+                "still_running": still_running,
+                "done": value.get("done", control.get("done")),
+                "next_action": value.get("next_action", control.get("next_action")),
+                "run_id": run_id,
                 "runtime": compact_runtime_context(value.get("runtime")),
                 "explanation": compact_run_explanation(value.get("explanation")),
                 "helpers": compact_helper_observations(value.get("helpers")),
@@ -1238,11 +1262,14 @@ def large_result_preview(value: Any) -> dict[str, Any] | None:
     if isinstance(value, dict):
         kind = "record"
         count = len(value)
+        control = preview_record_control_fields(value)
         return {
             "__waymark_large_output__": True,
             "type": kind,
             "keys": list(value.keys())[:LARGE_RESULT_PEEK_ITEMS],
             "len": count,
+            **control,
+            **({"control": control} if control else {}),
             "head": preview_record(value),
             "hint": (
                 "Large record output was replaced with a peek. Emit selected fields "
@@ -1254,6 +1281,29 @@ def large_result_preview(value: Any) -> dict[str, Any] | None:
         "type": kind,
         "bytes": json_value_size(value),
         "hint": "Large output was replaced with a peek; use allow_large_output=true to force it.",
+    }
+
+
+RECORD_CONTROL_PREVIEW_KEYS = (
+    "ok",
+    "kind",
+    "exit_code",
+    "duration_ms",
+    "timed_out",
+    "still_running",
+    "done",
+    "next_action",
+    "run_id",
+    "cwd",
+    "argv",
+)
+
+
+def preview_record_control_fields(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value[key]
+        for key in RECORD_CONTROL_PREVIEW_KEYS
+        if key in value
     }
 
 

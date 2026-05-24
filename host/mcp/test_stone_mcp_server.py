@@ -158,6 +158,44 @@ class StoneMcpServerTests(unittest.TestCase):
         self.assertEqual(response["structuredContent"]["value"]["len"], 30)
         self.assertIn("large_output", response["structuredContent"]["diagnostics"])
 
+    def test_large_record_preview_preserves_run_control_fields(self) -> None:
+        value = {
+            "ok": False,
+            "kind": "still_running",
+            "exit_code": -1,
+            "duration_ms": 90000,
+            "timed_out": True,
+            "still_running": True,
+            "done": False,
+            "next_action": "run_wait_or_run_terminate",
+            "run_id": "run-7",
+            "env_diff": "x" * (server.LARGE_RESULT_BYTES + 1),
+        }
+
+        preview = server.large_result_preview(value)
+
+        self.assertIsNotNone(preview)
+        self.assertEqual(preview["run_id"], "run-7")
+        self.assertTrue(preview["timed_out"])
+        self.assertTrue(preview["still_running"])
+        self.assertFalse(preview["done"])
+        self.assertEqual(preview["next_action"], "run_wait_or_run_terminate")
+        self.assertEqual(preview["duration_ms"], 90000)
+        self.assertEqual(
+            preview["control"],
+            {
+                "ok": False,
+                "kind": "still_running",
+                "exit_code": -1,
+                "duration_ms": 90000,
+                "timed_out": True,
+                "still_running": True,
+                "done": False,
+                "next_action": "run_wait_or_run_terminate",
+                "run_id": "run-7",
+            },
+        )
+
     def test_read_frame_times_out_without_complete_frame(self) -> None:
         read_fd, write_fd = os.pipe()
         try:
@@ -703,6 +741,18 @@ class StoneMcpServerTests(unittest.TestCase):
 
         self.assertEqual(missing, set())
 
+    def test_visible_help_includes_run_wait_flow(self) -> None:
+        help_table = server.visible_help_table()
+
+        self.assertIn("run_wait", help_table)
+        self.assertIn("run_terminate", help_table)
+        self.assertIn("run_id", help_table["run"]["returns"]["fields"])
+        self.assertIn("still_running", help_table["run"]["returns"]["fields"])
+        self.assertIn("done", help_table["run"]["returns"]["fields"])
+        self.assertIn("next_action", help_table["run"]["returns"]["fields"])
+        self.assertIn("while result.still_running", help_table["run"]["example"])
+        self.assertIn("run_wait", help_table["run"]["example"])
+
     def test_stone_call_resolves_path_args_for_warm_reset_backend(self) -> None:
         args = server.stone_call_resolved_args("read_jsonl", {"path": "events.jsonl", "limit": 2}, "/repo")
 
@@ -857,6 +907,43 @@ class StoneMcpServerTests(unittest.TestCase):
             record["stone"]["run"]["helpers"][0]["next_checks"][0],
             ["python", "-m", "pip", "check"],
         )
+
+    def test_trace_recorder_reads_run_control_from_large_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "trace.jsonl"
+            recorder = server.TraceRecorder(str(trace_path))
+
+            recorder.record_tool_call(
+                "stone_call",
+                {"name": "run", "args": {"argv": ["bash", "-lc", "sleep 600"]}},
+                {
+                    "ok": True,
+                    "diagnostics": {"backend": "warm_stdio", "large_output": {"policy": "preview"}},
+                    "value": {
+                        "__waymark_large_output__": True,
+                        "type": "record",
+                        "control": {
+                            "ok": True,
+                            "kind": "still_running",
+                            "exit_code": -1,
+                            "duration_ms": 90000,
+                            "timed_out": True,
+                            "still_running": True,
+                            "run_id": "run-9",
+                        },
+                        "head": {"stdout": {"type": "str", "bytes": 5000000}},
+                    },
+                },
+                90001,
+            )
+
+            record = json.loads(trace_path.read_text())
+
+        self.assertEqual(record["stone"]["run"]["kind"], "still_running")
+        self.assertEqual(record["stone"]["run"]["run_id"], "run-9")
+        self.assertTrue(record["stone"]["run"]["still_running"])
+        self.assertTrue(record["stone"]["run"]["timed_out"])
+        self.assertEqual(record["stone"]["run"]["duration_ms"], 90000)
 
     def test_parse_hot_loop_diagnostics_from_stderr(self) -> None:
         stderr = (
