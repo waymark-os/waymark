@@ -167,7 +167,7 @@ class StoneMcpServerTests(unittest.TestCase):
             "timed_out": True,
             "still_running": True,
             "done": False,
-            "next_action": "run_wait_or_run_terminate",
+            "next_action": "run_status_or_run_wait_or_run_terminate",
             "run_id": "run-7",
             "env_diff": "x" * (server.LARGE_RESULT_BYTES + 1),
         }
@@ -179,7 +179,7 @@ class StoneMcpServerTests(unittest.TestCase):
         self.assertTrue(preview["timed_out"])
         self.assertTrue(preview["still_running"])
         self.assertFalse(preview["done"])
-        self.assertEqual(preview["next_action"], "run_wait_or_run_terminate")
+        self.assertEqual(preview["next_action"], "run_status_or_run_wait_or_run_terminate")
         self.assertEqual(preview["duration_ms"], 90000)
         self.assertEqual(
             preview["control"],
@@ -191,7 +191,7 @@ class StoneMcpServerTests(unittest.TestCase):
                 "timed_out": True,
                 "still_running": True,
                 "done": False,
-                "next_action": "run_wait_or_run_terminate",
+                "next_action": "run_status_or_run_wait_or_run_terminate",
                 "run_id": "run-7",
             },
         )

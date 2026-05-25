@@ -516,7 +516,7 @@ fn linux_exec_record(
         "next_action",
         Value::string(
             if output.still_running {
-                "run_wait_or_run_terminate"
+                "run_status_or_run_wait_or_run_terminate"
             } else if output.status == 0 {
                 "inspect_result_or_commit"
             } else {
