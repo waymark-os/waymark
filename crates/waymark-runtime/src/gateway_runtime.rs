@@ -185,6 +185,12 @@ pub(crate) fn run_wait(run_id: &str, timeout: Duration) -> Result<Record, ShellE
     linux_exec_record(output, Span::unknown(), usize::MAX, usize::MAX)
 }
 
+pub(crate) fn run_status(run_id: &str) -> Result<Record, ShellError> {
+    let config = required_config()?;
+    let output = with_client(&config, |client| client.linux_exec_wait(run_id, 1))?;
+    linux_exec_record(output, Span::unknown(), usize::MAX, usize::MAX)
+}
+
 pub(crate) fn run_terminate(run_id: &str) -> Result<Record, ShellError> {
     let config = required_config()?;
     let output = with_client(&config, |client| client.linux_exec_terminate(run_id))?;

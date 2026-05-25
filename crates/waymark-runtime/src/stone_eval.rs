@@ -28,8 +28,8 @@ use crate::linux_tools::{
         wait_port_call_values,
     },
     process::{
-        resolve_command_call_values, run_call_values, run_terminate_call_values,
-        run_wait_call_values,
+        resolve_command_call_values, run_call_values, run_status_call_values,
+        run_terminate_call_values, run_wait_call_values,
     },
 };
 use crate::stone_ast::{
@@ -1851,6 +1851,7 @@ impl Evaluator<'_> {
             "round" => self.eval_round_call(call),
             "run" => self.eval_run_call(call),
             "must_run" => self.eval_must_run_call(call),
+            "run_status" => self.eval_run_status_call(call),
             "run_wait" => self.eval_run_wait_call(call),
             "run_terminate" => self.eval_run_terminate_call(call),
             "resolve_command" => self.eval_resolve_command_call(call),
@@ -3590,6 +3591,23 @@ impl Evaluator<'_> {
         }
     }
 
+    fn eval_run_status_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        #[cfg(target_os = "hermit")]
+        {
+            let _ = call;
+            return Err(stone_error(
+                "run_status",
+                "run_status() requires the Linux/POSIX adapter and is unavailable on Hermit",
+            ));
+        }
+
+        #[cfg(not(target_os = "hermit"))]
+        {
+            let (positional, named) = self.eval_call_values(call)?;
+            run_status_call_values(&positional, &named).map(RuntimeValue::Nu)
+        }
+    }
+
     fn eval_run_terminate_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         #[cfg(target_os = "hermit")]
         {
@@ -5195,6 +5213,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "round",
     "rm",
     "run",
+    "run_status",
     "run_terminate",
     "run_wait",
     "slice",

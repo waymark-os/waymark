@@ -745,13 +745,16 @@ class StoneMcpServerTests(unittest.TestCase):
         help_table = server.visible_help_table()
 
         self.assertIn("run_wait", help_table)
+        self.assertIn("run_status", help_table)
         self.assertIn("run_terminate", help_table)
         self.assertIn("run_id", help_table["run"]["returns"]["fields"])
         self.assertIn("still_running", help_table["run"]["returns"]["fields"])
         self.assertIn("done", help_table["run"]["returns"]["fields"])
         self.assertIn("next_action", help_table["run"]["returns"]["fields"])
-        self.assertIn("while result.still_running", help_table["run"]["example"])
+        self.assertIn("while", help_table["run"]["example"])
+        self.assertIn("still_running", help_table["run"]["example"])
         self.assertIn("run_wait", help_table["run"]["example"])
+        self.assertIn("run_status", help_table["run"]["example"])
 
     def test_stone_call_resolves_path_args_for_warm_reset_backend(self) -> None:
         args = server.stone_call_resolved_args("read_jsonl", {"path": "events.jsonl", "limit": 2}, "/repo")

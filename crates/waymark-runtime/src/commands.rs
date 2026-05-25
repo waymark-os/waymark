@@ -612,8 +612,9 @@ if starts_with(line, "ERROR"):
             r#"result = run(["wc", "-l", "/app/input.txt"])"#,
             r#"result = run(["printf", "ok"], timeout_ms=5000)"#,
             r#"result = run(["make", "build"])
-while result.still_running:
-    result = run_wait(result.run_id, timeout_ms=60000)"#,
+while "still_running" in result and result.still_running:
+    status = run_status(result.run_id)
+    result = run_wait(result.run_id, timeout_ms=30000)"#,
             r#"result = run(["sh", "-c", "printf warning >&2"], stdout="suppress", stderr="capture", max_stderr_bytes=12000)"#,
             r#"if not result.ok:
     emit({"exit_code": result.exit_code, "stderr": result.stderr, "explanation": result.explanation})"#,
@@ -624,7 +625,7 @@ while result.still_running:
             "Do not use shell backgrounding, nohup, or `&` for long-lived services; use start_daemon().",
             "For noisy commands, suppress or cap output explicitly instead of flooding stdout/stderr.",
             "Do not ignore result.ok; inspect stderr, exit_code, timed_out, and explanation before retrying.",
-            "If result.still_running is true and result.run_id is present, use run_wait(result.run_id, timeout_ms=...) or run_terminate(result.run_id).",
+            "If result.still_running is true and result.run_id is present, use run_status(result.run_id), run_wait(result.run_id, timeout_ms=...), or run_terminate(result.run_id).",
             "After run_wait returns still_running=false or done=true, do not call run_wait for that run_id again.",
             "If result.timed_out is true without a run_id, inspect partial output first; rerun with a larger timeout_ms only when the command is expected to be slow.",
         ],
@@ -647,13 +648,27 @@ while result.still_running:
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "run_status",
+        signature: "run_status(run_id: str) -> record",
+        use_when: "Gateway mode only. Use after Gateway-backed run() returns still_running=true and a run_id when you want an immediate per-run status check without waiting.",
+        examples: &[r#"if "still_running" in result and result.still_running:
+    status = run_status(result.run_id)"#],
+        avoid: &[
+            "Do not use for general workspace state; use state() for runtime and transaction state.",
+            "Do not call for normal completed run() results without a run_id.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "run_wait",
         signature: "run_wait(run_id: str, timeout_ms: int = 30000) -> record",
-        use_when: "Use after Gateway-backed run() returns timed_out=true, still_running=true, and a run_id.",
-        examples: &[r#"while result.still_running:
-    result = run_wait(result.run_id, timeout_ms=60000)"#],
+        use_when: "Gateway mode only. Use after Gateway-backed run() returns timed_out=true, still_running=true, and a run_id when you intentionally want to wait; timeout_ms=0 waits until finish.",
+        examples: &[r#"while "still_running" in result and result.still_running:
+    status = run_status(result.run_id)
+    result = run_wait(result.run_id, timeout_ms=30000)"#],
         avoid: &[
             "Do not call for normal completed run() results without a run_id.",
+            "Do not use long waits through MCP when you need interactive progress; use run_status() and short run_wait() calls.",
             "Do not call again after run_wait returns still_running=false or done=true; inspect the result and continue the task.",
         ],
         aliases: &[],
@@ -662,7 +677,7 @@ while result.still_running:
         name: "run_terminate",
         signature: "run_terminate(run_id: str) -> record",
         use_when: "Use to stop a Gateway-backed run() that returned still_running=true when the command should not continue.",
-        examples: &[r#"if result.still_running:
+        examples: &[r#"if "still_running" in result and result.still_running:
     stopped = run_terminate(result.run_id)"#],
         avoid: &["Prefer run_wait() if the command is expected to finish soon."],
         aliases: &[],

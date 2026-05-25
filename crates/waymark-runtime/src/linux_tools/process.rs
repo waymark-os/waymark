@@ -447,8 +447,11 @@ pub(crate) fn run_wait_call_values(
             }
         }
     }
-    if timeout_ms <= 0 {
-        return Err(stone_error("run_wait", "timeout_ms must be positive"));
+    if timeout_ms < 0 {
+        return Err(stone_error(
+            "run_wait",
+            "timeout_ms must be non-negative; use 0 to wait until the run finishes",
+        ));
     }
     if gateway_runtime::enabled() {
         return gateway_runtime::run_wait(&run_id, Duration::from_millis(timeout_ms as u64))
@@ -457,6 +460,27 @@ pub(crate) fn run_wait_call_values(
     Err(stone_error(
         "run_wait",
         "run_wait() is only available for Gateway-backed run() calls",
+    ))
+}
+
+pub(crate) fn run_status_call_values(
+    positional: &[Value],
+    named: &[(String, Value)],
+) -> Result<Value, ShellError> {
+    if positional.len() != 1 || !named.is_empty() {
+        return Err(stone_error(
+            "run_status",
+            "run_status() requires exactly one run_id argument",
+        ));
+    }
+    let run_id = value_to_string(&positional[0], "run_status run_id")?;
+    if gateway_runtime::enabled() {
+        return gateway_runtime::run_status(&run_id)
+            .map(|record| Value::record(record, Span::unknown()));
+    }
+    Err(stone_error(
+        "run_status",
+        "run_status() is only available for Gateway-backed run() calls",
     ))
 }
 
