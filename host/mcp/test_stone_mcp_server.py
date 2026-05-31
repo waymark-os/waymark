@@ -158,6 +158,153 @@ class StoneMcpServerTests(unittest.TestCase):
         self.assertEqual(response["structuredContent"]["value"]["len"], 30)
         self.assertIn("large_output", response["structuredContent"]["diagnostics"])
 
+    def test_tool_result_includes_advisory_runtime_status(self) -> None:
+        old_env = os.environ.copy()
+        try:
+            os.environ.update(
+                {
+                    "WAYMARK_STONE_CWD": "/app",
+                    "WAYMARK_GATEWAY_TX": "tx-1",
+                    "WAYMARK_GATEWAY_CONTAINER": "task-container",
+                    "WAYMARK_AGENT_STARTED_AT_MS": "100000",
+                    "WAYMARK_AGENT_DEADLINE_MS": "400000",
+                    "WAYMARK_AGENT_TIME_BUDGET_SOURCE": "terminal-bench-agent-timeout",
+                }
+            )
+            backend = FakeBackend({"ok": True, "value": {"done": True}})
+            mcp = server.McpServer(backend, io.BytesIO(), io.BytesIO(), io.StringIO())
+
+            response = mcp.call_tool({"name": "stone_call", "arguments": {"name": "pwd"}})
+
+            status = response["structuredContent"]["diagnostics"]["runtime_status"]
+            self.assertEqual(status["cwd"], "/app")
+            self.assertEqual(status["gateway"]["tx"], "tx-1")
+            self.assertEqual(status["gateway"]["container"], "task-container")
+            self.assertEqual(status["time_budget"]["kind"], "advisory")
+            self.assertEqual(status["time_budget"]["source"], "terminal-bench-agent-timeout")
+            self.assertIn("elapsed_sec", status["time_budget"])
+            self.assertIn("remaining_sec", status["time_budget"])
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_process_call_warns_when_advisory_time_budget_is_low(self) -> None:
+        old_env = os.environ.copy()
+        now_ms = int(server.time.time() * 1000)
+        try:
+            os.environ.update(
+                {
+                    "WAYMARK_AGENT_STARTED_AT_MS": str(now_ms - 580_000),
+                    "WAYMARK_AGENT_DEADLINE_MS": str(now_ms + 20_000),
+                    "WAYMARK_AGENT_TIME_BUDGET_SOURCE": "terminal-bench-agent-timeout",
+                    "WAYMARK_AGENT_LOW_TIME_WARNING_SEC": "60",
+                }
+            )
+            backend = FakeBackend(
+                {
+                    "ok": True,
+                    "value": {
+                        "done": False,
+                        "still_running": True,
+                        "run_id": "run-1",
+                    },
+                }
+            )
+            mcp = server.McpServer(backend, io.BytesIO(), io.BytesIO(), io.StringIO())
+
+            response = mcp.call_tool(
+                {
+                    "name": "stone_call",
+                    "arguments": {
+                        "name": "run_wait",
+                        "args": {"run_id": "run-1", "timeout_ms": 60000},
+                    },
+                }
+            )
+
+            warnings = response["structuredContent"]["diagnostics"]["warnings"]
+            codes = {warning["code"] for warning in warnings}
+            self.assertIn("agent_time_budget_wrap_up", codes)
+            self.assertIn("tool_wait_exceeds_remaining_time", codes)
+            self.assertIn("process_still_running_with_low_time", codes)
+            wrap_up = next(
+                warning for warning in warnings if warning["code"] == "agent_time_budget_wrap_up"
+            )
+            self.assertEqual(wrap_up["suggested_action"], "wrap_up_now")
+            self.assertIn("Finalize", " ".join(wrap_up["suggested_actions"]))
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_process_call_warns_with_low_time_before_wrap_up_threshold(self) -> None:
+        old_env = os.environ.copy()
+        now_ms = int(server.time.time() * 1000)
+        try:
+            os.environ.update(
+                {
+                    "WAYMARK_AGENT_STARTED_AT_MS": str(now_ms - 500_000),
+                    "WAYMARK_AGENT_DEADLINE_MS": str(now_ms + 90_000),
+                    "WAYMARK_AGENT_TIME_BUDGET_SOURCE": "terminal-bench-agent-timeout",
+                    "WAYMARK_AGENT_LOW_TIME_WARNING_SEC": "120",
+                    "WAYMARK_AGENT_WRAP_UP_WARNING_SEC": "30",
+                }
+            )
+            backend = FakeBackend({"ok": True, "value": {"done": True}})
+            mcp = server.McpServer(backend, io.BytesIO(), io.BytesIO(), io.StringIO())
+
+            response = mcp.call_tool(
+                {
+                    "name": "stone_call",
+                    "arguments": {"name": "run", "args": {"argv": ["printf", "ok"]}},
+                }
+            )
+
+            warnings = response["structuredContent"]["diagnostics"]["warnings"]
+            codes = {warning["code"] for warning in warnings}
+            self.assertIn("agent_time_budget_low", codes)
+            self.assertNotIn("agent_time_budget_wrap_up", codes)
+            low = next(warning for warning in warnings if warning["code"] == "agent_time_budget_low")
+            self.assertEqual(low["suggested_action"], "prefer_finalize_or_short_checks")
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_process_call_warns_when_advisory_time_budget_is_expired(self) -> None:
+        old_env = os.environ.copy()
+        now_ms = int(server.time.time() * 1000)
+        try:
+            os.environ.update(
+                {
+                    "WAYMARK_AGENT_STARTED_AT_MS": str(now_ms - 610_000),
+                    "WAYMARK_AGENT_DEADLINE_MS": str(now_ms - 1_000),
+                    "WAYMARK_AGENT_TIME_BUDGET_SOURCE": "terminal-bench-agent-timeout",
+                }
+            )
+            backend = FakeBackend({"ok": True, "value": {"done": True}})
+            mcp = server.McpServer(backend, io.BytesIO(), io.BytesIO(), io.StringIO())
+
+            response = mcp.call_tool(
+                {
+                    "name": "stone_call",
+                    "arguments": {
+                        "name": "run",
+                        "args": {"argv": ["printf", "ok"], "timeout_ms": 30000},
+                    },
+                }
+            )
+
+            warnings = response["structuredContent"]["diagnostics"]["warnings"]
+            codes = {warning["code"] for warning in warnings}
+            self.assertIn("agent_time_budget_expired", codes)
+            self.assertIn("tool_wait_exceeds_remaining_time", codes)
+            expired = next(
+                warning for warning in warnings if warning["code"] == "agent_time_budget_expired"
+            )
+            self.assertEqual(expired["suggested_action"], "wrap_up_now")
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
     def test_large_record_preview_preserves_run_control_fields(self) -> None:
         value = {
             "ok": False,

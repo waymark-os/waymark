@@ -2106,6 +2106,226 @@ def hidden_blind_source(source: str) -> bool:
     return any(name in source for name in hidden)
 
 
+def optional_int_env(name: str) -> int | None:
+    value = os.environ.get(name)
+    if not value:
+        return None
+    try:
+        return int(float(value))
+    except ValueError:
+        return None
+
+
+def runtime_status(cwd: str | None = None) -> dict[str, Any]:
+    now_ms = int(time.time() * 1000)
+    started_at_ms = optional_int_env("WAYMARK_AGENT_STARTED_AT_MS")
+    deadline_ms = optional_int_env("WAYMARK_AGENT_DEADLINE_MS")
+    time_budget = None
+    if started_at_ms is not None or deadline_ms is not None:
+        time_budget = sparse(
+            {
+                "kind": "advisory",
+                "source": os.environ.get("WAYMARK_AGENT_TIME_BUDGET_SOURCE"),
+                "elapsed_sec": max(0, (now_ms - started_at_ms) // 1000)
+                if started_at_ms is not None
+                else None,
+                "remaining_sec": max(0, (deadline_ms - now_ms) // 1000)
+                if deadline_ms is not None
+                else None,
+            }
+        )
+    return sparse(
+        {
+            "cwd": cwd or os.environ.get("WAYMARK_STONE_CWD") or os.getcwd(),
+            "virtual_env": os.environ.get("VIRTUAL_ENV"),
+            "conda_env": os.environ.get("CONDA_DEFAULT_ENV"),
+            "gateway": sparse(
+                {
+                    "tx": os.environ.get("WAYMARK_GATEWAY_TX"),
+                    "container": os.environ.get("WAYMARK_GATEWAY_CONTAINER"),
+                    "image": os.environ.get("WAYMARK_GATEWAY_IMAGE"),
+                    "workspace_mount": os.environ.get("WAYMARK_GATEWAY_WORKSPACE_MOUNT"),
+                    "surface": os.environ.get("WAYMARK_GATEWAY_AGENT_SURFACE"),
+                }
+            ),
+            "time_budget": time_budget,
+        }
+    )
+
+
+def advisory_time_budget_warnings(
+    tool_name: str | None,
+    args: dict[str, Any],
+    result: dict[str, Any],
+    status: dict[str, Any],
+) -> list[dict[str, Any]]:
+    time_budget = status.get("time_budget")
+    if not isinstance(time_budget, dict):
+        return []
+
+    remaining_sec = time_budget.get("remaining_sec")
+    if not isinstance(remaining_sec, int):
+        return []
+
+    low_threshold_sec = optional_int_env("WAYMARK_AGENT_LOW_TIME_WARNING_SEC") or 120
+    wrap_up_threshold_sec = optional_int_env("WAYMARK_AGENT_WRAP_UP_WARNING_SEC") or 30
+    warnings: list[dict[str, Any]] = []
+    call_name = str(args.get("name", "")) if tool_name == "stone_call" else str(tool_name or "")
+    call_args = args.get("args") if tool_name == "stone_call" else args
+
+    process_call = call_name in {"run", "must_run", "run_wait", "run_status", "run_terminate"}
+    if not process_call:
+        return warnings
+
+    if remaining_sec <= 0:
+        warnings.append(
+            {
+                "code": "agent_time_budget_expired",
+                "severity": "critical",
+                "message": (
+                    "Advisory agent time budget is exhausted. Do not start or wait on "
+                    "long-running work; finalize with the best available artifact or stop."
+                ),
+                "suggested_action": "wrap_up_now",
+                "suggested_actions": [
+                    "Stop starting or waiting on long-running work.",
+                    "Use the best existing artifact or current state.",
+                    "Run only short validation or file checks if absolutely necessary.",
+                    "Finalize the task now.",
+                ],
+                "remaining_sec": remaining_sec,
+            }
+        )
+    elif remaining_sec <= wrap_up_threshold_sec:
+        warnings.append(
+            {
+                "code": "agent_time_budget_wrap_up",
+                "severity": "critical",
+                "message": (
+                    "Advisory agent time budget is almost exhausted. Wrap up now with "
+                    "the best available artifact; do not start or continue long-running work."
+                ),
+                "suggested_action": "wrap_up_now",
+                "suggested_actions": [
+                    "Finalize with the best existing artifact or current state.",
+                    "Do not start a replacement long-running command.",
+                    "If a process is still running, call run_status once and terminate it unless it is already complete.",
+                    "Use only quick checks that fit comfortably inside remaining time.",
+                ],
+                "remaining_sec": remaining_sec,
+                "threshold_sec": wrap_up_threshold_sec,
+            }
+        )
+    elif remaining_sec <= low_threshold_sec:
+        warnings.append(
+            {
+                "code": "agent_time_budget_low",
+                "severity": "warning",
+                "message": (
+                    "Advisory agent time budget is low. Avoid long-running work and prefer "
+                    "checking status, terminating stale runs, or finalizing existing results."
+                ),
+                "suggested_action": "prefer_finalize_or_short_checks",
+                "suggested_actions": [
+                    "Prefer short validation commands over new long-running commands.",
+                    "If a process is running, inspect it with run_status.",
+                    "Terminate work that cannot finish comfortably before the budget expires.",
+                    "Finalize with an existing artifact instead of starting over.",
+                ],
+                "remaining_sec": remaining_sec,
+                "threshold_sec": low_threshold_sec,
+            }
+        )
+
+    timeout_ms = stone_call_timeout_ms(call_name, call_args)
+    if timeout_ms is not None and timeout_ms / 1000 > max(0, remaining_sec):
+        warnings.append(
+            {
+                "code": "tool_wait_exceeds_remaining_time",
+                "severity": "warning",
+                "message": (
+                    "Requested process wait timeout exceeds the advisory remaining agent "
+                    "time. Use a shorter wait, run_status, run_terminate, or finalize."
+                ),
+                "suggested_action": "shorten_wait_or_wrap_up",
+                "suggested_actions": [
+                    "Use run_status instead of a long run_wait.",
+                    "If waiting is necessary, choose timeout_ms below the remaining time.",
+                    "If remaining time is low, terminate stale work and wrap up.",
+                ],
+                "remaining_sec": remaining_sec,
+                "requested_timeout_ms": timeout_ms,
+            }
+        )
+
+    value = result.get("value")
+    if isinstance(value, dict) and value.get("still_running") and remaining_sec <= low_threshold_sec:
+        warnings.append(
+            {
+                "code": "process_still_running_with_low_time",
+                "severity": "warning",
+                "message": (
+                    "A process is still running while advisory agent time is low. Prefer "
+                    "run_status or run_terminate before another long wait."
+                ),
+                "suggested_action": "inspect_or_terminate_then_wrap_up",
+                "suggested_actions": [
+                    "Call run_status to check whether the process is already complete or nearly complete.",
+                    "If it cannot finish comfortably within remaining time, call run_terminate.",
+                    "Do not start another long-running process.",
+                    "Finalize with any usable artifact already present.",
+                ],
+                "remaining_sec": remaining_sec,
+                "run_id": value.get("run_id"),
+            }
+        )
+
+    return warnings
+
+
+def stone_call_timeout_ms(call_name: str, args: Any) -> int | None:
+    if call_name in {"run", "must_run"}:
+        if isinstance(args, dict):
+            value = args.get("timeout_ms")
+        else:
+            return None
+    elif call_name == "run_wait":
+        if isinstance(args, dict):
+            value = args.get("timeout_ms")
+        elif isinstance(args, list) and len(args) >= 2:
+            value = args[1]
+        else:
+            return None
+    else:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def attach_runtime_status(
+    result: dict[str, Any],
+    cwd: str | None = None,
+    tool_name: str | None = None,
+    args: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    diagnostics = result.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    status = runtime_status(cwd)
+    diagnostics["runtime_status"] = status
+    warnings = advisory_time_budget_warnings(tool_name, args or {}, result, status)
+    if warnings:
+        existing = diagnostics.get("warnings")
+        if isinstance(existing, list):
+            diagnostics["warnings"] = [*existing, *warnings]
+        else:
+            diagnostics["warnings"] = warnings
+    result["diagnostics"] = diagnostics
+    return result
+
+
 class McpServer:
     def __init__(
         self,
@@ -2228,6 +2448,12 @@ class McpServer:
                 },
             }
         duration_ms = int((time.monotonic() - started) * 1000)
+        result = attach_runtime_status(
+            result,
+            args.get("cwd") if isinstance(args, dict) else None,
+            str(name) if name is not None else None,
+            args if isinstance(args, dict) else {},
+        )
         result = sanitize_for_agent(result)
         self.trace.record_tool_call(str(name), args if isinstance(args, dict) else {}, result, duration_ms)
         text = json.dumps(result, indent=2, sort_keys=True)
