@@ -134,6 +134,7 @@ pub(crate) fn run_command(
     env_overrides: &[(String, String)],
     stdin: Option<&str>,
     timeout: Duration,
+    background: bool,
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
 ) -> Result<Record, ShellError> {
@@ -142,7 +143,11 @@ pub(crate) fn run_command(
     let mut options = LinuxExecOptions::new(config.tx.clone(), config.image.clone(), argv.to_vec())
         .workspace_mount(config.workspace_mount.clone())
         .workdir(workdir)
-        .timeout_ms(run_sync_timeout_ms(timeout));
+        .timeout_ms(if background {
+            1
+        } else {
+            run_sync_timeout_ms(timeout)
+        });
     if let Some(container) = &config.container {
         options = options.container(container.clone());
     }
@@ -155,6 +160,7 @@ pub(crate) fn run_command(
     let output = with_client(&config, |client| client.linux_exec(options))?;
     let span = Span::unknown();
     let mut record = linux_exec_record(output, span, max_stdout_bytes, max_stderr_bytes)?;
+    record.push("background", Value::bool(background, span));
     record.push("cwd", Value::string(cwd.display().to_string(), span));
     record.push(
         "argv",
@@ -182,13 +188,19 @@ pub(crate) fn run_wait(run_id: &str, timeout: Duration) -> Result<Record, ShellE
     let config = required_config()?;
     let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
     let output = with_client(&config, |client| client.linux_exec_wait(run_id, timeout_ms))?;
-    linux_exec_record(output, Span::unknown(), usize::MAX, usize::MAX)
+    let span = Span::unknown();
+    let mut record = linux_exec_record(output, span, usize::MAX, usize::MAX)?;
+    append_run_ownership_fields(&mut record, &config, run_id, span);
+    Ok(record)
 }
 
 pub(crate) fn run_status(run_id: &str) -> Result<Record, ShellError> {
     let config = required_config()?;
     let output = with_client(&config, |client| client.linux_exec_wait(run_id, 1))?;
-    linux_exec_record(output, Span::unknown(), usize::MAX, usize::MAX)
+    let span = Span::unknown();
+    let mut record = linux_exec_record(output, span, usize::MAX, usize::MAX)?;
+    append_run_ownership_fields(&mut record, &config, run_id, span);
+    Ok(record)
 }
 
 pub(crate) fn run_terminate(run_id: &str) -> Result<Record, ShellError> {
@@ -209,6 +221,7 @@ pub(crate) fn start_daemon(
         env_overrides,
         None,
         Duration::from_millis(1),
+        true,
         usize::MAX,
         usize::MAX,
     )?;
@@ -297,6 +310,9 @@ pub(crate) fn daemon_status(run_id: &str, timeout: Duration) -> Result<Value, Sh
             .cloned()
             .unwrap_or_else(|| Value::bool(false, span)),
     );
+    push_if_present(&mut record, "processes", &output, span);
+    push_if_present(&mut record, "listen_addrs", &output, span);
+    push_if_present(&mut record, "open_files", &output, span);
     Ok(Value::record(record, span))
 }
 
@@ -343,7 +359,7 @@ pub(crate) fn ps_record(interval_ms: u64, cwd: &Path) -> Result<Value, ShellErro
             .processes
             .into_iter()
             .map(|process| {
-                let mut record = Record::with_capacity(10);
+                let mut record = Record::with_capacity(14);
                 record.push("pid", Value::int(process.pid, span));
                 record.push("ppid", Value::int(process.ppid, span));
                 record.push("name", Value::string(process.name, span));
@@ -354,6 +370,30 @@ pub(crate) fn ps_record(interval_ms: u64, cwd: &Path) -> Result<Value, ShellErro
                 record.push("memory_bytes", Value::int(process.memory_bytes, span));
                 record.push("virtual_bytes", Value::int(process.virtual_bytes, span));
                 record.push("owner_uid", Value::int(process.owner_uid, span));
+                record.push("owner_kind", Value::string(process.owner_kind, span));
+                record.push("owner_id", Value::string(process.owner_id, span));
+                record.push(
+                    "listen_addrs",
+                    Value::list(
+                        process
+                            .listen_addrs
+                            .into_iter()
+                            .map(|addr| Value::string(addr, span))
+                            .collect(),
+                        span,
+                    ),
+                );
+                record.push(
+                    "open_files",
+                    Value::list(
+                        process
+                            .open_files
+                            .into_iter()
+                            .map(|path| Value::string(path, span))
+                            .collect(),
+                        span,
+                    ),
+                );
                 Value::record(record, span)
             })
             .collect(),
@@ -483,6 +523,7 @@ fn linux_exec_record(
     max_stdout_bytes: usize,
     max_stderr_bytes: usize,
 ) -> Result<Record, ShellError> {
+    let suggested_actions = linux_exec_suggested_actions(&output);
     let stdout = truncate_text(output.stdout, max_stdout_bytes);
     let stderr = truncate_text(output.stderr, max_stderr_bytes);
     let mut record = Record::new();
@@ -509,9 +550,28 @@ fn linux_exec_record(
     );
     record.push("stdout", Value::string(stdout.text, span));
     record.push("stderr", Value::string(stderr.text, span));
+    record.push(
+        "stdout_bytes",
+        Value::int(i64::try_from(output.stdout_bytes).unwrap_or(i64::MAX), span),
+    );
+    record.push(
+        "stderr_bytes",
+        Value::int(i64::try_from(output.stderr_bytes).unwrap_or(i64::MAX), span),
+    );
+    record.push("stdout_tail", Value::string(output.stdout_tail, span));
+    record.push("stderr_tail", Value::string(output.stderr_tail, span));
     record.push("timed_out", Value::bool(output.timed_out, span));
     record.push("still_running", Value::bool(output.still_running, span));
     record.push("done", Value::bool(!output.still_running, span));
+    if output.timed_out {
+        record.push(
+            "partial_output_hint",
+            Value::string(
+                "The command reached a timeout, but stdout/stderr may contain useful partial results or readiness signals. Inspect stdout_tail, stderr_tail, stdout, and stderr before retrying or terminating.",
+                span,
+            ),
+        );
+    }
     record.push(
         "next_action",
         Value::string(
@@ -522,6 +582,16 @@ fn linux_exec_record(
             } else {
                 "inspect_error_or_retry"
             },
+            span,
+        ),
+    );
+    record.push(
+        "suggested_actions",
+        Value::list(
+            suggested_actions
+                .into_iter()
+                .map(|action| Value::string(action, span))
+                .collect(),
             span,
         ),
     );
@@ -538,6 +608,31 @@ fn linux_exec_record(
     Ok(record)
 }
 
+fn linux_exec_suggested_actions(
+    output: &waymark_gateway_client::proto::LinuxExecResponse,
+) -> Vec<&'static str> {
+    if output.still_running && output.timed_out {
+        return vec![
+            "Inspect stdout_tail, stderr_tail, stdout, and stderr for partial success, readiness, prompts, paths, ports, or other progress signals.",
+            "If partial output shows the task is ready or nearly complete, validate with a short follow-up command instead of terminating.",
+            "If the process should continue, use run_status or run_wait with a bounded timeout.",
+            "Terminate only when the partial output indicates the process is stale, wrong, or no longer useful.",
+        ];
+    }
+    if output.timed_out {
+        return vec![
+            "Inspect stdout_tail, stderr_tail, stdout, and stderr for partial success, readiness, prompts, paths, ports, or other progress signals before retrying.",
+            "If partial output is useful, continue from that state or validate it with a short command.",
+            "Retry only after using the partial output to adjust the command or plan.",
+        ];
+    }
+    if output.status == 0 {
+        vec!["Inspect the result and continue with the next task step."]
+    } else {
+        vec!["Inspect stdout, stderr, stdout_tail, and stderr_tail before retrying or changing approach."]
+    }
+}
+
 fn record_bool(record: &Record, key: &str) -> Option<bool> {
     let Value::Bool { val, .. } = record.get(key)? else {
         return None;
@@ -550,6 +645,105 @@ fn record_string(record: &Record, key: &str) -> Option<String> {
         return None;
     };
     Some(val.clone())
+}
+
+fn push_if_present(target: &mut Record, key: &str, source: &Record, span: Span) {
+    target.push(
+        key,
+        source
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| Value::list(Vec::new(), span)),
+    );
+}
+
+fn append_run_ownership_fields(
+    record: &mut Record,
+    config: &GatewayRuntimeConfig,
+    run_id: &str,
+    span: Span,
+) {
+    let output = match with_client(config, |client| client.linux_ps(probe_options(config), 0)) {
+        Ok(output) => output,
+        Err(_) => {
+            record.push("processes", Value::list(Vec::new(), span));
+            record.push("listen_addrs", Value::list(Vec::new(), span));
+            record.push("open_files", Value::list(Vec::new(), span));
+            return;
+        }
+    };
+    let mut listen_addrs = Vec::new();
+    let mut open_files = Vec::new();
+    let mut processes = Vec::new();
+    for process in output
+        .processes
+        .into_iter()
+        .filter(|process| process.owner_id == run_id)
+    {
+        for addr in &process.listen_addrs {
+            if !listen_addrs.contains(addr) {
+                listen_addrs.push(addr.clone());
+            }
+        }
+        for path in &process.open_files {
+            if !open_files.contains(path) {
+                open_files.push(path.clone());
+            }
+        }
+        let mut process_record = Record::new();
+        process_record.push("pid", Value::int(process.pid, span));
+        process_record.push("ppid", Value::int(process.ppid, span));
+        process_record.push("name", Value::string(process.name, span));
+        process_record.push("command", Value::string(process.command, span));
+        process_record.push("status", Value::string(process.status, span));
+        process_record.push("cwd", Value::string(process.cwd, span));
+        process_record.push("owner_kind", Value::string(process.owner_kind, span));
+        process_record.push("owner_id", Value::string(process.owner_id, span));
+        process_record.push(
+            "listen_addrs",
+            Value::list(
+                process
+                    .listen_addrs
+                    .into_iter()
+                    .map(|addr| Value::string(addr, span))
+                    .collect(),
+                span,
+            ),
+        );
+        process_record.push(
+            "open_files",
+            Value::list(
+                process
+                    .open_files
+                    .into_iter()
+                    .map(|path| Value::string(path, span))
+                    .collect(),
+                span,
+            ),
+        );
+        processes.push(Value::record(process_record, span));
+    }
+    record.push("processes", Value::list(processes, span));
+    record.push(
+        "listen_addrs",
+        Value::list(
+            listen_addrs
+                .into_iter()
+                .map(|addr| Value::string(addr, span))
+                .collect(),
+            span,
+        ),
+    );
+    record.push(
+        "open_files",
+        Value::list(
+            open_files
+                .into_iter()
+                .map(|path| Value::string(path, span))
+                .collect(),
+            span,
+        ),
+    );
 }
 
 fn probe_options(config: &GatewayRuntimeConfig) -> LinuxProbeOptions {

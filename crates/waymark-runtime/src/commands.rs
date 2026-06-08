@@ -606,11 +606,19 @@ if starts_with(line, "ERROR"):
     },
     StoneHelpEntry {
         name: "run",
-        signature: r#"run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576) -> record"#,
-        use_when: "Use only when the task explicitly needs a POSIX program that should finish. Nonzero exits return ok=false with stdout, stderr, and an explanation record.",
+        signature: r#"run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, background: bool = False, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576) -> record"#,
+        use_when: "Use only when the task explicitly needs a POSIX program. Nonzero exits return ok=false with stdout, stderr, and an explanation record. For task commands that may run more than a few seconds but should eventually exit, pass background=True and manage the returned run_id with run_status/run_wait/run_terminate.",
         examples: &[
             r#"result = run(["wc", "-l", "/app/input.txt"])"#,
             r#"result = run(["printf", "ok"], timeout_ms=5000)"#,
+            r#"job = run(["long_running_command", "arg1", "arg2"], cwd="/app", background=True)
+while job.still_running:
+    status = run_status(job.run_id)
+    job = run_wait(job.run_id, timeout_ms=30000)"#,
+            r#"job = run(["make", "build"], cwd="/app", background=True)
+while job.still_running:
+    status = run_status(job.run_id)
+    job = run_wait(job.run_id, timeout_ms=30000)"#,
             r#"result = run(["make", "build"])
 while "still_running" in result and result.still_running:
     status = run_status(result.run_id)
@@ -622,7 +630,8 @@ while "still_running" in result and result.still_running:
         avoid: &[
             "Do not pass shell strings; pass argv lists.",
             "Do not use run for normal file/JSON/CSV work.",
-            "Do not use shell backgrounding, nohup, or `&` for long-lived services; use start_daemon().",
+            "Use background=True for long-running task commands that should eventually exit, such as builds, tests, installs, downloads, benchmarks, or data processing.",
+            "Do not use shell backgrounding, nohup, or `&`; use background=True for long task commands, or start_daemon() for servers/services that must stay running while tests execute.",
             "For noisy commands, suppress or cap output explicitly instead of flooding stdout/stderr.",
             "Do not ignore result.ok; inspect stderr, exit_code, timed_out, and explanation before retrying.",
             "If result.still_running is true and result.run_id is present, use run_status(result.run_id), run_wait(result.run_id, timeout_ms=...), or run_terminate(result.run_id).",

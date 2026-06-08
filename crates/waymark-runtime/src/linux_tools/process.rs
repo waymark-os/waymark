@@ -142,6 +142,7 @@ pub(crate) fn run_call_values(
     let mut stdin: Option<String> = None;
     let mut env_overrides: Vec<(String, String)> = Vec::new();
     let mut timeout_ms: i64 = 300_000;
+    let mut background = false;
     let mut max_stdout_bytes: usize = 1_048_576;
     let mut max_stderr_bytes: usize = 1_048_576;
     let mut stdout_target = RunOutputTarget::Capture;
@@ -188,6 +189,9 @@ pub(crate) fn run_call_values(
                     return Err(stone_error(context, "timeout_ms must be positive"));
                 }
             }
+            "background" => {
+                background = value_to_bool(value, &format!("{context} background"))?;
+            }
             "max_stdout_bytes" => {
                 max_stdout_bytes = value_to_limit(value, &format!("{context} max_stdout_bytes"))?;
             }
@@ -204,7 +208,7 @@ pub(crate) fn run_call_values(
                 return Err(stone_error(
                     context,
                     format!(
-                        "unsupported keyword `{other}`; expected cwd, env, stdin, timeout_ms, max_stdout_bytes, max_stderr_bytes, stdout, or stderr"
+                        "unsupported keyword `{other}`; expected cwd, env, stdin, timeout_ms, background, max_stdout_bytes, max_stderr_bytes, stdout, or stderr"
                     ),
                 ));
             }
@@ -221,6 +225,7 @@ pub(crate) fn run_call_values(
         &env_overrides,
         stdin.as_deref(),
         Duration::from_millis(timeout_ms as u64),
+        background,
         stdout_target,
         stderr_target,
         max_stdout_bytes,
@@ -232,6 +237,16 @@ pub(crate) fn run_call_values(
         cwd,
         env_overrides,
     })
+}
+
+fn value_to_bool(value: &Value, context: &str) -> Result<bool, ShellError> {
+    let Value::Bool { val, .. } = value else {
+        return Err(stone_error(
+            context,
+            format!("expected bool, got {}", value.get_type()),
+        ));
+    };
+    Ok(*val)
 }
 
 pub(crate) fn resolve_command_call_values(
@@ -1419,6 +1434,7 @@ fn run_posix_command(
     env_overrides: &[(String, String)],
     stdin: Option<&str>,
     timeout: Duration,
+    background: bool,
     stdout_target: RunOutputTarget,
     stderr_target: RunOutputTarget,
     max_stdout_bytes: usize,
@@ -1437,6 +1453,7 @@ fn run_posix_command(
             env_overrides,
             stdin,
             timeout,
+            background,
             max_stdout_bytes,
             max_stderr_bytes,
         )?;
@@ -1459,6 +1476,12 @@ fn run_posix_command(
         record.push("suppressed", Value::record(suppressed, span));
         record.push("stderr_to_stdout", Value::bool(false, span));
         return Ok(record);
+    }
+    if background {
+        return Err(stone_error(
+            "run",
+            "run(background=True) is only available in Gateway-backed runtime; use start_daemon() for local long-lived services",
+        ));
     }
     static RUN_ID: AtomicU64 = AtomicU64::new(0);
 

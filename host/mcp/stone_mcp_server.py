@@ -141,9 +141,15 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
     },
     "run": {
         "name": "run",
-        "signature": 'run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576) -> record',
+        "signature": 'run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, background: bool = False, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576) -> record',
         "effects": ["process", "unknown"],
-        "example": 'result = run(["cargo", "test"], cwd="."); while "still_running" in result and result.still_running: status = run_status(result.run_id); result = run_wait(result.run_id, timeout_ms=30000)',
+        "example": 'job = run(["long_running_command", "arg1", "arg2"], cwd="/app", background=True); while job.still_running: status = run_status(job.run_id); job = run_wait(job.run_id, timeout_ms=30000)',
+        "use_when": "Use for POSIX programs. For task commands that may run more than a few seconds but should eventually exit, pass background=True and manage the returned run_id with run_status/run_wait/run_terminate.",
+        "avoid": [
+            "Do not pass shell strings; pass argv lists.",
+            "Use background=True for long-running task commands that should eventually exit, such as builds, tests, installs, downloads, benchmarks, or data processing.",
+            "Do not use shell backgrounding, nohup, or `&`; use background=True for long task commands, or start_daemon() for servers/services that must stay running while tests execute.",
+        ],
         "call_form": "stone_call",
         "args": [
             {"name": "argv", "type": "list[str]", "required": True, "example": ["cargo", "test"]},
@@ -151,6 +157,7 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
             {"name": "stdin", "type": "str?", "required": False},
             {"name": "timeout_ms", "type": "int?", "required": False, "example": 5000},
             {"name": "env", "type": "record?", "required": False},
+            {"name": "background", "type": "bool", "required": False, "example": True},
             {"name": "stdout", "type": "str", "required": False, "example": "capture"},
             {"name": "stderr", "type": "str", "required": False, "example": "capture"},
             {"name": "max_stdout_bytes", "type": "int", "required": False, "example": 1048576},
@@ -163,13 +170,18 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
                 "cwd",
                 "stdout",
                 "stderr",
+                "stdout_tail",
+                "stderr_tail",
                 "exit_code",
                 "ok",
                 "timed_out",
                 "still_running",
                 "done",
                 "next_action",
+                "suggested_actions",
+                "partial_output_hint",
                 "run_id",
+                "background",
                 "duration_ms",
                 "explanation",
             ],
@@ -222,9 +234,13 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
                 "cwd",
                 "stdout",
                 "stderr",
+                "stdout_tail",
+                "stderr_tail",
                 "exit_code",
                 "ok",
                 "timed_out",
+                "suggested_actions",
+                "partial_output_hint",
                 "duration_ms",
                 "explanation",
             ],
@@ -364,6 +380,10 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
                 "memory_bytes",
                 "virtual_bytes",
                 "owner_uid",
+                "owner_kind",
+                "owner_id",
+                "listen_addrs",
+                "open_files",
             ],
         },
     },
@@ -1882,12 +1902,30 @@ def escape_linux(reason: str, command: str, cwd: str | None = None) -> dict[str,
             },
         }
     run_cwd = resolve_cwd(cwd)
+    gateway_container = os.environ.get("WAYMARK_GATEWAY_CONTAINER", "").strip()
+    gateway_workspace_mount = os.environ.get("WAYMARK_GATEWAY_WORKSPACE_MOUNT", "").strip()
+    if gateway_container:
+        if gateway_workspace_mount and str(run_cwd).startswith(gateway_workspace_mount):
+            exec_cwd = str(run_cwd)
+        elif gateway_workspace_mount:
+            exec_cwd = gateway_workspace_mount
+        else:
+            exec_cwd = "/"
+        argv = ["docker", "exec", "-w", exec_cwd, gateway_container, "sh", "-lc", command]
+        execution_target = {
+            "kind": "gateway_container",
+            "container": gateway_container,
+            "cwd": exec_cwd,
+        }
+    else:
+        argv = command
+        execution_target = {"kind": "mcp_process", "cwd": str(run_cwd)}
     start = time.monotonic()
     try:
         proc = subprocess.run(
-            command,
-            shell=True,
-            cwd=str(run_cwd),
+            argv,
+            shell=not gateway_container,
+            cwd=str(run_cwd) if not gateway_container else None,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1924,6 +1962,7 @@ def escape_linux(reason: str, command: str, cwd: str | None = None) -> dict[str,
             "diagnostics": {
                 "exit_code": proc.returncode,
                 "duration_ms": int((time.monotonic() - start) * 1000),
+                "execution_target": execution_target,
             },
             "effects": {"unknown": True},
         }

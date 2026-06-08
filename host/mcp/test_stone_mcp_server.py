@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import json
 import io
 import os
@@ -933,6 +934,36 @@ class StoneMcpServerTests(unittest.TestCase):
         self.assertEqual(result["stdout"], "hello")
         self.assertEqual(result["gap"], "unsupported/out_of_scope")
         self.assertEqual(result["effects"], {"unknown": True})
+
+    def test_escape_linux_uses_attached_gateway_container_when_available(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["docker"],
+            0,
+            stdout="container\n",
+            stderr="",
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "WAYMARK_GATEWAY_CONTAINER": "task-main-1",
+                "WAYMARK_GATEWAY_WORKSPACE_MOUNT": "/app",
+            },
+        ), mock.patch.object(server.subprocess, "run", return_value=completed) as run:
+            result = server.escape_linux("need direct shell for a smoke check", "pwd", "/app/src")
+
+        self.assertTrue(result["ok"])
+        run.assert_called_once()
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command,
+            ["docker", "exec", "-w", "/app/src", "task-main-1", "sh", "-lc", "pwd"],
+        )
+        self.assertFalse(run.call_args.kwargs["shell"])
+        self.assertIsNone(run.call_args.kwargs["cwd"])
+        self.assertEqual(
+            result["diagnostics"]["execution_target"],
+            {"kind": "gateway_container", "container": "task-main-1", "cwd": "/app/src"},
+        )
 
     def test_trace_recorder_writes_escape_accounting_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
