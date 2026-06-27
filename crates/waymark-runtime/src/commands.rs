@@ -761,6 +761,14 @@ if not info.ok:
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "env_txs",
+        signature: r#"env_txs(workspace: str = "", purpose: str = "") -> list[record]"#,
+        use_when: "Use in Gateway mode to discover open transactions, especially retained checkpoint-run branches.",
+        examples: &[r#"debug_branches = env_txs(purpose="checkpoint-run")"#],
+        avoid: &["Do not assume retained branches are gone until they disappear from this list."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "env_finish",
         signature: "env_finish() -> record",
         use_when: "Use before the final answer in Gateway mode to verify the transaction is clean or already closed.",

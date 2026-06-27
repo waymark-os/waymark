@@ -44,6 +44,33 @@ pub(crate) fn env_tx_info(tx: String) -> Result<Value, ShellError> {
     Ok(Value::record(record, span))
 }
 
+pub(crate) fn env_txs(workspace: String, purpose: String) -> Result<Value, ShellError> {
+    let config = required_config()?;
+    let list = with_client(&config, |client| {
+        client.env_tx_list(workspace.clone(), purpose.clone())
+    })?;
+    let span = Span::unknown();
+    let transactions = list
+        .transactions
+        .into_iter()
+        .map(|info| {
+            let mut record = Record::new();
+            record.push("tx", Value::string(info.tx, span));
+            record.push("workspace", Value::string(info.workspace, span));
+            record.push("base_generation", Value::string(info.base_generation, span));
+            record.push("provider", Value::string(info.provider, span));
+            record.push(
+                "parent_checkpoint",
+                Value::string(info.parent_checkpoint, span),
+            );
+            record.push("purpose", Value::string(info.purpose, span));
+            record.push("merged_path", Value::string(info.merged_path, span));
+            Value::record(record, span)
+        })
+        .collect();
+    Ok(Value::list(transactions, span))
+}
+
 pub(crate) fn env_finish() -> Result<Value, ShellError> {
     let config = required_config()?;
     let finish = with_client(&config, |client| client.env_finish(&config.tx))?;

@@ -1860,6 +1860,7 @@ impl Evaluator<'_> {
             "state" => self.eval_state_call(call),
             "env_state" | "env_diff" => self.eval_env_state_call(call),
             "env_tx_info" => self.eval_env_tx_info_call(call),
+            "env_txs" => self.eval_env_txs_call(call),
             "env_finish" => self.eval_env_finish_call(call),
             "env_restore" => self.eval_env_restore_call(call),
             "env_checkpoint" => self.eval_env_checkpoint_call(call),
@@ -3892,6 +3893,39 @@ impl Evaluator<'_> {
         gateway_env::env_tx_info(tx).map(RuntimeValue::Nu)
     }
 
+    fn eval_env_txs_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 2 {
+            return Err(stone_error(
+                "env_txs",
+                "env_txs() accepts at most workspace and purpose arguments",
+            ));
+        }
+        let mut workspace = positional
+            .first()
+            .map(|value| value_to_string(value, "env_txs workspace"))
+            .transpose()?
+            .unwrap_or_default();
+        let mut purpose = positional
+            .get(1)
+            .map(|value| value_to_string(value, "env_txs purpose"))
+            .transpose()?
+            .unwrap_or_default();
+        for (name, value) in named {
+            match name.as_str() {
+                "workspace" => workspace = value_to_string(&value, "env_txs workspace")?,
+                "purpose" => purpose = value_to_string(&value, "env_txs purpose")?,
+                _ => {
+                    return Err(stone_error(
+                        "env_txs",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        gateway_env::env_txs(workspace, purpose).map(RuntimeValue::Nu)
+    }
+
     fn eval_env_finish_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         if !call.positional.is_empty() || !call.named.is_empty() {
             return Err(stone_error("env_finish", "env_finish() takes no arguments"));
@@ -5487,6 +5521,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "env_rollback",
     "env_state",
     "env_tx_info",
+    "env_txs",
     "fail",
     "filter",
     "find",

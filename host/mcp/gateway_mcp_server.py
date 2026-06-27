@@ -107,6 +107,17 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "tx_list",
+        "description": "List open Gateway transactions with metadata.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string"},
+                "purpose": {"type": "string"},
+            },
+        },
+    },
+    {
         "name": "stone_call",
         "description": "Run a Linux command in the Gateway transaction view.",
         "inputSchema": {
@@ -416,6 +427,11 @@ class GatewayMcp:
             return self.rpc.call("env.diff", ["--tx", required(args, "tx"), "--sample-limit", sample_limit])
         if name in {"tx_info", "env_tx_info"}:
             return self.rpc.call("env.tx_info", ["--tx", required(args, "tx")])
+        if name in {"tx_list", "env_tx_list"}:
+            call_args: list[str] = []
+            add_optional(call_args, args, "workspace", "--workspace")
+            add_optional(call_args, args, "purpose", "--purpose")
+            return self.rpc.call("env.tx_list", call_args)
         if name in {"finish", "env_finish"}:
             return self.rpc.call("env.finish", ["--tx", required(args, "tx")])
         if name in {"restore", "env_restore"}:
