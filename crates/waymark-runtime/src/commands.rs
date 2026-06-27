@@ -810,6 +810,17 @@ if not info.ok:
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "env_run_checkpoint",
+        signature: r#"env_run_checkpoint(checkpoint: str, image: str, argv: list[str], workspace_mount: str = "/app", workdir: str = "/app", timeout_ms: int = 300000, env: record? = None, stdin: str = "", user: str = "") -> record"#,
+        use_when: "Use in Gateway mode to fork a checkpoint into an ephemeral branch, run a Linux command there, inspect output and diff, and automatically roll the branch back.",
+        examples: &[r#"result = env_run_checkpoint(cp.checkpoint, "python:3.12-slim", ["python", "-c", "print('ok')"])"#],
+        avoid: &[
+            "Do not use this as a commit; it always rolls back the branch.",
+            "Do not use hidden benchmark verifier output as stock pass@1 feedback.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "env_commit",
         signature: r#"env_commit(message: str = "agent commit", allow_risky: bool = False) -> record"#,
         use_when: "Use in Gateway mode to publish intended transaction changes as a new immutable generation. In blind Gateway agent surface mode, Waymark authorizes intended commits because change inspection is hidden.",

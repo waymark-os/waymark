@@ -517,7 +517,7 @@ pub(crate) fn wait_port_record(
     Ok(Value::record(record, span))
 }
 
-fn linux_exec_record(
+pub(crate) fn linux_exec_record(
     output: waymark_gateway_client::proto::LinuxExecResponse,
     span: Span,
     max_stdout_bytes: usize,

@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::collections::HashMap;
+
 use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, Value};
+use waymark_gateway_client::proto::EnvRunCheckpointRequest;
 use waymark_gateway_client::GatewayRpcClient;
 
-use crate::gateway_runtime::{config, GatewayEndpoint, GatewayRuntimeConfig};
+use crate::gateway_runtime::{config, linux_exec_record, GatewayEndpoint, GatewayRuntimeConfig};
 use crate::json::json_to_nu_value;
 
 pub(crate) fn enabled() -> bool {
@@ -258,6 +261,61 @@ pub(crate) fn env_rollback() -> Result<Value, ShellError> {
     let mut record = Record::new();
     record.push("tx", Value::string(config.tx, span));
     record.push("rolled_back", Value::bool(true, span));
+    Ok(Value::record(record, span))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn env_run_checkpoint(
+    checkpoint: String,
+    image: String,
+    argv: Vec<String>,
+    workspace_mount: String,
+    workdir: String,
+    env: Vec<(String, String)>,
+    user: String,
+    stdin: String,
+    timeout_ms: u64,
+) -> Result<Value, ShellError> {
+    let config = required_config()?;
+    let run = with_client(&config, |client| {
+        client.env_run_checkpoint(EnvRunCheckpointRequest {
+            checkpoint: checkpoint.clone(),
+            image: image.clone(),
+            argv: argv.clone(),
+            workspace_mount: workspace_mount.clone(),
+            workdir: workdir.clone(),
+            env: env.clone().into_iter().collect::<HashMap<_, _>>(),
+            user: user.clone(),
+            stdin: stdin.clone(),
+            timeout_ms,
+            read_only_mounts: Vec::new(),
+        })
+    })?;
+    let span = Span::unknown();
+    let mut record = if let Some(output) = run.output {
+        linux_exec_record(output, span, 1_048_576, 1_048_576)?
+    } else {
+        Record::new()
+    };
+    record.push("checkpoint", Value::string(run.checkpoint, span));
+    record.push("branch_tx", Value::string(run.tx, span));
+    record.push("rolled_back", Value::bool(run.rolled_back, span));
+    record.push(
+        "fork_duration_ms",
+        Value::int(run.fork_duration_ms as i64, span),
+    );
+    record.push(
+        "diff_duration_ms",
+        Value::int(run.diff_duration_ms as i64, span),
+    );
+    record.push(
+        "rollback_duration_ms",
+        Value::int(run.rollback_duration_ms as i64, span),
+    );
+    record.push(
+        "total_duration_ms",
+        Value::int(run.total_duration_ms as i64, span),
+    );
     Ok(Value::record(record, span))
 }
 

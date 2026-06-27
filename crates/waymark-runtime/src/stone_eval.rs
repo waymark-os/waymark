@@ -1866,6 +1866,7 @@ impl Evaluator<'_> {
             "env_restore_checkpoint" => self.eval_env_restore_checkpoint_call(call),
             "env_checkpoints" => self.eval_env_checkpoints_call(call),
             "env_discard_checkpoint" => self.eval_env_discard_checkpoint_call(call),
+            "env_run_checkpoint" => self.eval_env_run_checkpoint_call(call),
             "env_commit" => self.eval_env_commit_call(call),
             "env_rollback" => self.eval_env_rollback_call(call),
             "last_result" => self.eval_last_result_call(call),
@@ -3998,6 +3999,107 @@ impl Evaluator<'_> {
         gateway_env::env_discard_checkpoint(checkpoint, force).map(RuntimeValue::Nu)
     }
 
+    fn eval_env_run_checkpoint_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 3 {
+            return Err(stone_error(
+                "env_run_checkpoint",
+                "env_run_checkpoint() expects checkpoint, image, and argv",
+            ));
+        }
+        let first_positional_is_argv = matches!(positional.first(), Some(Value::List { .. }));
+        let mut checkpoint = if first_positional_is_argv {
+            None
+        } else {
+            positional
+                .first()
+                .map(|value| value_to_string(value, "env_run_checkpoint checkpoint"))
+                .transpose()?
+        };
+        let mut image = if first_positional_is_argv {
+            None
+        } else {
+            positional
+                .get(1)
+                .map(|value| value_to_string(value, "env_run_checkpoint image"))
+                .transpose()?
+        };
+        let mut argv = if first_positional_is_argv {
+            positional
+                .first()
+                .map(|value| value_to_string_list(value, "env_run_checkpoint argv"))
+                .transpose()?
+        } else {
+            positional
+                .get(2)
+                .map(|value| value_to_string_list(value, "env_run_checkpoint argv"))
+                .transpose()?
+        };
+        let mut workspace_mount = "/app".to_string();
+        let mut workdir = "/app".to_string();
+        let mut env = Vec::new();
+        let mut user = String::new();
+        let mut stdin = String::new();
+        let mut timeout_ms = 300_000_u64;
+        for (name, value) in named {
+            match name.as_str() {
+                "checkpoint" => {
+                    checkpoint = Some(value_to_string(&value, "env_run_checkpoint checkpoint")?)
+                }
+                "image" => image = Some(value_to_string(&value, "env_run_checkpoint image")?),
+                "argv" => argv = Some(value_to_string_list(&value, "env_run_checkpoint argv")?),
+                "workspace_mount" => {
+                    workspace_mount = value_to_string(&value, "env_run_checkpoint workspace_mount")?
+                }
+                "workdir" | "cwd" => {
+                    workdir = value_to_string(&value, "env_run_checkpoint workdir")?
+                }
+                "env" => env = value_to_string_pairs(&value, "env_run_checkpoint env")?,
+                "user" => user = value_to_string(&value, "env_run_checkpoint user")?,
+                "stdin" => stdin = value_to_string(&value, "env_run_checkpoint stdin")?,
+                "timeout_ms" => {
+                    timeout_ms = value_to_u64(&value, "env_run_checkpoint timeout_ms")?;
+                    if timeout_ms == 0 {
+                        return Err(stone_error(
+                            "env_run_checkpoint",
+                            "timeout_ms must be positive",
+                        ));
+                    }
+                }
+                other => {
+                    return Err(stone_error(
+                        "env_run_checkpoint",
+                        format!("unexpected keyword argument `{other}`"),
+                    ));
+                }
+            }
+        }
+        let checkpoint = checkpoint
+            .ok_or_else(|| stone_error("env_run_checkpoint", "missing checkpoint argument"))?;
+        let image =
+            image.ok_or_else(|| stone_error("env_run_checkpoint", "missing image argument"))?;
+        let argv =
+            argv.ok_or_else(|| stone_error("env_run_checkpoint", "missing argv argument"))?;
+        if argv.is_empty() {
+            return Err(stone_error(
+                "env_run_checkpoint",
+                "argv list cannot be empty",
+            ));
+        }
+        gateway_env::env_run_checkpoint(
+            checkpoint,
+            image,
+            argv,
+            workspace_mount,
+            workdir,
+            env,
+            user,
+            stdin,
+            timeout_ms,
+        )
+        .map(RuntimeValue::Nu)
+    }
+
     fn required_checkpoint_arg(
         &mut self,
         call: &Call,
@@ -5321,6 +5423,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "env_fork",
     "env_restore",
     "env_restore_checkpoint",
+    "env_run_checkpoint",
     "env_rollback",
     "env_state",
     "fail",
@@ -6026,6 +6129,33 @@ fn stone_error(kind: &str, message: impl Into<String>) -> ShellError {
         GenericError::new_internal(format!("Stone {kind} error"), message.into())
             .with_code("stone_script_error"),
     )
+}
+
+fn value_to_string_list(value: &Value, context: &str) -> Result<Vec<String>, ShellError> {
+    let Value::List { vals, .. } = value else {
+        return Err(stone_error(
+            context,
+            format!("expected list of strings, got {}", value.get_type()),
+        ));
+    };
+    vals.iter()
+        .map(|value| value_to_string(value, context))
+        .collect()
+}
+
+fn value_to_string_pairs(
+    value: &Value,
+    context: &str,
+) -> Result<Vec<(String, String)>, ShellError> {
+    let Value::Record { val, .. } = value else {
+        return Err(stone_error(
+            context,
+            format!("expected record of string values, got {}", value.get_type()),
+        ));
+    };
+    val.iter()
+        .map(|(key, value)| value_to_string(value, context).map(|value| (key.clone(), value)))
+        .collect()
 }
 
 fn run_record_ok(record: &Record) -> bool {

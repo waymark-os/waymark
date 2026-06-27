@@ -593,6 +593,7 @@ class StoneMcpServerTests(unittest.TestCase):
         checkpoint = server.stone_signature("env_checkpoint")
         fork = server.stone_signature("env_fork")
         restore = server.stone_signature("env_restore_checkpoint")
+        run_checkpoint = server.stone_signature("env_run_checkpoint")
 
         self.assertTrue(checkpoint["ok"], checkpoint)
         self.assertEqual(checkpoint["value"]["args"][0]["name"], "reason")
@@ -600,6 +601,8 @@ class StoneMcpServerTests(unittest.TestCase):
         self.assertEqual(fork["value"]["args"][0]["name"], "checkpoint")
         self.assertTrue(restore["ok"], restore)
         self.assertEqual(restore["value"]["args"][0]["name"], "checkpoint")
+        self.assertTrue(run_checkpoint["ok"], run_checkpoint)
+        self.assertEqual(run_checkpoint["value"]["args"][0]["name"], "checkpoint")
 
     def test_stone_call_generates_emit_wrapped_builtin_call(self) -> None:
         backend = FakeBackend()
@@ -621,16 +624,27 @@ class StoneMcpServerTests(unittest.TestCase):
             {"checkpoint": "cp-1"},
             "/repo",
         )
+        run_checkpoint = server.stone_call(
+            backend,
+            "env_run_checkpoint",
+            {"checkpoint": "cp-1", "image": "alpine:latest", "argv": ["sh", "-c", "true"]},
+            "/repo",
+        )
 
         self.assertTrue(checkpoint["ok"], checkpoint)
         self.assertTrue(fork["ok"], fork)
         self.assertTrue(restore["ok"], restore)
+        self.assertTrue(run_checkpoint["ok"], run_checkpoint)
         self.assertEqual(
             backend.calls,
             [
                 ('emit(env_checkpoint("before test"))\n', None),
                 ('emit(env_fork("cp-1"))\n', None),
                 ('emit(env_restore_checkpoint("cp-1"))\n', None),
+                (
+                    'emit(env_run_checkpoint(["sh", "-c", "true"], checkpoint="cp-1", image="alpine:latest"))\n',
+                    None,
+                ),
             ],
         )
 
