@@ -122,6 +122,16 @@ pub(crate) fn env_checkpoint(reason: String) -> Result<Value, ShellError> {
         "create_duration_ms",
         Value::int(checkpoint.create_duration_ms as i64, span),
     );
+    record.push("copy_files", Value::int(checkpoint.copy_files as i64, span));
+    record.push("copy_bytes", Value::int(checkpoint.copy_bytes as i64, span));
+    record.push(
+        "reflink_attempts",
+        Value::int(checkpoint.reflink_attempts as i64, span),
+    );
+    record.push(
+        "reflink_successes",
+        Value::int(checkpoint.reflink_successes as i64, span),
+    );
     record.push("root_path", Value::string(checkpoint.root_path, span));
     Ok(Value::record(record, span))
 }
@@ -222,6 +232,16 @@ pub(crate) fn env_checkpoints(
             record.push(
                 "create_duration_ms",
                 Value::int(checkpoint.create_duration_ms as i64, span),
+            );
+            record.push("copy_files", Value::int(checkpoint.copy_files as i64, span));
+            record.push("copy_bytes", Value::int(checkpoint.copy_bytes as i64, span));
+            record.push(
+                "reflink_attempts",
+                Value::int(checkpoint.reflink_attempts as i64, span),
+            );
+            record.push(
+                "reflink_successes",
+                Value::int(checkpoint.reflink_successes as i64, span),
             );
             Value::record(record, span)
         })
