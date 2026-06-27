@@ -100,8 +100,20 @@ pub(crate) fn env_checkpoint(reason: String) -> Result<Value, ShellError> {
         Value::int(checkpoint.created_at_ms as i64, span),
     );
     record.push(
+        "discarded_at_ms",
+        if checkpoint.has_discarded_at_ms {
+            Value::int(checkpoint.discarded_at_ms as i64, span)
+        } else {
+            Value::nothing(span)
+        },
+    );
+    record.push(
         "storage_bytes",
         Value::int(checkpoint.storage_bytes as i64, span),
+    );
+    record.push(
+        "create_duration_ms",
+        Value::int(checkpoint.create_duration_ms as i64, span),
     );
     record.push("root_path", Value::string(checkpoint.root_path, span));
     Ok(Value::record(record, span))
@@ -136,6 +148,18 @@ pub(crate) fn env_restore_checkpoint(checkpoint: String) -> Result<Value, ShellE
         "terminated_runs",
         Value::int(restore.terminated_runs as i64, span),
     );
+    record.push(
+        "terminated_run_ids",
+        Value::list(
+            restore
+                .terminated_run_ids
+                .into_iter()
+                .map(|run_id| Value::string(run_id, span))
+                .collect(),
+            span,
+        ),
+    );
+    record.push("duration_ms", Value::int(restore.duration_ms as i64, span));
     if let Some(diff) = restore.diff {
         record.push("clean", Value::bool(diff.clean, span));
         record.push("env_diff", Value::string(diff.text, span));
@@ -173,8 +197,20 @@ pub(crate) fn env_checkpoints(
             record.push("retention", Value::string(checkpoint.retention, span));
             record.push("reason", Value::string(checkpoint.reason, span));
             record.push(
+                "discarded_at_ms",
+                if checkpoint.has_discarded_at_ms {
+                    Value::int(checkpoint.discarded_at_ms as i64, span)
+                } else {
+                    Value::nothing(span)
+                },
+            );
+            record.push(
                 "storage_bytes",
                 Value::int(checkpoint.storage_bytes as i64, span),
+            );
+            record.push(
+                "create_duration_ms",
+                Value::int(checkpoint.create_duration_ms as i64, span),
             );
             Value::record(record, span)
         })
