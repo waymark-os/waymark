@@ -381,6 +381,18 @@ class GatewayMcp:
             "stderr": bound_text(result.get("stderr"), 600),
             "stdout": bound_text(result.get("stdout"), 600),
         }
+        for field in ("checkpoint", "source_tx", "branch_tx", "dry_run", "rolled_back", "retained"):
+            if field in result:
+                record[field] = result[field]
+        for result_field, trace_field in (
+            ("source_rollback", "source_rollback_ok"),
+            ("branch_rollback", "branch_rollback_ok"),
+            ("checkpoint_cleanup", "checkpoint_cleanup_ok"),
+            ("dry_run_cleanup", "dry_run_cleanup_ok"),
+        ):
+            nested = result.get(result_field)
+            if isinstance(nested, dict):
+                record[trace_field] = bool(nested.get("ok"))
         with self.trace.open("a", encoding="utf-8") as file:
             file.write(json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n")
 

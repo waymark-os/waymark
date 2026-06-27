@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -103,6 +105,41 @@ class GatewayMcpTests(unittest.TestCase):
         self.assertTrue(result["retained"])
         self.assertIn("--keep-tx", rpc.calls[2][1])
         self.assertNotIn(("env.checkpoint_discard", ("--checkpoint", "cp-dry", "--force")), rpc.calls)
+
+    def test_trace_call_records_checkpoint_branch_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "trace.jsonl"
+            mcp = server.GatewayMcp(FakeRpc(), trace)  # type: ignore[arg-type]
+
+            mcp.trace_call(
+                "stone_call",
+                {"workspace": "repo", "dry_run": True, "argv": ["true"]},
+                {
+                    "ok": True,
+                    "exit_code": 0,
+                    "dry_run": True,
+                    "checkpoint": "cp-dry",
+                    "source_tx": "tx-source",
+                    "branch_tx": "tx-branch",
+                    "rolled_back": True,
+                    "retained": False,
+                    "source_rollback": {"ok": True, "stdout": "rolled_back\n"},
+                    "checkpoint_cleanup": {"ok": True, "stdout": "discarded\n"},
+                },
+                17,
+            )
+
+            record = json.loads(trace.read_text().strip())
+
+        self.assertEqual(record["tool"], "stone_call")
+        self.assertTrue(record["dry_run"])
+        self.assertEqual(record["checkpoint"], "cp-dry")
+        self.assertEqual(record["source_tx"], "tx-source")
+        self.assertEqual(record["branch_tx"], "tx-branch")
+        self.assertTrue(record["rolled_back"])
+        self.assertFalse(record["retained"])
+        self.assertTrue(record["source_rollback_ok"])
+        self.assertTrue(record["checkpoint_cleanup_ok"])
 
 
 if __name__ == "__main__":
