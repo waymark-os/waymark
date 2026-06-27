@@ -127,6 +127,7 @@ TOOLS: list[dict[str, Any]] = [
                 "checkpoint": {"type": "string"},
                 "workspace": {"type": "string"},
                 "dry_run": {"type": "boolean"},
+                "keep_tx": {"type": "boolean"},
                 "image": {"type": "string"},
                 "container": {"type": "string"},
                 "argv": {"type": "array", "items": {"type": "string"}},
@@ -531,6 +532,8 @@ class GatewayMcp:
                 add_optional(call_args, args, "stdin", "--stdin")
                 if args.get("timeout_ms") is not None:
                     call_args.extend(["--timeout-ms", str(args["timeout_ms"])])
+                if args.get("keep_tx"):
+                    call_args.append("--keep-tx")
                 add_read_only_mounts(call_args, args)
                 env = args.get("env")
                 if isinstance(env, dict):
@@ -543,13 +546,55 @@ class GatewayMcp:
                     **result,
                     "dry_run": True,
                     "checkpoint": args["checkpoint"],
+                    "branch_tx": field_from_stdout(result.get("stdout", ""), "tx"),
                     "rolled_back": result.get("ok") and "rolled_back\ttrue" in result.get("stdout", ""),
+                    "retained": result.get("ok") and "rolled_back\ttrue" not in result.get("stdout", ""),
                 }
             workspace = required(args, "workspace")
             snapshot = self.rpc.call("env.snapshot", ["--workspace", workspace])
             tx = parse_tx(snapshot["stdout"])
             if not tx:
                 return {**snapshot, "error": "dry-run env.snapshot did not return a tx"}
+            checkpoint_result = self.rpc.call(
+                "env.checkpoint",
+                ["--tx", tx, "--reason", "stone_call dry-run baseline"],
+            )
+            checkpoint = field_from_stdout(checkpoint_result.get("stdout", ""), "checkpoint")
+            if not checkpoint:
+                checkpoint = checkpoint_result.get("stdout", "").strip()
+            if not checkpoint_result.get("ok") or not checkpoint:
+                cleanup = self.rpc.call("env.rollback", ["--tx", tx])
+                return {
+                    **checkpoint_result,
+                    "dry_run": True,
+                    "workspace": workspace,
+                    "source_tx": tx,
+                    "rolled_back": False,
+                    "retained": False,
+                    "source_rollback": cleanup,
+                    "error": "dry-run env.checkpoint did not return a checkpoint",
+                }
+            args = {**args, "checkpoint": checkpoint}
+            result = self.stone_call(args)
+            cleanup = self.rpc.call("env.rollback", ["--tx", tx])
+            result = {
+                **result,
+                "workspace": workspace,
+                "source_tx": tx,
+                "checkpoint": checkpoint,
+                "source_rollback": cleanup,
+            }
+            if not args.get("keep_tx"):
+                checkpoint_cleanup = self.rpc.call(
+                    "env.checkpoint_discard",
+                    ["--checkpoint", checkpoint, "--force"],
+                )
+                result["checkpoint_cleanup"] = checkpoint_cleanup
+                if not checkpoint_cleanup.get("ok"):
+                    result["ok"] = False
+            if not cleanup.get("ok"):
+                result["ok"] = False
+            return result
         elif not tx:
             raise ValueError("stone_call requires tx unless dry_run is true")
 
@@ -621,6 +666,14 @@ def parse_tx(stdout: str) -> str | None:
         if len(parts) == 2 and parts[0] == "tx":
             return parts[1]
     return None
+
+
+def field_from_stdout(stdout: str, field: str) -> str:
+    prefix = f"{field}\t"
+    for line in stdout.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix) :]
+    return ""
 
 
 def decorate_gateway_result(method: str, result: dict[str, Any]) -> dict[str, Any]:
