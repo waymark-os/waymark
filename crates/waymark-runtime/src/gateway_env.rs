@@ -97,6 +97,10 @@ pub(crate) fn env_checkpoint(reason: String) -> Result<Value, ShellError> {
         "parent_checkpoint",
         Value::string(checkpoint.parent_checkpoint, span),
     );
+    record.push(
+        "child_count",
+        Value::int(checkpoint.child_count as i64, span),
+    );
     record.push("reason", Value::string(checkpoint.reason, span));
     record.push(
         "created_at_ms",
@@ -195,6 +199,10 @@ pub(crate) fn env_checkpoints(
             record.push(
                 "parent_checkpoint",
                 Value::string(checkpoint.parent_checkpoint, span),
+            );
+            record.push(
+                "child_count",
+                Value::int(checkpoint.child_count as i64, span),
             );
             record.push("status", Value::string(checkpoint.status, span));
             record.push("retention", Value::string(checkpoint.retention, span));
