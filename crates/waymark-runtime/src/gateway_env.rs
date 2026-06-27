@@ -249,6 +249,49 @@ pub(crate) fn env_checkpoints(
     Ok(Value::list(checkpoints, span))
 }
 
+pub(crate) fn env_checkpoint_gc() -> Result<Value, ShellError> {
+    let config = required_config()?;
+    let gc = with_client(&config, |client| client.env_checkpoint_gc())?;
+    let span = Span::unknown();
+    let entries = gc
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let mut record = Record::new();
+            record.push("checkpoint", Value::string(entry.checkpoint, span));
+            record.push("kind", Value::string(entry.kind, span));
+            record.push("path", Value::string(entry.path, span));
+            record.push(
+                "storage_bytes",
+                Value::int(entry.storage_bytes as i64, span),
+            );
+            record.push("reason", Value::string(entry.reason, span));
+            Value::record(record, span)
+        })
+        .collect();
+    let mut record = Record::new();
+    record.push(
+        "checkpoint_count",
+        Value::int(gc.checkpoint_count as i64, span),
+    );
+    record.push("active_count", Value::int(gc.active_count as i64, span));
+    record.push(
+        "discarded_count",
+        Value::int(gc.discarded_count as i64, span),
+    );
+    record.push("retained_count", Value::int(gc.retained_count as i64, span));
+    record.push(
+        "active_payload_bytes",
+        Value::int(gc.active_payload_bytes as i64, span),
+    );
+    record.push(
+        "reclaimable_bytes",
+        Value::int(gc.reclaimable_bytes as i64, span),
+    );
+    record.push("entries", Value::list(entries, span));
+    Ok(Value::record(record, span))
+}
+
 pub(crate) fn env_discard_checkpoint(checkpoint: String, force: bool) -> Result<Value, ShellError> {
     let config = required_config()?;
     let discard = with_client(&config, |client| {

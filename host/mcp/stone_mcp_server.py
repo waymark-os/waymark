@@ -312,6 +312,12 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "effects": ["read_env", "read_file"],
         "example": "checkpoints = env_checkpoints()",
     },
+    "env_checkpoint_gc": {
+        "name": "env_checkpoint_gc",
+        "signature": "env_checkpoint_gc() -> record",
+        "effects": ["read_env", "read_file"],
+        "example": "gc = env_checkpoint_gc()",
+    },
     "env_discard_checkpoint": {
         "name": "env_discard_checkpoint",
         "signature": "env_discard_checkpoint(checkpoint: str, force: bool = False) -> record",
@@ -514,6 +520,7 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
     "env_fork": ("checkpoint",),
     "env_restore_checkpoint": ("checkpoint",),
     "env_checkpoints": ("workspace", "include_discarded"),
+    "env_checkpoint_gc": (),
     "env_discard_checkpoint": ("checkpoint", "force"),
     "env_run_checkpoint": (
         "checkpoint",
@@ -565,6 +572,7 @@ Stone_CALL_ALIASES: dict[str, str] = {
 
 Stone_ONE_POSITIONAL_THEN_KEYWORDS = {
     "env_checkpoint",
+    "env_checkpoint_gc",
     "env_checkpoints",
     "env_commit",
     "env_discard_checkpoint",
@@ -2159,6 +2167,7 @@ BLIND_STONE_CALLS = {
     "env_diff",
     "env_restore",
     "env_checkpoint",
+    "env_checkpoint_gc",
     "env_fork",
     "env_restore_checkpoint",
     "env_checkpoints",
@@ -2217,6 +2226,7 @@ def hidden_blind_source(source: str) -> bool:
         "env_diff",
         "env_restore",
         "env_checkpoint",
+        "env_checkpoint_gc",
         "env_fork",
         "env_restore_checkpoint",
         "env_checkpoints",

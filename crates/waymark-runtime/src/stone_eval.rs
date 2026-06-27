@@ -1865,6 +1865,7 @@ impl Evaluator<'_> {
             "env_fork" => self.eval_env_fork_call(call),
             "env_restore_checkpoint" => self.eval_env_restore_checkpoint_call(call),
             "env_checkpoints" => self.eval_env_checkpoints_call(call),
+            "env_checkpoint_gc" => self.eval_env_checkpoint_gc_call(call),
             "env_discard_checkpoint" => self.eval_env_discard_checkpoint_call(call),
             "env_run_checkpoint" => self.eval_env_run_checkpoint_call(call),
             "env_commit" => self.eval_env_commit_call(call),
@@ -3961,6 +3962,17 @@ impl Evaluator<'_> {
         gateway_env::env_checkpoints(workspace, include_discarded).map(RuntimeValue::Nu)
     }
 
+    fn eval_env_checkpoint_gc_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if !positional.is_empty() || !named.is_empty() {
+            return Err(stone_error(
+                "env_checkpoint_gc",
+                "env_checkpoint_gc() does not accept arguments",
+            ));
+        }
+        gateway_env::env_checkpoint_gc().map(RuntimeValue::Nu)
+    }
+
     fn eval_env_discard_checkpoint_call(
         &mut self,
         call: &Call,
@@ -5415,6 +5427,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "echo",
     "emit",
     "env_checkpoint",
+    "env_checkpoint_gc",
     "env_checkpoints",
     "env_commit",
     "env_discard_checkpoint",

@@ -802,6 +802,14 @@ if not info.ok:
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "env_checkpoint_gc",
+        signature: "env_checkpoint_gc() -> record",
+        use_when: "Use in Gateway mode to inspect checkpoint storage reachability and reclaimable orphan payloads without deleting anything.",
+        examples: &[r#"gc = env_checkpoint_gc()"#],
+        avoid: &["Do not treat this as cleanup; it reports candidates only."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "env_discard_checkpoint",
         signature: "env_discard_checkpoint(checkpoint: str, force: bool = False) -> record",
         use_when: "Use in Gateway mode to discard an unneeded checkpoint branch.",
