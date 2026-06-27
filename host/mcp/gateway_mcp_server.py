@@ -222,6 +222,10 @@ TOOLS: list[dict[str, Any]] = [
                 "checkpoint": {"type": "string"},
                 "image": {"type": "string"},
                 "argv": {"type": "array", "items": {"type": "string"}},
+                "keep_tx": {
+                    "type": "boolean",
+                    "description": "Keep the forked transaction open instead of rolling it back.",
+                },
                 "workspace_mount": {"type": "string"},
                 "read_only_mounts": {
                     "type": "array",
@@ -451,6 +455,8 @@ class GatewayMcp:
             add_optional(call_args, args, "stdin", "--stdin")
             if args.get("timeout_ms") is not None:
                 call_args.extend(["--timeout-ms", str(args["timeout_ms"])])
+            if args.get("keep_tx"):
+                call_args.append("--keep-tx")
             add_read_only_mounts(call_args, args)
             for key, value in sorted(dict(args.get("env", {})).items()):
                 call_args.extend(["--env", f"{key}={value}"])

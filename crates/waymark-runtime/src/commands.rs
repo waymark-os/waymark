@@ -819,11 +819,14 @@ if not info.ok:
     },
     StoneHelpEntry {
         name: "env_run_checkpoint",
-        signature: r#"env_run_checkpoint(checkpoint: str, image: str, argv: list[str], workspace_mount: str = "/app", workdir: str = "/app", timeout_ms: int = 300000, env: record? = None, stdin: str = "", user: str = "") -> record"#,
-        use_when: "Use in Gateway mode to fork a checkpoint into an ephemeral branch, run a Linux command there, inspect output and diff, and automatically roll the branch back.",
-        examples: &[r#"result = env_run_checkpoint(cp.checkpoint, "python:3.12-slim", ["python", "-c", "print('ok')"])"#],
+        signature: r#"env_run_checkpoint(checkpoint: str, image: str, argv: list[str], workspace_mount: str = "/app", workdir: str = "/app", timeout_ms: int = 300000, env: record? = None, stdin: str = "", user: str = "", keep_tx: bool = False) -> record"#,
+        use_when: "Use in Gateway mode to fork a checkpoint into a branch, run a Linux command there, inspect output and diff, and roll the branch back unless keep_tx is true.",
+        examples: &[
+            r#"result = env_run_checkpoint(cp.checkpoint, "python:3.12-slim", ["python", "-c", "print('ok')"])"#,
+            r#"debug = env_run_checkpoint(cp.checkpoint, "python:3.12-slim", ["pytest", "-q"], keep_tx=True)"#,
+        ],
         avoid: &[
-            "Do not use this as a commit; it always rolls back the branch.",
+            "Do not use retained branches as commits; commit intended final changes explicitly.",
             "Do not use hidden benchmark verifier output as stock pass@1 feedback.",
         ],
         aliases: &[],

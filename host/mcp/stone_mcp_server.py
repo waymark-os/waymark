@@ -326,7 +326,7 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
     },
     "env_run_checkpoint": {
         "name": "env_run_checkpoint",
-        "signature": "env_run_checkpoint(checkpoint: str, image: str, argv: list[str], workspace_mount: str = '/app', workdir: str = '/app', timeout_ms: int = 300000, env: record? = None, stdin: str = '', user: str = '') -> record",
+        "signature": "env_run_checkpoint(checkpoint: str, image: str, argv: list[str], workspace_mount: str = '/app', workdir: str = '/app', timeout_ms: int = 300000, env: record? = None, stdin: str = '', user: str = '', keep_tx: bool = False) -> record",
         "effects": ["process", "read_file", "write_file", "remove_file"],
         "example": 'result = env_run_checkpoint(cp.checkpoint, "python:3.12-slim", ["python", "-c", "print(\'ok\')"])',
     },
@@ -532,6 +532,7 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
         "env",
         "stdin",
         "user",
+        "keep_tx",
     ),
     "env_commit": ("message", "allow_risky"),
     "env_rollback": (),

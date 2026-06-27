@@ -352,6 +352,7 @@ pub(crate) fn env_run_checkpoint(
     user: String,
     stdin: String,
     timeout_ms: u64,
+    keep_tx: bool,
 ) -> Result<Value, ShellError> {
     let config = required_config()?;
     let run = with_client(&config, |client| {
@@ -366,6 +367,7 @@ pub(crate) fn env_run_checkpoint(
             stdin: stdin.clone(),
             timeout_ms,
             read_only_mounts: Vec::new(),
+            keep_tx,
         })
     })?;
     let span = Span::unknown();

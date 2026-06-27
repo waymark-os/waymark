@@ -4069,6 +4069,7 @@ impl Evaluator<'_> {
         let mut user = String::new();
         let mut stdin = String::new();
         let mut timeout_ms = 300_000_u64;
+        let mut keep_tx = false;
         for (name, value) in named {
             match name.as_str() {
                 "checkpoint" => {
@@ -4094,6 +4095,7 @@ impl Evaluator<'_> {
                         ));
                     }
                 }
+                "keep_tx" => keep_tx = value_to_bool(&value, "env_run_checkpoint keep_tx")?,
                 other => {
                     return Err(stone_error(
                         "env_run_checkpoint",
@@ -4124,6 +4126,7 @@ impl Evaluator<'_> {
             user,
             stdin,
             timeout_ms,
+            keep_tx,
         )
         .map(RuntimeValue::Nu)
     }
