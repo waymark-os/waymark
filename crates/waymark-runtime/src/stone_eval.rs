@@ -3964,13 +3964,29 @@ impl Evaluator<'_> {
 
     fn eval_env_checkpoint_gc_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let (positional, named) = self.eval_call_values(call)?;
-        if !positional.is_empty() || !named.is_empty() {
+        if positional.len() > 1 {
             return Err(stone_error(
                 "env_checkpoint_gc",
-                "env_checkpoint_gc() does not accept arguments",
+                "env_checkpoint_gc() accepts at most one apply argument",
             ));
         }
-        gateway_env::env_checkpoint_gc().map(RuntimeValue::Nu)
+        let mut apply = positional
+            .first()
+            .map(|value| value_to_bool(value, "env_checkpoint_gc apply"))
+            .transpose()?
+            .unwrap_or(false);
+        for (name, value) in named {
+            match name.as_str() {
+                "apply" => apply = value_to_bool(&value, "env_checkpoint_gc apply")?,
+                _ => {
+                    return Err(stone_error(
+                        "env_checkpoint_gc",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        gateway_env::env_checkpoint_gc(apply).map(RuntimeValue::Nu)
     }
 
     fn eval_env_discard_checkpoint_call(

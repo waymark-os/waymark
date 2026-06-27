@@ -803,10 +803,10 @@ if not info.ok:
     },
     StoneHelpEntry {
         name: "env_checkpoint_gc",
-        signature: "env_checkpoint_gc() -> record",
-        use_when: "Use in Gateway mode to inspect checkpoint storage reachability and reclaimable orphan payloads without deleting anything.",
-        examples: &[r#"gc = env_checkpoint_gc()"#],
-        avoid: &["Do not treat this as cleanup; it reports candidates only."],
+        signature: "env_checkpoint_gc(apply: bool = False) -> record",
+        use_when: "Use in Gateway mode to inspect checkpoint storage reachability, or remove reclaimable orphan payloads only when apply is true.",
+        examples: &[r#"gc = env_checkpoint_gc()"#, r#"env_checkpoint_gc(apply=True)"#],
+        avoid: &["Do not pass apply=True without reviewing the dry-run entries first."],
         aliases: &[],
     },
     StoneHelpEntry {

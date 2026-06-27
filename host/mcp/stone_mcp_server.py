@@ -314,8 +314,8 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
     },
     "env_checkpoint_gc": {
         "name": "env_checkpoint_gc",
-        "signature": "env_checkpoint_gc() -> record",
-        "effects": ["read_env", "read_file"],
+        "signature": "env_checkpoint_gc(apply: bool = False) -> record",
+        "effects": ["read_env", "read_file", "remove_file"],
         "example": "gc = env_checkpoint_gc()",
     },
     "env_discard_checkpoint": {
@@ -520,7 +520,7 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
     "env_fork": ("checkpoint",),
     "env_restore_checkpoint": ("checkpoint",),
     "env_checkpoints": ("workspace", "include_discarded"),
-    "env_checkpoint_gc": (),
+    "env_checkpoint_gc": ("apply",),
     "env_discard_checkpoint": ("checkpoint", "force"),
     "env_run_checkpoint": (
         "checkpoint",

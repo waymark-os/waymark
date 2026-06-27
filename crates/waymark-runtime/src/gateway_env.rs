@@ -249,9 +249,9 @@ pub(crate) fn env_checkpoints(
     Ok(Value::list(checkpoints, span))
 }
 
-pub(crate) fn env_checkpoint_gc() -> Result<Value, ShellError> {
+pub(crate) fn env_checkpoint_gc(apply: bool) -> Result<Value, ShellError> {
     let config = required_config()?;
-    let gc = with_client(&config, |client| client.env_checkpoint_gc())?;
+    let gc = with_client(&config, |client| client.env_checkpoint_gc(apply))?;
     let span = Span::unknown();
     let entries = gc
         .entries
@@ -270,6 +270,7 @@ pub(crate) fn env_checkpoint_gc() -> Result<Value, ShellError> {
         })
         .collect();
     let mut record = Record::new();
+    record.push("applied", Value::bool(gc.applied, span));
     record.push(
         "checkpoint_count",
         Value::int(gc.checkpoint_count as i64, span),
@@ -288,6 +289,11 @@ pub(crate) fn env_checkpoint_gc() -> Result<Value, ShellError> {
         "reclaimable_bytes",
         Value::int(gc.reclaimable_bytes as i64, span),
     );
+    record.push(
+        "deleted_entries",
+        Value::int(gc.deleted_entries as i64, span),
+    );
+    record.push("deleted_bytes", Value::int(gc.deleted_bytes as i64, span));
     record.push("entries", Value::list(entries, span));
     Ok(Value::record(record, span))
 }

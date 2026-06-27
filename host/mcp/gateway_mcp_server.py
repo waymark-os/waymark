@@ -208,7 +208,9 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Report checkpoint storage reachability and reclaimable orphan payloads without deleting anything.",
         "inputSchema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "apply": {"type": "boolean"},
+            },
         },
     },
     {
@@ -431,7 +433,10 @@ class GatewayMcp:
                 call_args.append("--force")
             return self.rpc.call("env.checkpoint_discard", call_args)
         if name in {"checkpoint_gc", "env_checkpoint_gc"}:
-            return self.rpc.call("env.checkpoint_gc", [])
+            call_args: list[str] = []
+            if args.get("apply"):
+                call_args.append("--apply")
+            return self.rpc.call("env.checkpoint_gc", call_args)
         if name in {"run_checkpoint", "env_run_checkpoint"}:
             call_args = [
                 "--checkpoint",
