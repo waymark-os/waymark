@@ -276,6 +276,12 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "example": "changes = env_diff(sample_limit=50)",
         "alias_for": "env_state",
     },
+    "env_tx_info": {
+        "name": "env_tx_info",
+        "signature": "env_tx_info(tx: str = '') -> record",
+        "effects": ["read_env"],
+        "example": "info = env_tx_info()",
+    },
     "env_finish": {
         "name": "env_finish",
         "signature": "env_finish() -> record",
@@ -514,6 +520,7 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
     "state": (),
     "env_state": ("sample_limit",),
     "env_diff": ("sample_limit",),
+    "env_tx_info": ("tx",),
     "env_finish": (),
     "env_restore": ("paths",),
     "env_checkpoint": ("reason",),
@@ -2166,6 +2173,7 @@ TOOLS = [
 BLIND_STONE_CALLS = {
     "env_state",
     "env_diff",
+    "env_tx_info",
     "env_restore",
     "env_checkpoint",
     "env_checkpoint_gc",
@@ -2225,6 +2233,7 @@ def hidden_blind_source(source: str) -> bool:
     hidden = (
         "env_state",
         "env_diff",
+        "env_tx_info",
         "env_restore",
         "env_checkpoint",
         "env_checkpoint_gc",

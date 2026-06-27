@@ -753,6 +753,14 @@ if not info.ok:
         aliases: &["env_diff"],
     },
     StoneHelpEntry {
+        name: "env_tx_info",
+        signature: r#"env_tx_info(tx: str = "") -> record"#,
+        use_when: "Use in Gateway mode to inspect transaction metadata such as parent checkpoint and retained checkpoint-run purpose.",
+        examples: &[r#"info = env_tx_info()"#, r#"info = env_tx_info(debug.branch_tx)"#],
+        avoid: &["Do not infer retained branch lifecycle from path names; use structured metadata."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "env_finish",
         signature: "env_finish() -> record",
         use_when: "Use before the final answer in Gateway mode to verify the transaction is clean or already closed.",

@@ -1859,6 +1859,7 @@ impl Evaluator<'_> {
             "sys" | "sys_info" | "sysinfo" => self.eval_sys_call(call),
             "state" => self.eval_state_call(call),
             "env_state" | "env_diff" => self.eval_env_state_call(call),
+            "env_tx_info" => self.eval_env_tx_info_call(call),
             "env_finish" => self.eval_env_finish_call(call),
             "env_restore" => self.eval_env_restore_call(call),
             "env_checkpoint" => self.eval_env_checkpoint_call(call),
@@ -3864,6 +3865,33 @@ impl Evaluator<'_> {
         gateway_env::env_state(sample_limit).map(RuntimeValue::Nu)
     }
 
+    fn eval_env_tx_info_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 1 {
+            return Err(stone_error(
+                "env_tx_info",
+                "env_tx_info() accepts at most one tx argument",
+            ));
+        }
+        let mut tx = positional
+            .first()
+            .map(|value| value_to_string(value, "env_tx_info tx"))
+            .transpose()?
+            .unwrap_or_default();
+        for (name, value) in named {
+            match name.as_str() {
+                "tx" => tx = value_to_string(&value, "env_tx_info tx")?,
+                _ => {
+                    return Err(stone_error(
+                        "env_tx_info",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        gateway_env::env_tx_info(tx).map(RuntimeValue::Nu)
+    }
+
     fn eval_env_finish_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         if !call.positional.is_empty() || !call.named.is_empty() {
             return Err(stone_error("env_finish", "env_finish() takes no arguments"));
@@ -5458,6 +5486,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "env_run_checkpoint",
     "env_rollback",
     "env_state",
+    "env_tx_info",
     "fail",
     "filter",
     "find",

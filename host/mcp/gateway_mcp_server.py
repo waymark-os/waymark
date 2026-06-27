@@ -98,6 +98,15 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "tx_info",
+        "description": "Return Gateway transaction metadata, including retained checkpoint-run purpose.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"tx": {"type": "string"}},
+            "required": ["tx"],
+        },
+    },
+    {
         "name": "stone_call",
         "description": "Run a Linux command in the Gateway transaction view.",
         "inputSchema": {
@@ -405,6 +414,8 @@ class GatewayMcp:
         if name == "state":
             sample_limit = str(args.get("sample_limit", 50))
             return self.rpc.call("env.diff", ["--tx", required(args, "tx"), "--sample-limit", sample_limit])
+        if name in {"tx_info", "env_tx_info"}:
+            return self.rpc.call("env.tx_info", ["--tx", required(args, "tx")])
         if name in {"finish", "env_finish"}:
             return self.rpc.call("env.finish", ["--tx", required(args, "tx")])
         if name in {"restore", "env_restore"}:
