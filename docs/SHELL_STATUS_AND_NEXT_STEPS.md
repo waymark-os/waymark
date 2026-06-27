@@ -379,7 +379,7 @@ The first implementation can make rollback terminate or invalidate live runs
 rather than restore memory. The important bit is that this policy is explicit
 and visible to the agent.
 
-### 4. Hide snapshot work under model latency
+### 4. Hide Snapshot Work Under Model Latency
 
 DeltaBox schedules checkpoint work while the model is thinking. Waymark can do
 the same at the Gateway/shell layer:
@@ -392,6 +392,11 @@ the same at the Gateway/shell layer:
 
 This matters for TB-style evals because it gives the shell better safety
 without putting every checkpoint on the critical path.
+
+This remains a paper lesson, but it is not the next implementation target. The
+current Gateway work is intentionally staying synchronous until checkpoint
+branch lifecycle, retention, cleanup, and trace semantics are boring and easy to
+audit.
 
 ### 5. Add reachability-aware cleanup
 
@@ -516,8 +521,9 @@ Implemented eighth slice, 2026-06-26:
 - Gateway MCP `stone_call` can now use checkpoint-backed dry-runs:
   pass `dry_run: true` and `checkpoint: ...` to route through
   `env.run_checkpoint`.
-- The older workspace snapshot dry-run remains as a fallback when no checkpoint
-  is supplied.
+- At this point in the sequence, the older workspace snapshot dry-run remained
+  as a fallback when no checkpoint was supplied. Later slices replaced that
+  fallback with explicit checkpoint branches.
 - The sibling `../waymark` Gateway MCP forwarder exposes the same behavior over
   the protobuf RPC CLI.
 - Checkpoint-backed `stone_call` dry-run rejects attached containers for now,
@@ -622,6 +628,73 @@ Focused Harbor/TBv2.1 subset, 2026-06-26:
   official Harbor reward and Gateway checkpoint verifier agree, verifier
   branches roll back, and failures are now inspectable from summary/traces.
 
+Implemented thirteenth slice, 2026-06-27:
+
+- Gateway can list open transactions with optional `workspace` and `purpose`
+  filters.
+- Gateway CLI/RPC/protobuf/Rust client/MCP expose transaction discovery through
+  `env.tx_list` / `env list-tx`.
+- Waymark Shell exposes `env_txs(workspace="", purpose="")`, so retained
+  checkpoint-run branches can be discovered structurally instead of by parsing
+  transaction directories.
+- Transaction records include `parent_checkpoint`, `purpose`, and merged path
+  metadata needed to audit retained dry-run/debug branches.
+
+Implemented fourteenth slice, 2026-06-27:
+
+- Gateway MCP `stone_call dry_run=true` with a workspace now uses visible
+  checkpoint branches instead of the old hidden temporary transaction fallback.
+- Default lifecycle:
+  `env.snapshot -> env.checkpoint -> env.run_checkpoint -> rollback source tx
+  -> discard checkpoint`.
+- If the caller supplies `checkpoint`, the dry-run goes directly through
+  `env.run_checkpoint`.
+- `keep_tx=true` retains the checkpoint-run branch and returns `branch_tx`; the
+  branch is discoverable with `env_txs(purpose="checkpoint-run")`.
+- The sibling `../waymark` Gateway MCP RPC forwarder uses the same default
+  checkpoint-backed dry-run behavior for Docker/container agents.
+
+Implemented fifteenth slice, 2026-06-27:
+
+- Gateway MCP `stone_eval dry_run=true` now uses visible checkpoint branches.
+- Default lifecycle:
+  `env.snapshot -> env.checkpoint -> env.fork -> stone_eval(branch_tx) ->
+  rollback branch tx -> rollback source tx -> discard checkpoint`.
+- If the caller supplies `checkpoint`, Gateway MCP forks that checkpoint and
+  evaluates Stone in the forked branch.
+- `keep_tx=true` retains the eval branch and returns `branch_tx`; retained
+  branches can be inspected through `env_tx_info` / `env_txs`.
+- The old hidden temporary-transaction dry-run helper was removed from Gateway
+  MCP.
+
+Implemented sixteenth slice, 2026-06-27:
+
+- Gateway MCP traces now record checkpoint branch lifecycle fields for dry-runs:
+  `checkpoint`, `source_tx`, `branch_tx`, `dry_run`, `rolled_back`, and
+  `retained`.
+- Cleanup outcomes are summarized as booleans:
+  `source_rollback_ok`, `branch_rollback_ok`, and `checkpoint_cleanup_ok`.
+- The sibling `../waymark` Gateway MCP RPC forwarder records the same lifecycle
+  fields for container-agent traces.
+- Trace-derived checkpoint metrics now count result-backed dry-runs, not only
+  calls where a checkpoint id appeared in the original arguments.
+- Metrics include retained and rolled-back dry-run counts.
+
+Current non-async next candidates:
+
+1. Retention policy hardening: distinguish temporary dry-run checkpoints,
+   retained debug branches, and user-created checkpoints more explicitly.
+2. Dry-run ergonomics: expose a compact `dry_run_summary` record so agents can
+   inspect lifecycle and cleanup status without reading stdout/tabbed fields.
+3. Cleanup safety: make temporary checkpoint cleanup failures more explicit and
+   actionable in dry-run results and traces.
+
+Explicitly deferred:
+
+- Async checkpoint/diff preparation under model latency. Keep it as a paper
+  lesson, but do not implement it until synchronous branch lifecycle and cleanup
+  policy are stable.
+
 1. Formalize the vocabulary in the protocol and docs:
    `env.snapshot` is "open tx from generation"; a new `env.checkpoint` records
    the current tx state; `env.fork` opens a tx from a generation or checkpoint;
@@ -639,19 +712,21 @@ Focused Harbor/TBv2.1 subset, 2026-06-26:
    invalidated. The current tx cleanup behavior is a base to expose, not a
    complete contract.
 5. Continue converting MCP/Stone dry-run from one-off hidden transactions into
-   visible checkpoint branch operations. Gateway MCP `stone_call` supports this
-   when a checkpoint is supplied; Stone-native script dry-run and default
-   workspace dry-run still use the older temporary transaction path.
+   visible checkpoint branch operations. Completed for Gateway MCP `stone_call`
+   and `stone_eval` workspace dry-runs; both now expose checkpoint/source/branch
+   metadata and optional retained branches.
 6. Build benchmark verifier dry-run on top of `env.run_checkpoint`. A verifier
    attempt now has a diagnostic harness hook, metrics, and read-only test-volume
    support for image-backed checkpoint runs. The TB v1 development wrapper and
    Harbor/TBv2 adapter both feed the same generic verifier; remaining work is
    optional retained branches for debugging.
-7. Add async checkpoint/diff preparation after mutating operations so model
-   latency can hide Gateway bookkeeping and make `env_finish` cheap.
+7. Async checkpoint/diff preparation remains deferred. Do not start this until
+   retention policy, cleanup safety, and dry-run result ergonomics are stable.
 8. Add checkpoint metrics to TB harness output before using the mechanism for a
    larger score run: branch count, checkpoint/rollback latency, storage growth,
    terminated live runs, verifier attempts, and retained/discarded branches.
+   Partially complete: checkpoint-run calls, checkpoint-backed dry-runs, and
+   retained/rolled-back dry-runs are now trace-derived metrics.
 9. Defer DeltaCR-like process memory restore until filesystem and live-run
    semantics are correct. If later needed, integrate it behind the same Gateway
    checkpoint abstraction instead of exposing it as the agent contract.
