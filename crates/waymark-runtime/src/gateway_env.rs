@@ -75,6 +75,126 @@ pub(crate) fn env_restore(paths: Vec<String>) -> Result<Value, ShellError> {
     Ok(Value::record(record, span))
 }
 
+pub(crate) fn env_checkpoint(reason: String) -> Result<Value, ShellError> {
+    let config = required_config()?;
+    let checkpoint = with_client(&config, |client| {
+        client.env_checkpoint(&config.tx, reason.clone())
+    })?;
+    let span = Span::unknown();
+    let mut record = Record::new();
+    record.push("tx", Value::string(config.tx, span));
+    record.push("checkpoint", Value::string(checkpoint.checkpoint, span));
+    record.push("workspace", Value::string(checkpoint.workspace, span));
+    record.push(
+        "base_generation",
+        Value::string(checkpoint.base_generation, span),
+    );
+    record.push("source_tx", Value::string(checkpoint.source_tx, span));
+    record.push(
+        "parent_checkpoint",
+        Value::string(checkpoint.parent_checkpoint, span),
+    );
+    record.push("reason", Value::string(checkpoint.reason, span));
+    record.push(
+        "created_at_ms",
+        Value::int(checkpoint.created_at_ms as i64, span),
+    );
+    record.push(
+        "storage_bytes",
+        Value::int(checkpoint.storage_bytes as i64, span),
+    );
+    record.push("root_path", Value::string(checkpoint.root_path, span));
+    Ok(Value::record(record, span))
+}
+
+pub(crate) fn env_fork(checkpoint: String) -> Result<Value, ShellError> {
+    let config = required_config()?;
+    let fork = with_client(&config, |client| {
+        client.env_fork(checkpoint.clone(), "", "")
+    })?;
+    let span = Span::unknown();
+    let mut record = Record::new();
+    record.push("checkpoint", Value::string(checkpoint, span));
+    record.push("tx", Value::string(fork.tx, span));
+    record.push("workspace", Value::string(fork.workspace, span));
+    record.push("base_generation", Value::string(fork.base_generation, span));
+    record.push("provider", Value::string(fork.provider, span));
+    record.push("merged_path", Value::string(fork.merged_path, span));
+    Ok(Value::record(record, span))
+}
+
+pub(crate) fn env_restore_checkpoint(checkpoint: String) -> Result<Value, ShellError> {
+    let config = required_config()?;
+    let restore = with_client(&config, |client| {
+        client.env_restore_checkpoint(&config.tx, checkpoint.clone())
+    })?;
+    let span = Span::unknown();
+    let mut record = Record::new();
+    record.push("tx", Value::string(restore.tx, span));
+    record.push("checkpoint", Value::string(restore.checkpoint, span));
+    record.push(
+        "terminated_runs",
+        Value::int(restore.terminated_runs as i64, span),
+    );
+    if let Some(diff) = restore.diff {
+        record.push("clean", Value::bool(diff.clean, span));
+        record.push("env_diff", Value::string(diff.text, span));
+        record.push("json", json_text_value(&diff.json, span)?);
+    }
+    Ok(Value::record(record, span))
+}
+
+pub(crate) fn env_checkpoints(
+    workspace: String,
+    include_discarded: bool,
+) -> Result<Value, ShellError> {
+    let config = required_config()?;
+    let list = with_client(&config, |client| {
+        client.env_checkpoint_list(workspace.clone(), include_discarded)
+    })?;
+    let span = Span::unknown();
+    let checkpoints = list
+        .checkpoints
+        .into_iter()
+        .map(|checkpoint| {
+            let mut record = Record::new();
+            record.push("checkpoint", Value::string(checkpoint.checkpoint, span));
+            record.push("workspace", Value::string(checkpoint.workspace, span));
+            record.push(
+                "base_generation",
+                Value::string(checkpoint.base_generation, span),
+            );
+            record.push("source_tx", Value::string(checkpoint.source_tx, span));
+            record.push(
+                "parent_checkpoint",
+                Value::string(checkpoint.parent_checkpoint, span),
+            );
+            record.push("status", Value::string(checkpoint.status, span));
+            record.push("retention", Value::string(checkpoint.retention, span));
+            record.push("reason", Value::string(checkpoint.reason, span));
+            record.push(
+                "storage_bytes",
+                Value::int(checkpoint.storage_bytes as i64, span),
+            );
+            Value::record(record, span)
+        })
+        .collect();
+    Ok(Value::list(checkpoints, span))
+}
+
+pub(crate) fn env_discard_checkpoint(checkpoint: String, force: bool) -> Result<Value, ShellError> {
+    let config = required_config()?;
+    let discard = with_client(&config, |client| {
+        client.env_checkpoint_discard(checkpoint.clone(), force)
+    })?;
+    let span = Span::unknown();
+    let mut record = Record::new();
+    record.push("checkpoint", Value::string(discard.checkpoint, span));
+    record.push("discarded", Value::bool(true, span));
+    record.push("force", Value::bool(force, span));
+    Ok(Value::record(record, span))
+}
+
 pub(crate) fn env_commit(message: String, allow_risky: bool) -> Result<Value, ShellError> {
     let config = required_config()?;
     let effective_allow_risky = allow_risky || blind_agent_surface_enabled();

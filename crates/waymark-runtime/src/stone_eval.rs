@@ -1861,6 +1861,11 @@ impl Evaluator<'_> {
             "env_state" | "env_diff" => self.eval_env_state_call(call),
             "env_finish" => self.eval_env_finish_call(call),
             "env_restore" => self.eval_env_restore_call(call),
+            "env_checkpoint" => self.eval_env_checkpoint_call(call),
+            "env_fork" => self.eval_env_fork_call(call),
+            "env_restore_checkpoint" => self.eval_env_restore_checkpoint_call(call),
+            "env_checkpoints" => self.eval_env_checkpoints_call(call),
+            "env_discard_checkpoint" => self.eval_env_discard_checkpoint_call(call),
             "env_commit" => self.eval_env_commit_call(call),
             "env_rollback" => self.eval_env_rollback_call(call),
             "last_result" => self.eval_last_result_call(call),
@@ -3884,6 +3889,145 @@ impl Evaluator<'_> {
         gateway_env::env_restore(paths).map(RuntimeValue::Nu)
     }
 
+    fn eval_env_checkpoint_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 1 {
+            return Err(stone_error(
+                "env_checkpoint",
+                "env_checkpoint() accepts at most one reason argument",
+            ));
+        }
+        let mut reason = positional
+            .first()
+            .map(|value| value_to_string(value, "env_checkpoint reason"))
+            .transpose()?
+            .unwrap_or_default();
+        for (name, value) in named {
+            match name.as_str() {
+                "reason" => reason = value_to_string(&value, "env_checkpoint reason")?,
+                _ => {
+                    return Err(stone_error(
+                        "env_checkpoint",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        gateway_env::env_checkpoint(reason).map(RuntimeValue::Nu)
+    }
+
+    fn eval_env_fork_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let checkpoint = self.required_checkpoint_arg(call, "env_fork")?;
+        gateway_env::env_fork(checkpoint).map(RuntimeValue::Nu)
+    }
+
+    fn eval_env_restore_checkpoint_call(
+        &mut self,
+        call: &Call,
+    ) -> Result<RuntimeValue, ShellError> {
+        let checkpoint = self.required_checkpoint_arg(call, "env_restore_checkpoint")?;
+        gateway_env::env_restore_checkpoint(checkpoint).map(RuntimeValue::Nu)
+    }
+
+    fn eval_env_checkpoints_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 1 {
+            return Err(stone_error(
+                "env_checkpoints",
+                "env_checkpoints() accepts at most one workspace argument",
+            ));
+        }
+        let mut workspace = positional
+            .first()
+            .map(|value| value_to_string(value, "env_checkpoints workspace"))
+            .transpose()?
+            .unwrap_or_default();
+        let mut include_discarded = false;
+        for (name, value) in named {
+            match name.as_str() {
+                "workspace" => workspace = value_to_string(&value, "env_checkpoints workspace")?,
+                "include_discarded" => {
+                    include_discarded = value_to_bool(&value, "env_checkpoints include_discarded")?
+                }
+                _ => {
+                    return Err(stone_error(
+                        "env_checkpoints",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        gateway_env::env_checkpoints(workspace, include_discarded).map(RuntimeValue::Nu)
+    }
+
+    fn eval_env_discard_checkpoint_call(
+        &mut self,
+        call: &Call,
+    ) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 1 {
+            return Err(stone_error(
+                "env_discard_checkpoint",
+                "env_discard_checkpoint() accepts exactly one checkpoint argument",
+            ));
+        }
+        let mut checkpoint = positional
+            .first()
+            .map(|value| value_to_string(value, "env_discard_checkpoint checkpoint"))
+            .transpose()?;
+        let mut force = false;
+        for (name, value) in named {
+            match name.as_str() {
+                "checkpoint" => {
+                    checkpoint = Some(value_to_string(
+                        &value,
+                        "env_discard_checkpoint checkpoint",
+                    )?)
+                }
+                "force" => force = value_to_bool(&value, "env_discard_checkpoint force")?,
+                _ => {
+                    return Err(stone_error(
+                        "env_discard_checkpoint",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        let checkpoint = checkpoint
+            .ok_or_else(|| stone_error("env_discard_checkpoint", "missing checkpoint argument"))?;
+        gateway_env::env_discard_checkpoint(checkpoint, force).map(RuntimeValue::Nu)
+    }
+
+    fn required_checkpoint_arg(
+        &mut self,
+        call: &Call,
+        context: &str,
+    ) -> Result<String, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 1 {
+            return Err(stone_error(
+                context,
+                format!("{context}() accepts exactly one checkpoint argument"),
+            ));
+        }
+        let mut checkpoint = positional
+            .first()
+            .map(|value| value_to_string(value, context))
+            .transpose()?;
+        for (name, value) in named {
+            match name.as_str() {
+                "checkpoint" => checkpoint = Some(value_to_string(&value, context)?),
+                _ => {
+                    return Err(stone_error(
+                        context,
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        checkpoint.ok_or_else(|| stone_error(context, "missing checkpoint argument"))
+    }
+
     fn eval_env_commit_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let (positional, named) = self.eval_call_values(call)?;
         if positional.len() > 1 {
@@ -5168,10 +5312,15 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "edit_file",
     "echo",
     "emit",
+    "env_checkpoint",
+    "env_checkpoints",
     "env_commit",
+    "env_discard_checkpoint",
     "env_diff",
     "env_finish",
+    "env_fork",
     "env_restore",
+    "env_restore_checkpoint",
     "env_rollback",
     "env_state",
     "fail",

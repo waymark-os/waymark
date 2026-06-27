@@ -159,6 +159,22 @@ class StoneMcpServerTests(unittest.TestCase):
         self.assertEqual(response["structuredContent"]["value"]["len"], 30)
         self.assertIn("large_output", response["structuredContent"]["diagnostics"])
 
+    def test_blind_surface_hides_commit_and_finish_calls(self) -> None:
+        old_env = os.environ.copy()
+        try:
+            os.environ["WAYMARK_GATEWAY_AGENT_SURFACE"] = "blind"
+            backend = FakeBackend({"ok": True, "value": "should not run"})
+
+            for name in ("env_commit", "env_finish"):
+                result = server.stone_call(backend, name, {})
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["error"]["code"], "stone_call_hidden_blind_surface")
+            self.assertEqual(backend.calls, [])
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
     def test_tool_result_includes_advisory_runtime_status(self) -> None:
         old_env = os.environ.copy()
         try:
@@ -573,6 +589,18 @@ class StoneMcpServerTests(unittest.TestCase):
         self.assertTrue(wait_for["ok"], wait_for)
         self.assertEqual(wait_for["value"]["call_form"], "stone_eval")
 
+    def test_stone_signature_includes_checkpoint_helpers(self) -> None:
+        checkpoint = server.stone_signature("env_checkpoint")
+        fork = server.stone_signature("env_fork")
+        restore = server.stone_signature("env_restore_checkpoint")
+
+        self.assertTrue(checkpoint["ok"], checkpoint)
+        self.assertEqual(checkpoint["value"]["args"][0]["name"], "reason")
+        self.assertTrue(fork["ok"], fork)
+        self.assertEqual(fork["value"]["args"][0]["name"], "checkpoint")
+        self.assertTrue(restore["ok"], restore)
+        self.assertEqual(restore["value"]["args"][0]["name"], "checkpoint")
+
     def test_stone_call_generates_emit_wrapped_builtin_call(self) -> None:
         backend = FakeBackend()
 
@@ -581,6 +609,30 @@ class StoneMcpServerTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["effects"], {"reads": ["package.json"]})
         self.assertEqual(backend.calls, [('emit(read_json("/repo/package.json"))\n', None)])
+
+    def test_stone_call_supports_checkpoint_helpers(self) -> None:
+        backend = FakeBackend()
+
+        checkpoint = server.stone_call(backend, "env_checkpoint", {"reason": "before test"}, "/repo")
+        fork = server.stone_call(backend, "env_fork", {"checkpoint": "cp-1"}, "/repo")
+        restore = server.stone_call(
+            backend,
+            "env_restore_checkpoint",
+            {"checkpoint": "cp-1"},
+            "/repo",
+        )
+
+        self.assertTrue(checkpoint["ok"], checkpoint)
+        self.assertTrue(fork["ok"], fork)
+        self.assertTrue(restore["ok"], restore)
+        self.assertEqual(
+            backend.calls,
+            [
+                ('emit(env_checkpoint("before test"))\n', None),
+                ('emit(env_fork("cp-1"))\n', None),
+                ('emit(env_restore_checkpoint("cp-1"))\n', None),
+            ],
+        )
 
     def test_stone_call_supports_file_aliases(self) -> None:
         backend = FakeBackend()

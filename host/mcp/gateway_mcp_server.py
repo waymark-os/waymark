@@ -104,15 +104,29 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "tx": {"type": "string"},
+                "checkpoint": {"type": "string"},
                 "workspace": {"type": "string"},
                 "dry_run": {"type": "boolean"},
                 "image": {"type": "string"},
                 "container": {"type": "string"},
                 "argv": {"type": "array", "items": {"type": "string"}},
                 "workspace_mount": {"type": "string"},
+                "read_only_mounts": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "host_path": {"type": "string"},
+                            "container_path": {"type": "string"},
+                        },
+                        "required": ["host_path", "container_path"],
+                    },
+                },
                 "workdir": {"type": "string"},
                 "env": {"type": "object", "additionalProperties": {"type": "string"}},
                 "user": {"type": "string"},
+                "stdin": {"type": "string"},
+                "timeout_ms": {"type": "integer"},
             },
             "required": ["argv"],
         },
@@ -127,6 +141,96 @@ TOOLS: list[dict[str, Any]] = [
                 "paths": {"type": "array", "items": {"type": "string"}},
             },
             "required": ["tx", "paths"],
+        },
+    },
+    {
+        "name": "checkpoint",
+        "description": "Persist the current Gateway transaction state as a named checkpoint.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tx": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "required": ["tx"],
+        },
+    },
+    {
+        "name": "fork",
+        "description": "Open an independent Gateway transaction from a checkpoint.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "checkpoint": {"type": "string"},
+                "container": {"type": "string"},
+                "workspace_mount": {"type": "string"},
+            },
+            "required": ["checkpoint"],
+        },
+    },
+    {
+        "name": "restore_checkpoint",
+        "description": "Restore an open Gateway transaction to a named checkpoint.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tx": {"type": "string"},
+                "checkpoint": {"type": "string"},
+            },
+            "required": ["tx", "checkpoint"],
+        },
+    },
+    {
+        "name": "checkpoint_list",
+        "description": "List Gateway checkpoints.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string"},
+                "include_discarded": {"type": "boolean"},
+            },
+        },
+    },
+    {
+        "name": "checkpoint_discard",
+        "description": "Discard a Gateway checkpoint.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "checkpoint": {"type": "string"},
+                "force": {"type": "boolean"},
+            },
+            "required": ["checkpoint"],
+        },
+    },
+    {
+        "name": "run_checkpoint",
+        "description": "Fork a checkpoint, run a Linux command in the fork, return output plus diff, then roll the fork back.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "checkpoint": {"type": "string"},
+                "image": {"type": "string"},
+                "argv": {"type": "array", "items": {"type": "string"}},
+                "workspace_mount": {"type": "string"},
+                "read_only_mounts": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "host_path": {"type": "string"},
+                            "container_path": {"type": "string"},
+                        },
+                        "required": ["host_path", "container_path"],
+                    },
+                },
+                "workdir": {"type": "string"},
+                "env": {"type": "object", "additionalProperties": {"type": "string"}},
+                "user": {"type": "string"},
+                "stdin": {"type": "string"},
+                "timeout_ms": {"type": "integer"},
+            },
+            "required": ["checkpoint", "image", "argv"],
         },
     },
     {
@@ -291,6 +395,53 @@ class GatewayMcp:
             return self.rpc.call("env.finish", ["--tx", required(args, "tx")])
         if name in {"restore", "env_restore"}:
             return self.rpc.call("env.restore", ["--tx", required(args, "tx"), *string_list(args.get("paths"))])
+        if name in {"checkpoint", "env_checkpoint"}:
+            call_args = ["--tx", required(args, "tx")]
+            if args.get("reason"):
+                call_args.extend(["--reason", str(args["reason"])])
+            return self.rpc.call("env.checkpoint", call_args)
+        if name in {"fork", "env_fork"}:
+            call_args = ["--checkpoint", required(args, "checkpoint")]
+            if args.get("container"):
+                call_args.extend(["--container", str(args["container"])])
+                call_args.extend(["--workspace-mount", str(args.get("workspace_mount", "/app"))])
+            return self.rpc.call("env.fork", call_args)
+        if name in {"restore_checkpoint", "env_restore_checkpoint"}:
+            return self.rpc.call(
+                "env.restore_checkpoint",
+                ["--tx", required(args, "tx"), "--checkpoint", required(args, "checkpoint")],
+            )
+        if name in {"checkpoint_list", "env_checkpoint_list"}:
+            call_args: list[str] = []
+            add_optional(call_args, args, "workspace", "--workspace")
+            if args.get("include_discarded"):
+                call_args.append("--include-discarded")
+            return self.rpc.call("env.checkpoint_list", call_args)
+        if name in {"checkpoint_discard", "env_checkpoint_discard"}:
+            call_args = ["--checkpoint", required(args, "checkpoint")]
+            if args.get("force"):
+                call_args.append("--force")
+            return self.rpc.call("env.checkpoint_discard", call_args)
+        if name in {"run_checkpoint", "env_run_checkpoint"}:
+            call_args = [
+                "--checkpoint",
+                required(args, "checkpoint"),
+                "--image",
+                required(args, "image"),
+                "--workspace-mount",
+                str(args.get("workspace_mount", "/app")),
+            ]
+            add_optional(call_args, args, "workdir", "--workdir")
+            add_optional(call_args, args, "user", "--user")
+            add_optional(call_args, args, "stdin", "--stdin")
+            if args.get("timeout_ms") is not None:
+                call_args.extend(["--timeout-ms", str(args["timeout_ms"])])
+            add_read_only_mounts(call_args, args)
+            for key, value in sorted(dict(args.get("env", {})).items()):
+                call_args.extend(["--env", f"{key}={value}"])
+            call_args.append("--")
+            call_args.extend(string_list(args.get("argv")))
+            return self.rpc.call("env.run_checkpoint", call_args)
         if name in {"rollback", "env_rollback"}:
             return self.rpc.call("env.rollback", ["--tx", required(args, "tx")])
         if name in {"commit", "env_commit"}:
@@ -309,6 +460,43 @@ class GatewayMcp:
         tx = args.get("tx")
         cleanup: dict[str, Any] | None = None
         if dry_run:
+            if args.get("checkpoint"):
+                if args.get("container"):
+                    return {
+                        "ok": False,
+                        "stdout": "",
+                        "stderr": "checkpoint dry-run does not support attached containers yet",
+                        "exit_code": 2,
+                        "dry_run": True,
+                        "checkpoint": args["checkpoint"],
+                    }
+                call_args = [
+                    "--checkpoint",
+                    required(args, "checkpoint"),
+                    "--image",
+                    required(args, "image"),
+                    "--workspace-mount",
+                    str(args.get("workspace_mount", "/app")),
+                ]
+                add_optional(call_args, args, "workdir", "--workdir")
+                add_optional(call_args, args, "user", "--user")
+                add_optional(call_args, args, "stdin", "--stdin")
+                if args.get("timeout_ms") is not None:
+                    call_args.extend(["--timeout-ms", str(args["timeout_ms"])])
+                add_read_only_mounts(call_args, args)
+                env = args.get("env")
+                if isinstance(env, dict):
+                    for key, value in sorted(env.items()):
+                        call_args.extend(["--env", f"{key}={value}"])
+                call_args.append("--")
+                call_args.extend(string_list(args.get("argv")))
+                result = self.rpc.call("env.run_checkpoint", call_args)
+                return {
+                    **result,
+                    "dry_run": True,
+                    "checkpoint": args["checkpoint"],
+                    "rolled_back": result.get("ok") and "rolled_back\ttrue" in result.get("stdout", ""),
+                }
             workspace = required(args, "workspace")
             snapshot = self.rpc.call("env.snapshot", ["--workspace", workspace])
             tx = parse_tx(snapshot["stdout"])
@@ -333,6 +521,10 @@ class GatewayMcp:
             call_args.extend(["--user", str(args["user"])])
         if args.get("stdin") is not None:
             call_args.extend(["--stdin", str(args["stdin"])])
+        if args.get("timeout_ms") is not None:
+            call_args.extend(["--timeout-ms", str(args["timeout_ms"])])
+        if not args.get("container"):
+            add_read_only_mounts(call_args, args)
         env = args.get("env")
         if isinstance(env, dict):
             for key, value in sorted(env.items()):
@@ -363,6 +555,16 @@ def add_optional(call_args: list[str], args: dict[str, Any], name: str, flag: st
     value = args.get(name)
     if isinstance(value, str) and value:
         call_args.extend([flag, value])
+
+
+def add_read_only_mounts(call_args: list[str], args: dict[str, Any]) -> None:
+    for mount in args.get("read_only_mounts", []) or []:
+        call_args.extend(
+            [
+                "--read-only-mount",
+                f"{mount['host_path']}:{mount['container_path']}",
+            ]
+        )
 
 
 def parse_tx(stdout: str) -> str | None:

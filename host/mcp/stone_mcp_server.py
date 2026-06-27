@@ -288,6 +288,36 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "effects": ["write_file", "remove_file"],
         "example": 'env_restore(["tmp.txt", "build.log"])',
     },
+    "env_checkpoint": {
+        "name": "env_checkpoint",
+        "signature": "env_checkpoint(reason: str = '') -> record",
+        "effects": ["read_file", "write_file"],
+        "example": 'cp = env_checkpoint(reason="before verifier attempt")',
+    },
+    "env_fork": {
+        "name": "env_fork",
+        "signature": "env_fork(checkpoint: str) -> record",
+        "effects": ["write_file"],
+        "example": "branch = env_fork(cp.checkpoint)",
+    },
+    "env_restore_checkpoint": {
+        "name": "env_restore_checkpoint",
+        "signature": "env_restore_checkpoint(checkpoint: str) -> record",
+        "effects": ["write_file", "remove_file", "process"],
+        "example": "env_restore_checkpoint(cp.checkpoint)",
+    },
+    "env_checkpoints": {
+        "name": "env_checkpoints",
+        "signature": "env_checkpoints(workspace: str = '', include_discarded: bool = False) -> list[record]",
+        "effects": ["read_env", "read_file"],
+        "example": "checkpoints = env_checkpoints()",
+    },
+    "env_discard_checkpoint": {
+        "name": "env_discard_checkpoint",
+        "signature": "env_discard_checkpoint(checkpoint: str, force: bool = False) -> record",
+        "effects": ["remove_file"],
+        "example": "env_discard_checkpoint(cp.checkpoint)",
+    },
     "env_commit": {
         "name": "env_commit",
         "signature": "env_commit(message: str = 'agent commit', allow_risky: bool = False) -> record",
@@ -474,6 +504,11 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
     "env_diff": ("sample_limit",),
     "env_finish": (),
     "env_restore": ("paths",),
+    "env_checkpoint": ("reason",),
+    "env_fork": ("checkpoint",),
+    "env_restore_checkpoint": ("checkpoint",),
+    "env_checkpoints": ("workspace", "include_discarded"),
+    "env_discard_checkpoint": ("checkpoint", "force"),
     "env_commit": ("message", "allow_risky"),
     "env_rollback": (),
     "last_result": (),
@@ -512,7 +547,12 @@ Stone_CALL_ALIASES: dict[str, str] = {
 }
 
 Stone_ONE_POSITIONAL_THEN_KEYWORDS = {
+    "env_checkpoint",
+    "env_checkpoints",
     "env_commit",
+    "env_discard_checkpoint",
+    "env_fork",
+    "env_restore_checkpoint",
     "must_run",
     "run",
     "run_status",
@@ -2096,8 +2136,20 @@ TOOLS = [
     },
 ]
 
-BLIND_STONE_CALLS = {"env_state", "env_diff", "env_restore", "env_rollback"}
-BLIND_HELP_NAMES = {"env_state", "env_diff", "env_restore", "env_rollback"}
+BLIND_STONE_CALLS = {
+    "env_state",
+    "env_diff",
+    "env_restore",
+    "env_checkpoint",
+    "env_fork",
+    "env_restore_checkpoint",
+    "env_checkpoints",
+    "env_discard_checkpoint",
+    "env_rollback",
+    "env_commit",
+    "env_finish",
+}
+BLIND_HELP_NAMES = BLIND_STONE_CALLS
 BLIND_RESULT_KEYS = {"effects", "env_state", "env_diff", "env_warnings", "next_actions"}
 
 
@@ -2141,7 +2193,17 @@ def sanitize_for_agent(value: Any) -> Any:
 
 
 def hidden_blind_source(source: str) -> bool:
-    hidden = ("env_state", "env_diff", "env_restore", "env_rollback")
+    hidden = (
+        "env_state",
+        "env_diff",
+        "env_restore",
+        "env_checkpoint",
+        "env_fork",
+        "env_restore_checkpoint",
+        "env_checkpoints",
+        "env_discard_checkpoint",
+        "env_rollback",
+    )
     return any(name in source for name in hidden)
 
 
