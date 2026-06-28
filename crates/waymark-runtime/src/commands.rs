@@ -611,18 +611,7 @@ if starts_with(line, "ERROR"):
         examples: &[
             r#"result = run(["wc", "-l", "/app/input.txt"])"#,
             r#"result = run(["printf", "ok"], timeout_ms=5000)"#,
-            r#"job = run(["long_running_command", "arg1", "arg2"], cwd="/app", background=True)
-while job.still_running:
-    status = run_status(job.run_id)
-    job = run_wait(job.run_id, timeout_ms=30000)"#,
-            r#"job = run(["make", "build"], cwd="/app", background=True)
-while job.still_running:
-    status = run_status(job.run_id)
-    job = run_wait(job.run_id, timeout_ms=30000)"#,
-            r#"result = run(["make", "build"])
-while "still_running" in result and result.still_running:
-    status = run_status(result.run_id)
-    result = run_wait(result.run_id, timeout_ms=30000)"#,
+            r#"result = run(["sh", "-c", "sleep 0.01 && printf done"], cwd="/app", timeout_ms=5000)"#,
             r#"result = run(["sh", "-c", "printf warning >&2"], stdout="suppress", stderr="capture", max_stderr_bytes=12000)"#,
             r#"if not result.ok:
     emit({"exit_code": result.exit_code, "stderr": result.stderr, "explanation": result.explanation})"#,
@@ -739,8 +728,8 @@ if not info.ok:
     StoneHelpEntry {
         name: "state",
         signature: "state() -> record",
-        use_when: "Use to retrieve cheap agent-facing runtime state such as cwd, git status, common tool availability, and Gateway transaction state when active.",
-        examples: &[r#"snapshot = state()"#, r#"emit(state().cwd)"#],
+        use_when: "Use to retrieve cheap agent-facing runtime state such as cwd, workspace root, git status, common tool availability, and Gateway transaction state when active.",
+        examples: &[r#"snapshot = state()"#, r#"emit(state().workspace)"#],
         avoid: &["Do not shell out to git status or which/version probes when this structured snapshot is enough."],
         aliases: &[],
     },

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "hermit"))]
 use std::time::Duration;
 
@@ -15,9 +15,75 @@ pub(crate) fn runtime_state_record(cwd: &Path) -> Value {
     let span = Span::unknown();
     let mut record = Record::new();
     record.push("cwd", Value::string(cwd.display().to_string(), span));
+    record.push("workspace", workspace_state_record(cwd, span));
     record.push("git", git_state_record(cwd, span));
     record.push("tools", tool_state_record(cwd, span));
     Value::record(record, span)
+}
+
+fn workspace_state_record(cwd: &Path, span: Span) -> Value {
+    let (kind, root) = detected_workspace_root(cwd);
+    let relative_path = cwd
+        .strip_prefix(&root)
+        .ok()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let name = root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string());
+    let mount_root = workspace_mount_root(cwd);
+
+    let mut record = Record::new();
+    record.push("kind", Value::string(kind, span));
+    record.push("name", Value::string(name, span));
+    record.push("root", Value::string(root.display().to_string(), span));
+    record.push("relative_path", Value::string(relative_path, span));
+    record.push(
+        "in_workspace_mount",
+        Value::bool(mount_root.is_some(), span),
+    );
+    record.push(
+        "mount_root",
+        mount_root
+            .map(|path| Value::string(path.display().to_string(), span))
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    Value::record(record, span)
+}
+
+#[cfg(target_os = "hermit")]
+fn detected_workspace_root(cwd: &Path) -> (&'static str, PathBuf) {
+    ("directory", cwd.to_path_buf())
+}
+
+#[cfg(not(target_os = "hermit"))]
+fn detected_workspace_root(cwd: &Path) -> (&'static str, PathBuf) {
+    let cwd_arg = cwd.display().to_string();
+    if let Some(root) = bounded_command_stdout(
+        "git",
+        &["-C", cwd_arg.as_str(), "rev-parse", "--show-toplevel"],
+        cwd,
+        Duration::from_millis(750),
+    )
+    .map(|text| PathBuf::from(text.trim()))
+    .filter(|path| !path.as_os_str().is_empty())
+    {
+        return ("git", root);
+    }
+    ("directory", cwd.to_path_buf())
+}
+
+fn workspace_mount_root(cwd: &Path) -> Option<PathBuf> {
+    let mut components = cwd.components();
+    let first = components.next()?;
+    let second = components.next()?;
+    if first.as_os_str() != "/" || second.as_os_str() != "workspace" {
+        return None;
+    }
+    let repo = components.next()?;
+    Some(Path::new("/").join("workspace").join(repo.as_os_str()))
 }
 
 #[cfg(target_os = "hermit")]
@@ -214,7 +280,7 @@ mod tests {
 
     use nu_protocol::Span;
 
-    use super::{runtime_state_record, string_list_value};
+    use super::{runtime_state_record, string_list_value, workspace_mount_root};
 
     #[cfg(not(target_os = "hermit"))]
     use super::{parse_git_count, tool_version};
@@ -246,6 +312,37 @@ mod tests {
         );
         assert!(record.get("git").expect("git").as_record().is_ok());
         assert!(record.get("tools").expect("tools").as_record().is_ok());
+        let workspace = record
+            .get("workspace")
+            .expect("workspace")
+            .as_record()
+            .expect("workspace record");
+        assert_eq!(
+            workspace
+                .get("root")
+                .expect("workspace root")
+                .as_str()
+                .expect("root string"),
+            "/tmp"
+        );
+        assert_eq!(
+            workspace
+                .get("relative_path")
+                .expect("relative path")
+                .as_str()
+                .expect("relative path string"),
+            ""
+        );
+    }
+
+    #[test]
+    fn workspace_mount_root_detects_workspace_repo_mount() {
+        assert_eq!(
+            workspace_mount_root(Path::new("/workspace/waymark/crates/runtime"))
+                .expect("workspace mount"),
+            Path::new("/workspace/waymark")
+        );
+        assert!(workspace_mount_root(Path::new("/tmp/waymark")).is_none());
     }
 
     #[cfg(not(target_os = "hermit"))]

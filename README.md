@@ -105,9 +105,9 @@ Save that as `example.stone`, then run:
 target/debug/waymark eval example.stone
 ```
 
-Use `state()` when an agent needs the current cwd, git summary, or common tool
-availability without ad hoc probes. Use `last_result()` to recover the previous
-Waymark response in a long-lived runtime process.
+Use `state()` when an agent needs the current cwd, workspace root, git summary,
+or common tool availability without ad hoc probes. Use `last_result()` to
+recover the previous Waymark response in a long-lived runtime process.
 
 In long-lived runtime processes, Stone top-level value and function bindings
 persist across eval calls. This lets an agent bind intermediate data once,

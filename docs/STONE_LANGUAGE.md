@@ -203,8 +203,8 @@ Supported handlers are `except:`, `except Exception:`, and
 - `sysinfo(section="all")`: typed host system snapshot. Sections include
   `"os"`, `"cpu"`, `"cpu_long"`, `"mem"`, `"disks"`, `"net"`, `"temp"`,
   and `"users"`. `sys()` is an alias.
-- `state()`: typed runtime snapshot with `cwd`, git summary, and common tool
-  availability/version probes.
+- `state()`: typed runtime snapshot with `cwd`, workspace root/relative path,
+  git summary, and common tool availability/version probes.
 - `last_result()`: previous Waymark command response as typed data, or `None`
   before any previous response in the current runtime process.
 - `help()`, `help("topic")`: builtin help.
