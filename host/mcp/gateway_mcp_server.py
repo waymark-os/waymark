@@ -216,6 +216,24 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "attempt_logs",
+        "description": "Read bounded stdout/stderr from an attempt's recorded controller run.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "attempt": {"type": "string"},
+                "stream": {
+                    "type": "string",
+                    "enum": ["stdout", "stderr", "both"],
+                    "default": "both",
+                },
+                "tail": {"type": "integer", "minimum": 1},
+                "max_bytes": {"type": "integer", "minimum": 1},
+            },
+            "required": ["attempt"],
+        },
+    },
+    {
         "name": "attempt_state",
         "description": "Return Gateway task attempt metadata plus transaction diff state.",
         "inputSchema": {
@@ -619,6 +637,12 @@ class GatewayMcp:
             return self.rpc.call("attempt.info", ["--attempt", required(args, "attempt")])
         if name == "attempt_start":
             return self.rpc.call("attempt.start", ["--attempt", required(args, "attempt")])
+        if name == "attempt_logs":
+            call_args = ["--attempt", required(args, "attempt")]
+            add_optional(call_args, args, "stream", "--stream")
+            add_optional(call_args, args, "tail", "--tail")
+            add_optional(call_args, args, "max_bytes", "--max-bytes")
+            return self.rpc.call("attempt.logs", call_args)
         if name == "attempt_state":
             call_args = ["--attempt", required(args, "attempt")]
             if args.get("sample_limit") is not None:

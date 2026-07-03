@@ -275,6 +275,12 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "effects": ["read_env", "read_file"],
         "example": "state = attempt_state(sample_limit=50)",
     },
+    "attempt_logs": {
+        "name": "attempt_logs",
+        "signature": "attempt_logs(attempt: str = '', stream: str = 'both', tail: int = 0, max_bytes: int = 65536) -> record",
+        "effects": ["read_env"],
+        "example": 'logs = attempt_logs(child.attempt, stream="stderr", tail=20)',
+    },
     "attempts": {
         "name": "attempts",
         "signature": "attempts(task: str = '', workspace: str = '', state: str = '') -> list[record]",
@@ -581,6 +587,7 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
     "state": (),
     "attempt_info": ("attempt",),
     "attempt_state": ("attempt", "sample_limit"),
+    "attempt_logs": ("attempt", "stream", "tail", "max_bytes"),
     "attempts": ("task", "workspace", "state"),
     "attempt_list": ("task", "workspace", "state"),
     "attempt_spawn": (
@@ -2271,6 +2278,7 @@ BLIND_STONE_CALLS = {
     "attempt_fork",
     "attempt_info",
     "attempt_list",
+    "attempt_logs",
     "attempt_run_process",
     "attempt_spawn",
     "attempt_start",
