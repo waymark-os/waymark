@@ -1863,6 +1863,7 @@ impl Evaluator<'_> {
             "sys" | "sys_info" | "sysinfo" => self.eval_sys_call(call),
             "state" => self.eval_state_call(call),
             "attempt_info" => self.eval_attempt_info_call(call),
+            "attempt_start" => self.eval_attempt_start_call(call),
             "attempt_state" => self.eval_attempt_state_call(call),
             "attempts" | "attempt_list" => self.eval_attempts_call(call),
             "attempt_spawn" => self.eval_attempt_spawn_call(call),
@@ -3871,6 +3872,33 @@ impl Evaluator<'_> {
             }
         }
         gateway_env::attempt_info(attempt).map(RuntimeValue::Nu)
+    }
+
+    fn eval_attempt_start_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 1 {
+            return Err(stone_error(
+                "attempt_start",
+                "attempt_start() accepts at most attempt argument",
+            ));
+        }
+        let mut attempt = positional
+            .first()
+            .map(|value| value_to_string(value, "attempt_start attempt"))
+            .transpose()?
+            .unwrap_or_default();
+        for (name, value) in named {
+            match name.as_str() {
+                "attempt" => attempt = value_to_string(&value, "attempt_start attempt")?,
+                _ => {
+                    return Err(stone_error(
+                        "attempt_start",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        gateway_env::attempt_start(attempt).map(RuntimeValue::Nu)
     }
 
     fn eval_attempt_state_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5885,6 +5913,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "attempt_list",
     "attempt_run_process",
     "attempt_spawn",
+    "attempt_start",
     "attempt_state",
     "attempts",
     "env_checkpoint",

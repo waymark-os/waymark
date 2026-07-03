@@ -766,6 +766,14 @@ if not info.ok:
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "attempt_start",
+        signature: r#"attempt_start(attempt: str = "") -> record"#,
+        use_when: "Use in Gateway mode to start an existing attempt's recorded controller program after inspecting or preparing the attempt.",
+        examples: &[r#"child = attempt_spawn(task_spec={"id": "task-debug"}, workspace_source={"workspace": "repo"}, program={"kind": "stone", "source": "write_file(\"hello.txt\", \"hello\")"})"#, r#"started = attempt_start(child.attempt)"#],
+        avoid: &["Do not use attempt_start for ordinary shell commands inside the current attempt; use run() or workspace builtins."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "attempt_fork",
         signature: r#"attempt_fork(parent_attempt: str = "", task: str = "", controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", resource_limits: record = {}, metadata: record = {}) -> record"#,
         use_when: "Use in Gateway mode to create a child attempt from the current or specified parent attempt workspace state.",

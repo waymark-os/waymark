@@ -24,6 +24,13 @@ pub(crate) fn attempt_info(attempt: String) -> Result<Value, ShellError> {
     Ok(attempt_record_value(record, Span::unknown()))
 }
 
+pub(crate) fn attempt_start(attempt: String) -> Result<Value, ShellError> {
+    let config = required_config()?;
+    let attempt = effective_attempt(&config, attempt)?;
+    let record = with_client(&config, |client| client.attempt_start(attempt))?;
+    Ok(attempt_record_value(record, Span::unknown()))
+}
+
 pub(crate) fn attempts(
     task: String,
     workspace: String,

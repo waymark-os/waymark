@@ -294,6 +294,12 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "effects": ["write_file"],
         "example": 'child = attempt_spawn(task_spec={"id": "task-debug", "objective": "write hello.txt"}, workspace_source={"workspace": "repo"}, program={"kind": "stone", "source": "write_file(\\"hello.txt\\", \\"hello\\")"})',
     },
+    "attempt_start": {
+        "name": "attempt_start",
+        "signature": "attempt_start(attempt: str = '') -> record",
+        "effects": ["write_file", "process"],
+        "example": "started = attempt_start(child.attempt)",
+    },
     "attempt_fork": {
         "name": "attempt_fork",
         "signature": "attempt_fork(parent_attempt: str = '', task: str = '', controller: str = '', capability_profile: str = '', container: str = '', workspace_mount: str = '', resource_limits: record = {}, metadata: record = {}) -> record",
@@ -593,6 +599,7 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
         "resource_limits",
         "metadata",
     ),
+    "attempt_start": ("attempt",),
     "attempt_fork": (
         "parent_attempt",
         "task",
@@ -2266,6 +2273,7 @@ BLIND_STONE_CALLS = {
     "attempt_list",
     "attempt_run_process",
     "attempt_spawn",
+    "attempt_start",
     "attempt_state",
     "attempts",
     "env_state",

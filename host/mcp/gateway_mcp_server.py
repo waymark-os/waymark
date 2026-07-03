@@ -207,6 +207,15 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "attempt_start",
+        "description": "Start an existing Gateway task attempt's recorded controller program.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"attempt": {"type": "string"}},
+            "required": ["attempt"],
+        },
+    },
+    {
         "name": "attempt_state",
         "description": "Return Gateway task attempt metadata plus transaction diff state.",
         "inputSchema": {
@@ -608,6 +617,8 @@ class GatewayMcp:
             return self.rpc.call("attempt.list", call_args)
         if name == "attempt_info":
             return self.rpc.call("attempt.info", ["--attempt", required(args, "attempt")])
+        if name == "attempt_start":
+            return self.rpc.call("attempt.start", ["--attempt", required(args, "attempt")])
         if name == "attempt_state":
             call_args = ["--attempt", required(args, "attempt")]
             if args.get("sample_limit") is not None:
