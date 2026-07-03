@@ -263,6 +263,49 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "effects": ["read_env", "read_file", "process"],
         "example": "snapshot = state()",
     },
+    "attempt_info": {
+        "name": "attempt_info",
+        "signature": "attempt_info(attempt: str = '') -> record",
+        "effects": ["read_env"],
+        "example": "me = attempt_info()",
+    },
+    "attempt_state": {
+        "name": "attempt_state",
+        "signature": "attempt_state(attempt: str = '', sample_limit: int = 100) -> record",
+        "effects": ["read_env", "read_file"],
+        "example": "state = attempt_state(sample_limit=50)",
+    },
+    "attempts": {
+        "name": "attempts",
+        "signature": "attempts(task: str = '', workspace: str = '', state: str = '') -> list[record]",
+        "effects": ["read_env"],
+        "example": 'active = attempts(state="active")',
+    },
+    "attempt_list": {
+        "name": "attempt_list",
+        "signature": "attempt_list(task: str = '', workspace: str = '', state: str = '') -> list[record]",
+        "effects": ["read_env"],
+        "example": 'active = attempt_list(state="active")',
+        "alias_for": "attempts",
+    },
+    "attempt_spawn": {
+        "name": "attempt_spawn",
+        "signature": "attempt_spawn(task: str, workspace: str, controller: str = '', capability_profile: str = '', container: str = '', workspace_mount: str = '', resource_limits: record = {}, metadata: record = {}) -> record",
+        "effects": ["write_file"],
+        "example": 'child = attempt_spawn("task-debug", "repo", controller="codex")',
+    },
+    "attempt_fork": {
+        "name": "attempt_fork",
+        "signature": "attempt_fork(parent_attempt: str = '', task: str = '', controller: str = '', capability_profile: str = '', container: str = '', workspace_mount: str = '', resource_limits: record = {}, metadata: record = {}) -> record",
+        "effects": ["write_file"],
+        "example": 'branch = attempt_fork(task="try-alt-fix", controller="codex")',
+    },
+    "attempt_finish": {
+        "name": "attempt_finish",
+        "signature": "attempt_finish(action: str, attempt: str = '', message: str = '', reason: str = '', allow_risky: bool = False) -> record",
+        "effects": ["write_file", "remove_file"],
+        "example": 'attempt_finish("rollback", reason="debug branch done")',
+    },
     "env_state": {
         "name": "env_state",
         "signature": "env_state(sample_limit: int = 100) -> record",
@@ -524,6 +567,31 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
     "run_terminate": ("run_id",),
     "resolve_command": ("name",),
     "state": (),
+    "attempt_info": ("attempt",),
+    "attempt_state": ("attempt", "sample_limit"),
+    "attempts": ("task", "workspace", "state"),
+    "attempt_list": ("task", "workspace", "state"),
+    "attempt_spawn": (
+        "task",
+        "workspace",
+        "controller",
+        "capability_profile",
+        "container",
+        "workspace_mount",
+        "resource_limits",
+        "metadata",
+    ),
+    "attempt_fork": (
+        "parent_attempt",
+        "task",
+        "controller",
+        "capability_profile",
+        "container",
+        "workspace_mount",
+        "resource_limits",
+        "metadata",
+    ),
+    "attempt_finish": ("action", "attempt", "message", "reason", "allow_risky"),
     "env_state": ("sample_limit",),
     "env_diff": ("sample_limit",),
     "env_tx_info": ("tx",),
@@ -568,6 +636,7 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
 }
 
 Stone_CALL_ALIASES: dict[str, str] = {
+    "attempt_list": "attempts",
     "delete_dir": "rm",
     "delete_directory": "rm",
     "delete_file": "rm",
@@ -2178,6 +2247,13 @@ TOOLS = [
 ]
 
 BLIND_STONE_CALLS = {
+    "attempt_finish",
+    "attempt_fork",
+    "attempt_info",
+    "attempt_list",
+    "attempt_spawn",
+    "attempt_state",
+    "attempts",
     "env_state",
     "env_diff",
     "env_tx_info",

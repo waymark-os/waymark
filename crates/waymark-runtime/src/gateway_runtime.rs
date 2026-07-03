@@ -23,6 +23,7 @@ pub(crate) enum GatewayEndpoint {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GatewayRuntimeConfig {
     pub(crate) endpoint: GatewayEndpoint,
+    pub(crate) attempt: String,
     pub(crate) tx: String,
     pub(crate) image: String,
     pub(crate) container: Option<String>,
@@ -759,6 +760,7 @@ fn probe_options(config: &GatewayRuntimeConfig) -> LinuxProbeOptions {
 fn config_from_process_env() -> Option<GatewayRuntimeConfig> {
     let socket = std::env::var_os("WAYMARK_GATEWAY_SOCKET")?;
     let tx = std::env::var("WAYMARK_GATEWAY_TX").ok()?;
+    let attempt = std::env::var("WAYMARK_GATEWAY_ATTEMPT_ID").unwrap_or_default();
     let image = std::env::var("WAYMARK_GATEWAY_IMAGE").unwrap_or_default();
     let container = std::env::var("WAYMARK_GATEWAY_CONTAINER")
         .ok()
@@ -767,6 +769,7 @@ fn config_from_process_env() -> Option<GatewayRuntimeConfig> {
         std::env::var("WAYMARK_GATEWAY_WORKSPACE_MOUNT").unwrap_or_else(|_| "/app".to_string());
     Some(GatewayRuntimeConfig {
         endpoint: GatewayEndpoint::Unix(PathBuf::from(socket)),
+        attempt,
         tx,
         image,
         container,

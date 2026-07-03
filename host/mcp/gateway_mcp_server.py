@@ -118,6 +118,90 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "attempt_spawn",
+        "description": "Create a Gateway task attempt and its transaction.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string"},
+                "workspace": {"type": "string"},
+                "controller": {"type": "string"},
+                "capability_profile": {"type": "string"},
+                "container": {"type": "string"},
+                "workspace_mount": {"type": "string"},
+                "resource_limits": {"type": "object", "additionalProperties": {"type": "string"}},
+                "metadata": {"type": "object", "additionalProperties": {"type": "string"}},
+            },
+            "required": ["task", "workspace"],
+        },
+    },
+    {
+        "name": "attempt_fork",
+        "description": "Fork a child Gateway task attempt from a parent attempt checkpoint.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "parent_attempt": {"type": "string"},
+                "task": {"type": "string"},
+                "controller": {"type": "string"},
+                "capability_profile": {"type": "string"},
+                "container": {"type": "string"},
+                "workspace_mount": {"type": "string"},
+                "resource_limits": {"type": "object", "additionalProperties": {"type": "string"}},
+                "metadata": {"type": "object", "additionalProperties": {"type": "string"}},
+            },
+            "required": ["parent_attempt"],
+        },
+    },
+    {
+        "name": "attempt_list",
+        "description": "List Gateway task attempts with optional filters.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string"},
+                "workspace": {"type": "string"},
+                "state": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "attempt_info",
+        "description": "Return Gateway task attempt metadata.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"attempt": {"type": "string"}},
+            "required": ["attempt"],
+        },
+    },
+    {
+        "name": "attempt_state",
+        "description": "Return Gateway task attempt metadata plus transaction diff state.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "attempt": {"type": "string"},
+                "sample_limit": {"type": "integer"},
+            },
+            "required": ["attempt"],
+        },
+    },
+    {
+        "name": "attempt_finish",
+        "description": "Close a Gateway task attempt by commit, rollback, fail, or kill.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "attempt": {"type": "string"},
+                "action": {"type": "string"},
+                "message": {"type": "string"},
+                "reason": {"type": "string"},
+                "allow_risky": {"type": "boolean"},
+            },
+            "required": ["attempt", "action"],
+        },
+    },
+    {
         "name": "stone_call",
         "description": "Run a Linux command in the Gateway transaction view.",
         "inputSchema": {
@@ -381,7 +465,16 @@ class GatewayMcp:
             "stderr": bound_text(result.get("stderr"), 600),
             "stdout": bound_text(result.get("stdout"), 600),
         }
-        for field in ("checkpoint", "source_tx", "branch_tx", "dry_run", "rolled_back", "retained"):
+        for field in (
+            "attempt",
+            "parent_attempt",
+            "checkpoint",
+            "source_tx",
+            "branch_tx",
+            "dry_run",
+            "rolled_back",
+            "retained",
+        ):
             if field in result:
                 record[field] = result[field]
         for result_field, trace_field in (
@@ -445,6 +538,44 @@ class GatewayMcp:
             add_optional(call_args, args, "workspace", "--workspace")
             add_optional(call_args, args, "purpose", "--purpose")
             return self.rpc.call("env.tx_list", call_args)
+        if name == "attempt_spawn":
+            call_args = ["--task", required(args, "task"), "--workspace", required(args, "workspace")]
+            add_attempt_options(call_args, args)
+            return self.rpc.call("attempt.spawn", call_args)
+        if name == "attempt_fork":
+            call_args = ["--parent-attempt", required(args, "parent_attempt")]
+            if args.get("task"):
+                call_args.extend(["--task", str(args["task"])])
+            add_attempt_options(call_args, args)
+            return self.rpc.call("attempt.fork", call_args)
+        if name == "attempt_list":
+            call_args: list[str] = []
+            add_optional(call_args, args, "task", "--task")
+            add_optional(call_args, args, "workspace", "--workspace")
+            add_optional(call_args, args, "state", "--state")
+            return self.rpc.call("attempt.list", call_args)
+        if name == "attempt_info":
+            return self.rpc.call("attempt.info", ["--attempt", required(args, "attempt")])
+        if name == "attempt_state":
+            call_args = ["--attempt", required(args, "attempt")]
+            if args.get("sample_limit") is not None:
+                call_args.extend(["--sample-limit", str(args["sample_limit"])])
+            return self.rpc.call("attempt.state", call_args)
+        if name == "attempt_finish":
+            action = required(args, "action")
+            if action not in {"commit", "rollback", "fail", "kill"}:
+                return {
+                    "ok": False,
+                    "stdout": "",
+                    "stderr": f"unknown attempt finish action: {action}",
+                    "exit_code": 2,
+                }
+            call_args = ["--attempt", required(args, "attempt"), "--action", action]
+            add_optional(call_args, args, "message", "--message")
+            add_optional(call_args, args, "reason", "--reason")
+            if args.get("allow_risky"):
+                call_args.append("--allow-risky")
+            return self.rpc.call("attempt.finish", call_args)
         if name in {"finish", "env_finish"}:
             return self.rpc.call("env.finish", ["--tx", required(args, "tx")])
         if name in {"restore", "env_restore"}:
@@ -660,6 +791,20 @@ def add_optional(call_args: list[str], args: dict[str, Any], name: str, flag: st
     value = args.get(name)
     if isinstance(value, str) and value:
         call_args.extend([flag, value])
+
+
+def add_attempt_options(call_args: list[str], args: dict[str, Any]) -> None:
+    add_optional(call_args, args, "controller", "--controller")
+    add_optional(call_args, args, "capability_profile", "--capability-profile")
+    if args.get("container"):
+        call_args.extend(["--container", str(args["container"])])
+        call_args.extend(["--workspace-mount", str(args.get("workspace_mount", "/app"))])
+    elif args.get("workspace_mount"):
+        call_args.extend(["--workspace-mount", str(args["workspace_mount"])])
+    for key, value in sorted(dict(args.get("resource_limits") or {}).items()):
+        call_args.extend(["--limit", f"{key}={value}"])
+    for key, value in sorted(dict(args.get("metadata") or {}).items()):
+        call_args.extend(["--meta", f"{key}={value}"])
 
 
 def add_read_only_mounts(call_args: list[str], args: dict[str, Any]) -> None:

@@ -36,6 +36,8 @@ class FakeRpc:
             return {"ok": True, "stdout": "rolled_back\n", "stderr": "", "exit_code": 0}
         if method == "env.checkpoint_discard":
             return {"ok": True, "stdout": "discarded\n", "stderr": "", "exit_code": 0}
+        if method.startswith("attempt."):
+            return {"ok": True, "stdout": "attempt\tattempt-1\n", "stderr": "", "exit_code": 0}
         raise AssertionError(f"unexpected RPC call: {method} {args!r}")
 
 
@@ -140,6 +142,43 @@ class GatewayMcpTests(unittest.TestCase):
         self.assertFalse(record["retained"])
         self.assertTrue(record["source_rollback_ok"])
         self.assertTrue(record["checkpoint_cleanup_ok"])
+
+    def test_attempt_fork_routes_to_gateway_rpc(self) -> None:
+        rpc = FakeRpc()
+        mcp = server.GatewayMcp(rpc)  # type: ignore[arg-type]
+
+        result = mcp.run_tool(
+            "attempt_fork",
+            {
+                "parent_attempt": "attempt-parent",
+                "task": "try-alt",
+                "controller": "codex",
+                "capability_profile": "shell-mcp",
+                "metadata": {"reason": "debug"},
+            },
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(
+            rpc.calls,
+            [
+                (
+                    "attempt.fork",
+                    (
+                        "--parent-attempt",
+                        "attempt-parent",
+                        "--task",
+                        "try-alt",
+                        "--controller",
+                        "codex",
+                        "--capability-profile",
+                        "shell-mcp",
+                        "--meta",
+                        "reason=debug",
+                    ),
+                )
+            ],
+        )
 
 
 if __name__ == "__main__":
