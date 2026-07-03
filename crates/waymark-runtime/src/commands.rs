@@ -759,9 +759,9 @@ if not info.ok:
     },
     StoneHelpEntry {
         name: "attempt_spawn",
-        signature: r#"attempt_spawn(task: str, workspace: str, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", resource_limits: record = {}, metadata: record = {}) -> record"#,
-        use_when: "Use in Gateway mode when a controller needs to create a new top-level task attempt with its own transaction.",
-        examples: &[r#"child = attempt_spawn("task-debug", "repo", controller="codex", capability_profile="shell-mcp")"#],
+        signature: r#"attempt_spawn(task: str = "", workspace: str = "", task_spec: record = {}, program: record = {}, workspace_source: record = {}, context_source: record = {}, capabilities: record = {}, start: bool = false, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", resource_limits: record = {}, metadata: record = {}) -> record"#,
+        use_when: "Use in Gateway mode when a controller needs to create a new top-level task attempt with its own transaction and explicit task/control-flow definition.",
+        examples: &[r#"child = attempt_spawn(task_spec={"id": "task-debug", "objective": "write hello.txt"}, workspace_source={"workspace": "repo"}, program={"kind": "stone", "source": "write_file(\"hello.txt\", \"hello\")"})"#],
         avoid: &["Do not spawn attempts for ordinary file edits inside the current attempt; use workspace builtins directly."],
         aliases: &[],
     },

@@ -4,9 +4,9 @@ use std::collections::HashMap;
 
 use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, Value};
 use waymark_gateway_client::proto::{
-    AttemptFinishRequest, AttemptFinishResponse, AttemptForkRequest, AttemptRecord,
+    AttemptFinishRequest, AttemptFinishResponse, AttemptForkRequest, AttemptProgram, AttemptRecord,
     AttemptRunProcessRequest, AttemptRunProcessResponse, AttemptSpawnRequest, AttemptStateResponse,
-    EnvRunCheckpointRequest,
+    CapabilityRequest, ContextSource, EnvRunCheckpointRequest, TaskSpec, WorkspaceSource,
 };
 use waymark_gateway_client::GatewayRpcClient;
 
@@ -52,6 +52,16 @@ pub(crate) fn attempt_state(attempt: String, sample_limit: u32) -> Result<Value,
     attempt_state_value(state, Span::unknown())
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AttemptSpawnV1 {
+    pub task_spec: Option<TaskSpec>,
+    pub program: Option<AttemptProgram>,
+    pub workspace_source: Option<WorkspaceSource>,
+    pub context_source: Option<ContextSource>,
+    pub capabilities: Option<CapabilityRequest>,
+    pub start: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attempt_spawn(
     task: String,
@@ -62,6 +72,7 @@ pub(crate) fn attempt_spawn(
     workspace_mount: String,
     resource_limits: Vec<(String, String)>,
     metadata: Vec<(String, String)>,
+    spawn_v1: AttemptSpawnV1,
 ) -> Result<Value, ShellError> {
     let config = required_config()?;
     let attempt = with_client(&config, |client| {
@@ -74,6 +85,12 @@ pub(crate) fn attempt_spawn(
             workspace_mount: workspace_mount.clone(),
             resource_limits: resource_limits.clone().into_iter().collect(),
             metadata: metadata.clone().into_iter().collect(),
+            task_spec: spawn_v1.task_spec.clone(),
+            program: spawn_v1.program.clone(),
+            workspace_source: spawn_v1.workspace_source.clone(),
+            context_source: spawn_v1.context_source.clone(),
+            capabilities: spawn_v1.capabilities.clone(),
+            start: spawn_v1.start,
         })
     })?;
     Ok(attempt_record_value(attempt, Span::unknown()))

@@ -131,8 +131,40 @@ TOOLS: list[dict[str, Any]] = [
                 "workspace_mount": {"type": "string"},
                 "resource_limits": {"type": "object", "additionalProperties": {"type": "string"}},
                 "metadata": {"type": "object", "additionalProperties": {"type": "string"}},
+                "task_spec": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "objective": {"type": "string"},
+                    },
+                    "additionalProperties": True,
+                },
+                "program": {
+                    "type": "object",
+                    "additionalProperties": True,
+                },
+                "workspace_source": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string"},
+                        "workspace": {"type": "string"},
+                        "generation": {"type": "string"},
+                        "attempt": {"type": "string"},
+                        "checkpoint": {"type": "string"},
+                    },
+                },
+                "context_source": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string"},
+                        "attempt": {"type": "string"},
+                        "context": {"type": "string"},
+                        "include_last_turns": {"type": "integer"},
+                    },
+                },
+                "capabilities": {"type": "object", "additionalProperties": {"type": "string"}},
+                "start": {"type": "boolean"},
             },
-            "required": ["task", "workspace"],
         },
     },
     {
@@ -552,8 +584,15 @@ class GatewayMcp:
             add_optional(call_args, args, "purpose", "--purpose")
             return self.rpc.call("env.tx_list", call_args)
         if name == "attempt_spawn":
-            call_args = ["--task", required(args, "task"), "--workspace", required(args, "workspace")]
+            task_spec = dict(args.get("task_spec") or {})
+            workspace_source = dict(args.get("workspace_source") or {})
+            task = args.get("task") or task_spec.get("id")
+            workspace = args.get("workspace") or workspace_source.get("workspace")
+            if not task or not workspace:
+                raise ValueError("attempt_spawn requires task/workspace or task_spec.id/workspace_source.workspace")
+            call_args = ["--task", str(task), "--workspace", str(workspace)]
             add_attempt_options(call_args, args)
+            add_spawn_options(call_args, args)
             return self.rpc.call("attempt.spawn", call_args)
         if name == "attempt_fork":
             call_args = ["--parent-attempt", required(args, "parent_attempt")]
@@ -828,6 +867,68 @@ def add_attempt_options(call_args: list[str], args: dict[str, Any]) -> None:
         call_args.extend(["--limit", f"{key}={value}"])
     for key, value in sorted(dict(args.get("metadata") or {}).items()):
         call_args.extend(["--meta", f"{key}={value}"])
+
+
+def add_spawn_options(call_args: list[str], args: dict[str, Any]) -> None:
+    task_spec = dict(args.get("task_spec") or {})
+    if task_spec.get("id"):
+        call_args.extend(["--task-spec-id", str(task_spec["id"])])
+    if task_spec.get("objective"):
+        call_args.extend(["--task-objective", str(task_spec["objective"])])
+
+    program = dict(args.get("program") or {})
+    nested_stone = dict(program.get("stone") or {})
+    nested_builtin = dict(program.get("builtin") or {})
+    nested_artifact = dict(program.get("artifact") or {})
+    kind = str(program.get("kind") or "").lower()
+    if nested_stone or kind == "stone" or program.get("source"):
+        source = nested_stone.get("source", program.get("source", ""))
+        call_args.extend(["--program-stone-source", str(source)])
+        entrypoint = nested_stone.get("entrypoint", program.get("entrypoint"))
+        if entrypoint:
+            call_args.extend(["--program-entrypoint", str(entrypoint)])
+    elif nested_builtin or kind == "builtin" or program.get("name"):
+        name = nested_builtin.get("name", program.get("name", ""))
+        call_args.extend(["--program-builtin", str(name)])
+        args_json = nested_builtin.get("args_json", program.get("args_json"))
+        if args_json:
+            call_args.extend(["--program-args-json", str(args_json)])
+    elif nested_artifact or kind == "artifact" or program.get("artifact"):
+        artifact = nested_artifact.get("artifact", program.get("artifact", ""))
+        call_args.extend(["--program-artifact", str(artifact)])
+        entrypoint = nested_artifact.get("entrypoint", program.get("entrypoint"))
+        if entrypoint:
+            call_args.extend(["--program-entrypoint", str(entrypoint)])
+        args_json = nested_artifact.get("args_json", program.get("args_json"))
+        if args_json:
+            call_args.extend(["--program-args-json", str(args_json)])
+
+    workspace_source = dict(args.get("workspace_source") or {})
+    for key, flag in [
+        ("kind", "--workspace-source-kind"),
+        ("workspace", "--workspace-source-workspace"),
+        ("generation", "--workspace-source-generation"),
+        ("attempt", "--workspace-source-attempt"),
+        ("checkpoint", "--workspace-source-checkpoint"),
+    ]:
+        if workspace_source.get(key):
+            call_args.extend([flag, str(workspace_source[key])])
+
+    context_source = dict(args.get("context_source") or {})
+    for key, flag in [
+        ("kind", "--context-source-kind"),
+        ("attempt", "--context-source-attempt"),
+        ("context", "--context-source-context"),
+    ]:
+        if context_source.get(key):
+            call_args.extend([flag, str(context_source[key])])
+    if context_source.get("include_last_turns") is not None:
+        call_args.extend(["--context-include-last-turns", str(context_source["include_last_turns"])])
+
+    for key, value in sorted(dict(args.get("capabilities") or {}).items()):
+        call_args.extend(["--capability", f"{key}={value}"])
+    if args.get("start"):
+        call_args.append("--start")
 
 
 def add_read_only_mounts(call_args: list[str], args: dict[str, Any]) -> None:

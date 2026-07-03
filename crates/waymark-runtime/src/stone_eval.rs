@@ -13,6 +13,10 @@ use nu_protocol::{
     IntoPipelineData, PipelineData, Record, ShellError, Span, Value,
 };
 use serde_json::{json, Value as JsonValue};
+use waymark_gateway_client::proto::{
+    attempt_program, ArtifactProgram, AttemptProgram, BuiltinWorkflow, CapabilityRequest,
+    ContextSource, StoneProgram, TaskSpec as GatewayTaskSpec, WorkspaceSource,
+};
 
 use crate::commands::{stone_help_overview, stone_help_topic};
 use crate::gateway_env;
@@ -3975,6 +3979,7 @@ impl Evaluator<'_> {
         let mut workspace_mount = String::new();
         let mut resource_limits = Vec::new();
         let mut metadata = Vec::new();
+        let mut spawn_v1 = gateway_env::AttemptSpawnV1::default();
         for (name, value) in named {
             match name.as_str() {
                 "task" => task = Some(value_to_string(&value, "attempt_spawn task")?),
@@ -3997,6 +4002,38 @@ impl Evaluator<'_> {
                 "metadata" | "meta" => {
                     metadata = value_to_string_pairs(&value, "attempt_spawn metadata")?
                 }
+                "task_spec" => {
+                    let spec = task_spec_from_value(&value, "attempt_spawn task_spec")?;
+                    if task.is_none() && !spec.id.is_empty() {
+                        task = Some(spec.id.clone());
+                    }
+                    spawn_v1.task_spec = Some(spec);
+                }
+                "program" => {
+                    spawn_v1.program = Some(program_from_value(&value, "attempt_spawn program")?);
+                }
+                "workspace_source" => {
+                    let source =
+                        workspace_source_from_value(&value, "attempt_spawn workspace_source")?;
+                    if workspace.is_none() && !source.workspace.is_empty() {
+                        workspace = Some(source.workspace.clone());
+                    }
+                    spawn_v1.workspace_source = Some(source);
+                }
+                "context_source" => {
+                    spawn_v1.context_source = Some(context_source_from_value(
+                        &value,
+                        "attempt_spawn context_source",
+                    )?);
+                }
+                "capabilities" => {
+                    spawn_v1.capabilities = Some(CapabilityRequest {
+                        values: value_to_string_pairs(&value, "attempt_spawn capabilities")?
+                            .into_iter()
+                            .collect(),
+                    });
+                }
+                "start" => spawn_v1.start = value_to_bool(&value, "attempt_spawn start")?,
                 _ => {
                     return Err(stone_error(
                         "attempt_spawn",
@@ -4017,6 +4054,7 @@ impl Evaluator<'_> {
             workspace_mount,
             resource_limits,
             metadata,
+            spawn_v1,
         )
         .map(RuntimeValue::Nu)
     }
@@ -6594,6 +6632,179 @@ fn value_to_string_pairs(
     val.iter()
         .map(|(key, value)| value_to_string(value, context).map(|value| (key.clone(), value)))
         .collect()
+}
+
+fn task_spec_from_value(value: &Value, context: &str) -> Result<GatewayTaskSpec, ShellError> {
+    let record = value_record(value, context)?;
+    Ok(GatewayTaskSpec {
+        id: record_string_field(record, "id", context)?,
+        objective: record_string_field(record, "objective", context)?,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        success: Vec::new(),
+        constraints: Vec::new(),
+        metadata: Default::default(),
+    })
+}
+
+fn program_from_value(value: &Value, context: &str) -> Result<AttemptProgram, ShellError> {
+    let record = value_record(value, context)?;
+    if let Some(stone) = record_record_field(record, "stone", context)? {
+        return Ok(AttemptProgram {
+            program: Some(attempt_program::Program::Stone(StoneProgram {
+                source: record_string_field(stone, "source", context)?,
+                entrypoint: record_string_field(stone, "entrypoint", context)?,
+            })),
+        });
+    }
+    if let Some(builtin) = record_record_field(record, "builtin", context)? {
+        return Ok(AttemptProgram {
+            program: Some(attempt_program::Program::Builtin(BuiltinWorkflow {
+                name: record_string_field(builtin, "name", context)?,
+                args_json: record_string_field(builtin, "args_json", context)?,
+            })),
+        });
+    }
+    if let Some(artifact) = record_record_field(record, "artifact", context)? {
+        return Ok(AttemptProgram {
+            program: Some(attempt_program::Program::Artifact(ArtifactProgram {
+                artifact: record_string_field(artifact, "artifact", context)?,
+                entrypoint: record_string_field(artifact, "entrypoint", context)?,
+                args_json: record_string_field(artifact, "args_json", context)?,
+            })),
+        });
+    }
+
+    let kind = record_string_field(record, "kind", context)?;
+    let source = record_string_field(record, "source", context)?;
+    let name = record_string_field(record, "name", context)?;
+    let artifact = record_string_field(record, "artifact", context)?;
+    match kind.as_str() {
+        "stone" => Ok(AttemptProgram {
+            program: Some(attempt_program::Program::Stone(StoneProgram {
+                source,
+                entrypoint: record_string_field(record, "entrypoint", context)?,
+            })),
+        }),
+        "builtin" => Ok(AttemptProgram {
+            program: Some(attempt_program::Program::Builtin(BuiltinWorkflow {
+                name,
+                args_json: record_string_field(record, "args_json", context)?,
+            })),
+        }),
+        "artifact" => Ok(AttemptProgram {
+            program: Some(attempt_program::Program::Artifact(ArtifactProgram {
+                artifact,
+                entrypoint: record_string_field(record, "entrypoint", context)?,
+                args_json: record_string_field(record, "args_json", context)?,
+            })),
+        }),
+        "" if !source.is_empty() => Ok(AttemptProgram {
+            program: Some(attempt_program::Program::Stone(StoneProgram {
+                source,
+                entrypoint: record_string_field(record, "entrypoint", context)?,
+            })),
+        }),
+        "" if !name.is_empty() => Ok(AttemptProgram {
+            program: Some(attempt_program::Program::Builtin(BuiltinWorkflow {
+                name,
+                args_json: record_string_field(record, "args_json", context)?,
+            })),
+        }),
+        "" if !artifact.is_empty() => Ok(AttemptProgram {
+            program: Some(attempt_program::Program::Artifact(ArtifactProgram {
+                artifact,
+                entrypoint: record_string_field(record, "entrypoint", context)?,
+                args_json: record_string_field(record, "args_json", context)?,
+            })),
+        }),
+        other => Err(stone_error(
+            context,
+            format!("unknown attempt program kind `{other}`"),
+        )),
+    }
+}
+
+fn workspace_source_from_value(
+    value: &Value,
+    context: &str,
+) -> Result<WorkspaceSource, ShellError> {
+    let record = value_record(value, context)?;
+    Ok(WorkspaceSource {
+        kind: record_string_field(record, "kind", context)?,
+        workspace: record_string_field(record, "workspace", context)?,
+        generation: record_string_field(record, "generation", context)?,
+        attempt: record_string_field(record, "attempt", context)?,
+        checkpoint: record_string_field(record, "checkpoint", context)?,
+    })
+}
+
+fn context_source_from_value(value: &Value, context: &str) -> Result<ContextSource, ShellError> {
+    let record = value_record(value, context)?;
+    Ok(ContextSource {
+        kind: record_string_field(record, "kind", context)?,
+        attempt: record_string_field(record, "attempt", context)?,
+        context: record_string_field(record, "context", context)?,
+        include_last_turns: record_u32_field(record, "include_last_turns", context)?,
+    })
+}
+
+fn value_record<'a>(value: &'a Value, context: &str) -> Result<&'a Record, ShellError> {
+    let Value::Record { val, .. } = value else {
+        return Err(stone_error(
+            context,
+            format!("expected record, got {}", value.get_type()),
+        ));
+    };
+    Ok(val)
+}
+
+fn record_record_field<'a>(
+    record: &'a Record,
+    field: &str,
+    context: &str,
+) -> Result<Option<&'a Record>, ShellError> {
+    match record.get(field) {
+        None | Some(Value::Nothing { .. }) => Ok(None),
+        Some(value @ Value::Record { .. }) => Ok(Some(value_record(value, context)?)),
+        Some(other) => Err(stone_error(
+            context,
+            format!(
+                "record field `{field}` expected record, got {}",
+                other.get_type()
+            ),
+        )),
+    }
+}
+
+fn record_string_field(record: &Record, field: &str, context: &str) -> Result<String, ShellError> {
+    record
+        .get(field)
+        .map(|value| value_to_string(value, context))
+        .transpose()
+        .map(|value| value.unwrap_or_default())
+}
+
+fn record_u32_field(record: &Record, field: &str, context: &str) -> Result<u32, ShellError> {
+    let Some(value) = record.get(field) else {
+        return Ok(0);
+    };
+    match value {
+        Value::Int { val, .. } => u32::try_from(*val).map_err(|_| {
+            stone_error(
+                context,
+                format!("record field `{field}` expects an unsigned integer"),
+            )
+        }),
+        Value::Nothing { .. } => Ok(0),
+        other => Err(stone_error(
+            context,
+            format!(
+                "record field `{field}` expected int, got {}",
+                other.get_type()
+            ),
+        )),
+    }
 }
 
 fn run_record_ok(record: &Record) -> bool {

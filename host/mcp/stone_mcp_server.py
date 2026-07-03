@@ -290,9 +290,9 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
     },
     "attempt_spawn": {
         "name": "attempt_spawn",
-        "signature": "attempt_spawn(task: str, workspace: str, controller: str = '', capability_profile: str = '', container: str = '', workspace_mount: str = '', resource_limits: record = {}, metadata: record = {}) -> record",
+        "signature": "attempt_spawn(task: str = '', workspace: str = '', task_spec: record = {}, program: record = {}, workspace_source: record = {}, context_source: record = {}, capabilities: record = {}, start: bool = false, controller: str = '', capability_profile: str = '', container: str = '', workspace_mount: str = '', resource_limits: record = {}, metadata: record = {}) -> record",
         "effects": ["write_file"],
-        "example": 'child = attempt_spawn("task-debug", "repo", controller="codex")',
+        "example": 'child = attempt_spawn(task_spec={"id": "task-debug", "objective": "write hello.txt"}, workspace_source={"workspace": "repo"}, program={"kind": "stone", "source": "write_file(\\"hello.txt\\", \\"hello\\")"})',
     },
     "attempt_fork": {
         "name": "attempt_fork",
@@ -580,6 +580,12 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
     "attempt_spawn": (
         "task",
         "workspace",
+        "task_spec",
+        "program",
+        "workspace_source",
+        "context_source",
+        "capabilities",
+        "start",
         "controller",
         "capability_profile",
         "container",
