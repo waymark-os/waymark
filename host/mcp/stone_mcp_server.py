@@ -302,9 +302,21 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
     },
     "attempt_start": {
         "name": "attempt_start",
-        "signature": "attempt_start(attempt: str = '') -> record",
+        "signature": "attempt_start(attempt: str = '', wait: bool = false, timeout_ms: int = 0) -> record",
         "effects": ["write_file", "process"],
         "example": "started = attempt_start(child.attempt)",
+    },
+    "attempt_wait": {
+        "name": "attempt_wait",
+        "signature": "attempt_wait(attempt: str = '', timeout_ms: int = 0) -> record",
+        "effects": ["read_env", "process"],
+        "example": "done = attempt_wait(child.attempt, timeout_ms=30000)",
+    },
+    "attempt_terminate": {
+        "name": "attempt_terminate",
+        "signature": "attempt_terminate(attempt: str = '') -> record",
+        "effects": ["process"],
+        "example": "attempt_terminate(child.attempt)",
     },
     "attempt_fork": {
         "name": "attempt_fork",
@@ -606,7 +618,9 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
         "resource_limits",
         "metadata",
     ),
-    "attempt_start": ("attempt",),
+    "attempt_start": ("attempt", "wait", "timeout_ms"),
+    "attempt_wait": ("attempt", "timeout_ms"),
+    "attempt_terminate": ("attempt",),
     "attempt_fork": (
         "parent_attempt",
         "task",
@@ -2282,6 +2296,8 @@ BLIND_STONE_CALLS = {
     "attempt_run_process",
     "attempt_spawn",
     "attempt_start",
+    "attempt_wait",
+    "attempt_terminate",
     "attempt_state",
     "attempts",
     "env_state",

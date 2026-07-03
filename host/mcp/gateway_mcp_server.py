@@ -211,7 +211,11 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Start an existing Gateway task attempt's recorded controller program.",
         "inputSchema": {
             "type": "object",
-            "properties": {"attempt": {"type": "string"}},
+            "properties": {
+                "attempt": {"type": "string"},
+                "wait": {"type": "boolean", "default": False},
+                "timeout_ms": {"type": "integer", "minimum": 1},
+            },
             "required": ["attempt"],
         },
     },
@@ -230,6 +234,27 @@ TOOLS: list[dict[str, Any]] = [
                 "tail": {"type": "integer", "minimum": 1},
                 "max_bytes": {"type": "integer", "minimum": 1},
             },
+            "required": ["attempt"],
+        },
+    },
+    {
+        "name": "attempt_wait",
+        "description": "Wait for an attempt controller run to complete and sync controller state.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "attempt": {"type": "string"},
+                "timeout_ms": {"type": "integer", "minimum": 1},
+            },
+            "required": ["attempt"],
+        },
+    },
+    {
+        "name": "attempt_terminate",
+        "description": "Send TERM to an attempt controller run.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"attempt": {"type": "string"}},
             "required": ["attempt"],
         },
     },
@@ -636,13 +661,23 @@ class GatewayMcp:
         if name == "attempt_info":
             return self.rpc.call("attempt.info", ["--attempt", required(args, "attempt")])
         if name == "attempt_start":
-            return self.rpc.call("attempt.start", ["--attempt", required(args, "attempt")])
+            call_args = ["--attempt", required(args, "attempt")]
+            if args.get("wait"):
+                call_args.append("--wait")
+            add_optional(call_args, args, "timeout_ms", "--timeout-ms")
+            return self.rpc.call("attempt.start", call_args)
         if name == "attempt_logs":
             call_args = ["--attempt", required(args, "attempt")]
             add_optional(call_args, args, "stream", "--stream")
             add_optional(call_args, args, "tail", "--tail")
             add_optional(call_args, args, "max_bytes", "--max-bytes")
             return self.rpc.call("attempt.logs", call_args)
+        if name == "attempt_wait":
+            call_args = ["--attempt", required(args, "attempt")]
+            add_optional(call_args, args, "timeout_ms", "--timeout-ms")
+            return self.rpc.call("attempt.wait", call_args)
+        if name == "attempt_terminate":
+            return self.rpc.call("attempt.terminate", ["--attempt", required(args, "attempt")])
         if name == "attempt_state":
             call_args = ["--attempt", required(args, "attempt")]
             if args.get("sample_limit") is not None:
