@@ -1864,6 +1864,7 @@ impl Evaluator<'_> {
             "attempt_spawn" => self.eval_attempt_spawn_call(call),
             "attempt_fork" => self.eval_attempt_fork_call(call),
             "attempt_finish" => self.eval_attempt_finish_call(call),
+            "attempt_run_process" => self.eval_attempt_run_process_call(call),
             "env_state" | "env_diff" => self.eval_env_state_call(call),
             "env_tx_info" => self.eval_env_tx_info_call(call),
             "env_txs" => self.eval_env_txs_call(call),
@@ -4122,6 +4123,52 @@ impl Evaluator<'_> {
             .map(RuntimeValue::Nu)
     }
 
+    fn eval_attempt_run_process_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 3 {
+            return Err(stone_error(
+                "attempt_run_process",
+                "attempt_run_process() accepts at most attempt, argv, and env positional arguments",
+            ));
+        }
+        let mut attempt = positional
+            .first()
+            .map(|value| value_to_string(value, "attempt_run_process attempt"))
+            .transpose()?
+            .unwrap_or_default();
+        let mut argv = positional
+            .get(1)
+            .map(|value| value_to_string_list(value, "attempt_run_process argv"))
+            .transpose()?;
+        let mut env = positional
+            .get(2)
+            .map(|value| value_to_string_pairs(value, "attempt_run_process env"))
+            .transpose()?
+            .unwrap_or_default();
+        for (name, value) in named {
+            match name.as_str() {
+                "attempt" => attempt = value_to_string(&value, "attempt_run_process attempt")?,
+                "argv" => argv = Some(value_to_string_list(&value, "attempt_run_process argv")?),
+                "env" => env = value_to_string_pairs(&value, "attempt_run_process env")?,
+                _ => {
+                    return Err(stone_error(
+                        "attempt_run_process",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        let argv =
+            argv.ok_or_else(|| stone_error("attempt_run_process", "missing argv argument"))?;
+        if argv.is_empty() {
+            return Err(stone_error(
+                "attempt_run_process",
+                "argv list cannot be empty",
+            ));
+        }
+        gateway_env::attempt_run_process(attempt, argv, env).map(RuntimeValue::Nu)
+    }
+
     fn eval_env_state_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let (positional, named) = self.eval_call_values(call)?;
         if positional.len() > 1 {
@@ -5798,6 +5845,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "attempt_fork",
     "attempt_info",
     "attempt_list",
+    "attempt_run_process",
     "attempt_spawn",
     "attempt_state",
     "attempts",

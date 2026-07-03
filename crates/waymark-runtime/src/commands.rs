@@ -782,6 +782,14 @@ if not info.ok:
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "attempt_run_process",
+        signature: r#"attempt_run_process(attempt: str = "", argv: list[str], env: record = {}) -> record"#,
+        use_when: "Use in Gateway mode to ask the host Gateway to run a delegated controller process attached to an attempt transaction.",
+        examples: &[r#"run = attempt_run_process(child.attempt, ["/path/to/controller"], env={"HELIX_ROOT": "/path/to/helix"})"#],
+        avoid: &["Do not use for ordinary Linux commands inside the workspace; use run() for POSIX tools."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "env_state",
         signature: "env_state(sample_limit: int = 100) -> record",
         use_when: "Use in Gateway mode to inspect uncommitted transaction changes, warnings, and a bounded structured diff.",

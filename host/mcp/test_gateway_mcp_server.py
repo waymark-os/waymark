@@ -180,6 +180,40 @@ class GatewayMcpTests(unittest.TestCase):
             ],
         )
 
+    def test_attempt_run_process_routes_to_gateway_rpc(self) -> None:
+        rpc = FakeRpc()
+        mcp = server.GatewayMcp(rpc)  # type: ignore[arg-type]
+
+        result = mcp.run_tool(
+            "attempt_run_process",
+            {
+                "attempt": "attempt-child",
+                "argv": ["/controller", "--hello"],
+                "env": {"HELIX_ROOT": "/helix", "HELIX_WARM_BUILD": "0"},
+            },
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(
+            rpc.calls,
+            [
+                (
+                    "attempt.run_process",
+                    (
+                        "--attempt",
+                        "attempt-child",
+                        "--env",
+                        "HELIX_ROOT=/helix",
+                        "--env",
+                        "HELIX_WARM_BUILD=0",
+                        "--",
+                        "/controller",
+                        "--hello",
+                    ),
+                )
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

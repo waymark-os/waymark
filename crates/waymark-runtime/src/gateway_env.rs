@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, Value};
 use waymark_gateway_client::proto::{
     AttemptFinishRequest, AttemptFinishResponse, AttemptForkRequest, AttemptRecord,
-    AttemptSpawnRequest, AttemptStateResponse, EnvRunCheckpointRequest,
+    AttemptRunProcessRequest, AttemptRunProcessResponse, AttemptSpawnRequest, AttemptStateResponse,
+    EnvRunCheckpointRequest,
 };
 use waymark_gateway_client::GatewayRpcClient;
 
@@ -125,6 +126,23 @@ pub(crate) fn attempt_finish(
         })
     })?;
     attempt_finish_value(finish, Span::unknown())
+}
+
+pub(crate) fn attempt_run_process(
+    attempt: String,
+    argv: Vec<String>,
+    env: Vec<(String, String)>,
+) -> Result<Value, ShellError> {
+    let config = required_config()?;
+    let attempt = effective_attempt(&config, attempt)?;
+    let run = with_client(&config, |client| {
+        client.attempt_run_process(AttemptRunProcessRequest {
+            attempt: attempt.clone(),
+            argv: argv.clone(),
+            env: env.clone().into_iter().collect(),
+        })
+    })?;
+    Ok(attempt_process_value(run, Span::unknown()))
 }
 
 pub(crate) fn env_state(sample_limit: u32) -> Result<Value, ShellError> {
@@ -654,6 +672,46 @@ fn attempt_finish_value(finish: AttemptFinishResponse, span: Span) -> Result<Val
         record.push("json", json_text_value(&diff.json, span)?);
     }
     Ok(Value::record(record, span))
+}
+
+fn attempt_process_value(run: AttemptRunProcessResponse, span: Span) -> Value {
+    let mut record = Record::new();
+    record.push("run", Value::string(run.run, span));
+    record.push(
+        "attempt",
+        run.attempt
+            .map(|attempt| attempt_record_value(attempt, span))
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    record.push("task", Value::string(run.task, span));
+    record.push("workspace", Value::string(run.workspace, span));
+    record.push("tx", Value::string(run.tx, span));
+    record.push("status", Value::int(i64::from(run.status), span));
+    record.push("ok", Value::bool(run.status == 0, span));
+    record.push("stdout", Value::string(run.stdout, span));
+    record.push("stderr", Value::string(run.stderr, span));
+    record.push("stdout_path", Value::string(run.stdout_path, span));
+    record.push("stderr_path", Value::string(run.stderr_path, span));
+    record.push(
+        "started_at_ms",
+        Value::int(u64_to_i64(run.started_at_ms), span),
+    );
+    record.push(
+        "completed_at_ms",
+        Value::int(u64_to_i64(run.completed_at_ms), span),
+    );
+    record.push("duration_ms", Value::int(u64_to_i64(run.duration_ms), span));
+    record.push(
+        "argv",
+        Value::list(
+            run.argv
+                .into_iter()
+                .map(|arg| Value::string(arg, span))
+                .collect(),
+            span,
+        ),
+    );
+    Value::record(record, span)
 }
 
 fn string_map_value(map: HashMap<String, String>, span: Span) -> Value {

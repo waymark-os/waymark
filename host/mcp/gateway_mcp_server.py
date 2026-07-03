@@ -202,6 +202,19 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "attempt_run_process",
+        "description": "Run a host-authority controller process attached to a Gateway task attempt.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "attempt": {"type": "string"},
+                "argv": {"type": "array", "items": {"type": "string"}},
+                "env": {"type": "object", "additionalProperties": {"type": "string"}},
+            },
+            "required": ["attempt", "argv"],
+        },
+    },
+    {
         "name": "stone_call",
         "description": "Run a Linux command in the Gateway transaction view.",
         "inputSchema": {
@@ -576,6 +589,16 @@ class GatewayMcp:
             if args.get("allow_risky"):
                 call_args.append("--allow-risky")
             return self.rpc.call("attempt.finish", call_args)
+        if name == "attempt_run_process":
+            argv = args.get("argv")
+            if not isinstance(argv, list) or not all(isinstance(part, str) for part in argv):
+                raise ValueError("attempt_run_process requires argv: list[str]")
+            call_args = ["--attempt", required(args, "attempt")]
+            for key, value in sorted((args.get("env") or {}).items()):
+                call_args.extend(["--env", f"{key}={value}"])
+            call_args.append("--")
+            call_args.extend(argv)
+            return self.rpc.call("attempt.run_process", call_args)
         if name in {"finish", "env_finish"}:
             return self.rpc.call("env.finish", ["--tx", required(args, "tx")])
         if name in {"restore", "env_restore"}:

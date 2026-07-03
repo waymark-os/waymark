@@ -714,6 +714,21 @@ class StoneMcpServerTests(unittest.TestCase):
             'emit(run(["bash", "-lc", "make noisy"], cwd="/app", stdout="suppress", stderr="capture", max_stderr_bytes=12000))\n',
         )
 
+    def test_stone_call_supports_attempt_run_process_env(self) -> None:
+        source = server.stone_call_source(
+            "attempt_run_process",
+            {
+                "attempt": "attempt-child",
+                "argv": ["python3", "/controller.py"],
+                "env": {"HELIX_ROOT": "/helix"},
+            },
+        )
+
+        self.assertEqual(
+            source,
+            'emit(attempt_run_process("attempt-child", ["python3", "/controller.py"], {"HELIX_ROOT": "/helix"}))\n',
+        )
+
     def test_stone_call_supports_positional_run_convenience(self) -> None:
         source = server.stone_call_source("run", [["bash", "-lc", "cat"], "/app", "input", 1000])
 

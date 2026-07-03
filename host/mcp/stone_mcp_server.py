@@ -306,6 +306,12 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "effects": ["write_file", "remove_file"],
         "example": 'attempt_finish("rollback", reason="debug branch done")',
     },
+    "attempt_run_process": {
+        "name": "attempt_run_process",
+        "signature": "attempt_run_process(attempt: str = '', argv: list[str], env: record = {}) -> record",
+        "effects": ["process", "write_file", "unknown"],
+        "example": 'run = attempt_run_process(child.attempt, ["/path/to/controller"], env={"HELIX_ROOT": "/path/to/helix"})',
+    },
     "env_state": {
         "name": "env_state",
         "signature": "env_state(sample_limit: int = 100) -> record",
@@ -592,6 +598,7 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
         "metadata",
     ),
     "attempt_finish": ("action", "attempt", "message", "reason", "allow_risky"),
+    "attempt_run_process": ("attempt", "argv", "env"),
     "env_state": ("sample_limit",),
     "env_diff": ("sample_limit",),
     "env_tx_info": ("tx",),
@@ -2251,6 +2258,7 @@ BLIND_STONE_CALLS = {
     "attempt_fork",
     "attempt_info",
     "attempt_list",
+    "attempt_run_process",
     "attempt_spawn",
     "attempt_state",
     "attempts",
