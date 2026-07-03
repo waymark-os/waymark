@@ -5,6 +5,10 @@
 Helpers are dynamic Stone extension registrations. They let projects add
 diagnostic behavior without rebuilding Waymark Shell.
 
+This page documents the current helper-file mechanism. The broader runtime hook
+plan, including more hook points and agent-registered callbacks, is in
+[Stone Hooks Design](STONE_HOOKS_DESIGN.md).
+
 ## Search Path
 
 By default helpers are loaded from:
