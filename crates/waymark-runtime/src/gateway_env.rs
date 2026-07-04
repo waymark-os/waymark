@@ -775,30 +775,90 @@ fn required_config() -> Result<GatewayRuntimeConfig, ShellError> {
     config().ok_or_else(|| stone_error("env", "Gateway runtime config is not active"))
 }
 
-#[cfg(unix)]
-fn with_client<T>(
-    config: &GatewayRuntimeConfig,
-    call: impl FnOnce(
-        &mut GatewayRpcClient<std::os::unix::net::UnixStream>,
-    ) -> waymark_gateway_client::Result<T>,
-) -> Result<T, ShellError> {
-    match &config.endpoint {
-        GatewayEndpoint::Unix(path) => {
-            let mut client = GatewayRpcClient::connect_unix(path)
-                .map_err(|err| stone_error("gateway connect", err.to_string()))?;
-            call(&mut client).map_err(|err| stone_error("gateway rpc", err.to_string()))
+#[cfg(any(unix, target_os = "hermit"))]
+enum GatewayClientStream {
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixStream),
+    #[cfg(any(target_os = "hermit", target_os = "linux"))]
+    Vsock(waymark_gateway_client::VsockStream),
+}
+
+#[cfg(any(unix, target_os = "hermit"))]
+impl std::io::Read for GatewayClientStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            GatewayClientStream::Unix(stream) => stream.read(buf),
+            #[cfg(any(target_os = "hermit", target_os = "linux"))]
+            GatewayClientStream::Vsock(stream) => stream.read(buf),
         }
-        GatewayEndpoint::Vsock { .. } => Err(stone_error(
-            "gateway connect",
-            "Gateway vsock transport is not wired in this build",
-        )),
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(any(unix, target_os = "hermit"))]
+impl std::io::Write for GatewayClientStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            GatewayClientStream::Unix(stream) => stream.write(buf),
+            #[cfg(any(target_os = "hermit", target_os = "linux"))]
+            GatewayClientStream::Vsock(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            #[cfg(unix)]
+            GatewayClientStream::Unix(stream) => stream.flush(),
+            #[cfg(any(target_os = "hermit", target_os = "linux"))]
+            GatewayClientStream::Vsock(stream) => stream.flush(),
+        }
+    }
+}
+
+#[cfg(any(unix, target_os = "hermit"))]
+fn with_client<T>(
+    config: &GatewayRuntimeConfig,
+    call: impl FnOnce(&mut GatewayRpcClient<GatewayClientStream>) -> waymark_gateway_client::Result<T>,
+) -> Result<T, ShellError> {
+    let stream = match &config.endpoint {
+        #[cfg(unix)]
+        GatewayEndpoint::Unix(path) => {
+            let stream = std::os::unix::net::UnixStream::connect(path)
+                .map_err(|err| stone_error("gateway connect", err.to_string()))?;
+            GatewayClientStream::Unix(stream)
+        }
+        #[cfg(not(unix))]
+        GatewayEndpoint::Unix(_) => {
+            return Err(stone_error(
+                "gateway connect",
+                "Gateway Unix transport is not wired in this build",
+            ))
+        }
+        #[cfg(any(target_os = "hermit", target_os = "linux"))]
+        GatewayEndpoint::Vsock { cid, port } => {
+            let stream = waymark_gateway_client::VsockStream::connect(
+                waymark_gateway_client::VsockAddr::new(*cid, *port),
+            )
+            .map_err(|err| stone_error("gateway connect", err.to_string()))?;
+            GatewayClientStream::Vsock(stream)
+        }
+        #[cfg(not(any(target_os = "hermit", target_os = "linux")))]
+        GatewayEndpoint::Vsock { .. } => {
+            return Err(stone_error(
+                "gateway connect",
+                "Gateway vsock transport is not wired in this build",
+            ))
+        }
+    };
+    let mut client = GatewayRpcClient::from_stream(stream);
+    call(&mut client).map_err(|err| stone_error("gateway rpc", err.to_string()))
+}
+
+#[cfg(not(any(unix, target_os = "hermit")))]
 struct UnsupportedGatewayStream;
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "hermit")))]
 impl std::io::Read for UnsupportedGatewayStream {
     fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
         Err(std::io::Error::new(
@@ -808,7 +868,7 @@ impl std::io::Read for UnsupportedGatewayStream {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "hermit")))]
 impl std::io::Write for UnsupportedGatewayStream {
     fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
         Err(std::io::Error::new(
@@ -822,7 +882,7 @@ impl std::io::Write for UnsupportedGatewayStream {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, target_os = "hermit")))]
 fn with_client<T>(
     _config: &GatewayRuntimeConfig,
     _call: impl FnOnce(
