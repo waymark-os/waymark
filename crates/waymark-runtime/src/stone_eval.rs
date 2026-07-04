@@ -53,7 +53,6 @@ use crate::stone_builtins::{
     value_to_path_string, value_to_string, value_to_u64, value_truthy, value_type_name,
     where_builtin, where_compare_builtin, zfill_text,
 };
-#[cfg(not(target_os = "hermit"))]
 use crate::stone_file_ops::{
     cat_text, create_dir_all, diff_record_for_paths, edit_text_file, find_records, io_stone_error,
     list_dir_records, open_runtime_file, read_bytes_for_jsonl, read_csv_file, read_json_file,
@@ -68,7 +67,6 @@ use crate::stone_helpers::{
     stone_run_event_from_record, stone_run_event_value, StoneHelperHandlerKind, StoneHelperHook,
     StoneHelperRegistry, StoneRunEvent,
 };
-#[cfg(not(target_os = "hermit"))]
 use crate::stone_vm::{
     match_hot_jsonl_aggregation_body, match_outer_jsonl_file_loop_body, try_lower_generic_loop,
     try_lower_hot_loop, ConstId, GenericLoopIter, GenericLoopOp, GenericLoopPlan, HotLoopIter,
@@ -3508,7 +3506,6 @@ impl Evaluator<'_> {
         record_method_builtin(&record, &call.name, &args).map(RuntimeValue::Nu)
     }
 
-    #[cfg(not(target_os = "hermit"))]
     fn eval_call_values(
         &mut self,
         call: &Call,
@@ -3531,7 +3528,6 @@ impl Evaluator<'_> {
         Ok((positional, named))
     }
 
-    #[cfg(not(target_os = "hermit"))]
     fn current_cwd_path(&mut self, context: &str) -> Result<PathBuf, ShellError> {
         self.engine_state
             .cwd_as_string(Some(self.stack))

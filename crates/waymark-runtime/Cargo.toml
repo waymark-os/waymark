@@ -26,3 +26,6 @@ sysinfo = "0.38.4"
 
 [features]
 default = []
+
+[target.'cfg(target_os = "hermit")'.dependencies]
+hermit-abi = { path = "../../../helix/third_party/hermit-rs/hermit-abi" }

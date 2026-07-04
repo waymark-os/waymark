@@ -796,9 +796,38 @@ fn with_client<T>(
 }
 
 #[cfg(not(unix))]
+struct UnsupportedGatewayStream;
+
+#[cfg(not(unix))]
+impl std::io::Read for UnsupportedGatewayStream {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Gateway transport is not wired in this build",
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+impl std::io::Write for UnsupportedGatewayStream {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Gateway transport is not wired in this build",
+        ))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
 fn with_client<T>(
     _config: &GatewayRuntimeConfig,
-    _call: impl FnOnce(&mut ()) -> waymark_gateway_client::Result<T>,
+    _call: impl FnOnce(
+        &mut GatewayRpcClient<UnsupportedGatewayStream>,
+    ) -> waymark_gateway_client::Result<T>,
 ) -> Result<T, ShellError> {
     Err(stone_error(
         "gateway connect",
