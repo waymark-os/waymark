@@ -5,13 +5,18 @@ use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
 use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, Value};
-use serde_json::Value as JsonValue;
-use waymark_gateway_client::proto::{WorkspaceEntry, WorkspaceEntryKind};
+use serde_json::{json, Value as JsonValue};
+use waymark_gateway_client::proto::{
+    ModelCallRequest, ModelMessage, ModelSampling, WorkspaceEntry, WorkspaceEntryKind,
+};
 use waymark_gateway_client::{GatewayRpcClient, LinuxExecOptions, LinuxProbeOptions};
 
+use crate::agent::{AgentError, AgentModelGateway};
 use crate::json::json_to_nu_value;
+use crate::json::nu_to_json_value;
 
 const DEFAULT_RUN_SYNC_BUDGET_MS: u64 = 90_000;
+const DEFAULT_AGENT_WORKSPACE_READ_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
@@ -52,6 +57,378 @@ pub(crate) fn config() -> Option<GatewayRuntimeConfig> {
 
 pub(crate) fn enabled() -> bool {
     config().is_some()
+}
+
+pub(crate) struct GatewayAgentModelGateway {
+    config: GatewayRuntimeConfig,
+}
+
+impl GatewayAgentModelGateway {
+    pub(crate) fn active() -> Option<Self> {
+        config().map(|config| Self { config })
+    }
+}
+
+impl AgentModelGateway for GatewayAgentModelGateway {
+    fn request_model(&mut self, request: &JsonValue) -> Result<JsonValue, AgentError> {
+        gateway_model_request(&self.config, request).map_err(agent_gateway_error)
+    }
+
+    fn request_workspace_rpc(&mut self, request: &JsonValue) -> Result<JsonValue, String> {
+        gateway_workspace_request(&self.config, request).map_err(|err| err.to_string())
+    }
+
+    fn request_linux_rpc(&mut self, request: &JsonValue) -> Result<JsonValue, String> {
+        gateway_linux_request(&self.config, request).map_err(|err| err.to_string())
+    }
+}
+
+fn gateway_model_request(
+    config: &GatewayRuntimeConfig,
+    request: &JsonValue,
+) -> Result<JsonValue, ShellError> {
+    let rpc_request = model_call_request_from_json(config, request)?;
+    let response = with_client(config, |client| client.model_call(rpc_request))?;
+    Ok(json!({
+        "ok": true,
+        "text": response.content,
+        "provider": response.provider,
+        "request_id": response.provider_request_id,
+        "model": response.resolved_model,
+        "finish_reason": response.finish_reason,
+        "latency_ms": response.latency_ms,
+        "usage": response.usage.map(|usage| json!({
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "total_tokens": usage.total_tokens,
+        })).unwrap_or(JsonValue::Null),
+    }))
+}
+
+fn model_call_request_from_json(
+    config: &GatewayRuntimeConfig,
+    request: &JsonValue,
+) -> Result<ModelCallRequest, ShellError> {
+    let messages = request
+        .get("messages")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| stone_error("gateway model", "model request requires messages array"))?
+        .iter()
+        .map(model_message_from_json)
+        .collect::<Result<Vec<_>, _>>()?;
+    if messages.is_empty() {
+        return Err(stone_error(
+            "gateway model",
+            "model request messages array must not be empty",
+        ));
+    }
+
+    let sampling = model_sampling_from_json(request)?;
+    let max_output_tokens = match optional_u32_json(request, "max_output_tokens")? {
+        Some(value) => value,
+        None => optional_u32_json(request, "max_tokens")?.unwrap_or_default(),
+    };
+    Ok(ModelCallRequest {
+        attempt: config.attempt.clone(),
+        capability_profile: std::env::var("WAYMARK_GATEWAY_MODEL_CAPABILITY_PROFILE")
+            .unwrap_or_default(),
+        model_class: request
+            .get("model_class")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string)
+            .or_else(|| std::env::var("WAYMARK_GATEWAY_MODEL_CLASS").ok())
+            .unwrap_or_else(|| "agent".to_string()),
+        model_hint: request
+            .get("model")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        messages,
+        sampling,
+        max_output_tokens,
+        response_format: response_format_from_json(request.get("response_format"))?,
+        metadata: model_metadata_from_json(request),
+    })
+}
+
+fn model_message_from_json(value: &JsonValue) -> Result<ModelMessage, ShellError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| stone_error("gateway model", "message must be an object"))?;
+    let role = object
+        .get("role")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| stone_error("gateway model", "message requires role"))?;
+    let content = object
+        .get("content")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| stone_error("gateway model", "message requires string content"))?;
+    Ok(ModelMessage {
+        role: role.to_string(),
+        content: content.to_string(),
+        name: object
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        metadata: Default::default(),
+    })
+}
+
+fn model_sampling_from_json(request: &JsonValue) -> Result<Option<ModelSampling>, ShellError> {
+    let temperature = optional_f64_json(request, "temperature")?;
+    let top_p = optional_f64_json(request, "top_p")?;
+    let seed = optional_u32_json(request, "seed")?;
+    if temperature.is_none() && top_p.is_none() && seed.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(ModelSampling {
+        temperature: temperature.unwrap_or_default(),
+        top_p: top_p.unwrap_or_default(),
+        seed: seed.unwrap_or_default(),
+    }))
+}
+
+fn response_format_from_json(value: Option<&JsonValue>) -> Result<String, ShellError> {
+    match value {
+        Some(JsonValue::String(value)) => Ok(value.clone()),
+        Some(value @ JsonValue::Object(_)) => serde_json::to_string(value)
+            .map_err(|err| stone_error("gateway model", format!("invalid response_format: {err}"))),
+        Some(_) => Err(stone_error(
+            "gateway model",
+            "response_format must be a string or object",
+        )),
+        None => Ok(String::new()),
+    }
+}
+
+fn model_metadata_from_json(request: &JsonValue) -> std::collections::HashMap<String, String> {
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("source".to_string(), "waymark-runtime".to_string());
+    if let Some(object) = request.get("metadata").and_then(JsonValue::as_object) {
+        for (key, value) in object {
+            if let Some(value) = value.as_str() {
+                metadata.insert(key.clone(), value.to_string());
+            }
+        }
+    }
+    metadata
+}
+
+fn optional_u32_json(value: &JsonValue, key: &str) -> Result<Option<u32>, ShellError> {
+    let Some(value) = value.get(key) else {
+        return Ok(None);
+    };
+    let Some(number) = value.as_u64() else {
+        return Err(stone_error(
+            "gateway model",
+            format!("{key} must be an unsigned integer"),
+        ));
+    };
+    let number = u32::try_from(number).map_err(|_| {
+        stone_error(
+            "gateway model",
+            format!("{key} exceeds maximum unsigned 32-bit integer"),
+        )
+    })?;
+    Ok(Some(number))
+}
+
+fn optional_f64_json(value: &JsonValue, key: &str) -> Result<Option<f64>, ShellError> {
+    let Some(value) = value.get(key) else {
+        return Ok(None);
+    };
+    value.as_f64().map(Some).ok_or_else(|| {
+        stone_error(
+            "gateway model",
+            format!("{key} must be a finite JSON number"),
+        )
+    })
+}
+
+fn agent_gateway_error(err: ShellError) -> AgentError {
+    AgentError {
+        code: "gateway_model_rpc",
+        message: err.to_string(),
+    }
+}
+
+fn gateway_workspace_request(
+    config: &GatewayRuntimeConfig,
+    request: &JsonValue,
+) -> Result<JsonValue, ShellError> {
+    let started = std::time::Instant::now();
+    let tool = request
+        .get("tool")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| stone_error("gateway workspace", "workspace request requires tool"))?;
+    let input = request.get("input").unwrap_or(&JsonValue::Null);
+    let path = input
+        .get("path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| stone_error("gateway workspace", "workspace request requires input.path"))?;
+    let rel = workspace_path(config, Path::new(path))?;
+    match tool {
+        "read" => {
+            let max_bytes = input
+                .get("max_bytes")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(DEFAULT_AGENT_WORKSPACE_READ_BYTES);
+            let response = with_client(config, |client| {
+                client.workspace_tx_read(&config.tx, rel, max_bytes)
+            })?;
+            let bytes = response.content;
+            let byte_len = bytes.len();
+            let (content, value_truncated) = match String::from_utf8(bytes) {
+                Ok(text) => (json!(text), false),
+                Err(err) => (
+                    json!({
+                        "$type": "binary",
+                        "bytes": err.into_bytes().len(),
+                        "content": null,
+                    }),
+                    true,
+                ),
+            };
+            Ok(json!({
+                "ok": true,
+                "value": {
+                    "path": path,
+                    "bytes": byte_len,
+                    "content": content,
+                    "truncated": value_truncated,
+                },
+                "truncated": {
+                    "value": value_truncated,
+                    "stdout": false,
+                    "stderr": false,
+                },
+                "duration_ms": elapsed_ms(started),
+            }))
+        }
+        "write" => {
+            let content = input
+                .get("content")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    stone_error("gateway workspace", "write request requires string content")
+                })?;
+            let append = input
+                .get("mode")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|mode| mode == "append");
+            let response = with_client(config, |client| {
+                client.workspace_tx_write(&config.tx, rel, content.as_bytes().to_vec(), append)
+            })?;
+            Ok(json!({
+                "ok": true,
+                "value": {
+                    "path": path,
+                    "bytes": response.bytes,
+                },
+                "duration_ms": elapsed_ms(started),
+            }))
+        }
+        "list" => {
+            let entries = with_client(config, |client| client.workspace_tx_list(&config.tx, rel))?;
+            let entries = entries
+                .into_iter()
+                .map(|entry| {
+                    json!({
+                        "path": app_path(config, &entry.path),
+                        "kind": entry_kind(entry.kind),
+                        "bytes": entry.size,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "ok": true,
+                "value": {
+                    "path": path,
+                    "entries": entries,
+                    "truncated": false,
+                },
+                "truncated": {
+                    "value": false,
+                    "stdout": false,
+                    "stderr": false,
+                },
+                "duration_ms": elapsed_ms(started),
+            }))
+        }
+        other => Err(stone_error(
+            "gateway workspace",
+            format!("unsupported workspace tool {other:?}"),
+        )),
+    }
+}
+
+fn gateway_linux_request(
+    config: &GatewayRuntimeConfig,
+    request: &JsonValue,
+) -> Result<JsonValue, ShellError> {
+    let command = request
+        .get("command")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| stone_error("gateway linux", "linux request requires command"))?;
+    let cwd = request
+        .get("cwd")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("/app");
+    let timeout_ms = request
+        .get("timeout_ms")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(DEFAULT_RUN_SYNC_BUDGET_MS);
+    let max_stdout_bytes = request
+        .get("max_stdout_bytes")
+        .and_then(JsonValue::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(usize::MAX);
+    let max_stderr_bytes = request
+        .get("max_stderr_bytes")
+        .and_then(JsonValue::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(usize::MAX);
+    let workdir = container_path(config, Path::new(cwd))?;
+    let mut options = LinuxExecOptions::new(
+        config.tx.clone(),
+        config.image.clone(),
+        vec!["sh".to_string(), "-lc".to_string(), command.to_string()],
+    )
+    .workspace_mount(config.workspace_mount.clone())
+    .workdir(workdir)
+    .timeout_ms(timeout_ms);
+    if let Some(container) = &config.container {
+        options = options.container(container.clone());
+    }
+    let output = with_client(config, |client| client.linux_exec(options))?;
+    let record = linux_exec_record(output, Span::unknown(), max_stdout_bytes, max_stderr_bytes)?;
+    let value = nu_to_json_value(&Value::record(record, Span::unknown()));
+    Ok(json!({
+        "ok": value.get("ok").and_then(JsonValue::as_bool).unwrap_or(false),
+        "kind": value.get("kind").cloned().unwrap_or_else(|| json!("exec_failed")),
+        "value": {
+            "exit_code": value.get("exit_code").cloned().unwrap_or(JsonValue::Null),
+            "cwd": cwd,
+            "command": command,
+        },
+        "stdout": value.get("stdout").cloned().unwrap_or_else(|| json!("")),
+        "stderr": value.get("stderr").cloned().unwrap_or_else(|| json!("")),
+        "truncated": value.get("truncated").cloned().unwrap_or_else(|| json!({
+            "stdout": false,
+            "stderr": false,
+            "value": false,
+        })),
+        "duration_ms": value.get("duration_ms").cloned().unwrap_or_else(|| json!(0)),
+        "error": {
+            "code": value.get("kind").and_then(JsonValue::as_str).unwrap_or("exec_failed"),
+            "message": value.get("stderr").and_then(JsonValue::as_str).unwrap_or("linux exec failed"),
+        },
+    }))
+}
+
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 pub(crate) fn read_text(path: &Path, max_bytes: usize) -> Result<String, ShellError> {
@@ -932,6 +1309,18 @@ fn workspace_path(config: &GatewayRuntimeConfig, path: &Path) -> Result<String, 
     Ok(rel.to_string_lossy().into_owned())
 }
 
+fn app_path(config: &GatewayRuntimeConfig, rel: &str) -> String {
+    let rel = rel.trim_start_matches('/');
+    if rel.is_empty() {
+        config.workspace_mount.clone()
+    } else {
+        Path::new(&config.workspace_mount)
+            .join(rel)
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 fn container_path(config: &GatewayRuntimeConfig, path: &Path) -> Result<String, ShellError> {
     if path.is_absolute() {
         if path.starts_with(&config.workspace_mount) {
@@ -1009,4 +1398,59 @@ fn stone_error(kind: &str, message: impl Into<String>) -> ShellError {
         GenericError::new_internal(format!("Stone {kind} error"), message.into())
             .with_code("stone_script_error"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_model_request_maps_agent_json_to_protobuf() {
+        let config = GatewayRuntimeConfig {
+            endpoint: GatewayEndpoint::Unix(PathBuf::from("/tmp/gateway.sock")),
+            attempt: "attempt-1".to_string(),
+            tx: "tx-1".to_string(),
+            image: "python:3.12".to_string(),
+            container: None,
+            workspace_mount: "/app".to_string(),
+        };
+        let request = model_call_request_from_json(
+            &config,
+            &json!({
+                "model": "served-model",
+                "model_class": "reasoning",
+                "messages": [
+                    {"role": "system", "content": "You are concise."},
+                    {"role": "user", "content": "hello"}
+                ],
+                "temperature": 0,
+                "top_p": 1,
+                "max_tokens": 64,
+                "metadata": {
+                    "request_id": "req-1",
+                    "ignored_non_string": 7
+                }
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(request.attempt, "attempt-1");
+        assert_eq!(request.model_hint, "served-model");
+        assert_eq!(request.model_class, "reasoning");
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages[1].role, "user");
+        assert_eq!(request.messages[1].content, "hello");
+        assert_eq!(request.sampling.as_ref().unwrap().temperature, 0.0);
+        assert_eq!(request.sampling.as_ref().unwrap().top_p, 1.0);
+        assert_eq!(request.max_output_tokens, 64);
+        assert_eq!(
+            request.metadata.get("request_id"),
+            Some(&"req-1".to_string())
+        );
+        assert_eq!(
+            request.metadata.get("source"),
+            Some(&"waymark-runtime".to_string())
+        );
+        assert!(!request.metadata.contains_key("ignored_non_string"));
+    }
 }

@@ -19,3 +19,6 @@ This is a preview implementation. It currently reuses selected Nushell crates
 for typed values, engine state, and JSON conversion. Stone and the public
 `waymark` command are the product surface; Nushell reuse is an implementation
 choice, not a separate user-facing shell contract.
+
+For the host-authority placement used by LibOS guests and sandboxed agents, see
+[`GATEWAY_RUNTIME.md`](GATEWAY_RUNTIME.md).

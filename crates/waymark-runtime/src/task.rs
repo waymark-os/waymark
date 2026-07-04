@@ -65,20 +65,30 @@ impl StoneGuest {
                             Some(gateway) => {
                                 self.agent_model_task_response(&resolved.agent, gateway)
                             }
-                            None => agent_response(
-                                self.current_cwd(),
-                                AgentRunResult {
-                                    ok: false,
-                                    final_value: None,
-                                    rounds: 0,
-                                    turns: 0,
-                                    trace: Vec::new(),
-                                    error: Some(crate::agent::AgentError {
-                                        code: "model_gateway_unavailable",
-                                        message: "agent task requires a model gateway".to_owned(),
-                                    }),
-                                },
-                            ),
+                            None => {
+                                let mut gateway_model =
+                                    crate::gateway_runtime::GatewayAgentModelGateway::active();
+                                match gateway_model.as_mut() {
+                                    Some(gateway) => {
+                                        self.agent_model_task_response(&resolved.agent, gateway)
+                                    }
+                                    None => agent_response(
+                                        self.current_cwd(),
+                                        AgentRunResult {
+                                            ok: false,
+                                            final_value: None,
+                                            rounds: 0,
+                                            turns: 0,
+                                            trace: Vec::new(),
+                                            error: Some(crate::agent::AgentError {
+                                                code: "model_gateway_unavailable",
+                                                message: "agent task requires a model gateway"
+                                                    .to_owned(),
+                                            }),
+                                        },
+                                    ),
+                                }
+                            }
                         },
                         None => self.agent_task_response(&resolved.agent),
                     },

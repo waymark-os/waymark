@@ -385,12 +385,16 @@ where
     }
 
     let memory_before_task = task_memory_stats(guest);
-    let mut gateway = StreamModelGateway {
-        stream,
-        task_id: id.to_owned(),
-        next_seq: 0,
+    let mut result = if crate::gateway_runtime::enabled() {
+        guest.task_response_from_value(task.clone())
+    } else {
+        let mut gateway = StreamModelGateway {
+            stream,
+            task_id: id.to_owned(),
+            next_seq: 0,
+        };
+        guest.task_response_from_value_with_model_gateway(task.clone(), &mut gateway)
     };
-    let mut result = guest.task_response_from_value_with_model_gateway(task.clone(), &mut gateway);
     let memory_after_task = task_memory_stats(guest);
 
     if let Err(err) = guest.reset_task_state() {
