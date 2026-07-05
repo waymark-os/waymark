@@ -61,34 +61,73 @@ pub(crate) fn enabled() -> bool {
 
 pub(crate) struct GatewayAgentModelGateway {
     config: GatewayRuntimeConfig,
+    #[cfg(any(unix, target_os = "hermit"))]
+    client: Option<GatewayRpcClient<GatewayClientStream>>,
 }
 
 impl GatewayAgentModelGateway {
     pub(crate) fn active() -> Option<Self> {
-        config().map(|config| Self { config })
+        config().map(|config| Self {
+            config,
+            #[cfg(any(unix, target_os = "hermit"))]
+            client: None,
+        })
+    }
+
+    #[cfg(any(unix, target_os = "hermit"))]
+    fn client(&mut self) -> Result<&mut GatewayRpcClient<GatewayClientStream>, ShellError> {
+        if self.client.is_none() {
+            self.client = Some(connect_gateway_client(&self.config)?);
+        }
+        Ok(self.client.as_mut().expect("gateway client initialized"))
+    }
+
+    #[cfg(not(any(unix, target_os = "hermit")))]
+    fn client(&mut self) -> Result<&mut GatewayRpcClient<UnsupportedGatewayStream>, ShellError> {
+        Err(stone_error(
+            "gateway connect",
+            "Gateway transport is not wired in this build",
+        ))
     }
 }
 
 impl AgentModelGateway for GatewayAgentModelGateway {
     fn request_model(&mut self, request: &JsonValue) -> Result<JsonValue, AgentError> {
-        gateway_model_request(&self.config, request).map_err(agent_gateway_error)
+        let config = self.config.clone();
+        let client = self.client().map_err(agent_gateway_error)?;
+        gateway_model_request(&config, client, request).map_err(agent_gateway_error)
     }
 
     fn request_workspace_rpc(&mut self, request: &JsonValue) -> Result<JsonValue, String> {
-        gateway_workspace_request(&self.config, request).map_err(|err| err.to_string())
+        let config = self.config.clone();
+        match self.client() {
+            Ok(client) => {
+                gateway_workspace_request(&config, client, request).map_err(|err| err.to_string())
+            }
+            Err(err) => Err(err.to_string()),
+        }
     }
 
     fn request_linux_rpc(&mut self, request: &JsonValue) -> Result<JsonValue, String> {
-        gateway_linux_request(&self.config, request).map_err(|err| err.to_string())
+        let config = self.config.clone();
+        match self.client() {
+            Ok(client) => {
+                gateway_linux_request(&config, client, request).map_err(|err| err.to_string())
+            }
+            Err(err) => Err(err.to_string()),
+        }
     }
 }
 
 fn gateway_model_request(
     config: &GatewayRuntimeConfig,
+    client: &mut GatewayRpcClient<GatewayClientStream>,
     request: &JsonValue,
 ) -> Result<JsonValue, ShellError> {
     let rpc_request = model_call_request_from_json(config, request)?;
-    let response = with_client(config, |client| client.model_call(rpc_request))?;
+    let response = client
+        .model_call(rpc_request)
+        .map_err(|err| stone_error("gateway rpc", err.to_string()))?;
     Ok(json!({
         "ok": true,
         "text": response.content,
@@ -255,6 +294,7 @@ fn agent_gateway_error(err: ShellError) -> AgentError {
 
 fn gateway_workspace_request(
     config: &GatewayRuntimeConfig,
+    client: &mut GatewayRpcClient<GatewayClientStream>,
     request: &JsonValue,
 ) -> Result<JsonValue, ShellError> {
     let started = std::time::Instant::now();
@@ -274,9 +314,9 @@ fn gateway_workspace_request(
                 .get("max_bytes")
                 .and_then(JsonValue::as_u64)
                 .unwrap_or(DEFAULT_AGENT_WORKSPACE_READ_BYTES);
-            let response = with_client(config, |client| {
-                client.workspace_tx_read(&config.tx, rel, max_bytes)
-            })?;
+            let response = client
+                .workspace_tx_read(&config.tx, rel, max_bytes)
+                .map_err(|err| stone_error("gateway rpc", err.to_string()))?;
             let bytes = response.content;
             let byte_len = bytes.len();
             let (content, value_truncated) = match String::from_utf8(bytes) {
@@ -317,9 +357,9 @@ fn gateway_workspace_request(
                 .get("mode")
                 .and_then(JsonValue::as_str)
                 .is_some_and(|mode| mode == "append");
-            let response = with_client(config, |client| {
-                client.workspace_tx_write(&config.tx, rel, content.as_bytes().to_vec(), append)
-            })?;
+            let response = client
+                .workspace_tx_write(&config.tx, rel, content.as_bytes().to_vec(), append)
+                .map_err(|err| stone_error("gateway rpc", err.to_string()))?;
             Ok(json!({
                 "ok": true,
                 "value": {
@@ -330,7 +370,9 @@ fn gateway_workspace_request(
             }))
         }
         "list" => {
-            let entries = with_client(config, |client| client.workspace_tx_list(&config.tx, rel))?;
+            let entries = client
+                .workspace_tx_list(&config.tx, rel)
+                .map_err(|err| stone_error("gateway rpc", err.to_string()))?;
             let entries = entries
                 .into_iter()
                 .map(|entry| {
@@ -365,6 +407,7 @@ fn gateway_workspace_request(
 
 fn gateway_linux_request(
     config: &GatewayRuntimeConfig,
+    client: &mut GatewayRpcClient<GatewayClientStream>,
     request: &JsonValue,
 ) -> Result<JsonValue, ShellError> {
     let command = request
@@ -401,7 +444,9 @@ fn gateway_linux_request(
     if let Some(container) = &config.container {
         options = options.container(container.clone());
     }
-    let output = with_client(config, |client| client.linux_exec(options))?;
+    let output = client
+        .linux_exec(options)
+        .map_err(|err| stone_error("gateway rpc", err.to_string()))?;
     let record = linux_exec_record(output, Span::unknown(), max_stdout_bytes, max_stderr_bytes)?;
     let value = nu_to_json_value(&Value::record(record, Span::unknown()));
     Ok(json!({
@@ -1212,10 +1257,9 @@ impl std::io::Write for GatewayClientStream {
 }
 
 #[cfg(any(unix, target_os = "hermit"))]
-fn with_client<T>(
+fn connect_gateway_client(
     config: &GatewayRuntimeConfig,
-    call: impl FnOnce(&mut GatewayRpcClient<GatewayClientStream>) -> waymark_gateway_client::Result<T>,
-) -> Result<T, ShellError> {
+) -> Result<GatewayRpcClient<GatewayClientStream>, ShellError> {
     let stream = match &config.endpoint {
         #[cfg(unix)]
         GatewayEndpoint::Unix(path) => {
@@ -1246,7 +1290,15 @@ fn with_client<T>(
             ))
         }
     };
-    let mut client = GatewayRpcClient::from_stream(stream);
+    Ok(GatewayRpcClient::from_stream(stream))
+}
+
+#[cfg(any(unix, target_os = "hermit"))]
+fn with_client<T>(
+    config: &GatewayRuntimeConfig,
+    call: impl FnOnce(&mut GatewayRpcClient<GatewayClientStream>) -> waymark_gateway_client::Result<T>,
+) -> Result<T, ShellError> {
+    let mut client = connect_gateway_client(config)?;
     call(&mut client).map_err(|err| stone_error("gateway rpc", err.to_string()))
 }
 

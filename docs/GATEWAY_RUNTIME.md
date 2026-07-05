@@ -58,6 +58,11 @@ In Gateway runtime mode, agent tool calls use the same host-authority boundary:
 This preserves the existing agent tool response shape while moving authority
 for files, subprocesses, and credentials out of the unprivileged runtime.
 
+The built-in agent-loop helper keeps one Gateway RPC client open across a model
+episode. That matters for LibOS placement because Firecracker guest-initiated
+vsock connections are relatively expensive and repeated connect/close cycles
+can be less reliable than reusing the task-runtime channel.
+
 ## Task Server
 
 The task-server stream still supports `model_request`, `workspace_request`, and
