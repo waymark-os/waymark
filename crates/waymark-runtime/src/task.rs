@@ -42,6 +42,20 @@ impl StoneGuest {
         }
     }
 
+    pub fn task_response_from_gateway_attempt(&mut self) -> JsonValue {
+        let Some(mut gateway) = crate::gateway_runtime::GatewayAgentModelGateway::active() else {
+            return task_error(
+                None,
+                "gateway_attempt_unavailable",
+                "Gateway runtime config is not active",
+            );
+        };
+        match gateway.attempt_task_value() {
+            Ok(task) => self.task_response_from_value_with_model_gateway(task, &mut gateway),
+            Err(err) => task_error(None, "gateway_attempt_unavailable", format!("{err}")),
+        }
+    }
+
     fn task_response(&mut self, spec: TaskSpec) -> JsonValue {
         self.task_response_with_model_gateway(spec, None)
     }

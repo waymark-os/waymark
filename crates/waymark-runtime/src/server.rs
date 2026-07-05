@@ -289,7 +289,11 @@ fn task_frame_response(guest: &mut StoneGuest, frame: &JsonValue) -> JsonValue {
     }
 
     let memory_before_task = task_memory_stats(guest);
-    let mut result = guest.task_response_from_value(task.clone());
+    let mut result = if is_gateway_attempt_trigger(task) {
+        guest.task_response_from_gateway_attempt()
+    } else {
+        guest.task_response_from_value(task.clone())
+    };
     let memory_after_task = task_memory_stats(guest);
 
     if let Err(err) = guest.reset_task_state() {
@@ -385,7 +389,9 @@ where
     }
 
     let memory_before_task = task_memory_stats(guest);
-    let mut result = if crate::gateway_runtime::enabled() {
+    let mut result = if is_gateway_attempt_trigger(task) {
+        guest.task_response_from_gateway_attempt()
+    } else if crate::gateway_runtime::enabled() {
         guest.task_response_from_value(task.clone())
     } else {
         let mut gateway = StreamModelGateway {
@@ -432,6 +438,17 @@ where
             }
         }
     }))
+}
+
+fn is_gateway_attempt_trigger(task: &JsonValue) -> bool {
+    task.get("gateway_attempt")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+        || task
+            .get("runtime")
+            .and_then(|runtime| runtime.get("frontend"))
+            .and_then(JsonValue::as_str)
+            .is_some_and(|frontend| frontend == "gateway_attempt")
 }
 
 fn reset_work_dir_response(guest: &mut StoneGuest, frame: &JsonValue) -> JsonValue {

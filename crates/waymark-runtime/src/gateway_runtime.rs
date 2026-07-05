@@ -7,8 +7,9 @@ use std::time::Duration;
 use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, Value};
 use serde_json::{json, Value as JsonValue};
 use waymark_gateway_client::proto::{
-    AttemptChannelAttachBootRequest, AttemptChannelAttachRequest, AttemptChannelAttachResponse,
-    ModelCallRequest, ModelMessage, ModelSampling, WorkspaceEntry, WorkspaceEntryKind,
+    attempt_program, AttemptChannelAttachBootRequest, AttemptChannelAttachRequest,
+    AttemptChannelAttachResponse, AttemptControlBlock, ModelCallRequest, ModelMessage,
+    ModelSampling, TaskSpec as GatewayTaskSpec, WorkspaceEntry, WorkspaceEntryKind,
 };
 use waymark_gateway_client::{GatewayRpcClient, LinuxExecOptions, LinuxProbeOptions};
 
@@ -26,7 +27,7 @@ pub(crate) enum GatewayEndpoint {
     Vsock { cid: u32, port: u32 },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct GatewayRuntimeConfig {
     pub(crate) endpoint: GatewayEndpoint,
     pub(crate) attempt: String,
@@ -38,6 +39,7 @@ pub(crate) struct GatewayRuntimeConfig {
     pub(crate) workspace_mount: String,
     pub(crate) capability_profile: String,
     pub(crate) model_class: String,
+    pub(crate) control: Option<AttemptControlBlock>,
 }
 
 static CONFIG: OnceLock<RwLock<Option<GatewayRuntimeConfig>>> = OnceLock::new();
@@ -105,6 +107,20 @@ impl GatewayAgentModelGateway {
         Ok((
             config,
             self.client.as_mut().expect("gateway client initialized"),
+        ))
+    }
+
+    #[cfg(any(unix, target_os = "hermit"))]
+    pub(crate) fn attempt_task_value(&mut self) -> Result<JsonValue, ShellError> {
+        self.ensure_client()?;
+        control_task_value(&self.config)
+    }
+
+    #[cfg(not(any(unix, target_os = "hermit")))]
+    pub(crate) fn attempt_task_value(&mut self) -> Result<JsonValue, ShellError> {
+        Err(stone_error(
+            "gateway connect",
+            "Gateway transport is not wired in this build",
         ))
     }
 
@@ -1213,6 +1229,161 @@ fn probe_options(config: &GatewayRuntimeConfig) -> LinuxProbeOptions {
     }
 }
 
+fn control_task_value(config: &GatewayRuntimeConfig) -> Result<JsonValue, ShellError> {
+    let control = config
+        .control
+        .as_ref()
+        .ok_or_else(|| stone_error("gateway attempt", "attached attempt has no control block"))?;
+    let task_spec = control
+        .task_spec
+        .as_ref()
+        .ok_or_else(|| stone_error("gateway attempt", "attempt control block has no task_spec"))?;
+    let id = if task_spec.id.is_empty() {
+        config.attempt.as_str()
+    } else {
+        task_spec.id.as_str()
+    };
+    let program = control
+        .program
+        .as_ref()
+        .and_then(|program| program.program.as_ref());
+    match program {
+        Some(attempt_program::Program::Stone(stone)) => Ok(json!({
+            "version": 0,
+            "id": id,
+            "runtime": {"frontend": "stone"},
+            "script": {"source": stone.source},
+            "artifacts": control_artifacts(task_spec, &config.workspace_mount),
+        })),
+        Some(attempt_program::Program::Builtin(builtin))
+            if builtin.name.is_empty()
+                || builtin.name == "agent"
+                || builtin.name == "waymark.agent"
+                || builtin.name == "react" =>
+        {
+            let args = control_program_args(&builtin.args_json)?;
+            let task = args
+                .get("task")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| control_task_prompt(task_spec));
+            let mut agent = json!({
+                "task": task,
+                "max_turns": json_u64(&args, "max_turns").unwrap_or(16),
+                "max_rounds": json_u64(&args, "max_rounds").unwrap_or(16),
+            });
+            if let Some(model) = args.get("model").and_then(JsonValue::as_str) {
+                if !model.is_empty() {
+                    agent["model"] = JsonValue::String(model.to_string());
+                }
+            }
+            if let Some(completion_path) = args.get("completion_path").and_then(JsonValue::as_str) {
+                if !completion_path.is_empty() {
+                    agent["completion_path"] = JsonValue::String(completion_path.to_string());
+                }
+            }
+            if let Some(max_tool_ms) = json_u64(&args, "max_tool_ms") {
+                agent["max_tool_ms"] = JsonValue::from(max_tool_ms);
+            }
+            Ok(json!({
+                "version": 0,
+                "id": id,
+                "runtime": {"frontend": "agent"},
+                "agent": agent,
+                "artifacts": control_artifacts(task_spec, &config.workspace_mount),
+            }))
+        }
+        Some(attempt_program::Program::Builtin(builtin)) => Err(stone_error(
+            "gateway attempt",
+            format!("unsupported builtin attempt program `{}`", builtin.name),
+        )),
+        Some(attempt_program::Program::Artifact(_)) => Err(stone_error(
+            "gateway attempt",
+            "artifact attempt programs are not executable by the LibOS runtime yet",
+        )),
+        None => Err(stone_error(
+            "gateway attempt",
+            "attempt control block has no executable program",
+        )),
+    }
+}
+
+fn control_program_args(args_json: &str) -> Result<JsonValue, ShellError> {
+    if args_json.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(args_json).map_err(|err| {
+        stone_error(
+            "gateway attempt",
+            format!("invalid program args_json: {err}"),
+        )
+    })
+}
+
+fn json_u64(value: &JsonValue, key: &str) -> Option<u64> {
+    value.get(key).and_then(JsonValue::as_u64)
+}
+
+fn control_task_prompt(task_spec: &GatewayTaskSpec) -> String {
+    let mut lines = Vec::new();
+    if !task_spec.objective.is_empty() {
+        lines.push(task_spec.objective.clone());
+    }
+    for input in &task_spec.inputs {
+        lines.push(format!(
+            "Input: {} kind={} path={} mode={}",
+            input.name, input.kind, input.path, input.mode
+        ));
+    }
+    for output in &task_spec.outputs {
+        lines.push(format!(
+            "Output: {} kind={} path={} mode={} content_type={}",
+            output.name, output.kind, output.path, output.mode, output.content_type
+        ));
+    }
+    for success in &task_spec.success {
+        lines.push(format!(
+            "Success: kind={} input={} output={} path={} content={}",
+            success.kind, success.input, success.output, success.path, success.content
+        ));
+    }
+    for constraint in &task_spec.constraints {
+        lines.push(format!(
+            "Constraint: kind={} path={} enforcement={} args_json={}",
+            constraint.kind, constraint.path, constraint.enforcement, constraint.args_json
+        ));
+    }
+    lines.join("\n")
+}
+
+fn control_artifacts(task_spec: &GatewayTaskSpec, workspace_mount: &str) -> Vec<JsonValue> {
+    task_spec
+        .outputs
+        .iter()
+        .filter(|output| !output.path.is_empty())
+        .map(|output| {
+            let name = if output.name.is_empty() {
+                output.path.as_str()
+            } else {
+                output.name.as_str()
+            };
+            json!({
+                "name": name,
+                "kind": if output.content_type.is_empty() { "text" } else { output.content_type.as_str() },
+                "guest_path": control_workspace_path(workspace_mount, &output.path),
+            })
+        })
+        .collect()
+}
+
+fn control_workspace_path(workspace_mount: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("{}/{}", workspace_mount.trim_end_matches('/'), path)
+    }
+}
+
 fn config_from_process_env() -> Option<GatewayRuntimeConfig> {
     let endpoint = gateway_endpoint_from_env()?;
     let boot_token = std::env::var("WM_BOOT").unwrap_or_default();
@@ -1248,6 +1419,7 @@ fn config_from_process_env() -> Option<GatewayRuntimeConfig> {
         capability_profile: std::env::var("WAYMARK_GATEWAY_MODEL_CAPABILITY_PROFILE")
             .unwrap_or_default(),
         model_class: std::env::var("WAYMARK_GATEWAY_MODEL_CLASS").unwrap_or_default(),
+        control: None,
     })
 }
 
@@ -1425,6 +1597,7 @@ fn apply_attach_response(
     if !response.model_class.is_empty() {
         config.model_class = response.model_class;
     }
+    config.control = response.control;
 }
 
 #[cfg(any(unix, target_os = "hermit"))]
@@ -1590,6 +1763,7 @@ fn stone_error(kind: &str, message: impl Into<String>) -> ShellError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use waymark_gateway_client::proto::{AttemptProgram, BuiltinWorkflow, TaskOutput};
 
     #[test]
     fn gateway_model_request_maps_agent_json_to_protobuf() {
@@ -1604,6 +1778,7 @@ mod tests {
             workspace_mount: "/app".to_string(),
             capability_profile: "local".to_string(),
             model_class: "agent".to_string(),
+            control: None,
         };
         let request = model_call_request_from_json(
             &config,
@@ -1643,5 +1818,54 @@ mod tests {
             Some(&"waymark-runtime".to_string())
         );
         assert!(!request.metadata.contains_key("ignored_non_string"));
+    }
+
+    #[test]
+    fn control_block_maps_to_agent_task_json() {
+        let mut config = GatewayRuntimeConfig {
+            endpoint: GatewayEndpoint::Unix(PathBuf::from("/tmp/gateway.sock")),
+            attempt: "attempt-1".to_string(),
+            controller_run: "process-1".to_string(),
+            boot_token: String::new(),
+            tx: "tx-1".to_string(),
+            image: "python:3.12".to_string(),
+            container: None,
+            workspace_mount: "/app".to_string(),
+            capability_profile: "local".to_string(),
+            model_class: "agent".to_string(),
+            control: None,
+        };
+        config.control = Some(AttemptControlBlock {
+            task_spec: Some(GatewayTaskSpec {
+                id: "task-from-gateway".to_string(),
+                objective: "write hello.txt".to_string(),
+                outputs: vec![TaskOutput {
+                    name: "hello".to_string(),
+                    path: "hello.txt".to_string(),
+                    content_type: "text".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            program: Some(AttemptProgram {
+                program: Some(attempt_program::Program::Builtin(BuiltinWorkflow {
+                    name: "agent".to_string(),
+                    args_json: r#"{"model":"fixture","max_turns":4,"max_rounds":2}"#.to_string(),
+                })),
+            }),
+            ..Default::default()
+        });
+
+        let task = control_task_value(&config).unwrap();
+        assert_eq!(task["id"], json!("task-from-gateway"));
+        assert_eq!(task["runtime"]["frontend"], json!("agent"));
+        assert_eq!(task["agent"]["model"], json!("fixture"));
+        assert_eq!(
+            task["agent"]["task"],
+            json!("write hello.txt\nOutput: hello kind= path=hello.txt mode= content_type=text")
+        );
+        assert_eq!(task["agent"]["max_turns"], json!(4));
+        assert_eq!(task["agent"]["max_rounds"], json!(2));
+        assert_eq!(task["artifacts"][0]["guest_path"], json!("/app/hello.txt"));
     }
 }
