@@ -7,8 +7,8 @@ use std::time::Duration;
 use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, Value};
 use serde_json::{json, Value as JsonValue};
 use waymark_gateway_client::proto::{
-    AttemptChannelAttachRequest, ModelCallRequest, ModelMessage, ModelSampling, WorkspaceEntry,
-    WorkspaceEntryKind,
+    AttemptChannelAttachBootRequest, AttemptChannelAttachRequest, AttemptChannelAttachResponse,
+    ModelCallRequest, ModelMessage, ModelSampling, WorkspaceEntry, WorkspaceEntryKind,
 };
 use waymark_gateway_client::{GatewayRpcClient, LinuxExecOptions, LinuxProbeOptions};
 
@@ -31,10 +31,13 @@ pub(crate) struct GatewayRuntimeConfig {
     pub(crate) endpoint: GatewayEndpoint,
     pub(crate) attempt: String,
     pub(crate) controller_run: String,
+    pub(crate) boot_token: String,
     pub(crate) tx: String,
     pub(crate) image: String,
     pub(crate) container: Option<String>,
     pub(crate) workspace_mount: String,
+    pub(crate) capability_profile: String,
+    pub(crate) model_class: String,
 }
 
 static CONFIG: OnceLock<RwLock<Option<GatewayRuntimeConfig>>> = OnceLock::new();
@@ -77,15 +80,44 @@ impl GatewayAgentModelGateway {
     }
 
     #[cfg(any(unix, target_os = "hermit"))]
-    fn client(&mut self) -> Result<&mut GatewayRpcClient<GatewayClientStream>, ShellError> {
+    fn ensure_client(&mut self) -> Result<(), ShellError> {
         if self.client.is_none() {
-            self.client = Some(connect_gateway_client(&self.config)?);
+            let mut config = self.config.clone();
+            let client = connect_attached_gateway_client(&mut config)?;
+            self.config = config;
+            self.client = Some(client);
         }
-        Ok(self.client.as_mut().expect("gateway client initialized"))
+        Ok(())
+    }
+
+    #[cfg(any(unix, target_os = "hermit"))]
+    fn client_and_config(
+        &mut self,
+    ) -> Result<
+        (
+            GatewayRuntimeConfig,
+            &mut GatewayRpcClient<GatewayClientStream>,
+        ),
+        ShellError,
+    > {
+        self.ensure_client()?;
+        let config = self.config.clone();
+        Ok((
+            config,
+            self.client.as_mut().expect("gateway client initialized"),
+        ))
     }
 
     #[cfg(not(any(unix, target_os = "hermit")))]
-    fn client(&mut self) -> Result<&mut GatewayRpcClient<UnsupportedGatewayStream>, ShellError> {
+    fn client_and_config(
+        &mut self,
+    ) -> Result<
+        (
+            GatewayRuntimeConfig,
+            &mut GatewayRpcClient<UnsupportedGatewayStream>,
+        ),
+        ShellError,
+    > {
         Err(stone_error(
             "gateway connect",
             "Gateway transport is not wired in this build",
@@ -95,15 +127,13 @@ impl GatewayAgentModelGateway {
 
 impl AgentModelGateway for GatewayAgentModelGateway {
     fn request_model(&mut self, request: &JsonValue) -> Result<JsonValue, AgentError> {
-        let config = self.config.clone();
-        let client = self.client().map_err(agent_gateway_error)?;
+        let (config, client) = self.client_and_config().map_err(agent_gateway_error)?;
         gateway_model_request(&config, client, request).map_err(agent_gateway_error)
     }
 
     fn request_workspace_rpc(&mut self, request: &JsonValue) -> Result<JsonValue, String> {
-        let config = self.config.clone();
-        match self.client() {
-            Ok(client) => {
+        match self.client_and_config() {
+            Ok((config, client)) => {
                 gateway_workspace_request(&config, client, request).map_err(|err| err.to_string())
             }
             Err(err) => Err(err.to_string()),
@@ -111,9 +141,8 @@ impl AgentModelGateway for GatewayAgentModelGateway {
     }
 
     fn request_linux_rpc(&mut self, request: &JsonValue) -> Result<JsonValue, String> {
-        let config = self.config.clone();
-        match self.client() {
-            Ok(client) => {
+        match self.client_and_config() {
+            Ok((config, client)) => {
                 gateway_linux_request(&config, client, request).map_err(|err| err.to_string())
             }
             Err(err) => Err(err.to_string()),
@@ -172,12 +201,15 @@ fn model_call_request_from_json(
     Ok(ModelCallRequest {
         attempt: config.attempt.clone(),
         capability_profile: std::env::var("WAYMARK_GATEWAY_MODEL_CAPABILITY_PROFILE")
-            .unwrap_or_default(),
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| config.capability_profile.clone()),
         model_class: request
             .get("model_class")
             .and_then(JsonValue::as_str)
             .map(str::to_string)
             .or_else(|| std::env::var("WAYMARK_GATEWAY_MODEL_CLASS").ok())
+            .or_else(|| (!config.model_class.is_empty()).then(|| config.model_class.clone()))
             .unwrap_or_else(|| "agent".to_string()),
         model_hint: request
             .get("model")
@@ -1182,20 +1214,13 @@ fn probe_options(config: &GatewayRuntimeConfig) -> LinuxProbeOptions {
 }
 
 fn config_from_process_env() -> Option<GatewayRuntimeConfig> {
-    let endpoint = if let Some(socket) = std::env::var_os("WAYMARK_GATEWAY_SOCKET") {
-        GatewayEndpoint::Unix(PathBuf::from(socket))
+    let endpoint = gateway_endpoint_from_env()?;
+    let boot_token = std::env::var("WM_BOOT").unwrap_or_default();
+    let tx = if boot_token.is_empty() {
+        std::env::var("WAYMARK_GATEWAY_TX").ok()?
     } else {
-        let port = std::env::var("WAYMARK_GATEWAY_VSOCK_PORT")
-            .ok()?
-            .parse::<u32>()
-            .ok()?;
-        let cid = std::env::var("WAYMARK_GATEWAY_VSOCK_CID")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(2);
-        GatewayEndpoint::Vsock { cid, port }
+        std::env::var("WAYMARK_GATEWAY_TX").unwrap_or_default()
     };
-    let tx = std::env::var("WAYMARK_GATEWAY_TX").ok()?;
     let attempt = std::env::var("WAYMARK_GATEWAY_ATTEMPT_ID").unwrap_or_default();
     let image = std::env::var("WAYMARK_GATEWAY_IMAGE").unwrap_or_default();
     let container = std::env::var("WAYMARK_GATEWAY_CONTAINER")
@@ -1215,11 +1240,35 @@ fn config_from_process_env() -> Option<GatewayRuntimeConfig> {
                     .filter(|value| !value.is_empty())
             })
             .unwrap_or_default(),
+        boot_token,
         tx,
         image,
         container,
         workspace_mount,
+        capability_profile: std::env::var("WAYMARK_GATEWAY_MODEL_CAPABILITY_PROFILE")
+            .unwrap_or_default(),
+        model_class: std::env::var("WAYMARK_GATEWAY_MODEL_CLASS").unwrap_or_default(),
     })
+}
+
+fn gateway_endpoint_from_env() -> Option<GatewayEndpoint> {
+    let endpoint = if let Some(socket) = std::env::var_os("WAYMARK_GATEWAY_SOCKET") {
+        GatewayEndpoint::Unix(PathBuf::from(socket))
+    } else if let Ok(port) = std::env::var("WAYMARK_GATEWAY_VSOCK_PORT") {
+        let port = port.parse::<u32>().ok()?;
+        let cid = std::env::var("WAYMARK_GATEWAY_VSOCK_CID")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(2);
+        GatewayEndpoint::Vsock { cid, port }
+    } else {
+        let raw = std::env::var("WM_GW").ok()?;
+        let (cid, port) = raw.split_once(':')?;
+        let cid = cid.parse::<u32>().ok()?;
+        let port = port.parse::<u32>().ok()?;
+        GatewayEndpoint::Vsock { cid, port }
+    };
+    Some(endpoint)
 }
 
 fn required_config() -> Result<GatewayRuntimeConfig, ShellError> {
@@ -1301,18 +1350,81 @@ fn connect_gateway_client(
             ))
         }
     };
-    let mut client = GatewayRpcClient::from_stream(stream);
-    if !config.attempt.is_empty() {
-        client
-            .attempt_channel_attach(AttemptChannelAttachRequest {
-                attempt: config.attempt.clone(),
-                controller_run: config.controller_run.clone(),
-                channel_epoch: String::new(),
-                metadata: [("source".to_string(), "waymark-runtime".to_string())].into(),
-            })
-            .map_err(|err| stone_error("gateway attach", err.to_string()))?;
-    }
+    Ok(GatewayRpcClient::from_stream(stream))
+}
+
+#[cfg(any(unix, target_os = "hermit"))]
+fn connect_attached_gateway_client(
+    config: &mut GatewayRuntimeConfig,
+) -> Result<GatewayRpcClient<GatewayClientStream>, ShellError> {
+    let mut client = connect_gateway_client(config)?;
+    attach_gateway_client(&mut client, config)?;
     Ok(client)
+}
+
+#[cfg(any(unix, target_os = "hermit"))]
+fn attach_gateway_client(
+    client: &mut GatewayRpcClient<GatewayClientStream>,
+    config: &mut GatewayRuntimeConfig,
+) -> Result<(), ShellError> {
+    let response = if !config.boot_token.is_empty() {
+        Some(
+            client
+                .attempt_channel_attach_boot(AttemptChannelAttachBootRequest {
+                    boot_token: config.boot_token.clone(),
+                    channel_epoch: String::new(),
+                    metadata: [("source".to_string(), "waymark-runtime".to_string())].into(),
+                })
+                .map_err(|err| stone_error("gateway attach", err.to_string()))?,
+        )
+    } else if !config.attempt.is_empty() {
+        Some(
+            client
+                .attempt_channel_attach(AttemptChannelAttachRequest {
+                    attempt: config.attempt.clone(),
+                    controller_run: config.controller_run.clone(),
+                    channel_epoch: String::new(),
+                    metadata: [("source".to_string(), "waymark-runtime".to_string())].into(),
+                })
+                .map_err(|err| stone_error("gateway attach", err.to_string()))?,
+        )
+    } else {
+        None
+    };
+    if let Some(response) = response {
+        apply_attach_response(config, response);
+    }
+    Ok(())
+}
+
+fn apply_attach_response(
+    config: &mut GatewayRuntimeConfig,
+    response: AttemptChannelAttachResponse,
+) {
+    if let Some(attempt) = response.attempt {
+        if !attempt.attempt.is_empty() {
+            config.attempt = attempt.attempt;
+        }
+    }
+    if !response.controller_run.is_empty() {
+        config.controller_run = response.controller_run;
+    }
+    if !response.capability_profile.is_empty() {
+        config.capability_profile = response.capability_profile;
+    }
+    if !response.tx.is_empty() {
+        config.tx = response.tx;
+    }
+    if !response.image.is_empty() {
+        config.image = response.image;
+    }
+    config.container = (!response.container.is_empty()).then_some(response.container);
+    if !response.workspace_mount.is_empty() {
+        config.workspace_mount = response.workspace_mount;
+    }
+    if !response.model_class.is_empty() {
+        config.model_class = response.model_class;
+    }
 }
 
 #[cfg(any(unix, target_os = "hermit"))]
@@ -1320,7 +1432,8 @@ fn with_client<T>(
     config: &GatewayRuntimeConfig,
     call: impl FnOnce(&mut GatewayRpcClient<GatewayClientStream>) -> waymark_gateway_client::Result<T>,
 ) -> Result<T, ShellError> {
-    let mut client = connect_gateway_client(config)?;
+    let mut config = config.clone();
+    let mut client = connect_attached_gateway_client(&mut config)?;
     call(&mut client).map_err(|err| stone_error("gateway rpc", err.to_string()))
 }
 
@@ -1484,10 +1597,13 @@ mod tests {
             endpoint: GatewayEndpoint::Unix(PathBuf::from("/tmp/gateway.sock")),
             attempt: "attempt-1".to_string(),
             controller_run: "process-1".to_string(),
+            boot_token: String::new(),
             tx: "tx-1".to_string(),
             image: "python:3.12".to_string(),
             container: None,
             workspace_mount: "/app".to_string(),
+            capability_profile: "local".to_string(),
+            model_class: "agent".to_string(),
         };
         let request = model_call_request_from_json(
             &config,
