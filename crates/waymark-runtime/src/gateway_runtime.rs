@@ -7,7 +7,8 @@ use std::time::Duration;
 use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, Value};
 use serde_json::{json, Value as JsonValue};
 use waymark_gateway_client::proto::{
-    ModelCallRequest, ModelMessage, ModelSampling, WorkspaceEntry, WorkspaceEntryKind,
+    AttemptChannelAttachRequest, ModelCallRequest, ModelMessage, ModelSampling, WorkspaceEntry,
+    WorkspaceEntryKind,
 };
 use waymark_gateway_client::{GatewayRpcClient, LinuxExecOptions, LinuxProbeOptions};
 
@@ -29,6 +30,7 @@ pub(crate) enum GatewayEndpoint {
 pub(crate) struct GatewayRuntimeConfig {
     pub(crate) endpoint: GatewayEndpoint,
     pub(crate) attempt: String,
+    pub(crate) controller_run: String,
     pub(crate) tx: String,
     pub(crate) image: String,
     pub(crate) container: Option<String>,
@@ -1204,6 +1206,15 @@ fn config_from_process_env() -> Option<GatewayRuntimeConfig> {
     Some(GatewayRuntimeConfig {
         endpoint,
         attempt,
+        controller_run: std::env::var("WAYMARK_GATEWAY_CONTROLLER_RUN")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                std::env::var("WAYMARK_ATTEMPT_PROCESS_RUN")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            })
+            .unwrap_or_default(),
         tx,
         image,
         container,
@@ -1290,7 +1301,18 @@ fn connect_gateway_client(
             ))
         }
     };
-    Ok(GatewayRpcClient::from_stream(stream))
+    let mut client = GatewayRpcClient::from_stream(stream);
+    if !config.attempt.is_empty() {
+        client
+            .attempt_channel_attach(AttemptChannelAttachRequest {
+                attempt: config.attempt.clone(),
+                controller_run: config.controller_run.clone(),
+                channel_epoch: String::new(),
+                metadata: [("source".to_string(), "waymark-runtime".to_string())].into(),
+            })
+            .map_err(|err| stone_error("gateway attach", err.to_string()))?;
+    }
+    Ok(client)
 }
 
 #[cfg(any(unix, target_os = "hermit"))]
@@ -1461,6 +1483,7 @@ mod tests {
         let config = GatewayRuntimeConfig {
             endpoint: GatewayEndpoint::Unix(PathBuf::from("/tmp/gateway.sock")),
             attempt: "attempt-1".to_string(),
+            controller_run: "process-1".to_string(),
             tx: "tx-1".to_string(),
             image: "python:3.12".to_string(),
             container: None,

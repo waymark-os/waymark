@@ -18,7 +18,12 @@ transaction:
 
 Optional config:
 
-- `WAYMARK_GATEWAY_ATTEMPT_ID`: attempt identity passed to Gateway model calls
+- `WAYMARK_GATEWAY_ATTEMPT_ID`: attempt identity for the runtime; when present,
+  the runtime calls `attempt.channel_attach` after opening the Gateway RPC
+  stream
+- `WAYMARK_GATEWAY_CONTROLLER_RUN`: controller-run identity for
+  `attempt.channel_attach`; if omitted, the runtime falls back to
+  `WAYMARK_ATTEMPT_PROCESS_RUN` when launched by Gateway's process supervisor
 - `WAYMARK_GATEWAY_IMAGE`: Linux sidecar image for `run`/agent tool execution
 - `WAYMARK_GATEWAY_CONTAINER`: existing container target, when used
 - `WAYMARK_GATEWAY_WORKSPACE_MOUNT`: guest/container workspace mount, default
@@ -62,6 +67,11 @@ The built-in agent-loop helper keeps one Gateway RPC client open across a model
 episode. That matters for LibOS placement because Firecracker guest-initiated
 vsock connections are relatively expensive and repeated connect/close cycles
 can be less reliable than reusing the task-runtime channel.
+
+When `WAYMARK_GATEWAY_ATTEMPT_ID` is set, that persistent client first attaches
+the stream to the attempt. Gateway then treats the stream as the attempt
+control channel: scoped calls default to the attached attempt/transaction, and
+non-matching attempt or tx fields are rejected by Gateway policy.
 
 ## Task Server
 
