@@ -8,8 +8,9 @@ use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, 
 use serde_json::{json, Value as JsonValue};
 use waymark_gateway_client::proto::{
     attempt_program, AttemptChannelAttachBootRequest, AttemptChannelAttachRequest,
-    AttemptChannelAttachResponse, AttemptControlBlock, ModelCallRequest, ModelMessage,
-    ModelSampling, TaskSpec as GatewayTaskSpec, WorkspaceEntry, WorkspaceEntryKind,
+    AttemptChannelAttachResponse, AttemptControlBlock, AttemptReportResultRequest,
+    ModelCallRequest, ModelMessage, ModelSampling, TaskSpec as GatewayTaskSpec, WorkspaceEntry,
+    WorkspaceEntryKind,
 };
 use waymark_gateway_client::{GatewayRpcClient, LinuxExecOptions, LinuxProbeOptions};
 
@@ -129,6 +130,21 @@ impl GatewayAgentModelGateway {
         Ok(())
     }
 
+    #[cfg(any(unix, target_os = "hermit"))]
+    pub(crate) fn report_attempt_result(&mut self, response: &JsonValue) -> Result<(), ShellError> {
+        let request = attempt_report_result_request(&self.config, response)?;
+        if let Some(client) = self.client.as_mut() {
+            client
+                .attempt_report_result(request)
+                .map_err(|err| stone_error("gateway report", err.to_string()))?;
+            self.client.take();
+            return Ok(());
+        }
+        let result = with_client(&self.config, |client| client.attempt_report_result(request));
+        clear_shared_gateway_client();
+        result.map(|_| ())
+    }
+
     #[cfg(not(any(unix, target_os = "hermit")))]
     pub(crate) fn install_shared_client(&mut self) -> Result<(), ShellError> {
         Err(stone_error(
@@ -139,6 +155,17 @@ impl GatewayAgentModelGateway {
 
     #[cfg(not(any(unix, target_os = "hermit")))]
     pub(crate) fn attempt_task_value(&mut self) -> Result<JsonValue, ShellError> {
+        Err(stone_error(
+            "gateway connect",
+            "Gateway transport is not wired in this build",
+        ))
+    }
+
+    #[cfg(not(any(unix, target_os = "hermit")))]
+    pub(crate) fn report_attempt_result(
+        &mut self,
+        _response: &JsonValue,
+    ) -> Result<(), ShellError> {
         Err(stone_error(
             "gateway connect",
             "Gateway transport is not wired in this build",
@@ -210,6 +237,66 @@ fn gateway_model_request(
             "total_tokens": usage.total_tokens,
         })).unwrap_or(JsonValue::Null),
     }))
+}
+
+fn attempt_report_result_request(
+    config: &GatewayRuntimeConfig,
+    response: &JsonValue,
+) -> Result<AttemptReportResultRequest, ShellError> {
+    let result_json = serde_json::to_string(response).map_err(|err| {
+        stone_error(
+            "gateway report",
+            format!("failed to encode task response JSON: {err}"),
+        )
+    })?;
+    let ok = response
+        .get("ok")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    let error_json = if ok {
+        String::new()
+    } else {
+        serde_json::to_string(response.get("error").unwrap_or(response)).map_err(|err| {
+            stone_error(
+                "gateway report",
+                format!("failed to encode task error JSON: {err}"),
+            )
+        })?
+    };
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("source".to_string(), "waymark-runtime".to_string());
+    if let Some(kind) = response.get("kind").and_then(JsonValue::as_str) {
+        metadata.insert("kind".to_string(), kind.to_string());
+    }
+    Ok(AttemptReportResultRequest {
+        attempt: config.attempt.clone(),
+        status: if ok { "succeeded" } else { "failed" }.to_string(),
+        result_json,
+        error_json,
+        reason: report_reason(response),
+        metadata,
+    })
+}
+
+fn report_reason(response: &JsonValue) -> String {
+    if response
+        .get("ok")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+    {
+        return response
+            .get("kind")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("success")
+            .to_string();
+    }
+    response
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(JsonValue::as_str)
+        .or_else(|| response.get("kind").and_then(JsonValue::as_str))
+        .unwrap_or("failed")
+        .to_string()
 }
 
 fn model_call_request_from_json(
@@ -1486,6 +1573,13 @@ fn shared_gateway_client() -> &'static Mutex<Option<GatewayRpcClient<GatewayClie
 }
 
 #[cfg(any(unix, target_os = "hermit"))]
+fn clear_shared_gateway_client() {
+    if let Ok(mut guard) = shared_gateway_client().lock() {
+        guard.take();
+    }
+}
+
+#[cfg(any(unix, target_os = "hermit"))]
 impl std::io::Read for GatewayClientStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
@@ -1856,6 +1950,70 @@ mod tests {
             Some(&"waymark-runtime".to_string())
         );
         assert!(!request.metadata.contains_key("ignored_non_string"));
+    }
+
+    #[test]
+    fn attempt_report_result_maps_task_response_to_protobuf() {
+        let config = GatewayRuntimeConfig {
+            endpoint: GatewayEndpoint::Unix(PathBuf::from("/tmp/gateway.sock")),
+            attempt: "attempt-1".to_string(),
+            controller_run: "process-1".to_string(),
+            boot_token: String::new(),
+            tx: "tx-1".to_string(),
+            image: "python:3.12".to_string(),
+            container: None,
+            workspace_mount: "/app".to_string(),
+            capability_profile: "local".to_string(),
+            model_class: "agent".to_string(),
+            control: None,
+        };
+
+        let request = attempt_report_result_request(
+            &config,
+            &json!({
+                "id": "task-1",
+                "ok": true,
+                "kind": "task_result",
+                "value": {
+                    "answer": "hello"
+                }
+            }),
+        )
+        .unwrap();
+        let result: JsonValue = serde_json::from_str(&request.result_json).unwrap();
+
+        assert_eq!(request.attempt, "attempt-1");
+        assert_eq!(request.status, "succeeded");
+        assert_eq!(request.error_json, "");
+        assert_eq!(request.reason, "task_result");
+        assert_eq!(
+            request.metadata.get("source"),
+            Some(&"waymark-runtime".to_string())
+        );
+        assert_eq!(
+            request.metadata.get("kind"),
+            Some(&"task_result".to_string())
+        );
+        assert_eq!(result["value"]["answer"], json!("hello"));
+
+        let request = attempt_report_result_request(
+            &config,
+            &json!({
+                "id": "task-1",
+                "ok": false,
+                "kind": "runner_error",
+                "error": {
+                    "code": "bad_task",
+                    "message": "bad task"
+                }
+            }),
+        )
+        .unwrap();
+        let error: JsonValue = serde_json::from_str(&request.error_json).unwrap();
+
+        assert_eq!(request.status, "failed");
+        assert_eq!(request.reason, "bad task");
+        assert_eq!(error["code"], json!("bad_task"));
     }
 
     #[test]

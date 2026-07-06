@@ -63,7 +63,15 @@ impl StoneGuest {
                         return task_error(None, "gateway_attempt_unavailable", format!("{err}"));
                     }
                 }
-                self.task_response_from_value_with_model_gateway(task, &mut gateway)
+                let response = self.task_response_from_value_with_model_gateway(task, &mut gateway);
+                if let Err(err) = gateway.report_attempt_result(&response) {
+                    return task_error(
+                        response.get("id").and_then(JsonValue::as_str),
+                        "gateway_report_failed",
+                        format!("{err}"),
+                    );
+                }
+                response
             }
             Err(err) => task_error(None, "gateway_attempt_unavailable", format!("{err}")),
         }
