@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::path::{Path, PathBuf};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, Value};
@@ -114,6 +114,27 @@ impl GatewayAgentModelGateway {
     pub(crate) fn attempt_task_value(&mut self) -> Result<JsonValue, ShellError> {
         self.ensure_client()?;
         control_task_value(&self.config)
+    }
+
+    #[cfg(any(unix, target_os = "hermit"))]
+    pub(crate) fn install_shared_client(&mut self) -> Result<(), ShellError> {
+        self.ensure_client()?;
+        set_config(Some(self.config.clone()));
+        if let Some(client) = self.client.take() {
+            shared_gateway_client()
+                .lock()
+                .map_err(|_| stone_error("gateway client", "shared Gateway client lock poisoned"))?
+                .replace(client);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, target_os = "hermit")))]
+    pub(crate) fn install_shared_client(&mut self) -> Result<(), ShellError> {
+        Err(stone_error(
+            "gateway connect",
+            "Gateway transport is not wired in this build",
+        ))
     }
 
     #[cfg(not(any(unix, target_os = "hermit")))]
@@ -1456,6 +1477,15 @@ enum GatewayClientStream {
 }
 
 #[cfg(any(unix, target_os = "hermit"))]
+static SHARED_GATEWAY_CLIENT: OnceLock<Mutex<Option<GatewayRpcClient<GatewayClientStream>>>> =
+    OnceLock::new();
+
+#[cfg(any(unix, target_os = "hermit"))]
+fn shared_gateway_client() -> &'static Mutex<Option<GatewayRpcClient<GatewayClientStream>>> {
+    SHARED_GATEWAY_CLIENT.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(any(unix, target_os = "hermit"))]
 impl std::io::Read for GatewayClientStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
@@ -1578,6 +1608,7 @@ fn apply_attach_response(
             config.attempt = attempt.attempt;
         }
     }
+    config.boot_token.clear();
     if !response.controller_run.is_empty() {
         config.controller_run = response.controller_run;
     }
@@ -1605,6 +1636,13 @@ fn with_client<T>(
     config: &GatewayRuntimeConfig,
     call: impl FnOnce(&mut GatewayRpcClient<GatewayClientStream>) -> waymark_gateway_client::Result<T>,
 ) -> Result<T, ShellError> {
+    if let Some(client) = shared_gateway_client()
+        .lock()
+        .map_err(|_| stone_error("gateway client", "shared Gateway client lock poisoned"))?
+        .as_mut()
+    {
+        return call(client).map_err(|err| stone_error("gateway rpc", err.to_string()));
+    }
     let mut config = config.clone();
     let mut client = connect_attached_gateway_client(&mut config)?;
     call(&mut client).map_err(|err| stone_error("gateway rpc", err.to_string()))
