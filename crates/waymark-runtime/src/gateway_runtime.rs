@@ -38,6 +38,7 @@ pub(crate) struct GatewayRuntimeConfig {
     pub(crate) image: String,
     pub(crate) container: Option<String>,
     pub(crate) workspace_mount: String,
+    pub(crate) host_workspace_path: Option<PathBuf>,
     pub(crate) capability_profile: String,
     pub(crate) model_class: String,
     pub(crate) control: Option<AttemptControlBlock>,
@@ -1507,6 +1508,9 @@ fn config_from_process_env() -> Option<GatewayRuntimeConfig> {
         .filter(|value| !value.is_empty());
     let workspace_mount =
         std::env::var("WAYMARK_GATEWAY_WORKSPACE_MOUNT").unwrap_or_else(|_| "/app".to_string());
+    let host_workspace_path = std::env::var_os("WAYMARK_GATEWAY_WORKSPACE_PATH")
+        .or_else(|| std::env::var_os("WAYMARK_ATTEMPT_WORKSPACE_PATH"))
+        .map(PathBuf::from);
     Some(GatewayRuntimeConfig {
         endpoint,
         attempt,
@@ -1524,6 +1528,7 @@ fn config_from_process_env() -> Option<GatewayRuntimeConfig> {
         image,
         container,
         workspace_mount,
+        host_workspace_path,
         capability_profile: std::env::var("WAYMARK_GATEWAY_MODEL_CAPABILITY_PROFILE")
             .unwrap_or_default(),
         model_class: std::env::var("WAYMARK_GATEWAY_MODEL_CLASS").unwrap_or_default(),
@@ -1785,6 +1790,11 @@ fn with_client<T>(
 fn workspace_path(config: &GatewayRuntimeConfig, path: &Path) -> Result<String, ShellError> {
     let mount = Path::new(&config.workspace_mount);
     let rel = if path.is_absolute() {
+        if let Some(host_workspace_path) = &config.host_workspace_path {
+            if let Ok(rel) = path.strip_prefix(host_workspace_path) {
+                return Ok(rel.to_string_lossy().into_owned());
+            }
+        }
         path.strip_prefix(mount).map_err(|_| {
             stone_error(
                 "gateway path",
@@ -1817,6 +1827,14 @@ fn container_path(config: &GatewayRuntimeConfig, path: &Path) -> Result<String, 
     if path.is_absolute() {
         if path.starts_with(&config.workspace_mount) {
             return Ok(path.to_string_lossy().into_owned());
+        }
+        if let Some(host_workspace_path) = &config.host_workspace_path {
+            if let Ok(rel) = path.strip_prefix(host_workspace_path) {
+                return Ok(Path::new(&config.workspace_mount)
+                    .join(rel)
+                    .to_string_lossy()
+                    .into_owned());
+            }
         }
         return Err(stone_error(
             "gateway path",
@@ -1908,6 +1926,7 @@ mod tests {
             image: "python:3.12".to_string(),
             container: None,
             workspace_mount: "/app".to_string(),
+            host_workspace_path: None,
             capability_profile: "local".to_string(),
             model_class: "agent".to_string(),
             control: None,
@@ -1963,6 +1982,7 @@ mod tests {
             image: "python:3.12".to_string(),
             container: None,
             workspace_mount: "/app".to_string(),
+            host_workspace_path: None,
             capability_profile: "local".to_string(),
             model_class: "agent".to_string(),
             control: None,
@@ -2027,6 +2047,7 @@ mod tests {
             image: "python:3.12".to_string(),
             container: None,
             workspace_mount: "/app".to_string(),
+            host_workspace_path: None,
             capability_profile: "local".to_string(),
             model_class: "agent".to_string(),
             control: None,

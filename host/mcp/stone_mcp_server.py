@@ -296,7 +296,7 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
     },
     "attempt_spawn": {
         "name": "attempt_spawn",
-        "signature": "attempt_spawn(task: str = '', workspace: str = '', task_spec: record = {}, program: record = {}, workspace_source: record = {}, context_source: record = {}, capabilities: record = {}, start: bool = false, controller: str = '', capability_profile: str = '', container: str = '', workspace_mount: str = '', resource_limits: record = {}, metadata: record = {}) -> record",
+        "signature": "attempt_spawn(task: str = '', workspace: str = '', task_spec: record = {}, program: record = {}, workspace_source: record = {}, context_source: record = {}, capabilities: record = {}, start: bool = false, controller: str = '', capability_profile: str = '', container: str = '', workspace_mount: str = '', parent_attempt: str = '', resource_limits: record = {}, metadata: record = {}) -> record",
         "effects": ["write_file"],
         "example": 'child = attempt_spawn(task_spec={"id": "task-debug", "objective": "write hello.txt"}, workspace_source={"workspace": "repo"}, program={"kind": "stone", "source": "write_file(\\"hello.txt\\", \\"hello\\")"})',
     },
@@ -615,6 +615,7 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
         "capability_profile",
         "container",
         "workspace_mount",
+        "parent_attempt",
         "resource_limits",
         "metadata",
     ),
@@ -712,6 +713,9 @@ Stone_ONE_POSITIONAL_THEN_KEYWORDS = {
     "daemon_status",
     "stop_daemon",
     "wait_port",
+}
+Stone_TWO_POSITIONAL_THEN_KEYWORDS = {
+    "attempt_finish",
 }
 
 
@@ -1585,17 +1589,26 @@ def sparse(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def stone_help(backend: StoneBackend, name: str | None = None) -> dict[str, Any]:
-    if blind_surface_enabled():
+    if blind_surface_enabled() or attempt_surface_enabled():
         if name is None:
             return {"ok": True, "value": visible_help_table()}
         normalized = Stone_CALL_ALIASES.get(str(name), str(name))
-        if normalized in BLIND_HELP_NAMES:
+        if blind_surface_enabled() and normalized in BLIND_HELP_NAMES:
             return {
                 "ok": False,
                 "error": {
                     "kind": "hidden_call",
                     "code": "stone_call_hidden_blind_surface",
                     "message": f"{normalized} is hidden in blind agent surface mode",
+                },
+            }
+        if attempt_surface_enabled() and normalized not in ATTEMPT_HELP_NAMES:
+            return {
+                "ok": False,
+                "error": {
+                    "kind": "hidden_call",
+                    "code": "stone_call_hidden_attempt_surface",
+                    "message": f"{normalized} is hidden in attempt agent surface mode",
                 },
             }
     source = "emit(help())\n" if not name else f"emit(help({stone_literal(name)}))\n"
@@ -1661,6 +1674,16 @@ def stone_signature_value(name: str) -> dict[str, Any] | None:
 
 
 def stone_signature(name: str) -> dict[str, Any]:
+    normalized = Stone_CALL_ALIASES.get(name, name)
+    if attempt_surface_enabled() and normalized not in ATTEMPT_HELP_NAMES:
+        return {
+            "ok": False,
+            "error": {
+                "kind": "hidden_call",
+                "code": "stone_call_hidden_attempt_surface",
+                "message": f"{normalized} is hidden in attempt agent surface mode",
+            },
+        }
     value = stone_signature_value(name)
     if value is None:
         return {
@@ -1684,6 +1707,15 @@ def stone_call(backend: StoneBackend, name: str, args: Any, cwd: str | None = No
                 "kind": "hidden_call",
                 "code": "stone_call_hidden_blind_surface",
                 "message": f"{name} is hidden in blind agent surface mode",
+            },
+        }
+    if attempt_surface_enabled() and name not in ATTEMPT_STONE_CALLS:
+        return {
+            "ok": False,
+            "error": {
+                "kind": "hidden_call",
+                "code": "stone_call_hidden_attempt_surface",
+                "message": f"{name} is hidden in attempt agent surface mode",
             },
         }
     try:
@@ -1841,6 +1873,18 @@ def stone_call_resolved_args(name: str, args: Any, cwd: str | None) -> Any:
 
 def stone_call_arguments(name: str, args: Any) -> tuple[list[Any], dict[str, Any]]:
     order = Stone_CALL_ARG_ORDER[name]
+    if name in Stone_TWO_POSITIONAL_THEN_KEYWORDS and isinstance(args, dict):
+        missing = [key for key in order[:2] if key not in args]
+        if missing:
+            raise ValueError(f"{name} requires a {missing[0]} argument")
+        positional = [args[key] for key in order[:2]]
+        named = {
+            key: value
+            for key, value in args.items()
+            if key not in order[:2] and value is not None
+        }
+        return positional, named
+
     if name in Stone_ONE_POSITIONAL_THEN_KEYWORDS and isinstance(args, dict):
         if "argv" not in args:
             first_key = order[0]
@@ -2259,6 +2303,121 @@ TOOLS = [
         },
     },
     {
+        "name": "attempt_spawn",
+        "description": (
+            "Spawn a child Waymark attempt. Prefer this typed wrapper over stone_call "
+            "for attempt control; set program.kind to \"stone\" and program.source "
+            "to the Stone control script."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string"},
+                "workspace": {
+                    "type": "string",
+                    "description": "Logical Gateway workspace name, for example harbor-crack-7z-hash.",
+                },
+                "task_spec": {"type": "object"},
+                "program": {"type": "object"},
+                "workspace_source": {"type": "object"},
+                "context_source": {"type": "object"},
+                "capabilities": {"type": "object"},
+                "start": {"type": "boolean"},
+                "controller": {"type": "string"},
+                "capability_profile": {"type": "string"},
+                "container": {"type": "string"},
+                "workspace_mount": {"type": "string"},
+                "parent_attempt": {"type": "string"},
+                "resource_limits": {"type": "object"},
+                "metadata": {"type": "object"},
+                "cwd": {"type": "string"},
+                "allow_large_output": {
+                    "type": "boolean",
+                    "description": "Bypass the MCP large-result peek and return the full value.",
+                },
+            },
+            "required": ["task", "workspace", "program"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "attempt_start",
+        "description": "Start a spawned Waymark attempt controller.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "attempt": {"type": "string"},
+                "wait": {"type": "boolean"},
+                "timeout_ms": {"type": "integer"},
+                "cwd": {"type": "string"},
+                "allow_large_output": {"type": "boolean"},
+            },
+            "required": ["attempt"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "attempt_state",
+        "description": "Inspect an attempt state and bounded workspace diff sample.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "attempt": {"type": "string"},
+                "sample_limit": {"type": "integer"},
+                "cwd": {"type": "string"},
+                "allow_large_output": {"type": "boolean"},
+            },
+            "required": ["attempt"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "attempt_info",
+        "description": "Inspect metadata for one attempt, defaulting to the current attempt when omitted.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "attempt": {"type": "string"},
+                "cwd": {"type": "string"},
+                "allow_large_output": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "attempts",
+        "description": "List Waymark attempts, optionally filtered by task, workspace, or state.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string"},
+                "workspace": {"type": "string"},
+                "state": {"type": "string"},
+                "cwd": {"type": "string"},
+                "allow_large_output": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "attempt_finish",
+        "description": "Commit or roll back a Waymark attempt.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["commit", "rollback"]},
+                "attempt": {"type": "string"},
+                "message": {"type": "string"},
+                "reason": {"type": "string"},
+                "allow_risky": {"type": "boolean"},
+                "cwd": {"type": "string"},
+                "allow_large_output": {"type": "boolean"},
+            },
+            "required": ["action", "attempt"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "stone_describe",
         "description": "Describe a workspace path with stat data, bounded preview, and cheap schema inference.",
         "inputSchema": {
@@ -2293,7 +2452,6 @@ BLIND_STONE_CALLS = {
     "attempt_info",
     "attempt_list",
     "attempt_logs",
-    "attempt_run_process",
     "attempt_spawn",
     "attempt_start",
     "attempt_wait",
@@ -2318,27 +2476,67 @@ BLIND_STONE_CALLS = {
 }
 BLIND_HELP_NAMES = BLIND_STONE_CALLS
 BLIND_RESULT_KEYS = {"effects", "env_state", "env_diff", "env_warnings", "next_actions"}
+ATTEMPT_STONE_CALLS = {
+    "attempt_finish",
+    "attempt_fork",
+    "attempt_info",
+    "attempt_list",
+    "attempt_spawn",
+    "attempt_start",
+    "attempt_state",
+    "attempts",
+    "help",
+}
+ATTEMPT_HELP_NAMES = ATTEMPT_STONE_CALLS
+ATTEMPT_MCP_TOOLS = {
+    "attempt_finish",
+    "attempt_info",
+    "attempt_spawn",
+    "attempt_start",
+    "attempt_state",
+    "attempts",
+    "stone_call",
+    "stone_help",
+    "stone_signature",
+}
+DIRECT_ATTEMPT_TOOLS = {
+    "attempt_finish",
+    "attempt_info",
+    "attempt_spawn",
+    "attempt_start",
+    "attempt_state",
+    "attempts",
+}
 
 
 def agent_surface_mode() -> str:
     mode = os.environ.get("WAYMARK_GATEWAY_AGENT_SURFACE", "full").strip().lower()
-    return mode if mode in {"full", "blind"} else "full"
+    return mode if mode in {"full", "blind", "attempt"} else "full"
 
 
 def blind_surface_enabled() -> bool:
     return agent_surface_mode() == "blind"
 
 
+def attempt_surface_enabled() -> bool:
+    return agent_surface_mode() == "attempt"
+
+
 def visible_tools() -> list[dict[str, Any]]:
+    if attempt_surface_enabled():
+        return [tool for tool in TOOLS if tool.get("name") in ATTEMPT_MCP_TOOLS]
+    filtered = [tool for tool in TOOLS if tool.get("name") not in DIRECT_ATTEMPT_TOOLS]
     if not blind_surface_enabled():
-        return TOOLS
-    return TOOLS
+        return filtered
+    return filtered
 
 
 def visible_help_table() -> dict[str, dict[str, Any]]:
     table = HELP_TABLE
     if blind_surface_enabled():
         table = {name: value for name, value in HELP_TABLE.items() if name not in BLIND_HELP_NAMES}
+    elif attempt_surface_enabled():
+        table = {name: value for name, value in HELP_TABLE.items() if name in ATTEMPT_HELP_NAMES}
     return {
         name: {**value, **(stone_signature_value(name) or {})}
         for name, value in table.items()
@@ -2598,6 +2796,24 @@ def attach_runtime_status(
     return result
 
 
+def direct_attempt_call_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    call_args = {
+        key: value
+        for key, value in args.items()
+        if key not in {"allow_large_output", "cwd"} and value not in (None, "", [], {})
+    }
+    if tool_name == "attempt_spawn":
+        workspace = call_args.get("workspace")
+        workspace_source = call_args.get("workspace_source")
+        if isinstance(workspace, str) and workspace:
+            if isinstance(workspace_source, dict):
+                workspace_source = {"workspace": workspace, **workspace_source}
+            else:
+                workspace_source = {"workspace": workspace}
+            call_args["workspace_source"] = workspace_source
+    return call_args
+
+
 class McpServer:
     def __init__(
         self,
@@ -2683,7 +2899,16 @@ class McpServer:
         args = params.get("arguments") or {}
         started = time.monotonic()
         if name == "stone_eval":
-            if blind_surface_enabled() and hidden_blind_source(str(args.get("source", ""))):
+            if attempt_surface_enabled():
+                result = {
+                    "ok": False,
+                    "error": {
+                        "kind": "hidden_call",
+                        "code": "stone_eval_hidden_attempt_surface",
+                        "message": "stone_eval is hidden in attempt agent surface mode; spawn a child attempt with program.kind='stone' instead",
+                    },
+                }
+            elif blind_surface_enabled() and hidden_blind_source(str(args.get("source", ""))):
                 result = {
                     "ok": False,
                     "error": {
@@ -2706,6 +2931,26 @@ class McpServer:
             result = apply_large_result_policy(
                 result, allow_large_output=bool(args.get("allow_large_output"))
             )
+        elif isinstance(name, str) and name in DIRECT_ATTEMPT_TOOLS:
+            if not attempt_surface_enabled():
+                result = {
+                    "ok": False,
+                    "error": {
+                        "kind": "hidden_call",
+                        "code": "attempt_tool_hidden_surface",
+                        "message": f"{name} is only available in attempt agent surface mode",
+                    },
+                }
+            else:
+                result = stone_call(
+                    self.backend,
+                    name,
+                    direct_attempt_call_args(name, args if isinstance(args, dict) else {}),
+                    args.get("cwd") if isinstance(args, dict) else None,
+                )
+                result = apply_large_result_policy(
+                    result, allow_large_output=bool(args.get("allow_large_output"))
+                )
         elif name == "stone_describe":
             result = stone_describe(str(args.get("path", "")), args.get("cwd"))
         elif name == "escape_linux":

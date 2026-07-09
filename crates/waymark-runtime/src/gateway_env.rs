@@ -77,11 +77,27 @@ pub(crate) fn attempt_spawn(
     capability_profile: String,
     container: String,
     workspace_mount: String,
+    parent_attempt: String,
     resource_limits: Vec<(String, String)>,
     metadata: Vec<(String, String)>,
     spawn_v1: AttemptSpawnV1,
 ) -> Result<Value, ShellError> {
     let config = required_config()?;
+    let container = if container.is_empty() {
+        config.container.clone().unwrap_or_default()
+    } else {
+        container
+    };
+    let workspace_mount = if workspace_mount.is_empty() {
+        config.workspace_mount.clone()
+    } else {
+        workspace_mount
+    };
+    let parent_attempt = if parent_attempt.is_empty() {
+        config.attempt.clone()
+    } else {
+        parent_attempt
+    };
     let attempt = with_client(&config, |client| {
         client.attempt_spawn(AttemptSpawnRequest {
             task: task.clone(),
@@ -90,6 +106,7 @@ pub(crate) fn attempt_spawn(
             capability_profile: capability_profile.clone(),
             container: container.clone(),
             workspace_mount: workspace_mount.clone(),
+            parent_attempt: parent_attempt.clone(),
             resource_limits: resource_limits.clone().into_iter().collect(),
             metadata: metadata.clone().into_iter().collect(),
             task_spec: spawn_v1.task_spec.clone(),

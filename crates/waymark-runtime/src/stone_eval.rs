@@ -4001,6 +4001,7 @@ impl Evaluator<'_> {
         let mut capability_profile = String::new();
         let mut container = String::new();
         let mut workspace_mount = String::new();
+        let mut parent_attempt = String::new();
         let mut resource_limits = Vec::new();
         let mut metadata = Vec::new();
         let mut spawn_v1 = gateway_env::AttemptSpawnV1::default();
@@ -4018,6 +4019,9 @@ impl Evaluator<'_> {
                 "container" => container = value_to_string(&value, "attempt_spawn container")?,
                 "workspace_mount" => {
                     workspace_mount = value_to_string(&value, "attempt_spawn workspace_mount")?
+                }
+                "parent_attempt" => {
+                    parent_attempt = value_to_string(&value, "attempt_spawn parent_attempt")?
                 }
                 "resource_limits" | "limits" => {
                     resource_limits =
@@ -4076,6 +4080,7 @@ impl Evaluator<'_> {
             capability_profile,
             container,
             workspace_mount,
+            parent_attempt,
             resource_limits,
             metadata,
             spawn_v1,

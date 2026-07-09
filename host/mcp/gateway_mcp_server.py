@@ -125,6 +125,7 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "task": {"type": "string"},
                 "workspace": {"type": "string"},
+                "parent_attempt": {"type": "string"},
                 "controller": {"type": "string"},
                 "capability_profile": {"type": "string"},
                 "container": {"type": "string"},
@@ -643,6 +644,7 @@ class GatewayMcp:
             if not task or not workspace:
                 raise ValueError("attempt_spawn requires task/workspace or task_spec.id/workspace_source.workspace")
             call_args = ["--task", str(task), "--workspace", str(workspace)]
+            add_optional(call_args, args, "parent_attempt", "--parent-attempt")
             add_attempt_options(call_args, args)
             add_spawn_options(call_args, args)
             return self.rpc.call("attempt.spawn", call_args)
