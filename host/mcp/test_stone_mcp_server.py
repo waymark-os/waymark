@@ -175,6 +175,108 @@ class StoneMcpServerTests(unittest.TestCase):
             os.environ.clear()
             os.environ.update(old_env)
 
+    def test_explicit_tx_surface_hides_attempt_calls_but_allows_transactions(self) -> None:
+        old_env = os.environ.copy()
+        try:
+            os.environ["WAYMARK_GATEWAY_AGENT_SURFACE"] = "explicit-tx"
+            backend = FakeBackend({"ok": True, "value": "ran"})
+
+            hidden = server.stone_call(backend, "attempt_spawn", {})
+            allowed = server.stone_call(backend, "env_state", {})
+
+            self.assertEqual(server.agent_surface_mode(), "explicit-tx")
+            self.assertFalse(hidden["ok"])
+            self.assertEqual(
+                hidden["error"]["code"], "stone_call_hidden_explicit_tx_surface"
+            )
+            self.assertTrue(allowed["ok"])
+            self.assertEqual(len(backend.calls), 1)
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_explicit_tx_surface_hides_attempt_discovery_and_eval_bypass(self) -> None:
+        old_env = os.environ.copy()
+        try:
+            os.environ["WAYMARK_GATEWAY_AGENT_SURFACE"] = "explicit-tx"
+            backend = FakeBackend({"ok": True, "value": "should not run"})
+            mcp = server.McpServer(backend, io.BytesIO(), io.BytesIO(), io.StringIO())
+
+            self.assertFalse(server.stone_help(backend, "attempt_info")["ok"])
+            self.assertFalse(server.stone_signature("attempt_info")["ok"])
+            self.assertNotIn("attempt_info", server.visible_help_table())
+            response = mcp.call_tool(
+                {"name": "stone_eval", "arguments": {"source": "emit(attempts())"}}
+            )
+
+            self.assertFalse(response["structuredContent"]["ok"])
+            self.assertEqual(
+                response["structuredContent"]["error"]["code"],
+                "stone_eval_hidden_explicit_tx_surface",
+            )
+            self.assertEqual(backend.calls, [])
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_large_record_preview_bounds_embedded_diff_text(self) -> None:
+        result = server.apply_large_result_policy(
+            {
+                "ok": True,
+                "value": {
+                    "env_diff": "x" * (server.LARGE_RESULT_BYTES + 1),
+                    "env_clean": False,
+                },
+            }
+        )
+
+        preview = result["value"]["head"]["env_diff"]
+        self.assertLess(len(preview.encode("utf-8")), 3 * 1024)
+        self.assertIn("truncated", preview)
+
+    def test_control_plane_result_stays_bounded_when_force_is_requested(self) -> None:
+        backend = FakeBackend(
+            {
+                "ok": True,
+                "value": {"env_diff": "x" * (server.LARGE_RESULT_BYTES + 1), "clean": False},
+            }
+        )
+        mcp = server.McpServer(backend, io.BytesIO(), io.BytesIO(), io.StringIO())
+
+        response = mcp.call_tool(
+            {
+                "name": "stone_call",
+                "arguments": {
+                    "name": "env_finish",
+                    "args": {},
+                    "allow_large_output": True,
+                },
+            }
+        )
+
+        result = response["structuredContent"]
+        self.assertTrue(result["value"]["__waymark_large_output__"])
+        self.assertNotIn("force", result["diagnostics"]["large_output"])
+
+    def test_env_restore_accepts_agent_visible_absolute_workspace_paths(self) -> None:
+        old_env = os.environ.copy()
+        try:
+            os.environ["WAYMARK_GATEWAY_WORKSPACE_MOUNT"] = "/app"
+            backend = FakeBackend({"ok": True, "value": {"clean": True}})
+
+            result = server.stone_call(
+                backend, "env_restore", {"paths": ["/app/work", "answer.txt"]}, "/app"
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(
+                backend.calls,
+                [('emit(env_restore(["work", "answer.txt"]))\n', None)],
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
     def test_tool_result_includes_advisory_runtime_status(self) -> None:
         old_env = os.environ.copy()
         try:

@@ -8,6 +8,7 @@ import abc
 import csv
 import json
 import os
+import re
 import select
 import shutil
 import struct
@@ -1432,9 +1433,9 @@ def bound_text(value: str | bytes | None, max_bytes: int = MAX_OUTPUT_BYTES) -> 
 
 
 def apply_large_result_policy(
-    result: dict[str, Any], *, allow_large_output: bool = False
+    result: dict[str, Any], *, allow_large_output: bool = False, force_allowed: bool = True
 ) -> dict[str, Any]:
-    if allow_large_output or not result.get("ok") or "value" not in result:
+    if (allow_large_output and force_allowed) or not result.get("ok") or "value" not in result:
         return result
     preview = large_result_preview(result.get("value"))
     if preview is None:
@@ -1443,15 +1444,20 @@ def apply_large_result_policy(
     policy_result = dict(result)
     policy_result["value"] = preview
     diagnostics = dict(policy_result.get("diagnostics") or {})
-    diagnostics["large_output"] = {
+    large_output = {
         "policy": "preview",
         "message": (
             "Large structured result was replaced with a peek. Bind large values and "
             "emit len/head/tail summaries, or call stone_eval with allow_large_output=true "
             "when the full value is required."
+            if force_allowed
+            else "Large control-plane feedback was replaced with a bounded peek. Use its "
+            "summary and samples, then request a narrower state or diff view if needed."
         ),
-        "force": "set allow_large_output=true on stone_eval",
     }
+    if force_allowed:
+        large_output["force"] = "set allow_large_output=true on stone_eval"
+    diagnostics["large_output"] = large_output
     policy_result["diagnostics"] = diagnostics
     return sparse(policy_result)
 
@@ -1545,6 +1551,8 @@ def preview_record(value: dict[str, Any]) -> dict[str, Any]:
                 "len": len(item),
                 "keys": list(item.keys())[:LARGE_RESULT_PEEK_ITEMS],
             }
+        elif isinstance(item, (str, bytes)):
+            preview[key] = bound_text(item, max_bytes=2 * 1024)
         else:
             preview[key] = item
     return preview
@@ -1589,7 +1597,7 @@ def sparse(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def stone_help(backend: StoneBackend, name: str | None = None) -> dict[str, Any]:
-    if blind_surface_enabled() or attempt_surface_enabled():
+    if blind_surface_enabled() or explicit_tx_surface_enabled() or attempt_surface_enabled():
         if name is None:
             return {"ok": True, "value": visible_help_table()}
         normalized = Stone_CALL_ALIASES.get(str(name), str(name))
@@ -1600,6 +1608,15 @@ def stone_help(backend: StoneBackend, name: str | None = None) -> dict[str, Any]
                     "kind": "hidden_call",
                     "code": "stone_call_hidden_blind_surface",
                     "message": f"{normalized} is hidden in blind agent surface mode",
+                },
+            }
+        if explicit_tx_surface_enabled() and normalized in EXPLICIT_TX_HIDDEN_HELP_NAMES:
+            return {
+                "ok": False,
+                "error": {
+                    "kind": "hidden_call",
+                    "code": "stone_call_hidden_explicit_tx_surface",
+                    "message": f"{normalized} is hidden in explicit transaction agent surface mode",
                 },
             }
         if attempt_surface_enabled() and normalized not in ATTEMPT_HELP_NAMES:
@@ -1675,6 +1692,15 @@ def stone_signature_value(name: str) -> dict[str, Any] | None:
 
 def stone_signature(name: str) -> dict[str, Any]:
     normalized = Stone_CALL_ALIASES.get(name, name)
+    if explicit_tx_surface_enabled() and normalized in EXPLICIT_TX_HIDDEN_HELP_NAMES:
+        return {
+            "ok": False,
+            "error": {
+                "kind": "hidden_call",
+                "code": "stone_call_hidden_explicit_tx_surface",
+                "message": f"{normalized} is hidden in explicit transaction agent surface mode",
+            },
+        }
     if attempt_surface_enabled() and normalized not in ATTEMPT_HELP_NAMES:
         return {
             "ok": False,
@@ -1707,6 +1733,15 @@ def stone_call(backend: StoneBackend, name: str, args: Any, cwd: str | None = No
                 "kind": "hidden_call",
                 "code": "stone_call_hidden_blind_surface",
                 "message": f"{name} is hidden in blind agent surface mode",
+            },
+        }
+    if explicit_tx_surface_enabled() and name in EXPLICIT_TX_HIDDEN_STONE_CALLS:
+        return {
+            "ok": False,
+            "error": {
+                "kind": "hidden_call",
+                "code": "stone_call_hidden_explicit_tx_surface",
+                "message": f"{name} is hidden in explicit transaction agent surface mode",
             },
         }
     if attempt_surface_enabled() and name not in ATTEMPT_STONE_CALLS:
@@ -1828,6 +1863,8 @@ def stone_call_source(name: str, args: Any) -> str:
 
 
 def stone_call_resolved_args(name: str, args: Any, cwd: str | None) -> Any:
+    if name == "env_restore":
+        return resolve_env_restore_args(args, cwd)
     if name not in {
         "cat",
         "find",
@@ -1868,6 +1905,34 @@ def stone_call_resolved_args(name: str, args: Any, cwd: str | None) -> Any:
                 for path in resolved[key]
             ]
             return resolved
+    return args
+
+
+def resolve_env_restore_args(args: Any, cwd: str | None) -> Any:
+    def resolve(path: Any) -> Any:
+        if not isinstance(path, str) or not Path(path).is_absolute():
+            return path
+        workspace = os.environ.get("WAYMARK_GATEWAY_WORKSPACE_MOUNT") or cwd
+        if not workspace:
+            return path
+        try:
+            relative = Path(path).resolve().relative_to(Path(workspace).resolve())
+        except ValueError:
+            return path
+        return relative.as_posix() if relative.parts else path
+
+    if isinstance(args, list):
+        return [resolve(path) for path in args]
+    if isinstance(args, dict):
+        paths = args.get("paths")
+        resolved = dict(args)
+        if isinstance(paths, list):
+            resolved["paths"] = [resolve(path) for path in paths]
+        elif paths is not None:
+            resolved["paths"] = resolve(paths)
+        return resolved
+    if isinstance(args, str):
+        return resolve(args)
     return args
 
 
@@ -2452,6 +2517,7 @@ BLIND_STONE_CALLS = {
     "attempt_info",
     "attempt_list",
     "attempt_logs",
+    "attempt_run_process",
     "attempt_spawn",
     "attempt_start",
     "attempt_wait",
@@ -2488,6 +2554,32 @@ ATTEMPT_STONE_CALLS = {
     "help",
 }
 ATTEMPT_HELP_NAMES = ATTEMPT_STONE_CALLS
+EXPLICIT_TX_HIDDEN_STONE_CALLS = {
+    "attempt_finish",
+    "attempt_fork",
+    "attempt_info",
+    "attempt_list",
+    "attempt_logs",
+    "attempt_run_process",
+    "attempt_spawn",
+    "attempt_start",
+    "attempt_wait",
+    "attempt_terminate",
+    "attempt_state",
+    "attempts",
+}
+EXPLICIT_TX_HIDDEN_HELP_NAMES = EXPLICIT_TX_HIDDEN_STONE_CALLS
+CONTROL_RESULTS_ALWAYS_BOUNDED = {
+    "attempt_info",
+    "attempt_logs",
+    "attempt_state",
+    "attempts",
+    "env_diff",
+    "env_finish",
+    "env_state",
+    "env_tx_info",
+    "env_txs",
+}
 ATTEMPT_MCP_TOOLS = {
     "attempt_finish",
     "attempt_info",
@@ -2511,11 +2603,15 @@ DIRECT_ATTEMPT_TOOLS = {
 
 def agent_surface_mode() -> str:
     mode = os.environ.get("WAYMARK_GATEWAY_AGENT_SURFACE", "full").strip().lower()
-    return mode if mode in {"full", "blind", "attempt"} else "full"
+    return mode if mode in {"full", "blind", "explicit-tx", "attempt"} else "full"
 
 
 def blind_surface_enabled() -> bool:
     return agent_surface_mode() == "blind"
+
+
+def explicit_tx_surface_enabled() -> bool:
+    return agent_surface_mode() == "explicit-tx"
 
 
 def attempt_surface_enabled() -> bool:
@@ -2535,6 +2631,12 @@ def visible_help_table() -> dict[str, dict[str, Any]]:
     table = HELP_TABLE
     if blind_surface_enabled():
         table = {name: value for name, value in HELP_TABLE.items() if name not in BLIND_HELP_NAMES}
+    elif explicit_tx_surface_enabled():
+        table = {
+            name: value
+            for name, value in HELP_TABLE.items()
+            if name not in EXPLICIT_TX_HIDDEN_HELP_NAMES
+        }
     elif attempt_surface_enabled():
         table = {name: value for name, value in HELP_TABLE.items() if name in ATTEMPT_HELP_NAMES}
     return {
@@ -2574,6 +2676,11 @@ def hidden_blind_source(source: str) -> bool:
         "env_rollback",
     )
     return any(name in source for name in hidden)
+
+
+def hidden_explicit_tx_source(source: str) -> bool:
+    names = "|".join(re.escape(name) for name in sorted(EXPLICIT_TX_HIDDEN_STONE_CALLS))
+    return re.search(rf"\b(?:{names})\b", source) is not None
 
 
 def optional_int_env(name: str) -> int | None:
@@ -2917,6 +3024,17 @@ class McpServer:
                         "message": "restore, rollback, and change-inspection builtins are hidden in blind agent surface mode",
                     },
                 }
+            elif explicit_tx_surface_enabled() and hidden_explicit_tx_source(
+                str(args.get("source", ""))
+            ):
+                result = {
+                    "ok": False,
+                    "error": {
+                        "kind": "hidden_call",
+                        "code": "stone_eval_hidden_explicit_tx_surface",
+                        "message": "attempt builtins are hidden in explicit transaction agent surface mode",
+                    },
+                }
             else:
                 result = self.backend.eval(str(args.get("source", "")), args.get("cwd"))
                 result = apply_large_result_policy(
@@ -2924,12 +3042,18 @@ class McpServer:
                 )
         elif name == "stone_help":
             result = stone_help(self.backend, args.get("name"))
+            result = apply_large_result_policy(result)
         elif name == "stone_signature":
             result = stone_signature(str(args.get("name", "")))
         elif name == "stone_call":
-            result = stone_call(self.backend, str(args.get("name", "")), args.get("args"), args.get("cwd"))
+            call_name = Stone_CALL_ALIASES.get(
+                str(args.get("name", "")), str(args.get("name", ""))
+            )
+            result = stone_call(self.backend, call_name, args.get("args"), args.get("cwd"))
             result = apply_large_result_policy(
-                result, allow_large_output=bool(args.get("allow_large_output"))
+                result,
+                allow_large_output=bool(args.get("allow_large_output")),
+                force_allowed=call_name not in CONTROL_RESULTS_ALWAYS_BOUNDED,
             )
         elif isinstance(name, str) and name in DIRECT_ATTEMPT_TOOLS:
             if not attempt_surface_enabled():
