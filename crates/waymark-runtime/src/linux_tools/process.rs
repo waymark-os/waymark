@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-#![cfg(not(target_os = "hermit"))]
-
+#[cfg(not(target_os = "hermit"))]
 use std::env;
+#[cfg(not(target_os = "hermit"))]
 use std::fs::{self, File};
+#[cfg(not(target_os = "hermit"))]
 use std::io::{ErrorKind, Read, Seek, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::FromRawFd;
@@ -12,16 +13,24 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "hermit"))]
 use std::process::{Command, ExitStatus, Stdio};
+#[cfg(not(target_os = "hermit"))]
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+#[cfg(not(target_os = "hermit"))]
 use std::sync::Once;
+#[cfg(not(target_os = "hermit"))]
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_os = "hermit"))]
+use std::time::Instant;
 
 use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, Value};
+#[cfg(not(target_os = "hermit"))]
 use serde_json::Value as JsonValue;
 
 use crate::gateway_runtime;
+#[cfg(not(target_os = "hermit"))]
 use crate::stone_helpers::attach_service_helper_observation;
 
 #[cfg(unix)]
@@ -249,6 +258,7 @@ fn value_to_bool(value: &Value, context: &str) -> Result<bool, ShellError> {
     Ok(*val)
 }
 
+#[cfg(not(target_os = "hermit"))]
 pub(crate) fn resolve_command_call_values(
     positional: &[Value],
     named: &[(String, Value)],
@@ -271,6 +281,7 @@ pub(crate) fn resolve_command_call_values(
     )?))
 }
 
+#[cfg(not(target_os = "hermit"))]
 pub(crate) fn start_daemon_call_values(
     positional: &[Value],
     named: &[(String, Value)],
@@ -326,6 +337,7 @@ pub(crate) fn start_daemon_call_values(
     start_posix_daemon(&argv, &cwd_path, &env_overrides, &stdout_path, &stderr_path)
 }
 
+#[cfg(not(target_os = "hermit"))]
 pub(crate) fn daemon_status_call_values(
     positional: &[Value],
     named: &[(String, Value)],
@@ -391,6 +403,7 @@ pub(crate) fn daemon_status_call_values(
     ))
 }
 
+#[cfg(not(target_os = "hermit"))]
 pub(crate) fn stop_daemon_call_values(
     positional: &[Value],
     named: &[(String, Value)],
@@ -520,6 +533,7 @@ pub(crate) fn run_terminate_call_values(
     ))
 }
 
+#[cfg(not(target_os = "hermit"))]
 pub(crate) fn wait_port_call_values(
     positional: &[Value],
     named: &[(String, Value)],
@@ -570,7 +584,6 @@ pub(crate) fn wait_port_call_values(
     Ok(wait_port_record(&host, port, &protocol, timeout))
 }
 
-#[cfg(not(target_os = "hermit"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RunOutputTarget {
     Capture,
@@ -578,7 +591,6 @@ enum RunOutputTarget {
     Stdout,
 }
 
-#[cfg(not(target_os = "hermit"))]
 fn value_to_run_stdout_target(value: &Value, context: &str) -> Result<RunOutputTarget, ShellError> {
     let target = value_to_string(value, context)?;
     match target.as_str() {
@@ -597,7 +609,6 @@ fn value_to_run_stdout_target(value: &Value, context: &str) -> Result<RunOutputT
     }
 }
 
-#[cfg(not(target_os = "hermit"))]
 fn value_to_run_stderr_target(value: &Value, context: &str) -> Result<RunOutputTarget, ShellError> {
     let target = value_to_string(value, context)?;
     match target.as_str() {
@@ -1427,7 +1438,6 @@ pub(crate) fn cleanup_stale_run_temp_files(dir: &Path, stale_after: Duration) {
     }
 }
 
-#[cfg(not(target_os = "hermit"))]
 fn run_posix_command(
     argv: &[String],
     cwd: &Path,
@@ -1477,204 +1487,214 @@ fn run_posix_command(
         record.push("stderr_to_stdout", Value::bool(false, span));
         return Ok(record);
     }
-    if background {
+    #[cfg(target_os = "hermit")]
+    {
         return Err(stone_error(
+            "run",
+            "run() on Hermit requires an attached Gateway linux.exec capability",
+        ));
+    }
+    #[cfg(not(target_os = "hermit"))]
+    {
+        if background {
+            return Err(stone_error(
             "run",
             "run(background=True) is only available in Gateway-backed runtime; use start_daemon() for local long-lived services",
         ));
-    }
-    static RUN_ID: AtomicU64 = AtomicU64::new(0);
+        }
+        static RUN_ID: AtomicU64 = AtomicU64::new(0);
 
-    let span = Span::unknown();
-    let started = Instant::now();
-    cleanup_stale_run_temp_files_once();
-    validate_command_cwd("run", cwd)?;
-    let temp_prefix = format!(
-        "stone-run-{}-{}",
-        std::process::id(),
-        RUN_ID.fetch_add(1, AtomicOrdering::Relaxed)
-    );
-    let mut stdout_file = (stdout_target == RunOutputTarget::Capture)
-        .then(|| create_command_capture_file("run", "stdout", &temp_prefix, "stdout"))
-        .transpose()?;
-    let mut stderr_file = (stderr_target == RunOutputTarget::Capture)
-        .then(|| create_command_capture_file("run", "stderr", &temp_prefix, "stderr"))
-        .transpose()?;
+        let span = Span::unknown();
+        let started = Instant::now();
+        cleanup_stale_run_temp_files_once();
+        validate_command_cwd("run", cwd)?;
+        let temp_prefix = format!(
+            "stone-run-{}-{}",
+            std::process::id(),
+            RUN_ID.fetch_add(1, AtomicOrdering::Relaxed)
+        );
+        let mut stdout_file = (stdout_target == RunOutputTarget::Capture)
+            .then(|| create_command_capture_file("run", "stdout", &temp_prefix, "stdout"))
+            .transpose()?;
+        let mut stderr_file = (stderr_target == RunOutputTarget::Capture)
+            .then(|| create_command_capture_file("run", "stderr", &temp_prefix, "stderr"))
+            .transpose()?;
 
-    let mut command = Command::new(&argv[0]);
-    let stdout_stdio = match stdout_target {
-        RunOutputTarget::Capture => Stdio::from(
-            stdout_file
-                .as_ref()
-                .expect("stdout capture file should exist")
-                .try_clone("run", "stdout")?,
-        ),
-        RunOutputTarget::Suppress => Stdio::null(),
-        RunOutputTarget::Stdout => unreachable!("stdout cannot target stdout"),
-    };
-    let stderr_stdio = match stderr_target {
-        RunOutputTarget::Capture => Stdio::from(
-            stderr_file
-                .as_ref()
-                .expect("stderr capture file should exist")
-                .try_clone("run", "stderr")?,
-        ),
-        RunOutputTarget::Suppress => Stdio::null(),
-        RunOutputTarget::Stdout => match stdout_target {
+        let mut command = Command::new(&argv[0]);
+        let stdout_stdio = match stdout_target {
             RunOutputTarget::Capture => Stdio::from(
                 stdout_file
                     .as_ref()
                     .expect("stdout capture file should exist")
-                    .try_clone("run", "stdout file for stderr")?,
+                    .try_clone("run", "stdout")?,
             ),
             RunOutputTarget::Suppress => Stdio::null(),
             RunOutputTarget::Stdout => unreachable!("stdout cannot target stdout"),
-        },
-    };
-    command
-        .args(&argv[1..])
-        .current_dir(cwd)
-        .stdout(stdout_stdio)
-        .stderr(stderr_stdio);
-    if stdin.is_some() {
-        command.stdin(Stdio::piped());
-    }
-    for (key, value) in env_overrides {
-        command.env(key, value);
-    }
+        };
+        let stderr_stdio = match stderr_target {
+            RunOutputTarget::Capture => Stdio::from(
+                stderr_file
+                    .as_ref()
+                    .expect("stderr capture file should exist")
+                    .try_clone("run", "stderr")?,
+            ),
+            RunOutputTarget::Suppress => Stdio::null(),
+            RunOutputTarget::Stdout => match stdout_target {
+                RunOutputTarget::Capture => Stdio::from(
+                    stdout_file
+                        .as_ref()
+                        .expect("stdout capture file should exist")
+                        .try_clone("run", "stdout file for stderr")?,
+                ),
+                RunOutputTarget::Suppress => Stdio::null(),
+                RunOutputTarget::Stdout => unreachable!("stdout cannot target stdout"),
+            },
+        };
+        command
+            .args(&argv[1..])
+            .current_dir(cwd)
+            .stdout(stdout_stdio)
+            .stderr(stderr_stdio);
+        if stdin.is_some() {
+            command.stdin(Stdio::piped());
+        }
+        for (key, value) in env_overrides {
+            command.env(key, value);
+        }
 
-    let mut child = command.spawn().map_err(|err| {
+        let mut child = command.spawn().map_err(|err| {
+            if let Some(file) = &stdout_file {
+                file.cleanup();
+            }
+            if let Some(file) = &stderr_file {
+                file.cleanup();
+            }
+            command_spawn_error("run", &argv[0], &err)
+        })?;
+        if let Some(stdin) = stdin {
+            if let Some(mut child_stdin) = child.stdin.take() {
+                child_stdin
+                    .write_all(stdin.as_bytes())
+                    .map_err(|err| stone_error("run", format!("failed to write stdin: {err}")))?;
+            }
+        }
+
+        let mut timed_out = false;
+        let status = loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|err| stone_error("run", format!("failed to wait for child: {err}")))?
+            {
+                break status;
+            }
+            if started.elapsed() >= timeout {
+                timed_out = true;
+                let _ = child.kill();
+                break child.wait().map_err(|err| {
+                    stone_error("run", format!("failed to reap timed-out child: {err}"))
+                })?;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        let stdout_bytes = stdout_file
+            .as_mut()
+            .map(|file| file.read_bytes("run", "stdout"))
+            .transpose()?
+            .unwrap_or_default();
+        let stderr_bytes = stderr_file
+            .as_mut()
+            .map(|file| file.read_bytes("run", "stderr"))
+            .transpose()?
+            .unwrap_or_default();
         if let Some(file) = &stdout_file {
             file.cleanup();
         }
         if let Some(file) = &stderr_file {
             file.cleanup();
         }
-        command_spawn_error("run", &argv[0], &err)
-    })?;
-    if let Some(stdin) = stdin {
-        if let Some(mut child_stdin) = child.stdin.take() {
-            child_stdin
-                .write_all(stdin.as_bytes())
-                .map_err(|err| stone_error("run", format!("failed to write stdin: {err}")))?;
+
+        let (stdout_text, stdout_truncated) = lossy_limited_text(&stdout_bytes, max_stdout_bytes);
+        let (stderr_text, stderr_truncated) = lossy_limited_text(&stderr_bytes, max_stderr_bytes);
+
+        let mut truncated = Record::new();
+        truncated.push("stdout", Value::bool(stdout_truncated, span));
+        truncated.push("stderr", Value::bool(stderr_truncated, span));
+        let mut suppressed = Record::new();
+        suppressed.push(
+            "stdout",
+            Value::bool(stdout_target == RunOutputTarget::Suppress, span),
+        );
+        suppressed.push(
+            "stderr",
+            Value::bool(stderr_target == RunOutputTarget::Suppress, span),
+        );
+
+        let explanation = if timed_out {
+            Some(run_timeout_explanation(argv, timeout, duration_ms, span))
+        } else if status.success() {
+            None
+        } else {
+            Some(external_process_failure_explanation(
+                &argv,
+                status,
+                &stdout_text,
+                &stderr_text,
+                span,
+            ))
+        };
+
+        let mut record = Record::new();
+        record.push("ok", Value::bool(status.success() && !timed_out, span));
+        record.push(
+            "kind",
+            Value::string(
+                if timed_out {
+                    "timeout"
+                } else if status.success() {
+                    "success"
+                } else {
+                    "exec_failed"
+                },
+                span,
+            ),
+        );
+        record.push(
+            "exit_code",
+            status
+                .code()
+                .map(|code| Value::int(i64::from(code), span))
+                .unwrap_or_else(|| Value::nothing(span)),
+        );
+        record.push("duration_ms", Value::int(duration_ms, span));
+        record.push("cwd", Value::string(cwd.display().to_string(), span));
+        record.push(
+            "argv",
+            Value::list(
+                argv.iter()
+                    .map(|arg| Value::string(arg.clone(), span))
+                    .collect(),
+                span,
+            ),
+        );
+        record.push("stdout", Value::string(stdout_text, span));
+        record.push("stderr", Value::string(stderr_text, span));
+        record.push("timed_out", Value::bool(timed_out, span));
+        record.push("truncated", Value::record(truncated, span));
+        record.push("suppressed", Value::record(suppressed, span));
+        record.push(
+            "stderr_to_stdout",
+            Value::bool(stderr_target == RunOutputTarget::Stdout, span),
+        );
+        if let Some(runtime) = maybe_python_runtime_context(argv, cwd, env_overrides) {
+            record.push("runtime", runtime);
         }
-    }
-
-    let mut timed_out = false;
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|err| stone_error("run", format!("failed to wait for child: {err}")))?
-        {
-            break status;
+        if let Some(explanation) = explanation {
+            record.push("explanation", explanation);
         }
-        if started.elapsed() >= timeout {
-            timed_out = true;
-            let _ = child.kill();
-            break child.wait().map_err(|err| {
-                stone_error("run", format!("failed to reap timed-out child: {err}"))
-            })?;
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-
-    let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-    let stdout_bytes = stdout_file
-        .as_mut()
-        .map(|file| file.read_bytes("run", "stdout"))
-        .transpose()?
-        .unwrap_or_default();
-    let stderr_bytes = stderr_file
-        .as_mut()
-        .map(|file| file.read_bytes("run", "stderr"))
-        .transpose()?
-        .unwrap_or_default();
-    if let Some(file) = &stdout_file {
-        file.cleanup();
+        Ok(record)
     }
-    if let Some(file) = &stderr_file {
-        file.cleanup();
-    }
-
-    let (stdout_text, stdout_truncated) = lossy_limited_text(&stdout_bytes, max_stdout_bytes);
-    let (stderr_text, stderr_truncated) = lossy_limited_text(&stderr_bytes, max_stderr_bytes);
-
-    let mut truncated = Record::new();
-    truncated.push("stdout", Value::bool(stdout_truncated, span));
-    truncated.push("stderr", Value::bool(stderr_truncated, span));
-    let mut suppressed = Record::new();
-    suppressed.push(
-        "stdout",
-        Value::bool(stdout_target == RunOutputTarget::Suppress, span),
-    );
-    suppressed.push(
-        "stderr",
-        Value::bool(stderr_target == RunOutputTarget::Suppress, span),
-    );
-
-    let explanation = if timed_out {
-        Some(run_timeout_explanation(argv, timeout, duration_ms, span))
-    } else if status.success() {
-        None
-    } else {
-        Some(external_process_failure_explanation(
-            &argv,
-            status,
-            &stdout_text,
-            &stderr_text,
-            span,
-        ))
-    };
-
-    let mut record = Record::new();
-    record.push("ok", Value::bool(status.success() && !timed_out, span));
-    record.push(
-        "kind",
-        Value::string(
-            if timed_out {
-                "timeout"
-            } else if status.success() {
-                "success"
-            } else {
-                "exec_failed"
-            },
-            span,
-        ),
-    );
-    record.push(
-        "exit_code",
-        status
-            .code()
-            .map(|code| Value::int(i64::from(code), span))
-            .unwrap_or_else(|| Value::nothing(span)),
-    );
-    record.push("duration_ms", Value::int(duration_ms, span));
-    record.push("cwd", Value::string(cwd.display().to_string(), span));
-    record.push(
-        "argv",
-        Value::list(
-            argv.iter()
-                .map(|arg| Value::string(arg.clone(), span))
-                .collect(),
-            span,
-        ),
-    );
-    record.push("stdout", Value::string(stdout_text, span));
-    record.push("stderr", Value::string(stderr_text, span));
-    record.push("timed_out", Value::bool(timed_out, span));
-    record.push("truncated", Value::record(truncated, span));
-    record.push("suppressed", Value::record(suppressed, span));
-    record.push(
-        "stderr_to_stdout",
-        Value::bool(stderr_target == RunOutputTarget::Stdout, span),
-    );
-    if let Some(runtime) = maybe_python_runtime_context(argv, cwd, env_overrides) {
-        record.push("runtime", runtime);
-    }
-    if let Some(explanation) = explanation {
-        record.push("explanation", explanation);
-    }
-    Ok(record)
 }
 
 #[cfg(not(target_os = "hermit"))]

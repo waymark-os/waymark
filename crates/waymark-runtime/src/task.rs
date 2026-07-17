@@ -60,7 +60,11 @@ impl StoneGuest {
                     == Some("stone")
                 {
                     if let Err(err) = gateway.install_shared_client() {
-                        return task_error(None, "gateway_attempt_unavailable", format!("{err}"));
+                        return task_error(
+                            None,
+                            "gateway_attempt_unavailable",
+                            shell_error_message(&err),
+                        );
                     }
                 }
                 let response = self.task_response_from_value_with_model_gateway(task, &mut gateway);
@@ -68,12 +72,16 @@ impl StoneGuest {
                     return task_error(
                         response.get("id").and_then(JsonValue::as_str),
                         "gateway_report_failed",
-                        format!("{err}"),
+                        shell_error_message(&err),
                     );
                 }
                 response
             }
-            Err(err) => task_error(None, "gateway_attempt_unavailable", format!("{err}")),
+            Err(err) => task_error(
+                None,
+                "gateway_attempt_unavailable",
+                shell_error_message(&err),
+            ),
         }
     }
 
@@ -633,6 +641,15 @@ fn task_error(id: Option<&str>, kind: &str, message: impl Into<String>) -> JsonV
     })
 }
 
+fn shell_error_message(err: &nu_protocol::ShellError) -> String {
+    match err {
+        nu_protocol::ShellError::Generic(generic) if !generic.msg.is_empty() => {
+            format!("{}: {}", generic.error, generic.msg)
+        }
+        _ => err.to_string(),
+    }
+}
+
 fn classify_guest_error(response: &JsonValue) -> &'static str {
     let code = response
         .get("error")
@@ -681,6 +698,21 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn gateway_task_errors_include_generic_error_detail() {
+        let err = nu_protocol::ShellError::Generic(
+            nu_protocol::shell_error::generic::GenericError::new_internal(
+                "Stone gateway attach error",
+                "connection refused",
+            ),
+        );
+
+        assert_eq!(
+            super::shell_error_message(&err),
+            "Stone gateway attach error: connection refused"
+        );
+    }
 
     #[test]
     fn runs_inline_task_spec() {

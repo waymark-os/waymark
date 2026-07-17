@@ -181,6 +181,10 @@ pub(crate) fn attempt_run_process(
             attempt: attempt.clone(),
             argv: argv.clone(),
             env: env.clone().into_iter().collect(),
+            image: config.image.clone(),
+            container: config.container.clone().unwrap_or_default(),
+            workspace_mount: config.workspace_mount.clone(),
+            wait_timeout_ms: 1_000,
         })
     })?;
     Ok(attempt_process_value(run, Span::unknown()))

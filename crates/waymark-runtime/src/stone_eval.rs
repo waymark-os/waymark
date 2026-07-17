@@ -25,16 +25,16 @@ use crate::json::{json_to_nu_value, nu_to_json_value};
 use crate::linux_tools::posix_tools;
 #[cfg(all(not(target_os = "hermit"), test))]
 use crate::linux_tools::process::cleanup_stale_run_temp_files;
+use crate::linux_tools::process::{
+    run_call_values, run_status_call_values, run_terminate_call_values, run_wait_call_values,
+};
 #[cfg(not(target_os = "hermit"))]
 use crate::linux_tools::{
     daemon::{
         daemon_status_call_values, start_daemon_call_values, stop_daemon_call_values,
         wait_port_call_values,
     },
-    process::{
-        resolve_command_call_values, run_call_values, run_status_call_values,
-        run_terminate_call_values, run_wait_call_values,
-    },
+    process::resolve_command_call_values,
 };
 use crate::stone_ast::{
     AssignTarget, AugOp, BoolOp, Call, CompareOp, ComprehensionClause, ExceptHandler, Expr,
@@ -3536,44 +3536,19 @@ impl Evaluator<'_> {
     }
 
     fn eval_run_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        #[cfg(target_os = "hermit")]
-        {
-            let _ = call;
-            return Err(stone_error(
-                "run",
-                "run() requires the Linux/POSIX adapter and is unavailable on Hermit",
-            ));
-        }
-
-        #[cfg(not(target_os = "hermit"))]
-        {
-            let record = self.eval_run_record(call, "run")?;
-            Ok(RuntimeValue::Nu(Value::record(record, Span::unknown())))
-        }
+        let record = self.eval_run_record(call, "run")?;
+        Ok(RuntimeValue::Nu(Value::record(record, Span::unknown())))
     }
 
     fn eval_must_run_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        #[cfg(target_os = "hermit")]
-        {
-            let _ = call;
-            return Err(stone_error(
-                "must_run",
-                "must_run() requires the Linux/POSIX adapter and is unavailable on Hermit",
-            ));
-        }
-
-        #[cfg(not(target_os = "hermit"))]
-        {
-            let record = self.eval_run_record(call, "must_run")?;
-            if run_record_ok(&record) {
-                Ok(RuntimeValue::Nu(Value::record(record, Span::unknown())))
-            } else {
-                Err(must_run_failure_error(record))
-            }
+        let record = self.eval_run_record(call, "must_run")?;
+        if run_record_ok(&record) {
+            Ok(RuntimeValue::Nu(Value::record(record, Span::unknown())))
+        } else {
+            Err(must_run_failure_error(record))
         }
     }
 
-    #[cfg(not(target_os = "hermit"))]
     fn eval_run_record(&mut self, call: &Call, context: &str) -> Result<Record, ShellError> {
         let (positional, named) = self.eval_call_values(call)?;
         let default_cwd = self.current_cwd_path(context)?;
@@ -3581,6 +3556,7 @@ impl Evaluator<'_> {
             self.resolve_script_path(path)
         })?;
         let mut record = invocation.record;
+        #[cfg(not(target_os = "hermit"))]
         self.attach_run_helper_observations(
             &mut record,
             &invocation.argv,
@@ -3592,54 +3568,18 @@ impl Evaluator<'_> {
     }
 
     fn eval_run_wait_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        #[cfg(target_os = "hermit")]
-        {
-            let _ = call;
-            return Err(stone_error(
-                "run_wait",
-                "run_wait() requires the Linux/POSIX adapter and is unavailable on Hermit",
-            ));
-        }
-
-        #[cfg(not(target_os = "hermit"))]
-        {
-            let (positional, named) = self.eval_call_values(call)?;
-            run_wait_call_values(&positional, &named).map(RuntimeValue::Nu)
-        }
+        let (positional, named) = self.eval_call_values(call)?;
+        run_wait_call_values(&positional, &named).map(RuntimeValue::Nu)
     }
 
     fn eval_run_status_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        #[cfg(target_os = "hermit")]
-        {
-            let _ = call;
-            return Err(stone_error(
-                "run_status",
-                "run_status() requires the Linux/POSIX adapter and is unavailable on Hermit",
-            ));
-        }
-
-        #[cfg(not(target_os = "hermit"))]
-        {
-            let (positional, named) = self.eval_call_values(call)?;
-            run_status_call_values(&positional, &named).map(RuntimeValue::Nu)
-        }
+        let (positional, named) = self.eval_call_values(call)?;
+        run_status_call_values(&positional, &named).map(RuntimeValue::Nu)
     }
 
     fn eval_run_terminate_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        #[cfg(target_os = "hermit")]
-        {
-            let _ = call;
-            return Err(stone_error(
-                "run_terminate",
-                "run_terminate() requires the Linux/POSIX adapter and is unavailable on Hermit",
-            ));
-        }
-
-        #[cfg(not(target_os = "hermit"))]
-        {
-            let (positional, named) = self.eval_call_values(call)?;
-            run_terminate_call_values(&positional, &named).map(RuntimeValue::Nu)
-        }
+        let (positional, named) = self.eval_call_values(call)?;
+        run_terminate_call_values(&positional, &named).map(RuntimeValue::Nu)
     }
 
     #[cfg(not(target_os = "hermit"))]

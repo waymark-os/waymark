@@ -2,7 +2,6 @@
 
 pub(crate) mod posix_tools;
 
-#[cfg(not(target_os = "hermit"))]
 pub(crate) mod process;
 
 #[cfg(not(target_os = "hermit"))]

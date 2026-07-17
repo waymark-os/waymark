@@ -74,14 +74,18 @@ the obvious blocker for the next round.
 
 ## Major Remaining Gaps
 
-### 1. LibOS / vsock placement
+### 1. LibOS / vsock placement validation
 
-This is the largest architectural gap. The default shell build still reports
-the vsock task server as unsupported, and the Gateway client path in the Stone
-runtime has a vsock-shaped config enum but only Unix-socket transport is wired.
+The deterministic architectural slice is now implemented and proven end to
+end: a Waymark LibOS guest attaches to its attempt over Firecracker vsock,
+uses Gateway workspace RPC, delegates Stone `run` to Gateway `linux.exec`,
+reports its result, closes the channel, and can publish the root with no open
+transaction. Hermit does not spawn a local POSIX process.
 
-Until this is fixed, the intended "agent uses shell/runtime directly inside
-LibOS, Gateway on host" placement has not been proven end to end.
+The remaining gap is behavioral rather than transport wiring: exercise the
+same placement with real model calls, child-attempt composition, cancellation,
+and benchmark tasks. Those experiments must gate on the deterministic
+placement conformance checks rather than inferring placement from MCP traces.
 
 ### 2. MCP surface consolidation
 

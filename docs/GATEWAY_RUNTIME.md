@@ -10,11 +10,15 @@ runtime config and calls Gateway RPC.
 ## Activation
 
 Gateway runtime mode is active when the process has a Gateway endpoint and
-transaction:
+either an attached transaction or a VM boot token:
 
 - `WAYMARK_GATEWAY_SOCKET`, or `WAYMARK_GATEWAY_VSOCK_CID` plus
   `WAYMARK_GATEWAY_VSOCK_PORT`
-- `WAYMARK_GATEWAY_TX`
+- `WAYMARK_GATEWAY_TX`, for an already scoped local/container runtime; or
+- `WM_BOOT`, for a LibOS guest that resolves its attempt and transaction by
+  calling `attempt.channel_attach_boot`
+
+Hermit boot arguments may use the compact endpoint form `WM_GW=CID:PORT`.
 
 Optional config:
 
@@ -57,8 +61,9 @@ In Gateway runtime mode, agent tool calls use the same host-authority boundary:
 
 - workspace `read`, `write`, and `list` call Gateway transaction RPCs for the
   active `WAYMARK_GATEWAY_TX`
-- Linux `run` calls Gateway `linux.exec` with the configured image/container
-  and workspace mount
+- Linux `run`/`must_run` calls Gateway `linux.exec` with the configured
+  image/container and workspace mount, including from Hermit; Hermit never
+  creates the POSIX process locally
 
 This preserves the existing agent tool response shape while moving authority
 for files, subprocesses, and credentials out of the unprivileged runtime.
@@ -72,6 +77,11 @@ When `WAYMARK_GATEWAY_ATTEMPT_ID` is set, that persistent client first attaches
 the stream to the attempt. Gateway then treats the stream as the attempt
 control channel: scoped calls default to the attached attempt/transaction, and
 non-matching attempt or tx fields are rejected by Gateway policy.
+
+The deterministic placement smoke in the Gateway repository proves this path
+over Firecracker vsock through workspace mutation, delegated `linux.exec`,
+controller result reporting, channel close, and root publication. See
+`docs/MILESTONE_ATTEMPT_LIBOS_HELLO.md` there.
 
 ## Task Server
 
