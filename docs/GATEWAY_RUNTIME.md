@@ -48,18 +48,18 @@ The runtime converts the agent request into Gateway `model.call` protobuf:
 - `model_class` or `WAYMARK_GATEWAY_MODEL_CLASS` selects the policy class
 - `temperature`, `top_p`, `seed`, and `max_output_tokens`/`max_tokens` map to
   sampling fields
-- `response_format` is passed through as a string
+- `response_format` is passed through as a string or structured record
 - string metadata is preserved with `source=waymark-runtime`
 
 The model provider key stays in the host Gateway. Waymark receives only the
 provider-neutral response text, resolved model metadata, finish reason, latency,
 and token usage when the provider reports it.
 
-The current `frontend: "agent"` uses a fixed Rust JSON-action loop. The proposed
-replacement semantic center is an explicit Stone `model_call` effect, allowing
-the loop itself to be a versioned and editable Stone program. See
-[`STONE_AGENT_PROGRAMMING_DESIGN.md`](STONE_AGENT_PROGRAMMING_DESIGN.md). This
-is a design proposal, not a currently available builtin.
+Stone now exposes the same RPC as the explicit `model_call` builtin, allowing a
+versioned or agent-generated Stone program to own the loop. The current
+`frontend: "agent"` fixed Rust JSON-action loop remains a compatibility
+frontend while Stone ReAct parity is evaluated. See
+[`STONE_AGENT_PROGRAMMING_DESIGN.md`](STONE_AGENT_PROGRAMMING_DESIGN.md).
 
 ## Tool Calls
 

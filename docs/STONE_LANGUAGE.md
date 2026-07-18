@@ -191,6 +191,15 @@ Supported handlers are `except:`, `except Exception:`, and
   Linux command execution for `set -e`-style scripts. It returns the same
   structured record as `run()` on success, and raises a Stone error with the run
   record attached when the external process exits nonzero or times out.
+- `model_call(messages, model_class="agent", ...)`: one explicit Gateway-backed
+  model effect. The Stone program supplies the ordered structured messages and
+  owns conversation state, retry, tool dispatch, and stopping policy. The
+  result contains normalized `content`, assistant `messages`, provider/model,
+  finish reason, latency, usage, and metadata. Provider credentials and
+  endpoints remain in Gateway. See `help("model_call")` and
+  [`model_two_turn.stone`](../examples/scripts/model_two_turn.stone). With the
+  current Gateway protobuf, explicit `top_p` and `seed` values must be greater
+  than zero; omit them to use provider defaults.
 - `wait_port(port, host="127.0.0.1", timeout_ms=30000, protocol="tcp")`:
   wait for a TCP port to accept connections, or for a UDP endpoint to accept a
   datagram send probe. UDP has no connection handshake, so use a real protocol

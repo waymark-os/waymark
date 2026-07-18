@@ -1818,6 +1818,7 @@ impl Evaluator<'_> {
             "json_dumps" => self.eval_json_dumps_call(call),
             "json_loads" => self.eval_json_loads_call(call),
             "help" => self.eval_help_call(call),
+            "model_call" => self.eval_model_call_call(call),
             "max" => self.eval_min_max_call(call, MinMax::Max),
             "min" => self.eval_min_max_call(call, MinMax::Min),
             "open" => self.eval_open_call(call),
@@ -3735,6 +3736,182 @@ impl Evaluator<'_> {
         };
         record.push("gateway", gateway_env::env_state(50)?);
         Ok(RuntimeValue::Nu(Value::record(record, span)))
+    }
+
+    fn eval_model_call_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        let [messages] = positional.as_slice() else {
+            return Err(model_call_input_error(
+                "model_call() requires exactly one positional messages list",
+            ));
+        };
+        let Value::List { vals, .. } = messages else {
+            return Err(model_call_input_error(format!(
+                "model_call messages must be a list of records, got {}",
+                messages.get_type()
+            )));
+        };
+        if vals.is_empty() {
+            return Err(model_call_input_error(
+                "model_call messages list must not be empty",
+            ));
+        }
+
+        let mut message_values = Vec::with_capacity(vals.len());
+        for (index, value) in vals.iter().enumerate() {
+            let Value::Record { val, .. } = value else {
+                return Err(model_call_input_error(format!(
+                    "model_call message {index} must be a record, got {}",
+                    value.get_type()
+                )));
+            };
+            for key in val.columns() {
+                if !matches!(key.as_str(), "role" | "content" | "name") {
+                    return Err(model_call_input_error(format!(
+                        "unsupported model_call message field {key:?}; expected role, content, or name"
+                    )));
+                }
+            }
+            let role = val.get("role").ok_or_else(|| {
+                model_call_input_error(format!("model_call message {index} requires role"))
+            })?;
+            let role = value_to_string(role, "model_call message role")
+                .map_err(|err| model_call_input_error(err.to_string()))?;
+            if !matches!(role.as_str(), "system" | "user" | "assistant") {
+                return Err(model_call_input_error(format!(
+                    "unsupported model_call message role {role:?}; expected system, user, or assistant"
+                )));
+            }
+            let content = val.get("content").ok_or_else(|| {
+                model_call_input_error(format!("model_call message {index} requires content"))
+            })?;
+            let content = value_to_string(content, "model_call message content")
+                .map_err(|err| model_call_input_error(err.to_string()))?;
+            let mut message = serde_json::Map::new();
+            message.insert("role".to_string(), JsonValue::String(role));
+            message.insert("content".to_string(), JsonValue::String(content));
+            if let Some(name) = val.get("name") {
+                if !matches!(name, Value::Nothing { .. }) {
+                    let name = value_to_string(name, "model_call message name")
+                        .map_err(|err| model_call_input_error(err.to_string()))?;
+                    message.insert("name".to_string(), JsonValue::String(name));
+                }
+            }
+            message_values.push(JsonValue::Object(message));
+        }
+
+        let mut request = serde_json::Map::new();
+        request.insert("messages".to_string(), JsonValue::Array(message_values));
+        let mut seen = HashSet::new();
+        for (name, value) in named {
+            if !seen.insert(name.clone()) {
+                return Err(model_call_input_error(format!(
+                    "duplicate model_call keyword argument `{name}`"
+                )));
+            }
+            if matches!(value, Value::Nothing { .. }) {
+                continue;
+            }
+            let json_value = match name.as_str() {
+                "model_class" | "model" => JsonValue::String(
+                    value_to_string(&value, &format!("model_call {name}"))
+                        .map_err(|err| model_call_input_error(err.to_string()))?,
+                ),
+                "temperature" | "top_p" => {
+                    let number = match value {
+                        Value::Int { val, .. } => val as f64,
+                        Value::Float { val, .. } => val,
+                        other => {
+                            return Err(model_call_input_error(format!(
+                                "model_call {name} must be a number, got {}",
+                                other.get_type()
+                            )));
+                        }
+                    };
+                    if !number.is_finite() || number < 0.0 {
+                        return Err(model_call_input_error(format!(
+                            "model_call {name} must be a finite non-negative number"
+                        )));
+                    }
+                    if name == "top_p" && (number <= 0.0 || number > 1.0) {
+                        return Err(model_call_input_error(
+                            "model_call top_p must be greater than 0 and at most 1 with the current Gateway protocol",
+                        ));
+                    }
+                    serde_json::Number::from_f64(number)
+                        .map(JsonValue::Number)
+                        .ok_or_else(|| {
+                            model_call_input_error(format!(
+                                "model_call {name} must be a finite JSON number"
+                            ))
+                        })?
+                }
+                "seed" | "max_output_tokens" => {
+                    let number = match value {
+                        Value::Int { val, .. } if val >= 0 => u64::try_from(val).unwrap_or(0),
+                        Value::Int { .. } => {
+                            return Err(model_call_input_error(format!(
+                                "model_call {name} must be non-negative"
+                            )));
+                        }
+                        other => {
+                            return Err(model_call_input_error(format!(
+                                "model_call {name} must be an integer, got {}",
+                                other.get_type()
+                            )));
+                        }
+                    };
+                    let number = u32::try_from(number).map_err(|_| {
+                        model_call_input_error(format!(
+                            "model_call {name} exceeds the unsigned 32-bit limit"
+                        ))
+                    })?;
+                    if name == "seed" && number == 0 {
+                        return Err(model_call_input_error(
+                            "model_call seed must be positive with the current Gateway protocol",
+                        ));
+                    }
+                    JsonValue::Number(serde_json::Number::from(number))
+                }
+                "response_format" => match value {
+                    value @ (Value::String { .. } | Value::Record { .. }) => {
+                        nu_to_json_value(&value)
+                    }
+                    other => {
+                        return Err(model_call_input_error(format!(
+                            "model_call response_format must be a string or record, got {}",
+                            other.get_type()
+                        )));
+                    }
+                },
+                "metadata" => {
+                    let Value::Record { val, .. } = &value else {
+                        return Err(model_call_input_error(format!(
+                            "model_call metadata must be a record, got {}",
+                            value.get_type()
+                        )));
+                    };
+                    for (key, metadata_value) in val.iter() {
+                        if !matches!(metadata_value, Value::String { .. } | Value::Glob { .. }) {
+                            return Err(model_call_input_error(format!(
+                                "model_call metadata field {key:?} must be a string, got {}",
+                                metadata_value.get_type()
+                            )));
+                        }
+                    }
+                    nu_to_json_value(&value)
+                }
+                other => {
+                    return Err(model_call_input_error(format!(
+                        "unexpected model_call keyword argument `{other}`; expected model_class, model, temperature, top_p, seed, max_output_tokens, response_format, or metadata"
+                    )));
+                }
+            };
+            request.insert(name, json_value);
+        }
+
+        gateway_runtime::model_call_value(&JsonValue::Object(request), Span::unknown())
+            .map(RuntimeValue::Nu)
     }
 
     fn eval_ps_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -6101,6 +6278,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "max",
     "md5",
     "min",
+    "model_call",
     "mkdir",
     "must_run",
     "open",
@@ -6783,6 +6961,16 @@ fn stone_error(kind: &str, message: impl Into<String>) -> ShellError {
     ShellError::Generic(
         GenericError::new_internal(format!("Stone {kind} error"), message.into())
             .with_code("stone_script_error"),
+    )
+}
+
+fn model_call_input_error(message: impl Into<String>) -> ShellError {
+    ShellError::Generic(
+        GenericError::new_internal("Stone model_call error", message.into())
+            .with_code("model_invalid_request")
+            .with_help(
+                "Use help(\"model_call\") and correct the structured message or option value.",
+            ),
     )
 }
 
@@ -8156,6 +8344,73 @@ emit({
             entries_without_examples.is_empty(),
             "every Stone help() entry must include at least one example; missing examples: {entries_without_examples:?}"
         );
+    }
+
+    #[test]
+    fn model_call_help_exposes_explicit_single_effect() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("model-call-help")?;
+        let program = lower_source(
+            r#"topic = help("model_call")
+emit({
+    "found": topic.found,
+    "has_messages": "messages: list[record]" in topic.signature,
+    "gateway_only": "Gateway mode only" in topic.use_when,
+    "no_retry": "exactly one model effect" in topic.avoid[1],
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, Span::unknown())?,
+            json_value!({
+                "found": true,
+                "has_messages": true,
+                "gateway_only": true,
+                "no_retry": true,
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn model_call_rejects_invalid_messages_and_options_before_rpc() -> Result<(), ShellError> {
+        let cases = [
+            (r#"model_call([])"#, "messages list must not be empty"),
+            (
+                r#"model_call([{"role": "tool", "content": "result"}])"#,
+                "unsupported model_call message role",
+            ),
+            (
+                r#"model_call([{"role": "user", "content": "hello", "secret": "no"}])"#,
+                "unsupported model_call message field",
+            ),
+            (
+                r#"model_call([{"role": "user", "content": "hello"}], top_p=2.0)"#,
+                "top_p must be greater than 0 and at most 1",
+            ),
+            (
+                r#"model_call([{"role": "user", "content": "hello"}], seed=0)"#,
+                "seed must be positive",
+            ),
+            (
+                r#"model_call([{"role": "user", "content": "hello"}], metadata={"round": 1})"#,
+                "metadata field",
+            ),
+        ];
+
+        for (index, (source, expected)) in cases.into_iter().enumerate() {
+            let (engine_state, mut stack, root) =
+                test_engine(&format!("model-call-invalid-{index}"))?;
+            let program = lower_source(source)?;
+            let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+                .expect_err("invalid model_call should fail before Gateway access");
+            let text = format!("{error:?}");
+            assert!(text.contains("model_invalid_request"), "{text}");
+            assert!(text.contains(expected), "expected {expected:?} in {text}");
+            cleanup_dir(&root);
+        }
+        Ok(())
     }
 
     #[test]

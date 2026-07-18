@@ -27,6 +27,19 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "model_call",
+        signature: r#"model_call(messages: list[record], model_class: str = "agent", model: str = "", temperature: float? = None, top_p: float? = None, seed: int? = None, max_output_tokens: int = 0, response_format: record | str | None = None, metadata: record[str, str] = {}) -> record"#,
+        use_when: "Gateway mode only. Use as the explicit low-level model effect when a Stone program owns the prompt, conversation, retry, and stopping policy.",
+        examples: &[r#"emit(model_call([{"role": "system", "content": "Answer concisely."}, {"role": "user", "content": "Return the word ready."}], model_class="agent", max_output_tokens=64).content)"#],
+        avoid: &[
+            "Do not pass provider credentials, endpoints, or secret environment-variable names; Gateway owns them.",
+            "Do not assume an automatic retry, memory, tool dispatcher, or stopping rule; model_call performs exactly one model effect.",
+            "With the current Gateway protobuf, explicit top_p and seed values must be greater than zero; omit them for provider defaults.",
+            "Keep messages and options structured; do not encode the request as shell text.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "emit",
         signature: "emit(value: Any? = pipeline_value) -> Any",
         use_when: "Use to return a structured result from an Stone script or MCP call.",
@@ -795,7 +808,7 @@ if not info.ok:
     StoneHelpEntry {
         name: "attempt_finish",
         signature: r#"attempt_finish(action: "commit" | "rollback" | "fail" | "kill", attempt: str = "", message: str = "", reason: str = "", allow_risky: bool = False) -> record"#,
-        use_when: "Compatibility lifecycle operation for closing an attempt by committing, rolling back, failing, or killing it.",
+        use_when: "Gateway mode only. Compatibility lifecycle operation for closing an attempt by committing, rolling back, failing, or killing it.",
         examples: &[r#"attempt_finish("rollback", reason="debug branch done")"#],
         avoid: &[
             "For normal candidate selection use attempt_report plus attempt_accept or attempt_discard.",
@@ -806,7 +819,7 @@ if not info.ok:
     StoneHelpEntry {
         name: "attempt_report",
         signature: r#"attempt_report(status: "succeeded" | "failed", result: Any = {}, error: Any = {}, reason: str = "", metadata: record = {}, attempt: str = "") -> record"#,
-        use_when: "Use from an attached attempt to record that same attempt's candidate result and evidence. Completed LibOS task programs are normally reported automatically by the runtime.",
+        use_when: "Gateway mode only. Use from an attached attempt to record that same attempt's candidate result and evidence. Completed LibOS task programs are normally reported automatically by the runtime.",
         examples: &[r#"report = attempt_report(status="succeeded", result={"tests": "pass"})"#],
         avoid: &["Reporting does not merge or publish workspace state; select the candidate explicitly afterward."],
         aliases: &[],
@@ -833,7 +846,7 @@ if not info.ok:
     StoneHelpEntry {
         name: "attempt_publish",
         signature: r#"attempt_publish(attempt: str, expected_generation: str, message: str = "", allow_risky: bool = False) -> record"#,
-        use_when: "Use only from an authorized root controller after the root has reported success; expected_generation prevents stale publication.",
+        use_when: "Gateway mode only. Use only from an authorized root controller after the root has reported success; expected_generation prevents stale publication.",
         examples: &[r#"published = attempt_publish(root.attempt, root.base_generation, message="selected candidate")"#],
         avoid: &[
             "A built-in model agent should normally return finish and let its outer attempt controller report and publish the root.",

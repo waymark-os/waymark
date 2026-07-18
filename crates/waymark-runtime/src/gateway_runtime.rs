@@ -9,8 +9,8 @@ use serde_json::{json, Value as JsonValue};
 use waymark_gateway_client::proto::{
     attempt_program, AttemptChannelAttachBootRequest, AttemptChannelAttachRequest,
     AttemptChannelAttachResponse, AttemptControlBlock, AttemptReportResultRequest,
-    ModelCallRequest, ModelMessage, ModelSampling, TaskSpec as GatewayTaskSpec, WorkspaceEntry,
-    WorkspaceEntryKind,
+    ModelCallRequest, ModelCallResponse, ModelMessage, ModelSampling, TaskSpec as GatewayTaskSpec,
+    WorkspaceEntry, WorkspaceEntryKind,
 };
 use waymark_gateway_client::{GatewayRpcClient, LinuxExecOptions, LinuxProbeOptions};
 
@@ -224,12 +224,44 @@ fn gateway_model_request(
     let response = client
         .model_call(rpc_request)
         .map_err(|err| stone_error("gateway rpc", err.to_string()))?;
-    Ok(json!({
+    Ok(model_call_response_json(response))
+}
+
+pub(crate) fn model_call_value(request: &JsonValue, span: Span) -> Result<Value, ShellError> {
+    let config = config().ok_or_else(|| {
+        model_call_error(
+            "model_unavailable",
+            "Gateway model capability is not active in this Stone runtime",
+        )
+    })?;
+    let rpc_request = model_call_request_from_json(&config, request)
+        .map_err(|err| model_call_error("model_invalid_request", shell_error_detail(&err)))?;
+    let response = with_client(&config, |client| client.model_call(rpc_request))
+        .map_err(|err| model_call_error("model_transport_failed", shell_error_detail(&err)))?;
+    Ok(json_to_nu_value(model_call_response_json(response), span))
+}
+
+fn model_call_response_json(response: ModelCallResponse) -> JsonValue {
+    let messages = response
+        .messages
+        .into_iter()
+        .map(|message| {
+            json!({
+                "role": message.role,
+                "content": message.content,
+                "name": message.name,
+                "metadata": message.metadata,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
         "ok": true,
-        "text": response.content,
+        "text": response.content.clone(),
+        "content": response.content,
         "provider": response.provider,
         "request_id": response.provider_request_id,
         "model": response.resolved_model,
+        "messages": messages,
         "finish_reason": response.finish_reason,
         "latency_ms": response.latency_ms,
         "usage": response.usage.map(|usage| json!({
@@ -237,7 +269,8 @@ fn gateway_model_request(
             "output_tokens": usage.output_tokens,
             "total_tokens": usage.total_tokens,
         })).unwrap_or(JsonValue::Null),
-    }))
+        "metadata": response.metadata,
+    })
 }
 
 fn attempt_report_result_request(
@@ -329,23 +362,17 @@ fn model_call_request_from_json(
             .ok()
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| config.capability_profile.clone()),
-        model_class: request
-            .get("model_class")
-            .and_then(JsonValue::as_str)
-            .map(str::to_string)
+        model_class: optional_string_json(request, "model_class")?
+            .filter(|value| !value.is_empty())
             .or_else(|| std::env::var("WAYMARK_GATEWAY_MODEL_CLASS").ok())
             .or_else(|| (!config.model_class.is_empty()).then(|| config.model_class.clone()))
             .unwrap_or_else(|| "agent".to_string()),
-        model_hint: request
-            .get("model")
-            .and_then(JsonValue::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        model_hint: optional_string_json(request, "model")?.unwrap_or_default(),
         messages,
         sampling,
         max_output_tokens,
         response_format: response_format_from_json(request.get("response_format"))?,
-        metadata: model_metadata_from_json(request),
+        metadata: model_metadata_from_json(request)?,
     })
 }
 
@@ -357,18 +384,38 @@ fn model_message_from_json(value: &JsonValue) -> Result<ModelMessage, ShellError
         .get("role")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| stone_error("gateway model", "message requires role"))?;
+    if !matches!(role, "system" | "user" | "assistant") {
+        return Err(stone_error(
+            "gateway model",
+            format!("unsupported message role {role:?}; expected system, user, or assistant"),
+        ));
+    }
     let content = object
         .get("content")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| stone_error("gateway model", "message requires string content"))?;
+    let name = match object.get("name") {
+        Some(JsonValue::String(name)) => name.clone(),
+        Some(JsonValue::Null) | None => String::new(),
+        Some(_) => {
+            return Err(stone_error(
+                "gateway model",
+                "message name must be a string when provided",
+            ));
+        }
+    };
+    for key in object.keys() {
+        if !matches!(key.as_str(), "role" | "content" | "name") {
+            return Err(stone_error(
+                "gateway model",
+                format!("unsupported message field {key:?}; expected role, content, or name"),
+            ));
+        }
+    }
     Ok(ModelMessage {
         role: role.to_string(),
         content: content.to_string(),
-        name: object
-            .get("name")
-            .and_then(JsonValue::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        name,
         metadata: Default::default(),
     })
 }
@@ -400,17 +447,32 @@ fn response_format_from_json(value: Option<&JsonValue>) -> Result<String, ShellE
     }
 }
 
-fn model_metadata_from_json(request: &JsonValue) -> std::collections::HashMap<String, String> {
+fn model_metadata_from_json(
+    request: &JsonValue,
+) -> Result<std::collections::HashMap<String, String>, ShellError> {
     let mut metadata = std::collections::HashMap::new();
     metadata.insert("source".to_string(), "waymark-runtime".to_string());
-    if let Some(object) = request.get("metadata").and_then(JsonValue::as_object) {
-        for (key, value) in object {
-            if let Some(value) = value.as_str() {
-                metadata.insert(key.clone(), value.to_string());
-            }
+    let Some(value) = request.get("metadata") else {
+        return Ok(metadata);
+    };
+    let object = value.as_object().ok_or_else(|| {
+        stone_error(
+            "gateway model",
+            "metadata must be a record with string values",
+        )
+    })?;
+    for (key, value) in object {
+        let value = value.as_str().ok_or_else(|| {
+            stone_error(
+                "gateway model",
+                format!("metadata field {key:?} must be a string"),
+            )
+        })?;
+        if key != "source" {
+            metadata.insert(key.clone(), value.to_string());
         }
     }
-    metadata
+    Ok(metadata)
 }
 
 fn optional_u32_json(value: &JsonValue, key: &str) -> Result<Option<u32>, ShellError> {
@@ -430,6 +492,17 @@ fn optional_u32_json(value: &JsonValue, key: &str) -> Result<Option<u32>, ShellE
         )
     })?;
     Ok(Some(number))
+}
+
+fn optional_string_json(value: &JsonValue, key: &str) -> Result<Option<String>, ShellError> {
+    let Some(value) = value.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(str::to_string)
+        .map(Some)
+        .ok_or_else(|| stone_error("gateway model", format!("{key} must be a string")))
 }
 
 fn optional_f64_json(value: &JsonValue, key: &str) -> Result<Option<f64>, ShellError> {
@@ -1910,6 +1983,32 @@ fn stone_error(kind: &str, message: impl Into<String>) -> ShellError {
     )
 }
 
+fn model_call_error(code: &'static str, message: impl Into<String>) -> ShellError {
+    let help = match code {
+        "model_unavailable" => {
+            "Run the Stone program inside an attached Waymark attempt with Gateway model.call capability."
+        }
+        "model_invalid_request" => {
+            "Use help(\"model_call\") and correct the structured message or option value."
+        }
+        _ => "Inspect Gateway availability and retry only if the program policy permits another model effect.",
+    };
+    ShellError::Generic(
+        GenericError::new_internal("Stone model_call error", message.into())
+            .with_code(code)
+            .with_help(help),
+    )
+}
+
+fn shell_error_detail(err: &ShellError) -> String {
+    match err {
+        ShellError::Generic(generic) if !generic.msg.is_empty() => {
+            format!("{}: {}", generic.error, generic.msg)
+        }
+        _ => err.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1944,8 +2043,7 @@ mod tests {
                 "top_p": 1,
                 "max_tokens": 64,
                 "metadata": {
-                    "request_id": "req-1",
-                    "ignored_non_string": 7
+                    "request_id": "req-1"
                 }
             }),
         )
@@ -1968,7 +2066,93 @@ mod tests {
             request.metadata.get("source"),
             Some(&"waymark-runtime".to_string())
         );
-        assert!(!request.metadata.contains_key("ignored_non_string"));
+    }
+
+    #[test]
+    fn gateway_model_request_rejects_invalid_structured_fields() {
+        let config = GatewayRuntimeConfig {
+            endpoint: GatewayEndpoint::Unix(PathBuf::from("/tmp/gateway.sock")),
+            attempt: "attempt-1".to_string(),
+            controller_run: "process-1".to_string(),
+            boot_token: String::new(),
+            tx: "tx-1".to_string(),
+            image: "python:3.12".to_string(),
+            container: None,
+            workspace_mount: "/app".to_string(),
+            host_workspace_path: None,
+            capability_profile: "local".to_string(),
+            model_class: "agent".to_string(),
+            control: None,
+        };
+
+        let invalid_role = format!(
+            "{:?}",
+            model_call_request_from_json(
+                &config,
+                &json!({"messages": [{"role": "tool", "content": "no"}]}),
+            )
+            .unwrap_err()
+        );
+        assert!(invalid_role.contains("unsupported message role"));
+
+        let invalid_metadata = format!(
+            "{:?}",
+            model_call_request_from_json(
+                &config,
+                &json!({
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "metadata": {"round": 1}
+                }),
+            )
+            .unwrap_err()
+        );
+        assert!(invalid_metadata.contains("metadata field"));
+    }
+
+    #[test]
+    fn gateway_model_response_preserves_structured_result() {
+        let response = model_call_response_json(ModelCallResponse {
+            provider: "fixture".to_string(),
+            provider_request_id: "req-1".to_string(),
+            resolved_model: "fixture-model".to_string(),
+            messages: vec![ModelMessage {
+                role: "assistant".to_string(),
+                content: "ready".to_string(),
+                name: String::new(),
+                metadata: [("kind".to_string(), "answer".to_string())]
+                    .into_iter()
+                    .collect(),
+            }],
+            content: "ready".to_string(),
+            usage: Some(waymark_gateway_client::proto::ModelUsage {
+                input_tokens: 4,
+                output_tokens: 1,
+                total_tokens: 5,
+            }),
+            finish_reason: "stop".to_string(),
+            latency_ms: 7,
+            metadata: [("model_class".to_string(), "agent".to_string())]
+                .into_iter()
+                .collect(),
+        });
+
+        assert_eq!(response["content"], json!("ready"));
+        assert_eq!(response["text"], json!("ready"));
+        assert_eq!(response["messages"][0]["role"], json!("assistant"));
+        assert_eq!(response["messages"][0]["metadata"]["kind"], json!("answer"));
+        assert_eq!(response["usage"]["total_tokens"], json!(5));
+        assert_eq!(response["metadata"]["model_class"], json!("agent"));
+    }
+
+    #[test]
+    fn model_call_error_detail_preserves_gateway_cause() {
+        let error = stone_error(
+            "gateway rpc",
+            "model provider returned HTTP 500: engine unavailable",
+        );
+        let detail = shell_error_detail(&error);
+        assert!(detail.contains("Stone gateway rpc error"), "{detail}");
+        assert!(detail.contains("HTTP 500: engine unavailable"), "{detail}");
     }
 
     #[test]

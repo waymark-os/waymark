@@ -1,0 +1,27 @@
+messages = [
+    {"role": "system", "content": "Answer concisely and follow the requested output shape."},
+    {"role": "user", "content": "Name one benefit of structured I/O for an agent shell."},
+]
+
+first = model_call(
+    messages,
+    model_class="agent",
+    max_output_tokens=128,
+)
+
+follow_up = messages + [
+    {"role": "assistant", "content": first.content},
+    {"role": "user", "content": "Rewrite that answer as one short sentence."},
+]
+second = model_call(
+    follow_up,
+    model_class="agent",
+    max_output_tokens=96,
+)
+
+emit({
+    "first": first.content,
+    "second": second.content,
+    "model": second.model,
+    "usage": second.usage,
+})
