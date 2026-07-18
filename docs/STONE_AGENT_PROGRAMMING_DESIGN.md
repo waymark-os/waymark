@@ -768,6 +768,10 @@ Exit criterion: the synthesized and checked-in Stone agents match the fixed
 loop on deterministic conformance, and synthesized programs from at least two
 outer-agent models pass a task end to end without a runtime code change.
 
+The first GPT-5.5 authorship observation and its deliberately limited
+interpretation are recorded in `STONE_AGENT_AUTHORSHIP_M2_PILOT.md`. That pilot
+does not yet meet this exit criterion.
+
 ### M3: Typed Inference
 
 1. Add JSON Schema validation to the Waymark runtime.

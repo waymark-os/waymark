@@ -1104,7 +1104,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "Record fields can be read as row[\"name\"] or row.name when the field name is identifier-shaped.",
             "Operators: +, -, *, /, //, &, |, <<, >>, comparisons, and/or/not, membership, is None.",
             "Conditional expressions use Python's value if condition else fallback shape.",
-            "Functions: def name(arg) works; optional type annotations like def name(arg: str) -> str are checked; immutable default values are supported.",
+            "Functions: def name(arg) works; omitted parameter and return annotations mean Any, optional annotations like def name(arg: str) -> str are checked, and immutable default values are supported. Use -> None for a checked procedure.",
             "try/except catches runtime evaluation errors; supported handlers are except:, except Exception:, and except Exception as e:.",
             "Lambdas: expression-only callbacks work in sort/map/filter, e.g. lambda r: r[\"name\"].",
             "String methods include strip/lstrip/rstrip, isdigit/isalpha/isalnum, count, split/rsplit/splitlines, replace, join, lower/upper, zfill, startswith, and endswith; split and rsplit accept optional maxsplit and default whitespace splitting.",

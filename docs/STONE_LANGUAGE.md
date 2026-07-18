@@ -116,6 +116,11 @@ def head(path: str, limit: int = 10) -> list:
     return read_text(path).splitlines()[0:limit]
 ```
 
+An omitted parameter or return annotation means `Any`, including for a
+zero-argument function. Use an explicit `-> None` when a function is intended
+to be a checked procedure. This preserves the Python-shaped expectation that
+`def solve(): ...; return value` may return a value without an annotation.
+
 Default expressions are evaluated when a call omits that argument. Mutable
 default literals such as `[]` and `{}` are rejected to avoid shared mutable
 state surprises.

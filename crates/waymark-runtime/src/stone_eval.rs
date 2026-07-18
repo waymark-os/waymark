@@ -7943,6 +7943,25 @@ emit({
     }
 
     #[test]
+    fn untyped_zero_argument_function_returns_structured_value() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("untyped-zero-arg-return")?;
+        let program = lower_source(
+            r#"def solve():
+    return {"answer": "ready", "turns": 1}
+
+emit(solve())
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, Span::unknown())?,
+            json_value!({"answer": "ready", "turns": 1})
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
     fn function_argument_type_errors_are_explicit() -> Result<(), ShellError> {
         let (engine_state, mut stack, root) = test_engine("typed-function-error")?;
         let program = lower_source(

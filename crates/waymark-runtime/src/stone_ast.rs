@@ -362,7 +362,6 @@ fn lower_function_def(function: py::StmtFunctionDef) -> Result<Stmt, ShellError>
     }
     let return_type = match function.returns {
         Some(return_type) => lower_type_annotation(&return_type)?,
-        None if params.is_empty() => StoneType::None,
         None => StoneType::Any,
     };
     Ok(Stmt::FunctionDef(FunctionDef {
@@ -1817,7 +1816,7 @@ value = normalize("01/02/2024")
     }
 
     #[test]
-    fn accepts_no_arg_procedure_definition_without_annotations() {
+    fn accepts_no_arg_untyped_function_with_any_return() {
         let program = lower_source(
             r#"def solve():
     pass
@@ -1832,7 +1831,7 @@ solve()
         };
         assert_eq!(function.name, "solve");
         assert!(function.params.is_empty());
-        assert_eq!(function.return_type, StoneType::None);
+        assert_eq!(function.return_type, StoneType::Any);
     }
 
     #[test]

@@ -149,6 +149,10 @@ def head(path, limit=10):
     return read_text(path).splitlines()[0:limit]
 ```
 
+Omitted parameter and return annotations mean `Any`; only explicit `-> None`
+declares a checked procedure. This applies equally to zero-argument functions,
+which agents commonly use as `solve()` entrypoints returning structured data.
+
 Implementation notes:
 
 - Store default expressions or evaluated default values with function metadata.
