@@ -93,8 +93,16 @@ tool-feedback parity case, not full loop parity.
 - Stone: `../waymark-gateway/target/runs/stone-react-parity-write-final-verified/summary.json`
 - Rust: `../waymark-gateway/target/runs/rust-react-parity-write-final/summary.json`
 
-Still untested under shared fixtures: malformed output, empty actions, tool
-failure and recovery, multiple actions in one round, turn exhaustion, and
-round exhaustion. The Stone baseline intentionally exposes only the common
-`read`, `write`, and `run_linux` subset at this stage; the Rust compatibility
-frontend has additional legacy tools.
+A second shared sequence returned an unknown tool on round one, followed by a
+write and final action in the same round-two response. Both frontends recovered,
+made two model calls, executed all three action turns, returned the same value,
+and produced the same verified transaction artifact. This covers tool-error
+feedback and multiple actions in one round:
+
+- Stone: `../waymark-gateway/target/runs/stone-react-parity-recover-multiaction/summary.json`
+- Rust: `../waymark-gateway/target/runs/rust-react-parity-recover-multiaction/summary.json`
+
+Still untested under shared fixtures: malformed output, empty actions, turn
+exhaustion, and round exhaustion. The Stone baseline intentionally exposes
+only the common `read`, `write`, and `run_linux` subset at this stage; the Rust
+compatibility frontend has additional legacy tools.
