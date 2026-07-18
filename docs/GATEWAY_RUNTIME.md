@@ -61,6 +61,12 @@ versioned or agent-generated Stone program to own the loop. The current
 frontend while Stone ReAct parity is evaluated. See
 [`STONE_AGENT_PROGRAMMING_DESIGN.md`](STONE_AGENT_PROGRAMMING_DESIGN.md).
 
+Attached Stone programs can also read the admitted task without hidden prompt
+construction. `task_spec()` returns the structured `TaskSpec` in the Gateway
+control block, and `task_input()` decodes its separate `task_input_json` value.
+Both are read-only task views. Provider credentials, model selection policy,
+and privileged workspace authority remain in Gateway.
+
 ## Tool Calls
 
 In Gateway runtime mode, agent tool calls use the same host-authority boundary:

@@ -56,8 +56,18 @@ Stone model/tool loop from compact interface help, and the first observed
 failure exposed a fixable LLM-language compatibility defect rather than a need
 for hidden harness control.
 
-It does not yet satisfy the M2 exit criterion. Only one author model was
-available, the fixture finished before tool dispatch, and the generated source
-has not yet been admitted unchanged through Waymark LibOS. Reusable structured
-task views, deterministic Rust/Stone loop parity, repair trials, and real task
-execution remain required.
+The exact saved GPT-5.5 source was subsequently admitted byte-for-byte through
+Gateway and executed in Waymark LibOS. It made one attached `model.call` and
+the LibOS controller reported `{"answer":"ready","turns":1}`. The checked-in
+`examples/scripts/react_agent.stone` baseline also passed in LibOS while
+reading its Gateway-backed `task_spec()` and dynamic `task_input()`.
+
+This still does not satisfy the M2 exit criterion. Only one author model was
+available and the fixture finished before tool dispatch. Deterministic
+Rust/Stone loop parity across tool, failure, and limit cases; repair trials;
+a second author model; and real task execution remain required.
+
+Additional local artifacts:
+
+- `../waymark-gateway/target/runs/stone-agent-authorship-m2-gpt55-libos-current/summary.json`
+- `../waymark-gateway/target/runs/stone-agent-react-baseline-m2-libos/summary.json`

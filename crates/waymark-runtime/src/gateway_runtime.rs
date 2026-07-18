@@ -241,6 +241,87 @@ pub(crate) fn model_call_value(request: &JsonValue, span: Span) -> Result<Value,
     Ok(json_to_nu_value(model_call_response_json(response), span))
 }
 
+pub(crate) fn task_spec_value(span: Span) -> Result<Value, ShellError> {
+    let config = config().ok_or_else(|| {
+        stone_error(
+            "task_spec",
+            "Gateway task context is not active in this Stone runtime",
+        )
+    })?;
+    let task_spec = config
+        .control
+        .as_ref()
+        .and_then(|control| control.task_spec.as_ref())
+        .ok_or_else(|| stone_error("task_spec", "attached attempt has no task specification"))?;
+    Ok(json_to_nu_value(task_spec_json(task_spec), span))
+}
+
+pub(crate) fn task_input_value(span: Span) -> Result<Value, ShellError> {
+    let config = config().ok_or_else(|| {
+        stone_error(
+            "task_input",
+            "Gateway task context is not active in this Stone runtime",
+        )
+    })?;
+    let input_json = config
+        .control
+        .as_ref()
+        .ok_or_else(|| stone_error("task_input", "attached attempt has no control block"))?
+        .task_input_json
+        .as_str();
+    let input = parse_task_input_json(input_json)?;
+    Ok(json_to_nu_value(input, span))
+}
+
+fn parse_task_input_json(input_json: &str) -> Result<JsonValue, ShellError> {
+    if input_json.is_empty() {
+        return Ok(JsonValue::Null);
+    }
+    serde_json::from_str(input_json).map_err(|error| {
+        stone_error(
+            "task_input",
+            format!("Gateway supplied invalid task input JSON: {error}"),
+        )
+    })
+}
+
+fn task_spec_json(task_spec: &GatewayTaskSpec) -> JsonValue {
+    json!({
+        "id": task_spec.id,
+        "objective": task_spec.objective,
+        "inputs": task_spec.inputs.iter().map(|input| json!({
+            "name": input.name,
+            "kind": input.kind,
+            "path": input.path,
+            "mode": input.mode,
+            "metadata": input.metadata,
+        })).collect::<Vec<_>>(),
+        "outputs": task_spec.outputs.iter().map(|output| json!({
+            "name": output.name,
+            "kind": output.kind,
+            "path": output.path,
+            "mode": output.mode,
+            "content_type": output.content_type,
+            "metadata": output.metadata,
+        })).collect::<Vec<_>>(),
+        "success": task_spec.success.iter().map(|criterion| json!({
+            "kind": criterion.kind,
+            "input": criterion.input,
+            "output": criterion.output,
+            "path": criterion.path,
+            "content": criterion.content,
+            "args_json": criterion.args_json,
+        })).collect::<Vec<_>>(),
+        "constraints": task_spec.constraints.iter().map(|constraint| json!({
+            "kind": constraint.kind,
+            "path": constraint.path,
+            "enforcement": constraint.enforcement,
+            "args_json": constraint.args_json,
+        })).collect::<Vec<_>>(),
+        "metadata": task_spec.metadata,
+    })
+}
+
 fn model_call_response_json(response: ModelCallResponse) -> JsonValue {
     let messages = response
         .messages
@@ -2012,7 +2093,55 @@ fn shell_error_detail(err: &ShellError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use waymark_gateway_client::proto::{AttemptProgram, BuiltinWorkflow, TaskOutput};
+    use waymark_gateway_client::proto::{
+        AttemptProgram, BuiltinWorkflow, SuccessCriterion, TaskConstraint, TaskInput, TaskOutput,
+    };
+
+    #[test]
+    fn structured_task_views_preserve_spec_and_dynamic_input() {
+        let spec = GatewayTaskSpec {
+            id: "task-1".to_string(),
+            objective: "produce a greeting".to_string(),
+            inputs: vec![TaskInput {
+                name: "name".to_string(),
+                kind: "json".to_string(),
+                mode: "read".to_string(),
+                ..Default::default()
+            }],
+            outputs: vec![TaskOutput {
+                name: "answer".to_string(),
+                path: "answer.txt".to_string(),
+                mode: "write".to_string(),
+                content_type: "text/plain".to_string(),
+                ..Default::default()
+            }],
+            success: vec![SuccessCriterion {
+                kind: "file_exists".to_string(),
+                path: "answer.txt".to_string(),
+                ..Default::default()
+            }],
+            constraints: vec![TaskConstraint {
+                kind: "read_only".to_string(),
+                path: "input.txt".to_string(),
+                enforcement: "gateway".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let value = task_spec_json(&spec);
+        assert_eq!(value["objective"], json!("produce a greeting"));
+        assert_eq!(value["inputs"][0]["name"], json!("name"));
+        assert_eq!(value["outputs"][0]["content_type"], json!("text/plain"));
+        assert_eq!(value["success"][0]["kind"], json!("file_exists"));
+        assert_eq!(value["constraints"][0]["enforcement"], json!("gateway"));
+        assert_eq!(
+            parse_task_input_json(r#"{"name":"Stone","count":2}"#).unwrap(),
+            json!({"name": "Stone", "count": 2})
+        );
+        assert_eq!(parse_task_input_json("").unwrap(), JsonValue::Null);
+        assert!(parse_task_input_json("{").is_err());
+    }
 
     #[test]
     fn gateway_model_request_maps_agent_json_to_protobuf() {

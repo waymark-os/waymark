@@ -1,0 +1,56 @@
+def react_agent():
+    spec = task_spec()
+    input = task_input()
+    protocol = {
+        "actions": [
+            {"kind": "run", "argv": ["program", "arg"]},
+            {"kind": "read", "path": "/app/file"},
+            {"kind": "write", "path": "/app/file", "content": "text"},
+            {"kind": "finish", "answer": "result"},
+        ]
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": "Return JSON only with one action matching this protocol: " + json_dumps(protocol),
+        },
+        {
+            "role": "user",
+            "content": json_dumps({"task_spec": spec, "task_input": input}),
+        },
+    ]
+
+    for turn in range(8):
+        response = model_call(
+            messages,
+            model_class="agent",
+            response_format={"type": "json_object"},
+            max_output_tokens=512,
+        )
+        action = json_loads(response.content)
+        messages.append({"role": "assistant", "content": response.content})
+
+        if action.kind == "run":
+            observation = run(action.argv, timeout_ms=60000)
+        elif action.kind == "read":
+            observation = {"ok": True, "content": read_text(action.path)}
+        elif action.kind == "write":
+            write_text(action.path, action.content)
+            observation = {"ok": True, "written": action.path}
+        elif action.kind == "finish":
+            return {"answer": action.answer, "turns": turn + 1}
+        else:
+            observation = {
+                "ok": False,
+                "error": {"code": "unsupported_action", "action": action},
+            }
+
+        messages.append({
+            "role": "user",
+            "content": json_dumps({"observation": observation}),
+        })
+
+    fail("agent exhausted its turn budget", code="agent_turn_limit")
+
+
+emit(react_agent())

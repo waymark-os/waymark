@@ -205,6 +205,14 @@ Supported handlers are `except:`, `except Exception:`, and
   [`model_two_turn.stone`](../examples/scripts/model_two_turn.stone). With the
   current Gateway protobuf, explicit `top_p` and `seed` values must be greater
   than zero; omit them to use provider defaults.
+- `task_spec()`: read the attached attempt's admitted objective, named inputs
+  and outputs, success criteria, constraints, and metadata as a structured
+  record. This is a read-only view, not a rendered prompt.
+- `task_input()`: read the attempt's separate dynamic JSON input as an ordinary
+  Stone value, or `None` when none was admitted. Gateway persists this value in
+  the attempt control block; it is not passed through environment variables.
+  See [`react_agent.stone`](../examples/scripts/react_agent.stone) for a
+  reusable model/tool loop built from these task views.
 - `wait_port(port, host="127.0.0.1", timeout_ms=30000, protocol="tcp")`:
   wait for a TCP port to accept connections, or for a UDP endpoint to accept a
   datagram send probe. UDP has no connection handshake, so use a real protocol

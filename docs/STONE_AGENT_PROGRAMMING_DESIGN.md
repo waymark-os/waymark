@@ -125,6 +125,8 @@ Waymark already has most of the surrounding mechanisms:
 - Stone has Gateway-backed attempt spawn/fork/start/wait/report/accept/discard
   and publication operations.
 - Gateway has a provider-neutral `model.call` RPC and owns model credentials.
+- Attached Stone programs have read-only `task_spec()` and `task_input()`
+  views backed by the Gateway attempt control block.
 - Waymark has a working Rust `AgentSession` with a fixed JSON-action ReAct
   loop.
 
@@ -383,8 +385,11 @@ criteria, constraints, and artifact declarations visible to the attempt.
 result for its own attempt.
 
 The first raw-model smoke and ad-hoc programs may embed task-specific prompts.
-`task_spec()` and `task_input()` are required for reusable programs and skills,
-not for proving that an outer agent can synthesize a working one-off agent.
+`task_spec()` and `task_input()` are implemented for attached attempts and are
+required for reusable programs and skills, not for proving that an outer agent
+can synthesize a working one-off agent. Dynamic input is carried separately as
+canonical JSON in the attempt control protocol; it is not prompt text or an
+environment-variable convention.
 
 ### Layer 0: Raw Model Device
 

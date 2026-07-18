@@ -75,6 +75,7 @@ pub(crate) struct AttemptSpawnV1 {
     pub workspace_source: Option<WorkspaceSource>,
     pub context_source: Option<ContextSource>,
     pub capabilities: Option<CapabilityRequest>,
+    pub task_input_json: String,
     pub start: bool,
 }
 
@@ -124,6 +125,7 @@ pub(crate) fn attempt_spawn(
             context_source: spawn_v1.context_source.clone(),
             capabilities: spawn_v1.capabilities.clone(),
             start: spawn_v1.start,
+            task_input_json: spawn_v1.task_input_json.clone(),
         })
     })?;
     Ok(attempt_record_value(attempt, Span::unknown()))

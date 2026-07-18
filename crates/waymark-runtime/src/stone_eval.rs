@@ -1819,6 +1819,8 @@ impl Evaluator<'_> {
             "json_loads" => self.eval_json_loads_call(call),
             "help" => self.eval_help_call(call),
             "model_call" => self.eval_model_call_call(call),
+            "task_spec" => self.eval_task_spec_call(call),
+            "task_input" => self.eval_task_input_call(call),
             "max" => self.eval_min_max_call(call, MinMax::Max),
             "min" => self.eval_min_max_call(call, MinMax::Min),
             "open" => self.eval_open_call(call),
@@ -3914,6 +3916,23 @@ impl Evaluator<'_> {
             .map(RuntimeValue::Nu)
     }
 
+    fn eval_task_spec_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.positional.is_empty() || !call.named.is_empty() {
+            return Err(stone_error("task_spec", "task_spec() accepts no arguments"));
+        }
+        gateway_runtime::task_spec_value(Span::unknown()).map(RuntimeValue::Nu)
+    }
+
+    fn eval_task_input_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.positional.is_empty() || !call.named.is_empty() {
+            return Err(stone_error(
+                "task_input",
+                "task_input() accepts no arguments",
+            ));
+        }
+        gateway_runtime::task_input_value(Span::unknown()).map(RuntimeValue::Nu)
+    }
+
     fn eval_ps_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let (positional, named) = self.eval_call_values(call)?;
         if positional.len() > 1 {
@@ -4158,6 +4177,15 @@ impl Evaluator<'_> {
                         task = Some(spec.id.clone());
                     }
                     spawn_v1.task_spec = Some(spec);
+                }
+                "task_input" => {
+                    spawn_v1.task_input_json = serde_json::to_string(&nu_to_json_value(&value))
+                        .map_err(|error| {
+                            stone_error(
+                                "attempt_spawn task_input",
+                                format!("failed to encode task input: {error}"),
+                            )
+                        })?;
                 }
                 "program" => {
                     spawn_v1.program = Some(program_from_value(&value, "attempt_spawn program")?);
@@ -6279,6 +6307,8 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "md5",
     "min",
     "model_call",
+    "task_spec",
+    "task_input",
     "mkdir",
     "must_run",
     "open",

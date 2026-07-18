@@ -40,6 +40,30 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "task_spec",
+        signature: "task_spec() -> record",
+        use_when: "Gateway mode only. Read the admitted task objective, named inputs and outputs, success criteria, constraints, and metadata as structured data for a reusable Stone program.",
+        examples: &[r#"spec = task_spec()
+emit({"id": spec.id, "objective": spec.objective, "outputs": spec.outputs})"#],
+        avoid: &[
+            "Do not reconstruct or scrape a hidden task prompt; use the structured fields directly.",
+            "Do not mutate the returned record and assume Gateway task authority changed; this is a read-only runtime view.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "task_input",
+        signature: "task_input() -> Any",
+        use_when: "Gateway mode only. Read the attempt's admitted dynamic JSON input as an ordinary Stone value; returns None when no input was supplied.",
+        examples: &[r#"input = task_input()
+emit({"input": input})"#],
+        avoid: &[
+            "Do not use environment variables or provider metadata as an implicit task-input channel.",
+            "Treat task_input() as read-only input; write task artifacts through declared workspace paths.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "emit",
         signature: "emit(value: Any? = pipeline_value) -> Any",
         use_when: "Use to return a structured result from an Stone script or MCP call.",
@@ -772,7 +796,7 @@ if not info.ok:
     },
     StoneHelpEntry {
         name: "attempt_spawn",
-        signature: r#"attempt_spawn(task: str = "", workspace: str = "", task_spec: record = {}, program: record = {}, workspace_source: record = {}, context_source: record = {}, capabilities: record = {}, start: bool = false, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", parent_attempt: str = "", resource_limits: record = {}, metadata: record = {}) -> record"#,
+        signature: r#"attempt_spawn(task: str = "", workspace: str = "", task_spec: record = {}, task_input: Any = None, program: record = {}, workspace_source: record = {}, context_source: record = {}, capabilities: record = {}, start: bool = false, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", parent_attempt: str = "", resource_limits: record = {}, metadata: record = {}) -> record"#,
         use_when: "Use in Gateway mode when a controller needs to create a new top-level task attempt with its own transaction and explicit task/control-flow definition.",
         examples: &[r#"child = attempt_spawn(task_spec={"id": "task-debug", "objective": "write hello.txt"}, workspace_source={"workspace": "repo"}, program={"kind": "stone", "source": "write_file(\"hello.txt\", \"hello\")"})"#],
         avoid: &["Do not spawn attempts for ordinary file edits inside the current attempt; use workspace builtins directly."],
