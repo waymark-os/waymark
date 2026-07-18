@@ -2,9 +2,12 @@
 
 # Stone Language
 
-Stone is the structured shell language used by Waymark Shell. It intentionally looks
-Python-shaped for control flow and literals, but the builtins are shell and data
-operations rather than Python standard-library APIs.
+Stone is the LLM-oriented structured shell language used by Waymark Shell. It
+intentionally looks Python-shaped because coding models already generate those
+control-flow and literal forms reliably, but the builtins are shell and data
+operations rather than Python standard-library APIs. Its primary author is an
+agent generating or repairing task-specific code; human readability remains
+valuable for review and debugging.
 
 ## Running Code
 

@@ -55,6 +55,12 @@ The model provider key stays in the host Gateway. Waymark receives only the
 provider-neutral response text, resolved model metadata, finish reason, latency,
 and token usage when the provider reports it.
 
+The current `frontend: "agent"` uses a fixed Rust JSON-action loop. The proposed
+replacement semantic center is an explicit Stone `model_call` effect, allowing
+the loop itself to be a versioned and editable Stone program. See
+[`STONE_AGENT_PROGRAMMING_DESIGN.md`](STONE_AGENT_PROGRAMMING_DESIGN.md). This
+is a design proposal, not a currently available builtin.
+
 ## Tool Calls
 
 In Gateway runtime mode, agent tool calls use the same host-authority boundary:

@@ -2,8 +2,10 @@
 
 # Stone LLM Compatibility Roadmap
 
-Stone uses Python-shaped syntax so coding agents and LLMs can write useful
-scripts without learning a new surface language. The goal is not to become
+Stone uses Python-shaped syntax so coding agents and LLMs can synthesize useful
+task-specific programs, including ad-hoc agents, without learning a novel
+surface language. Agents are the primary authors; humans primarily inspect,
+debug, and review the resulting source and traces. The goal is not to become
 Python. The goal is to accept the high-frequency Python shapes agents naturally
 emit, while preserving Stone's typed values, structured errors, explicit effects,
 and predictable shell/runtime behavior.
@@ -245,4 +247,3 @@ For each accepted Python-shaped feature:
 - Add baseline-vs-hot-loop tests if the feature can appear inside a lowered
   loop shape.
 - Update `docs/STONE_LANGUAGE.md` when the behavior becomes user-visible.
-
