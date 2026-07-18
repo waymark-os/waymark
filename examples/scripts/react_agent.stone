@@ -1,56 +1,82 @@
 def react_agent():
     spec = task_spec()
     input = task_input()
-    protocol = {
-        "actions": [
-            {"kind": "run", "argv": ["program", "arg"]},
-            {"kind": "read", "path": "/app/file"},
-            {"kind": "write", "path": "/app/file", "content": "text"},
-            {"kind": "finish", "answer": "result"},
-        ]
-    }
     messages = [
         {
             "role": "system",
-            "content": "Return JSON only with one action matching this protocol: " + json_dumps(protocol),
+            "content": "Return JSON only as {\"actions\":[...]}. Each action is either {\"tool\":\"read|write|run_linux|finish\",\"input\":{...}} or {\"final\":{...}}. Use argv lists for run_linux. After an observation, choose another tool action or finish.",
         },
         {
             "role": "user",
             "content": json_dumps({"task_spec": spec, "task_input": input}),
         },
     ]
+    turns = 0
 
-    for turn in range(8):
+    for round in range(16):
         response = model_call(
             messages,
             model_class="agent",
             response_format={"type": "json_object"},
             max_output_tokens=512,
         )
-        action = json_loads(response.content)
+        decoded = json_loads(response.content)
+        actions = decoded.actions
+        if len(actions) == 0:
+            fail("model actions array must not be empty", code="invalid_model_response")
         messages.append({"role": "assistant", "content": response.content})
+        saw_tool = False
 
-        if action.kind == "run":
-            observation = run(action.argv, timeout_ms=60000)
-        elif action.kind == "read":
-            observation = {"ok": True, "content": read_text(action.path)}
-        elif action.kind == "write":
-            write_text(action.path, action.content)
-            observation = {"ok": True, "written": action.path}
-        elif action.kind == "finish":
-            return {"answer": action.answer, "turns": turn + 1}
-        else:
-            observation = {
-                "ok": False,
-                "error": {"code": "unsupported_action", "action": action},
-            }
+        for action in actions:
+            if turns >= 16:
+                fail("agent exceeded max_turns 16", code="turn_limit_exceeded")
+            turns += 1
+            tool = get(action, "tool", "")
+            final = get(action, "final", None)
 
-        messages.append({
-            "role": "user",
-            "content": json_dumps({"observation": observation}),
-        })
+            if final is not None:
+                return final
+            if tool == "finish":
+                return get(action, "input", {"ok": True})
 
-    fail("agent exhausted its turn budget", code="agent_turn_limit")
+            saw_tool = True
+            args = get(action, "input", {})
+            if tool == "read":
+                result = {"ok": True, "content": read_text(args.path)}
+            elif tool == "write":
+                write_text(args.path, args.content)
+                result = {"ok": True, "path": args.path}
+            elif tool == "run_linux":
+                result = run(
+                    args.argv,
+                    cwd=get(args, "cwd", None),
+                    stdin=get(args, "stdin", None),
+                    timeout_ms=get(args, "timeout_ms", 60000),
+                )
+            else:
+                result = {
+                    "ok": False,
+                    "error": {
+                        "code": "unknown_tool",
+                        "message": "unsupported Stone agent tool: " + tool,
+                    },
+                }
+
+            messages.append({
+                "role": "user",
+                "content": json_dumps({
+                    "observation": {"tool_call": action, "tool_result": result},
+                    "instruction": "Use this observation to choose the next tool action or final. If tool_result.ok is false, correct the error if possible.",
+                }),
+            })
+
+        if not saw_tool:
+            fail(
+                "model action stream ended without a final value or tool call",
+                code="final_missing",
+            )
+
+    fail("agent exceeded max_rounds 16", code="round_limit_exceeded")
 
 
 emit(react_agent())

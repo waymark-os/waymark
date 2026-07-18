@@ -71,3 +71,30 @@ Additional local artifacts:
 
 - `../waymark-gateway/target/runs/stone-agent-authorship-m2-gpt55-libos-current/summary.json`
 - `../waymark-gateway/target/runs/stone-agent-react-baseline-m2-libos/summary.json`
+
+## First Shared-Fixture Parity Cell
+
+The checked-in Stone baseline was then aligned with the fixed Rust frontend's
+`{"actions":[...]}` response envelope, final forms, visible tool-observation
+feedback, and 16-round/16-turn accounting. Gateway's fixture backend selects a
+response by the number of assistant messages already visible in the request,
+so it needs no hidden mutable call counter.
+
+Both frontends received the identical two-response sequence:
+
+1. write the expected text to `/app/hello.txt`;
+2. return a final value with that answer and answer path.
+
+Both made two attached model calls and returned the same controller value.
+The Stone cell additionally verified the transaction file content before
+rollback and recorded the admitted source digest. This establishes one causal
+tool-feedback parity case, not full loop parity.
+
+- Stone: `../waymark-gateway/target/runs/stone-react-parity-write-final-verified/summary.json`
+- Rust: `../waymark-gateway/target/runs/rust-react-parity-write-final/summary.json`
+
+Still untested under shared fixtures: malformed output, empty actions, tool
+failure and recovery, multiple actions in one round, turn exhaustion, and
+round exhaustion. The Stone baseline intentionally exposes only the common
+`read`, `write`, and `run_linux` subset at this stage; the Rust compatibility
+frontend has additional legacy tools.
