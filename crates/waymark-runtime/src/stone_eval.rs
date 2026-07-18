@@ -1862,11 +1862,16 @@ impl Evaluator<'_> {
             "state" => self.eval_state_call(call),
             "attempt_info" => self.eval_attempt_info_call(call),
             "attempt_start" => self.eval_attempt_start_call(call),
+            "attempt_wait" => self.eval_attempt_wait_call(call),
             "attempt_state" => self.eval_attempt_state_call(call),
             "attempts" | "attempt_list" => self.eval_attempts_call(call),
             "attempt_spawn" => self.eval_attempt_spawn_call(call),
             "attempt_fork" => self.eval_attempt_fork_call(call),
             "attempt_finish" => self.eval_attempt_finish_call(call),
+            "attempt_report" => self.eval_attempt_report_call(call),
+            "attempt_accept" => self.eval_attempt_accept_call(call),
+            "attempt_discard" => self.eval_attempt_discard_call(call),
+            "attempt_publish" => self.eval_attempt_publish_call(call),
             "attempt_run_process" => self.eval_attempt_run_process_call(call),
             "env_state" | "env_diff" => self.eval_env_state_call(call),
             "env_tx_info" => self.eval_env_tx_info_call(call),
@@ -4048,6 +4053,8 @@ impl Evaluator<'_> {
         let mut workspace_mount = String::new();
         let mut resource_limits = Vec::new();
         let mut metadata = Vec::new();
+        let mut program = None;
+        let mut start = false;
         for (name, value) in named {
             match name.as_str() {
                 "parent_attempt" | "attempt" => {
@@ -4068,6 +4075,8 @@ impl Evaluator<'_> {
                 "metadata" | "meta" => {
                     metadata = value_to_string_pairs(&value, "attempt_fork metadata")?
                 }
+                "program" => program = Some(program_from_value(&value, "attempt_fork program")?),
+                "start" => start = value_to_bool(&value, "attempt_fork start")?,
                 _ => {
                     return Err(stone_error(
                         "attempt_fork",
@@ -4085,6 +4094,8 @@ impl Evaluator<'_> {
             workspace_mount,
             resource_limits,
             metadata,
+            program,
+            start,
         )
         .map(RuntimeValue::Nu)
     }
@@ -4127,6 +4138,199 @@ impl Evaluator<'_> {
         let action =
             action.ok_or_else(|| stone_error("attempt_finish", "missing action argument"))?;
         gateway_env::attempt_finish(attempt, action, message, reason, allow_risky)
+            .map(RuntimeValue::Nu)
+    }
+
+    fn eval_attempt_wait_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 2 {
+            return Err(stone_error(
+                "attempt_wait",
+                "attempt_wait() accepts at most attempt and timeout_ms positional arguments",
+            ));
+        }
+        let mut attempt = positional
+            .first()
+            .map(|value| value_to_string(value, "attempt_wait attempt"))
+            .transpose()?
+            .unwrap_or_default();
+        let mut timeout_ms = positional
+            .get(1)
+            .map(|value| value_to_u64(value, "attempt_wait timeout_ms"))
+            .transpose()?
+            .map(|value| {
+                u32::try_from(value)
+                    .map_err(|_| stone_error("attempt_wait", "timeout_ms is too large"))
+            })
+            .transpose()?;
+        for (name, value) in named {
+            match name.as_str() {
+                "attempt" => attempt = value_to_string(&value, "attempt_wait attempt")?,
+                "timeout_ms" => {
+                    timeout_ms = Some(
+                        u32::try_from(value_to_u64(&value, "attempt_wait timeout_ms")?)
+                            .map_err(|_| stone_error("attempt_wait", "timeout_ms is too large"))?,
+                    )
+                }
+                _ => {
+                    return Err(stone_error(
+                        "attempt_wait",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        gateway_env::attempt_wait(attempt, timeout_ms).map(RuntimeValue::Nu)
+    }
+
+    fn eval_attempt_report_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 2 {
+            return Err(stone_error(
+                "attempt_report",
+                "attempt_report() accepts at most status and result positional arguments",
+            ));
+        }
+        let mut status = positional
+            .first()
+            .map(|value| value_to_string(value, "attempt_report status"))
+            .transpose()?;
+        let mut attempt = String::new();
+        let mut result_json = positional
+            .get(1)
+            .map(|value| nu_to_json_value(value).to_string())
+            .unwrap_or_default();
+        let mut error_json = String::new();
+        let mut reason = String::new();
+        let mut metadata = Vec::new();
+        for (name, value) in named {
+            match name.as_str() {
+                "attempt" => attempt = value_to_string(&value, "attempt_report attempt")?,
+                "status" => status = Some(value_to_string(&value, "attempt_report status")?),
+                "result" => result_json = nu_to_json_value(&value).to_string(),
+                "error" => error_json = nu_to_json_value(&value).to_string(),
+                "reason" => reason = value_to_string(&value, "attempt_report reason")?,
+                "metadata" => metadata = value_to_string_pairs(&value, "attempt_report metadata")?,
+                _ => {
+                    return Err(stone_error(
+                        "attempt_report",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        let status =
+            status.ok_or_else(|| stone_error("attempt_report", "missing status argument"))?;
+        gateway_env::attempt_report(attempt, status, result_json, error_json, reason, metadata)
+            .map(RuntimeValue::Nu)
+    }
+
+    fn eval_attempt_accept_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 2 {
+            return Err(stone_error(
+                "attempt_accept",
+                "attempt_accept() accepts parent and child arguments",
+            ));
+        }
+        let mut parent = positional
+            .first()
+            .map(|value| value_to_string(value, "attempt_accept parent"))
+            .transpose()?
+            .unwrap_or_default();
+        let mut child = positional
+            .get(1)
+            .map(|value| value_to_string(value, "attempt_accept child"))
+            .transpose()?
+            .unwrap_or_default();
+        for (name, value) in named {
+            match name.as_str() {
+                "parent" => parent = value_to_string(&value, "attempt_accept parent")?,
+                "child" => child = value_to_string(&value, "attempt_accept child")?,
+                _ => {
+                    return Err(stone_error(
+                        "attempt_accept",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        gateway_env::attempt_accept(parent, child).map(RuntimeValue::Nu)
+    }
+
+    fn eval_attempt_discard_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 2 {
+            return Err(stone_error(
+                "attempt_discard",
+                "attempt_discard() accepts at most attempt and reason arguments",
+            ));
+        }
+        let mut attempt = positional
+            .first()
+            .map(|value| value_to_string(value, "attempt_discard attempt"))
+            .transpose()?
+            .unwrap_or_default();
+        let mut reason = positional
+            .get(1)
+            .map(|value| value_to_string(value, "attempt_discard reason"))
+            .transpose()?
+            .unwrap_or_default();
+        for (name, value) in named {
+            match name.as_str() {
+                "attempt" => attempt = value_to_string(&value, "attempt_discard attempt")?,
+                "reason" => reason = value_to_string(&value, "attempt_discard reason")?,
+                _ => {
+                    return Err(stone_error(
+                        "attempt_discard",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        gateway_env::attempt_discard(attempt, reason).map(RuntimeValue::Nu)
+    }
+
+    fn eval_attempt_publish_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 2 {
+            return Err(stone_error(
+                "attempt_publish",
+                "attempt_publish() accepts at most attempt and expected_generation arguments",
+            ));
+        }
+        let mut attempt = positional
+            .first()
+            .map(|value| value_to_string(value, "attempt_publish attempt"))
+            .transpose()?
+            .unwrap_or_default();
+        let mut expected_generation = positional
+            .get(1)
+            .map(|value| value_to_string(value, "attempt_publish expected_generation"))
+            .transpose()?
+            .unwrap_or_default();
+        let mut message = String::new();
+        let mut allow_risky = false;
+        for (name, value) in named {
+            match name.as_str() {
+                "attempt" => attempt = value_to_string(&value, "attempt_publish attempt")?,
+                "expected_generation" => {
+                    expected_generation =
+                        value_to_string(&value, "attempt_publish expected_generation")?
+                }
+                "message" => message = value_to_string(&value, "attempt_publish message")?,
+                "allow_risky" => {
+                    allow_risky = value_to_bool(&value, "attempt_publish allow_risky")?
+                }
+                _ => {
+                    return Err(stone_error(
+                        "attempt_publish",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        gateway_env::attempt_publish(attempt, expected_generation, message, allow_risky)
             .map(RuntimeValue::Nu)
     }
 
@@ -5850,12 +6054,17 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "emit",
     "attempt_finish",
     "attempt_fork",
+    "attempt_accept",
+    "attempt_discard",
     "attempt_info",
     "attempt_list",
+    "attempt_publish",
+    "attempt_report",
     "attempt_run_process",
     "attempt_spawn",
     "attempt_start",
     "attempt_state",
+    "attempt_wait",
     "attempts",
     "env_checkpoint",
     "env_checkpoint_gc",

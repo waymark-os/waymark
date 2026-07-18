@@ -774,27 +774,82 @@ if not info.ok:
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "attempt_wait",
+        signature: r#"attempt_wait(attempt: str = "", timeout_ms: int? = None) -> record"#,
+        use_when: "Use in Gateway mode after starting an asynchronous child controller; it returns the updated attempt record.",
+        examples: &[r#"done = attempt_wait(child.attempt, timeout_ms=30000)"#],
+        avoid: &["Do not poll in a tight loop; use a bounded wait and then inspect attempt_state or controller logs."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "attempt_fork",
-        signature: r#"attempt_fork(parent_attempt: str = "", task: str = "", controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", resource_limits: record = {}, metadata: record = {}) -> record"#,
+        signature: r#"attempt_fork(parent_attempt: str = "", task: str = "", program: record? = None, start: bool = False, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", resource_limits: record = {}, metadata: record = {}) -> record"#,
         use_when: "Use in Gateway mode to create a child attempt from the current or specified parent attempt workspace state.",
-        examples: &[r#"branch = attempt_fork(task="try-alt-fix", controller="codex")"#],
+        examples: &[
+            r#"branch = attempt_fork(task="try-alt-fix", metadata={"strategy": "alternate"})"#,
+            r#"branch = attempt_fork(program={"kind": "stone", "source": "write_file('/app/candidate.txt', 'ok')"}, start=True)"#,
+        ],
         avoid: &["Do not assume a fork mutates the parent attempt; it returns a separate attempt and transaction."],
         aliases: &[],
     },
     StoneHelpEntry {
         name: "attempt_finish",
         signature: r#"attempt_finish(action: "commit" | "rollback" | "fail" | "kill", attempt: str = "", message: str = "", reason: str = "", allow_risky: bool = False) -> record"#,
-        use_when: "Use in Gateway mode to close the current or specified attempt by committing, rolling back, failing, or killing it.",
+        use_when: "Compatibility lifecycle operation for closing an attempt by committing, rolling back, failing, or killing it.",
         examples: &[r#"attempt_finish("rollback", reason="debug branch done")"#],
-        avoid: &["Do not finish a parent attempt from a child controller unless that capability was explicitly delegated."],
+        avoid: &[
+            "For normal candidate selection use attempt_report plus attempt_accept or attempt_discard.",
+            "Do not finish a parent attempt from a child controller unless that capability was explicitly delegated.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "attempt_report",
+        signature: r#"attempt_report(status: "succeeded" | "failed", result: Any = {}, error: Any = {}, reason: str = "", metadata: record = {}, attempt: str = "") -> record"#,
+        use_when: "Use from an attached attempt to record that same attempt's candidate result and evidence. Completed LibOS task programs are normally reported automatically by the runtime.",
+        examples: &[r#"report = attempt_report(status="succeeded", result={"tests": "pass"})"#],
+        avoid: &["Reporting does not merge or publish workspace state; select the candidate explicitly afterward."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "attempt_accept",
+        signature: "attempt_accept(parent: str, child: str) -> record",
+        use_when: "Use in Gateway mode to import one successfully reported direct child's workspace state into its unchanged parent.",
+        examples: &[r#"accepted = attempt_accept(root.attempt, child.attempt)"#],
+        avoid: &[
+            "Do not accept an unreported or failed child.",
+            "The parent must not change between fork and accept; fork candidates from the same stable parent and select before editing it.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "attempt_discard",
+        signature: r#"attempt_discard(attempt: str, reason: str = "") -> record"#,
+        use_when: "Use in Gateway mode to roll back a failed, risky, or unwanted candidate and release its transaction state.",
+        examples: &[r#"attempt_discard(bad.attempt, reason="probe failed")"#],
+        avoid: &["Do not leave rejected child attempts active after making a selection."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "attempt_publish",
+        signature: r#"attempt_publish(attempt: str, expected_generation: str, message: str = "", allow_risky: bool = False) -> record"#,
+        use_when: "Use only from an authorized root controller after the root has reported success; expected_generation prevents stale publication.",
+        examples: &[r#"published = attempt_publish(root.attempt, root.base_generation, message="selected candidate")"#],
+        avoid: &[
+            "A built-in model agent should normally return finish and let its outer attempt controller report and publish the root.",
+            "Never publish a child attempt directly.",
+        ],
         aliases: &[],
     },
     StoneHelpEntry {
         name: "attempt_run_process",
         signature: r#"attempt_run_process(attempt: str = "", argv: list[str], env: record = {}) -> record"#,
-        use_when: "Use in Gateway mode to ask the host Gateway to run a delegated controller process attached to an attempt transaction.",
+        use_when: "Use in Gateway mode to ask the host Gateway to run a delegated process inside the currently attached attempt transaction.",
         examples: &[r#"run = attempt_run_process(child.attempt, ["/path/to/controller"], env={"HELIX_ROOT": "/path/to/helix"})"#],
-        avoid: &["Do not use for ordinary Linux commands inside the workspace; use run() for POSIX tools."],
+        avoid: &[
+            "An attached parent cannot run a process in a child directly; fork the child with a program and start it so the child receives its own scoped channel.",
+            "Do not use for ordinary Linux commands inside the current workspace; use run() for POSIX tools.",
+        ],
         aliases: &[],
     },
     StoneHelpEntry {
@@ -987,6 +1042,19 @@ if not info.ok:
 ];
 
 const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
+    StoneHelpTopic {
+        name: "attempt_workflow",
+        summary: "Branch, inspect, select, and clean candidate attempts while keeping Stone as the control language.",
+        bullets: &[
+            "Get the current root with root = attempt_info(); inspect cheap structured state with attempt_state(root.attempt).",
+            "Fork candidates only while the parent is stable. Give each child a Stone program and start it, for example child = attempt_fork(root.attempt, program={\"kind\": \"stone\", \"source\": \"...\"}, start=True).",
+            "Each child receives its own scoped LibOS channel. Use attempt_wait(child.attempt, timeout_ms=30000); the parent cannot issue child process operations through its own channel.",
+            "After attempt_wait, inspect each candidate with attempt_state(child.attempt). The child runtime reports its own result automatically; an attached parent cannot report on the child's behalf.",
+            "Select exactly one useful child with attempt_accept(root.attempt, child.attempt); close every rejected child with attempt_discard(child.attempt, reason=\"...\").",
+            "After selection, verify the imported files in the parent. A built-in model agent should return finish; its outer controller reports and publishes the root.",
+            "Before final, use attempts(state=\"active\") and ensure no child attempts remain active. Never use compatibility attempt_finish(commit) for candidate selection.",
+        ],
+    },
     StoneHelpTopic {
         name: "workflow",
         summary: "Recommended LLM workflow for solving tasks in Stone.",

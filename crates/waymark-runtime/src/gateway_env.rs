@@ -2,16 +2,16 @@
 
 use std::collections::HashMap;
 
+use crate::gateway_runtime::{config, linux_exec_record, with_client, GatewayRuntimeConfig};
+use crate::json::json_to_nu_value;
 use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, Value};
 use waymark_gateway_client::proto::{
-    AttemptFinishRequest, AttemptFinishResponse, AttemptForkRequest, AttemptProgram, AttemptRecord,
-    AttemptRunProcessRequest, AttemptRunProcessResponse, AttemptSpawnRequest, AttemptStateResponse,
-    CapabilityRequest, ContextSource, EnvRunCheckpointRequest, TaskSpec, WorkspaceSource,
+    AttemptAcceptResponse, AttemptFinishRequest, AttemptFinishResponse, AttemptForkRequest,
+    AttemptProgram, AttemptPublishRequest, AttemptRecord, AttemptReportResultRequest,
+    AttemptReportResultResponse, AttemptRunProcessRequest, AttemptRunProcessResponse,
+    AttemptSpawnRequest, AttemptStateResponse, CapabilityRequest, ContextSource,
+    EnvRunCheckpointRequest, TaskSpec, WorkspaceSource,
 };
-use waymark_gateway_client::GatewayRpcClient;
-
-use crate::gateway_runtime::{config, linux_exec_record, GatewayEndpoint, GatewayRuntimeConfig};
-use crate::json::json_to_nu_value;
 
 pub(crate) fn enabled() -> bool {
     config().is_some()
@@ -57,6 +57,15 @@ pub(crate) fn attempt_state(attempt: String, sample_limit: u32) -> Result<Value,
         client.attempt_state(attempt, sample_limit)
     })?;
     attempt_state_value(state, Span::unknown())
+}
+
+pub(crate) fn attempt_wait(attempt: String, timeout_ms: Option<u32>) -> Result<Value, ShellError> {
+    let config = required_config()?;
+    let attempt = effective_attempt(&config, attempt)?;
+    let record = with_client(&config, |client| {
+        client.attempt_wait(attempt.clone(), timeout_ms)
+    })?;
+    Ok(attempt_record_value(record, Span::unknown()))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -130,6 +139,8 @@ pub(crate) fn attempt_fork(
     workspace_mount: String,
     resource_limits: Vec<(String, String)>,
     metadata: Vec<(String, String)>,
+    program: Option<AttemptProgram>,
+    start: bool,
 ) -> Result<Value, ShellError> {
     let config = required_config()?;
     let parent_attempt = effective_attempt(&config, parent_attempt)?;
@@ -143,6 +154,8 @@ pub(crate) fn attempt_fork(
             workspace_mount: workspace_mount.clone(),
             resource_limits: resource_limits.clone().into_iter().collect(),
             metadata: metadata.clone().into_iter().collect(),
+            program: program.clone(),
+            start,
         })
     })?;
     Ok(attempt_record_value(attempt, Span::unknown()))
@@ -167,6 +180,79 @@ pub(crate) fn attempt_finish(
         })
     })?;
     attempt_finish_value(finish, Span::unknown())
+}
+
+pub(crate) fn attempt_report(
+    attempt: String,
+    status: String,
+    result_json: String,
+    error_json: String,
+    reason: String,
+    metadata: Vec<(String, String)>,
+) -> Result<Value, ShellError> {
+    let config = required_config()?;
+    let attempt = effective_attempt(&config, attempt)?;
+    let report = with_client(&config, |client| {
+        client.attempt_report_result(AttemptReportResultRequest {
+            attempt: attempt.clone(),
+            status: status.clone(),
+            result_json: result_json.clone(),
+            error_json: error_json.clone(),
+            reason: reason.clone(),
+            metadata: metadata.clone().into_iter().collect(),
+        })
+    })?;
+    attempt_report_value(report, Span::unknown())
+}
+
+pub(crate) fn attempt_accept(parent: String, child: String) -> Result<Value, ShellError> {
+    let config = required_config()?;
+    let parent = effective_attempt(&config, parent)?;
+    if child.is_empty() {
+        return Err(stone_error(
+            "attempt_accept",
+            "attempt_accept requires a child attempt",
+        ));
+    }
+    let accepted = with_client(&config, |client| {
+        client.attempt_accept(parent.clone(), child.clone())
+    })?;
+    attempt_accept_value(accepted, Span::unknown())
+}
+
+pub(crate) fn attempt_discard(attempt: String, reason: String) -> Result<Value, ShellError> {
+    attempt_finish(
+        attempt,
+        "rollback".to_string(),
+        String::new(),
+        reason,
+        false,
+    )
+}
+
+pub(crate) fn attempt_publish(
+    attempt: String,
+    expected_generation: String,
+    message: String,
+    allow_risky: bool,
+) -> Result<Value, ShellError> {
+    let config = required_config()?;
+    let attempt = effective_attempt(&config, attempt)?;
+    if expected_generation.is_empty() {
+        return Err(stone_error(
+            "attempt_publish",
+            "attempt_publish requires expected_generation",
+        ));
+    }
+    let published = with_client(&config, |client| {
+        client.attempt_publish(AttemptPublishRequest {
+            attempt: attempt.clone(),
+            expected_generation: expected_generation.clone(),
+            message: message.clone(),
+            allow_risky,
+        })
+    })?;
+    attempt_finish_value(published, Span::unknown())
 }
 
 pub(crate) fn attempt_run_process(
@@ -719,6 +805,67 @@ fn attempt_finish_value(finish: AttemptFinishResponse, span: Span) -> Result<Val
     Ok(Value::record(record, span))
 }
 
+fn attempt_report_value(
+    report: AttemptReportResultResponse,
+    span: Span,
+) -> Result<Value, ShellError> {
+    let mut record = Record::new();
+    record.push(
+        "attempt",
+        report
+            .attempt
+            .map(|attempt| attempt_record_value(attempt, span))
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    record.push("tx_closed", Value::bool(report.tx_closed, span));
+    record.push(
+        "file_changes",
+        Value::int(u64_to_i64(report.file_changes), span),
+    );
+    record.push(
+        "env_changes",
+        Value::int(u64_to_i64(report.env_changes), span),
+    );
+    if let Some(diff) = report.diff {
+        record.push("clean", Value::bool(diff.clean, span));
+        record.push("env_diff", Value::string(diff.text, span));
+        record.push("json", json_text_value(&diff.json, span)?);
+    }
+    Ok(Value::record(record, span))
+}
+
+fn attempt_accept_value(accepted: AttemptAcceptResponse, span: Span) -> Result<Value, ShellError> {
+    let mut record = Record::new();
+    record.push(
+        "parent",
+        accepted
+            .parent
+            .map(|attempt| attempt_record_value(attempt, span))
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    record.push(
+        "child",
+        accepted
+            .child
+            .map(|attempt| attempt_record_value(attempt, span))
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    record.push(
+        "file_changes",
+        Value::int(u64_to_i64(accepted.file_changes), span),
+    );
+    record.push(
+        "env_changes",
+        Value::int(u64_to_i64(accepted.env_changes), span),
+    );
+    if let Some(diff) = accepted.diff {
+        record.push("clean", Value::bool(diff.clean, span));
+        record.push("env_diff", Value::string(diff.text, span));
+        record.push("json", json_text_value(&diff.json, span)?);
+    }
+    Ok(Value::record(record, span))
+}
+
 fn attempt_process_value(run: AttemptRunProcessResponse, span: Span) -> Value {
     let mut record = Record::new();
     record.push("run", Value::string(run.run, span));
@@ -794,126 +941,6 @@ fn json_text_value(text: &str, span: Span) -> Result<Value, ShellError> {
 
 fn required_config() -> Result<GatewayRuntimeConfig, ShellError> {
     config().ok_or_else(|| stone_error("env", "Gateway runtime config is not active"))
-}
-
-#[cfg(any(unix, target_os = "hermit"))]
-enum GatewayClientStream {
-    #[cfg(unix)]
-    Unix(std::os::unix::net::UnixStream),
-    #[cfg(any(target_os = "hermit", target_os = "linux"))]
-    Vsock(waymark_gateway_client::VsockStream),
-}
-
-#[cfg(any(unix, target_os = "hermit"))]
-impl std::io::Read for GatewayClientStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            #[cfg(unix)]
-            GatewayClientStream::Unix(stream) => stream.read(buf),
-            #[cfg(any(target_os = "hermit", target_os = "linux"))]
-            GatewayClientStream::Vsock(stream) => stream.read(buf),
-        }
-    }
-}
-
-#[cfg(any(unix, target_os = "hermit"))]
-impl std::io::Write for GatewayClientStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            #[cfg(unix)]
-            GatewayClientStream::Unix(stream) => stream.write(buf),
-            #[cfg(any(target_os = "hermit", target_os = "linux"))]
-            GatewayClientStream::Vsock(stream) => stream.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            #[cfg(unix)]
-            GatewayClientStream::Unix(stream) => stream.flush(),
-            #[cfg(any(target_os = "hermit", target_os = "linux"))]
-            GatewayClientStream::Vsock(stream) => stream.flush(),
-        }
-    }
-}
-
-#[cfg(any(unix, target_os = "hermit"))]
-fn with_client<T>(
-    config: &GatewayRuntimeConfig,
-    call: impl FnOnce(&mut GatewayRpcClient<GatewayClientStream>) -> waymark_gateway_client::Result<T>,
-) -> Result<T, ShellError> {
-    let stream = match &config.endpoint {
-        #[cfg(unix)]
-        GatewayEndpoint::Unix(path) => {
-            let stream = std::os::unix::net::UnixStream::connect(path)
-                .map_err(|err| stone_error("gateway connect", err.to_string()))?;
-            GatewayClientStream::Unix(stream)
-        }
-        #[cfg(not(unix))]
-        GatewayEndpoint::Unix(_) => {
-            return Err(stone_error(
-                "gateway connect",
-                "Gateway Unix transport is not wired in this build",
-            ))
-        }
-        #[cfg(any(target_os = "hermit", target_os = "linux"))]
-        GatewayEndpoint::Vsock { cid, port } => {
-            let stream = waymark_gateway_client::VsockStream::connect(
-                waymark_gateway_client::VsockAddr::new(*cid, *port),
-            )
-            .map_err(|err| stone_error("gateway connect", err.to_string()))?;
-            GatewayClientStream::Vsock(stream)
-        }
-        #[cfg(not(any(target_os = "hermit", target_os = "linux")))]
-        GatewayEndpoint::Vsock { .. } => {
-            return Err(stone_error(
-                "gateway connect",
-                "Gateway vsock transport is not wired in this build",
-            ))
-        }
-    };
-    let mut client = GatewayRpcClient::from_stream(stream);
-    call(&mut client).map_err(|err| stone_error("gateway rpc", err.to_string()))
-}
-
-#[cfg(not(any(unix, target_os = "hermit")))]
-struct UnsupportedGatewayStream;
-
-#[cfg(not(any(unix, target_os = "hermit")))]
-impl std::io::Read for UnsupportedGatewayStream {
-    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "Gateway transport is not wired in this build",
-        ))
-    }
-}
-
-#[cfg(not(any(unix, target_os = "hermit")))]
-impl std::io::Write for UnsupportedGatewayStream {
-    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "Gateway transport is not wired in this build",
-        ))
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-#[cfg(not(any(unix, target_os = "hermit")))]
-fn with_client<T>(
-    _config: &GatewayRuntimeConfig,
-    _call: impl FnOnce(
-        &mut GatewayRpcClient<UnsupportedGatewayStream>,
-    ) -> waymark_gateway_client::Result<T>,
-) -> Result<T, ShellError> {
-    Err(stone_error(
-        "gateway connect",
-        "Gateway transport is not wired in this build",
-    ))
 }
 
 fn stone_error(kind: &str, message: impl Into<String>) -> ShellError {

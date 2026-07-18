@@ -1561,7 +1561,7 @@ fn required_config() -> Result<GatewayRuntimeConfig, ShellError> {
 }
 
 #[cfg(any(unix, target_os = "hermit"))]
-enum GatewayClientStream {
+pub(crate) enum GatewayClientStream {
     #[cfg(unix)]
     Unix(std::os::unix::net::UnixStream),
     #[cfg(any(target_os = "hermit", target_os = "linux"))]
@@ -1731,7 +1731,7 @@ fn apply_attach_response(
 }
 
 #[cfg(any(unix, target_os = "hermit"))]
-fn with_client<T>(
+pub(crate) fn with_client<T>(
     config: &GatewayRuntimeConfig,
     call: impl FnOnce(&mut GatewayRpcClient<GatewayClientStream>) -> waymark_gateway_client::Result<T>,
 ) -> Result<T, ShellError> {
@@ -1748,7 +1748,7 @@ fn with_client<T>(
 }
 
 #[cfg(not(any(unix, target_os = "hermit")))]
-struct UnsupportedGatewayStream;
+pub(crate) struct UnsupportedGatewayStream;
 
 #[cfg(not(any(unix, target_os = "hermit")))]
 impl std::io::Read for UnsupportedGatewayStream {
@@ -1775,7 +1775,7 @@ impl std::io::Write for UnsupportedGatewayStream {
 }
 
 #[cfg(not(any(unix, target_os = "hermit")))]
-fn with_client<T>(
+pub(crate) fn with_client<T>(
     _config: &GatewayRuntimeConfig,
     _call: impl FnOnce(
         &mut GatewayRpcClient<UnsupportedGatewayStream>,

@@ -13,9 +13,14 @@ Return JSON only. Do not use markdown.
 Use this shape:
 {"actions":[{"tool":"write","input":{"path":"/work/answer.txt","content":"...","mode":"replace"}},{"tool":"read","input":{"path":"/work/answer.txt"}},{"final":{...}}]}
 Allowed tools: run, run_linux, read, write, edit, list, find, search, finish.
+The run tool executes a persistent Stone language session, not a Linux shell. Its input is {"source":"..."}.
+Stone is the control language for first-class attempts. Before branching, call run with source emit(help("attempt_workflow")); use emit(help("attempt_fork")) for exact signatures.
+Use attempts when work is uncertain, risky, expensive to repeat, or has multiple plausible strategies. Fork candidates from a stable parent, wait for their reported results, inspect them, accept one, and discard every rejected child.
+Use run_linux only for a Linux operation in the current attempt. To execute child work, fork with a recorded Stone program and start it; each child receives its own scoped LibOS channel.
 Write generated files under /work unless the task explicitly names another writable output path.
-Use run_linux only for Linux shell commands that need host-side Linux tools. run_linux sees /app.
+run_linux sees the current attempt workspace at /app.
 If you write a file, read it back before final.
+Before final, ensure no child attempts remain active. Return finish for the current root; the outer controller reports and publishes it.
 Use {"tool":"finish","input":{...}} or {"final":{...}} when the task is complete.
 You may return one or more tool actions without a final value. After tool observations, return the next tool actions or finish."#;
 
@@ -777,6 +782,10 @@ mod tests {
         let request = model_request("write hello", Some("local-model"));
 
         assert_eq!(request["model"], json!("local-model"));
+        let system = request["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("persistent Stone language session"));
+        assert!(system.contains("help(\"attempt_workflow\")"));
+        assert!(system.contains("discard every rejected child"));
         assert_eq!(request["messages"][1]["role"], json!("user"));
         assert_eq!(request["messages"][1]["content"], json!("write hello"));
     }
