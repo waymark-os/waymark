@@ -123,7 +123,9 @@ to be a checked procedure. This preserves the Python-shaped expectation that
 
 Default expressions are evaluated when a call omits that argument. Mutable
 default literals such as `[]` and `{}` are rejected to avoid shared mutable
-state surprises.
+state surprises. Calls to user-defined functions currently accept positional
+arguments only; keyword arguments are reserved for builtins such as `run(...)`
+and `model_call(...)`.
 
 `try` / `except` catches runtime evaluation errors, not parse or lowering
 errors:
@@ -190,12 +192,21 @@ Supported handlers are `except:`, `except Exception:`, and
   `items.sort(key=..., reverse=...)` are also supported.
 - `list(value)` and `tuple(value)`: materialize a list view. In Stone,
   `tuple()` is an agent-compatibility alias for `list()`.
-- `run(argv, cwd=None, stdin=None, timeout_ms=None, env=None)`: Linux command
-  execution with structured stdout, stderr, status, and helper observations.
-- `must_run(argv, cwd=None, stdin=None, timeout_ms=None, env=None)`: checked
-  Linux command execution for `set -e`-style scripts. It returns the same
-  structured record as `run()` on success, and raises a Stone error with the run
-  record attached when the external process exits nonzero or times out.
+- `run(argv, cwd=None, stdin=None, timeout_ms=None, env=None, background=False,
+  stdout="capture", stderr="capture", max_stdout_bytes=1048576,
+  max_stderr_bytes=1048576)`: Linux command execution with structured stdout,
+  stderr, status, truncation flags, and helper observations. Agent loops should
+  normally set much smaller output bounds (for example 16 KiB/8 KiB) so one
+  noisy command cannot dominate every later model call. Set `stdout` or
+  `stderr` to `"suppress"`/`"discard"` when content is not evidence, or set
+  `stderr="stdout"` to merge it. A timeout can return a `still_running` handle;
+  terminate or wait for that handle explicitly before finishing the attempt.
+- `must_run(argv, cwd=None, stdin=None, timeout_ms=None, env=None,
+  stdout="capture", stderr="capture", max_stdout_bytes=1048576,
+  max_stderr_bytes=1048576)`: checked Linux command execution for
+  `set -e`-style scripts. It returns the same structured record as `run()` on
+  success, and raises a Stone error with the run record attached when the
+  external process exits nonzero or times out.
 - `model_call(messages, model_class="agent", ...)`: one explicit Gateway-backed
   model effect. The Stone program supplies the ordered structured messages and
   owns conversation state, retry, tool dispatch, and stopping policy. The

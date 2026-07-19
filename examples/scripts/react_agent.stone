@@ -66,6 +66,8 @@ def react_agent():
                     cwd=get(args, "cwd", None),
                     stdin=get(args, "stdin", None),
                     timeout_ms=get(args, "timeout_ms", 60000),
+                    max_stdout_bytes=get(args, "max_stdout_bytes", 16384),
+                    max_stderr_bytes=get(args, "max_stderr_bytes", 8192),
                 )
                 if get(result, "still_running", False):
                     cleanup = run_terminate(result.run_id)
