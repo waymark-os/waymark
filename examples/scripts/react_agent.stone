@@ -67,6 +67,14 @@ def react_agent():
                     stdin=get(args, "stdin", None),
                     timeout_ms=get(args, "timeout_ms", 60000),
                 )
+                if get(result, "still_running", False):
+                    cleanup = run_terminate(result.run_id)
+                    result = {
+                        "ok": False,
+                        "kind": "timed_out_and_terminated",
+                        "execution": result,
+                        "cleanup": cleanup,
+                    }
             else:
                 result = {
                     "ok": False,
