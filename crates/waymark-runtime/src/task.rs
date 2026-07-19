@@ -1254,6 +1254,7 @@ mod tests {
         assert_eq!(response["ok"], json!(false));
         assert_eq!(response["kind"], json!("task_failure"));
         assert_eq!(response["error"]["code"], json!("task_failure"));
+        assert_eq!(response["error"]["declared_code"], json!("bad_input"));
 
         let _ = fs::remove_dir_all(root);
     }

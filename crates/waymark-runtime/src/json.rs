@@ -153,6 +153,7 @@ fn record_to_json(record: &Record) -> JsonValue {
 
 fn shell_error_json(err: &ShellError) -> JsonValue {
     let (kind, code) = error_kind_and_code(err);
+    let task_failure = code == "task_failure";
     let mut map = Map::new();
     map.insert("kind".into(), JsonValue::String(kind.into()));
     map.insert("code".into(), JsonValue::String(code));
@@ -206,6 +207,16 @@ fn shell_error_json(err: &ShellError) -> JsonValue {
             map.insert("detail".into(), JsonValue::String(err.msg.to_string()));
             if let Some(help) = &err.help {
                 map.insert("help".into(), JsonValue::String(help.to_string()));
+                if task_failure {
+                    if let Some(declared_code) = help.strip_prefix("code=") {
+                        if !declared_code.is_empty() {
+                            map.insert(
+                                "declared_code".into(),
+                                JsonValue::String(declared_code.to_string()),
+                            );
+                        }
+                    }
+                }
             }
             match &err.site {
                 ErrorSite::Span(span) => insert_span(&mut map, *span),

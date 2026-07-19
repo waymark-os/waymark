@@ -160,6 +160,7 @@ pub(crate) fn run_call_values(
     for (index, value) in positional.iter().enumerate().skip(1) {
         match index {
             1 => match value {
+                Value::Nothing { .. } => {}
                 Value::Int { .. } | Value::Float { .. } => {
                     timeout_ms = value_to_i64(value, &format!("{context} timeout_ms"))?;
                     if timeout_ms <= 0 {
@@ -169,6 +170,7 @@ pub(crate) fn run_call_values(
                 _ => cwd = Some(value_to_string(value, &format!("{context} cwd"))?),
             },
             2 => match value {
+                Value::Nothing { .. } => {}
                 Value::Int { .. } | Value::Float { .. } => {
                     timeout_ms = value_to_i64(value, &format!("{context} timeout_ms"))?;
                     if timeout_ms <= 0 {
@@ -178,9 +180,11 @@ pub(crate) fn run_call_values(
                 _ => stdin = Some(value_to_string(value, &format!("{context} stdin"))?),
             },
             3 => {
-                timeout_ms = value_to_i64(value, &format!("{context} timeout_ms"))?;
-                if timeout_ms <= 0 {
-                    return Err(stone_error(context, "timeout_ms must be positive"));
+                if !matches!(value, Value::Nothing { .. }) {
+                    timeout_ms = value_to_i64(value, &format!("{context} timeout_ms"))?;
+                    if timeout_ms <= 0 {
+                        return Err(stone_error(context, "timeout_ms must be positive"));
+                    }
                 }
             }
             _ => unreachable!("run positional arity checked above"),
@@ -189,13 +193,33 @@ pub(crate) fn run_call_values(
 
     for (name, value) in named {
         match name.as_str() {
-            "cwd" => cwd = Some(value_to_string(value, &format!("{context} cwd"))?),
-            "stdin" => stdin = Some(value_to_string(value, &format!("{context} stdin"))?),
-            "env" => env_overrides = value_to_string_pairs(value, &format!("{context} env"))?,
+            "cwd" => {
+                cwd = if matches!(value, Value::Nothing { .. }) {
+                    None
+                } else {
+                    Some(value_to_string(value, &format!("{context} cwd"))?)
+                }
+            }
+            "stdin" => {
+                stdin = if matches!(value, Value::Nothing { .. }) {
+                    None
+                } else {
+                    Some(value_to_string(value, &format!("{context} stdin"))?)
+                }
+            }
+            "env" => {
+                env_overrides = if matches!(value, Value::Nothing { .. }) {
+                    Vec::new()
+                } else {
+                    value_to_string_pairs(value, &format!("{context} env"))?
+                }
+            }
             "timeout_ms" => {
-                timeout_ms = value_to_i64(value, &format!("{context} timeout_ms"))?;
-                if timeout_ms <= 0 {
-                    return Err(stone_error(context, "timeout_ms must be positive"));
+                if !matches!(value, Value::Nothing { .. }) {
+                    timeout_ms = value_to_i64(value, &format!("{context} timeout_ms"))?;
+                    if timeout_ms <= 0 {
+                        return Err(stone_error(context, "timeout_ms must be positive"));
+                    }
                 }
             }
             "background" => {
@@ -226,7 +250,7 @@ pub(crate) fn run_call_values(
 
     let cwd = match cwd {
         Some(path) => resolve_path(&path)?,
-        None => default_cwd,
+        None => gateway_runtime::workspace_mount_path().unwrap_or(default_cwd),
     };
     let record = run_posix_command(
         &argv,

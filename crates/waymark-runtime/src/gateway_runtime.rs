@@ -68,6 +68,13 @@ pub(crate) fn enabled() -> bool {
     config().is_some()
 }
 
+/// Return the virtual workspace root used by Gateway-backed filesystem and
+/// Linux RPCs. A LibOS guest's local cwd (normally `/work`) is not mounted in
+/// the remote Linux sandbox, so an omitted run cwd must resolve here.
+pub(crate) fn workspace_mount_path() -> Option<PathBuf> {
+    config().map(|config| PathBuf::from(config.workspace_mount))
+}
+
 pub(crate) struct GatewayAgentModelGateway {
     config: GatewayRuntimeConfig,
     #[cfg(any(unix, target_os = "hermit"))]

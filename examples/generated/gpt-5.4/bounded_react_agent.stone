@@ -1,0 +1,37 @@
+def inner_agent():
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a bounded inner agent. Return exactly one JSON object and nothing else. The only valid shapes are {\"kind\":\"run\",\"argv\":[string,...]} or {\"kind\":\"finish\",\"answer\":string}. The task is to produce the final answer ready. A run action is optional. If you can finish now, return {\"kind\":\"finish\",\"answer\":\"ready\"}."
+        },
+        {
+            "role": "user",
+            "content": "Produce the final answer ready. Return exactly one JSON object."
+        }
+    ]
+    turns = 0
+    for i in range(4):
+        response = model_call(messages, model_class="agent", max_output_tokens=128, response_format="json")
+        turns = turns + 1
+        action = json_loads(response.content)
+        if action.kind == "run":
+            result = run(action.argv, timeout_ms=5000)
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({
+                "role": "user",
+                "content": json_dumps({
+                    "observation": {
+                        "ok": result.ok,
+                        "exit_code": result.exit_code,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr
+                    }
+                })
+            })
+        elif action.kind == "finish":
+            return {"answer": action.answer, "turns": turns}
+        else:
+            fail("invalid action kind", code="invalid_action")
+    fail("inner agent exceeded turn limit", code="agent_turn_limit")
+
+emit(inner_agent())

@@ -213,6 +213,10 @@ Supported handlers are `except:`, `except Exception:`, and
   the attempt control block; it is not passed through environment variables.
   See [`react_agent.stone`](../examples/scripts/react_agent.stone) for a
   reusable model/tool loop built from these task views.
+- `fail(message, code="...")`: stop intentionally with the stable outer
+  category `task_failure`. The task response also exposes the program-selected
+  `declared_code`, preserving policy-specific reasons such as
+  `turn_limit_exceeded` without losing the task-failure classification.
 - `wait_port(port, host="127.0.0.1", timeout_ms=30000, protocol="tcp")`:
   wait for a TCP port to accept connections, or for a UDP endpoint to accept a
   datagram send probe. UDP has no connection handshake, so use a real protocol

@@ -866,6 +866,7 @@ emit(double(3))"#,
         assert_eq!(response["ok"], json!(false));
         assert_eq!(response["error"]["kind"], json!("generic"));
         assert_eq!(response["error"]["code"], json!("task_failure"));
+        assert_eq!(response["error"]["declared_code"], json!("bad_input"));
         assert_eq!(response["error"]["detail"], json!("bad input"));
         assert_eq!(response["error"]["help"], json!("code=bad_input"));
         assert!(response["error"]["related"].is_array());

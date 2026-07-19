@@ -1,6 +1,11 @@
 def react_agent():
     spec = task_spec()
     input = task_input()
+    max_turns = 16
+    max_rounds = 16
+    if input is not None:
+        max_turns = get(input, "max_turns", max_turns)
+        max_rounds = get(input, "max_rounds", max_rounds)
     messages = [
         {
             "role": "system",
@@ -13,14 +18,20 @@ def react_agent():
     ]
     turns = 0
 
-    for round in range(16):
+    for round in range(max_rounds):
         response = model_call(
             messages,
             model_class="agent",
             response_format={"type": "json_object"},
             max_output_tokens=512,
         )
-        decoded = json_loads(response.content)
+        try:
+            decoded = json_loads(response.content)
+        except Exception as error:
+            fail(
+                "model did not return valid JSON: " + str(error),
+                code="invalid_model_response",
+            )
         actions = decoded.actions
         if len(actions) == 0:
             fail("model actions array must not be empty", code="invalid_model_response")
@@ -28,8 +39,11 @@ def react_agent():
         saw_tool = False
 
         for action in actions:
-            if turns >= 16:
-                fail("agent exceeded max_turns 16", code="turn_limit_exceeded")
+            if turns >= max_turns:
+                fail(
+                    "agent exceeded max_turns " + str(max_turns),
+                    code="turn_limit_exceeded",
+                )
             turns += 1
             tool = get(action, "tool", "")
             final = get(action, "final", None)
@@ -76,7 +90,10 @@ def react_agent():
                 code="final_missing",
             )
 
-    fail("agent exceeded max_rounds 16", code="round_limit_exceeded")
+    fail(
+        "agent exceeded max_rounds " + str(max_rounds),
+        code="round_limit_exceeded",
+    )
 
 
 emit(react_agent())

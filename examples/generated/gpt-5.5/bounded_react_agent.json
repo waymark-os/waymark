@@ -1,0 +1,11 @@
+{
+  "admission": {
+    "fixture_answer": "ready",
+    "required_runtime_change": false,
+    "status": "pass"
+  },
+  "author_model": "gpt-5.5",
+  "experiment": "stone-agent-authorship-v1-gpt55",
+  "source_sha256": "2737683d65c8f1841edd9655514bd2380c269a0b4f6171fd3ce97c2746d01ed1",
+  "tool_calls": 0
+}

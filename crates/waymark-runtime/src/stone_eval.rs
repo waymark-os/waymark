@@ -10648,6 +10648,8 @@ emit({"ok": ok.ok, "stdout": ok.stdout, "kind": ok.kind})
 timed = run(["sh", "-c", "sleep 1"], timeout_ms=20)
 positional_cwd = run(["pwd"], "subdir")
 positional_timeout = run(["sh", "-c", "sleep 1"], 20)
+named_none = run(["pwd"], cwd=None, stdin=None, timeout_ms=None, env=None)
+positional_none = run(["sh", "-c", "printf none"], None, None, None)
 emit({
     "echoed_ok": echoed["ok"],
     "echoed": echoed["stdout"],
@@ -10659,6 +10661,8 @@ emit({
     "timed_steps": timed["explanation"]["next_steps"],
     "positional_cwd": positional_cwd["stdout"],
     "positional_timeout": positional_timeout["timed_out"],
+    "named_none": named_none["stdout"],
+    "positional_none": positional_none["stdout"],
 })
 "#,
         )?;
@@ -10686,6 +10690,11 @@ emit({
             json_value!(format!("{}\n", root.join("subdir").display()))
         );
         assert_eq!(value["positional_timeout"], json_value!(true));
+        assert_eq!(
+            value["named_none"],
+            json_value!(format!("{}\n", root.display()))
+        );
+        assert_eq!(value["positional_none"], json_value!("none"));
         cleanup_dir(&root);
         Ok(())
     }

@@ -44,17 +44,24 @@ the ChatGPT-backed Codex account. Both failed before inference with HTTP 400
 "model is not supported" responses. They are availability failures, not Stone
 authorship failures.
 
+GPT-5.4 was then run as the second independently addressable author model with
+the same frozen prompt and validators. It produced a distinct 1,631-byte
+program with zero tool calls. The source passed preflight and Gateway fixture
+execution on its first response, without a runtime change.
+
 Local artifacts:
 
 - `target/runs/stone-agent-authorship-v1-gpt55/aggregate.json`
+- `target/runs/stone-agent-authorship-v1-gpt54/aggregate.json`
 - `target/runs/stone-agent-authorship-v1-56/aggregate.json`
 
 ## Interpretation
 
-This pilot supports one narrow claim: GPT-5.5 can author a visible bounded
-Stone model/tool loop from compact interface help, and the first observed
-failure exposed a fixable LLM-language compatibility defect rather than a need
-for hidden harness control.
+This pilot supports a narrow language-usability claim: GPT-5.5 and GPT-5.4 can
+each author a distinct visible bounded Stone model/tool loop from compact
+interface help. The first observed GPT-5.5 failure exposed a fixable
+LLM-language compatibility defect rather than a need for hidden harness
+control.
 
 The exact saved GPT-5.5 source was subsequently admitted byte-for-byte through
 Gateway and executed in Waymark LibOS. It made one attached `model.call` and
@@ -62,14 +69,18 @@ the LibOS controller reported `{"answer":"ready","turns":1}`. The checked-in
 `examples/scripts/react_agent.stone` baseline also passed in LibOS while
 reading its Gateway-backed `task_spec()` and dynamic `task_input()`.
 
-This still does not satisfy the M2 exit criterion. Only one author model was
-available and the fixture finished before tool dispatch. Deterministic
-Rust/Stone loop parity across tool, failure, and limit cases; repair trials;
-a second author model; and real task execution remain required.
+Both exact admitted sources were later exercised through their `run` branches
+in Waymark LibOS. Each made two attached model calls, caused Linux RPC to write
+an author-specific transaction artifact, finished on the second response, had
+the artifact verified before rollback, and left the canonical generation
+unchanged. Their checked-in source bytes and author identities are under
+`examples/generated/`.
 
 Additional local artifacts:
 
 - `../waymark-gateway/target/runs/stone-agent-authorship-m2-gpt55-libos-current/summary.json`
+- `../waymark-gateway/target/runs/stone-agent-authorship-m2-gpt55-libos-tool/summary.json`
+- `../waymark-gateway/target/runs/stone-agent-authorship-m2-gpt54-libos-tool/summary.json`
 - `../waymark-gateway/target/runs/stone-agent-react-baseline-m2-libos/summary.json`
 
 ## First Shared-Fixture Parity Cell
@@ -102,7 +113,76 @@ feedback and multiple actions in one round:
 - Stone: `../waymark-gateway/target/runs/stone-react-parity-recover-multiaction/summary.json`
 - Rust: `../waymark-gateway/target/runs/rust-react-parity-recover-multiaction/summary.json`
 
-Still untested under shared fixtures: malformed output, empty actions, turn
-exhaustion, and round exhaustion. The Stone baseline intentionally exposes
-only the common `read`, `write`, and `run_linux` subset at this stage; the Rust
-compatibility frontend has additional legacy tools.
+## Shared Failure And Limit Parity
+
+The remaining four shared cases were frozen in
+`host/bench/run_stone_react_parity.py`. Rust and Stone received identical
+fixture responses and limits. Both produced the same logical outcome and model
+call count in every case:
+
+| Case | Logical error | Model calls per surface |
+| --- | --- | ---: |
+| malformed JSON | `invalid_model_response` | 1 |
+| empty actions | `invalid_model_response` | 1 |
+| turn exhaustion | `turn_limit_exceeded` | 1 |
+| round exhaustion | `round_limit_exceeded` | 2 |
+
+The stable runtime error category for an intentional `fail(...)` remains
+`task_failure`; its program-declared reason is preserved separately as
+`error.declared_code`. The runner compares the declared reason. This avoids
+turning application-specific stop names into unstable OS error categories.
+
+- `../waymark-gateway/target/runs/stone-react-parity-failures-v4/aggregate.json`
+
+## One-Repair Cohort
+
+`host/bench/eval_stone_agent_repair.py` injected one fault at a time into the
+admitted GPT-5.5 source: a missing function colon, an incompatible explicit
+return annotation, and an invalid `model_call` option. GPT-5.5 received only
+the broken source, the ordinary bounded structured diagnostic, and compact
+live help. It was allowed one response and no tools.
+
+All three repairs passed. Each changed the source, retained the visible agent
+control gates, reached `model_call`, and completed under the Gateway fixture.
+The parse, type-check, and model-effect diagnostics were therefore sufficient
+for these bounded repair cases.
+
+- `target/runs/stone-agent-repair-v1-gpt55/aggregate.json`
+
+## Transactional Workspace Task
+
+The reusable checked-in Stone loop then ran a nontrivial workspace
+transformation in Waymark LibOS. Starting from duplicate, unsorted lines in
+canonical `input.txt`, a `run_linux` action produced the sorted unique value
+`apple,banana,pear` in `/app/report.txt`. A second model response returned its
+answer path. The runner verified the transaction artifact, verified canonical
+input bytes were unchanged, and rolled the attempt back.
+
+This run exposed and caused two runtime fixes before it passed:
+
+1. explicit `None` for optional `run` arguments now means the option was
+   omitted, matching the documented Stone signature;
+2. omitted Gateway-backed `run` cwd now defaults to the Gateway workspace mount
+   (`/app`), not the LibOS guest's unrelated local `/work` directory.
+
+- `../waymark-gateway/target/runs/stone-agent-real-workspace-transform-v3/summary.json`
+
+## M2 Result And Boundary
+
+The M2 exit criterion is satisfied for the mechanism tested here:
+
+- two outer models synthesized distinct admitted Stone agents;
+- both exact programs executed model, Linux, and transaction effects in LibOS;
+- the checked-in Stone loop matches the fixed Rust loop on the frozen shared
+  success, recovery, malformed-output, empty-action, turn-limit, and
+  round-limit cases;
+- no runtime code change was needed for the GPT-5.4 program, while the original
+  GPT-5.5 observation and real workspace probe found general language/runtime
+  defects that were fixed and regression-tested.
+
+This does **not** validate the larger attempt-first OS hypothesis. The model
+responses here are deterministic fixtures, and the workspace task is
+constructed mechanism conformance. The next decisive question is
+programmability versus configuration: can an outer agent express behavior in
+Stone that the frozen Rust loop cannot express, followed by untouched,
+historically unresolved Terminal-Bench tasks.

@@ -906,19 +906,13 @@ helps agent computer use. A successful Stone ReAct demo alone does not.
 
 ## Immediate Next Step
 
-Implement M1 only. Do not start with new `agent` syntax, actors, automatic
-parallelism, or transparent resume.
+M1 and the M2 mechanism gate are complete. The evidence and remaining claim
+boundary are recorded in `STONE_AGENT_AUTHORSHIP_M2_PILOT.md`.
 
-The smallest informative slice is:
-
-```text
-Stone model_call builtin
-  -> Gateway model.call
-  -> local vLLM and deterministic fixture
-  -> explicit two-turn Stone program
-  -> complete help and trace evidence
-```
-
-That slice validates the architectural seam. M2 then tests whether moving the
-loop from Rust into Stone creates real programmability without sacrificing the
-working baseline.
+Run validation plan C next: freeze the Rust loop and require a control behavior
+that is not one of its configuration options, such as invoking a critic only
+after a failed verifier. The outer agent must express the change entirely as
+admitted Stone, and the runtime must remain unchanged. Then move to untouched,
+historically unresolved Terminal-Bench tasks for outcome evidence. Do not treat
+the deterministic M2 fixture cohort as validation of the broader attempt-first
+OS hypothesis.

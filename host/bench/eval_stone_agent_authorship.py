@@ -63,6 +63,7 @@ def run_capture(
         env=env,
         timeout=timeout,
         text=True,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -234,7 +235,11 @@ def execute_with_fixture(
     data_root = fixture_dir / "gateway-data"
     source = fixture_dir / "source"
     work = fixture_dir / "work"
-    socket_path = fixture_dir / "gateway.sock"
+    # AF_UNIX paths are capped at roughly 108 bytes on Linux. Experiment run
+    # directories are intentionally descriptive, so keep only the socket in a
+    # short-lived /tmp directory while all durable evidence stays in run_dir.
+    socket_root = Path(tempfile.mkdtemp(prefix="waymark-authorship-", dir="/tmp"))
+    socket_path = socket_root / "gateway.sock"
     source.mkdir(parents=True)
     work.mkdir()
     (source / "README.md").write_text("agent authorship fixture\n", encoding="utf-8")
@@ -303,6 +308,7 @@ def execute_with_fixture(
         except subprocess.TimeoutExpired:
             server.kill()
             server.wait(timeout=5)
+        shutil.rmtree(socket_root, ignore_errors=True)
 
 
 def source_features(source: str) -> dict[str, bool]:
