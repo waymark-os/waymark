@@ -17,7 +17,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 SANDBOX = ROOT.parent
-DEFAULT_MODELS = ["gpt-5.5", "gpt-5.6-terran", "gpt-5.6-lunar"]
+DEFAULT_MODELS = ["gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna"]
 FIXTURE_RESPONSE = {"kind": "finish", "answer": "ready"}
 
 

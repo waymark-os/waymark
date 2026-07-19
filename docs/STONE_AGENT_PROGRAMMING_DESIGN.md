@@ -758,7 +758,7 @@ Gateway in Waymark LibOS without receiving provider credentials.
 ### M2: Ad-Hoc Agent Authorship And ReAct Parity
 
 1. Have GPT-5.5 synthesize an ad-hoc JSON-action ReAct program from compact
-   Stone help, then repeat with `gpt-5.6-terran` and `gpt-5.6-lunar`; record
+   Stone help, then repeat with `gpt-5.6-terra` and `gpt-5.6-luna`; record
    each admitted source and author-model identity.
 2. Implement the current JSON-action ReAct behavior as checked-in Stone source
    for a reusable baseline.
@@ -826,7 +826,7 @@ This establishes semantics, not model usability.
 
 ### B. Outer-Agent Authorship And Repair Test
 
-Give GPT-5.5, `gpt-5.6-terran`, and `gpt-5.6-lunar` identical task context,
+Give GPT-5.5, `gpt-5.6-terra`, and `gpt-5.6-luna` identical task context,
 `help("model_call")`, and a compact Stone language reference. In isolated runs,
 ask each model to write:
 

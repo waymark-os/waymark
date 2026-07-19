@@ -62,6 +62,12 @@ emit(react())
         self.assertIsNotNone(HARNESS.invocation_unavailable_reason(events))
         self.assertIsNone(HARNESS.invocation_unavailable_reason('{"type":"turn.started"}\n'))
 
+    def test_default_gpt_56_variant_ids_are_exact(self) -> None:
+        self.assertIn("gpt-5.6-terra", HARNESS.DEFAULT_MODELS)
+        self.assertIn("gpt-5.6-luna", HARNESS.DEFAULT_MODELS)
+        self.assertNotIn("gpt-5.6-terran", HARNESS.DEFAULT_MODELS)
+        self.assertNotIn("gpt-5.6-lunar", HARNESS.DEFAULT_MODELS)
+
 
 if __name__ == "__main__":
     unittest.main()

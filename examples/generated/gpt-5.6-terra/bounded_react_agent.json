@@ -1,0 +1,11 @@
+{
+  "admission": {
+    "fixture_answer": "ready",
+    "required_runtime_change": false,
+    "status": "pass"
+  },
+  "author_model": "gpt-5.6-terra",
+  "experiment": "stone-agent-authorship-v1-gpt56-terra",
+  "source_sha256": "d954f1f937440ae94749c1154da4c20c004d1688ba60851f2cd94bef3ca29ad1",
+  "tool_calls": 0
+}

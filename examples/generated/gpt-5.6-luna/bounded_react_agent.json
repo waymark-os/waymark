@@ -1,0 +1,11 @@
+{
+  "admission": {
+    "fixture_answer": "ready",
+    "required_runtime_change": false,
+    "status": "pass"
+  },
+  "author_model": "gpt-5.6-luna",
+  "experiment": "stone-agent-authorship-v1-gpt56-luna",
+  "source_sha256": "8ea5c6e42633a5f0e599d9704035b5cfb2ba2d38def11f8efa29009ff7083335",
+  "tool_calls": 0
+}

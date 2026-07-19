@@ -39,10 +39,11 @@ explicit `-> None` now denotes a checked procedure. The exact saved GPT-5.5
 source, with no repair or regeneration, then passed both validation stages and
 returned `{"answer":"ready","turns":1}`.
 
-The requested `gpt-5.6-terran` and `gpt-5.6-lunar` cells were unavailable to
-the ChatGPT-backed Codex account. Both failed before inference with HTTP 400
-"model is not supported" responses. They are availability failures, not Stone
-authorship failures.
+The first attempted GPT-5.6 cells used the misspelled, nonexistent aliases
+`gpt-5.6-terran` and `gpt-5.6-lunar`. Their HTTP 400 responses are invalid typo
+probes and provide no evidence about GPT-5.6 availability or Stone usability.
+The corrected `gpt-5.6-terra` and `gpt-5.6-luna` cells each passed on their
+first response with zero tool calls and successful Gateway fixture execution.
 
 GPT-5.4 was then run as the second independently addressable author model with
 the same frozen prompt and validators. It produced a distinct 1,631-byte
@@ -53,15 +54,17 @@ Local artifacts:
 
 - `target/runs/stone-agent-authorship-v1-gpt55/aggregate.json`
 - `target/runs/stone-agent-authorship-v1-gpt54/aggregate.json`
-- `target/runs/stone-agent-authorship-v1-56/aggregate.json`
+- `target/runs/stone-agent-authorship-v1-gpt56-terra/aggregate.json`
+- `target/runs/stone-agent-authorship-v1-gpt56-luna/aggregate.json`
+- `target/runs/stone-agent-authorship-v1-56/aggregate.json` (invalid typo probes)
 
 ## Interpretation
 
-This pilot supports a narrow language-usability claim: GPT-5.5 and GPT-5.4 can
-each author a distinct visible bounded Stone model/tool loop from compact
-interface help. The first observed GPT-5.5 failure exposed a fixable
-LLM-language compatibility defect rather than a need for hidden harness
-control.
+This pilot supports a narrow language-usability claim: GPT-5.5, GPT-5.4,
+`gpt-5.6-terra`, and `gpt-5.6-luna` can each author a distinct visible bounded
+Stone model/tool loop from compact interface help. The first observed GPT-5.5
+failure exposed a fixable LLM-language compatibility defect rather than a need
+for hidden harness control.
 
 The exact saved GPT-5.5 source was subsequently admitted byte-for-byte through
 Gateway and executed in Waymark LibOS. It made one attached `model.call` and
@@ -171,7 +174,7 @@ This run exposed and caused two runtime fixes before it passed:
 
 The M2 exit criterion is satisfied for the mechanism tested here:
 
-- two outer models synthesized distinct admitted Stone agents;
+- four outer model IDs synthesized distinct admitted Stone agents;
 - both exact programs executed model, Linux, and transaction effects in LibOS;
 - the checked-in Stone loop matches the fixed Rust loop on the frozen shared
   success, recovery, malformed-output, empty-action, turn-limit, and
