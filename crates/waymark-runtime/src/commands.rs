@@ -64,6 +64,19 @@ emit({"input": input})"#],
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "agent_session",
+        signature: "agent_session() -> record",
+        use_when: "Gateway mode only. Build the standard structured session argument for a Stone AgentControl function from the attached task, input, attempt, limits, and available Shell tool families.",
+        examples: &[r#"def control(session):
+    return {"attempt": session.attempt.attempt, "objective": session.task.objective}
+emit(control(agent_session()))"#],
+        avoid: &[
+            "Do not treat the tool-name lists as authority; Gateway capabilities decide which protected calls are allowed.",
+            "Do not require agent_session() for a small direct Stone program; it is the reusable AgentControl convention, not new control syntax.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "emit",
         signature: "emit(value: Any? = pipeline_value) -> Any",
         use_when: "Use to return a structured result from an Stone script or MCP call.",
@@ -1079,6 +1092,19 @@ if not info.ok:
 ];
 
 const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
+    StoneHelpTopic {
+        name: "agent_control",
+        summary: "Write an ad-hoc or reusable agent as an ordinary Stone function over one structured session; optimized builtins follow the same control contract.",
+        bullets: &[
+            "Define def control(session): ... and invoke it with control(agent_session()); return the structured result and emit it at the program boundary.",
+            "session.task and session.input are structured task data; session.attempt is the current attempt record; session.limits exposes admitted resource limits.",
+            "session.tools lists discoverable Shell tool families, while the actual operations remain ordinary Stone builtins such as model_call, run, read_file, and attempt_fork.",
+            "A tool name is not authority. The attached attempt's Gateway capabilities mediate protected file, Linux, model, context, and attempt effects.",
+            "Compose controls with ordinary Stone functions: a wrapper may call a base control, inspect its structured result, verify it, retry within a bound, or fall back.",
+            "Use a child attempt when work needs independent workspace/context state, fate, authority, budget, or candidate acceptance; a model call alone is not a child attempt.",
+            "The builtin ReAct controller is an optimized AgentControl implementation, not a privileged Gateway mode or Stone language semantic.",
+        ],
+    },
     StoneHelpTopic {
         name: "attempt_workflow",
         summary: "Branch, inspect, select, and clean candidate attempts while keeping Stone as the control language.",

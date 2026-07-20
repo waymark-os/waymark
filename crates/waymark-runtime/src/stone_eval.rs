@@ -1821,6 +1821,7 @@ impl Evaluator<'_> {
             "model_call" => self.eval_model_call_call(call),
             "task_spec" => self.eval_task_spec_call(call),
             "task_input" => self.eval_task_input_call(call),
+            "agent_session" => self.eval_agent_session_call(call),
             "max" => self.eval_min_max_call(call, MinMax::Max),
             "min" => self.eval_min_max_call(call, MinMax::Min),
             "open" => self.eval_open_call(call),
@@ -3931,6 +3932,23 @@ impl Evaluator<'_> {
             ));
         }
         gateway_runtime::task_input_value(Span::unknown()).map(RuntimeValue::Nu)
+    }
+
+    fn eval_agent_session_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.positional.is_empty() || !call.named.is_empty() {
+            return Err(stone_error(
+                "agent_session",
+                "agent_session() accepts no arguments",
+            ));
+        }
+
+        let span = Span::unknown();
+        let task = gateway_runtime::task_spec_value(span)?;
+        let input = gateway_runtime::task_input_value(span)?;
+        let attempt = gateway_env::attempt_info(String::new())?;
+        Ok(RuntimeValue::Nu(agent_session_value(
+            task, input, attempt, span,
+        )))
     }
 
     fn eval_ps_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -6307,6 +6325,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "md5",
     "min",
     "model_call",
+    "agent_session",
     "task_spec",
     "task_input",
     "mkdir",
@@ -7004,6 +7023,61 @@ fn model_call_input_error(message: impl Into<String>) -> ShellError {
     )
 }
 
+fn agent_session_value(task: Value, input: Value, attempt: Value, span: Span) -> Value {
+    let limits = match &attempt {
+        Value::Record { val, .. } => val
+            .get("resource_limits")
+            .cloned()
+            .unwrap_or_else(|| Value::record(Record::new(), span)),
+        _ => Value::record(Record::new(), span),
+    };
+    let names = |items: &[&str]| {
+        Value::list(
+            items
+                .iter()
+                .map(|name| Value::string(*name, span))
+                .collect(),
+            span,
+        )
+    };
+    let mut tools = Record::new();
+    tools.push(
+        "resources",
+        names(&["sysinfo", "state", "run_status", "run_wait"]),
+    );
+    tools.push(
+        "files",
+        names(&["read_file", "write_file", "find", "search", "diff"]),
+    );
+    tools.push(
+        "linux",
+        names(&["run", "must_run", "run_status", "run_wait", "run_terminate"]),
+    );
+    tools.push("model", names(&["model_call"]));
+    tools.push("context", names(&["task_spec", "task_input"]));
+    tools.push(
+        "attempts",
+        names(&[
+            "attempt_spawn",
+            "attempt_fork",
+            "attempt_state",
+            "attempt_wait",
+            "attempt_report",
+            "attempt_accept",
+            "attempt_discard",
+            "attempt_publish",
+        ]),
+    );
+
+    let mut session = Record::new();
+    session.push("task", task);
+    session.push("input", input);
+    session.push("attempt", attempt);
+    session.push("limits", limits);
+    session.push("tools", Value::record(tools, span));
+    Value::record(session, span)
+}
+
 fn value_to_string_list(value: &Value, context: &str) -> Result<Vec<String>, ShellError> {
     let Value::List { vals, .. } = value else {
         return Err(stone_error(
@@ -7357,7 +7431,7 @@ mod tests {
     #[cfg(not(target_os = "hermit"))]
     use super::cleanup_stale_run_temp_files;
     use super::{
-        eval_program, eval_program_with_options, eval_program_with_output,
+        agent_session_value, eval_program, eval_program_with_options, eval_program_with_output,
         match_fused_map_update_if, EvalHotLoopDiagnostics, EvalOptions, RuntimeValue, TextLines,
         STONE_BUILTIN_NAMES,
     };
@@ -8335,15 +8409,20 @@ emit({
 write = help("write_file")
 edit = help("edit_file")
 session = help("session")
+agent_control = help("agent_control")
+agent_session = help("agent_session")
 missing = help("not_a_builtin")
 emit({
     "language": overview["language"],
     "has_unsupported": len(overview["unsupported"]) > 0,
     "has_session_topic": "session" in overview["topics"],
+    "has_agent_control_topic": "agent_control" in overview["topics"],
     "for_llm_mentions_bindings": "bindings persist" in overview["for_llm"],
     "for_llm_mentions_multiline_eval": "multi-line script" in overview["for_llm"],
     "session_mentions_live_bindings": "live name binding" in session["bullets"][1],
     "session_mentions_binding_ack": "bound names" in session["bullets"][2],
+    "agent_control_mentions_builtin": "optimized AgentControl" in agent_control["bullets"][6],
+    "agent_session_signature": agent_session["signature"],
     "write_signature": write["signature"],
     "write_example": write["examples"][0],
     "edit_signature": edit["signature"],
@@ -8359,10 +8438,13 @@ emit({
                 "language": "Stone",
                 "has_unsupported": true,
                 "has_session_topic": true,
+                "has_agent_control_topic": true,
                 "for_llm_mentions_bindings": true,
                 "for_llm_mentions_multiline_eval": true,
                 "session_mentions_live_bindings": true,
                 "session_mentions_binding_ack": true,
+                "agent_control_mentions_builtin": true,
+                "agent_session_signature": "agent_session() -> record",
                 "write_signature": "write_file(path: str, text: str, append: bool = False) -> record",
                 "write_example": "write_file(\"/app/report.txt\", \"ok\\n\")",
                 "edit_signature": "edit(path: str, old: str, new: str, all: bool = False) -> record",
@@ -8372,6 +8454,37 @@ emit({
 
         cleanup_dir(&root);
         Ok(())
+    }
+
+    #[test]
+    fn agent_session_value_exposes_structured_control_resources() {
+        let span = Span::unknown();
+        let session = agent_session_value(
+            json::json_to_nu_value(json_value!({"objective": "solve"}), span),
+            json::json_to_nu_value(json_value!({"strategy": "bounded"}), span),
+            json::json_to_nu_value(
+                json_value!({
+                    "attempt": "attempt-7",
+                    "resource_limits": {"model_calls": "4", "memory": "1GiB"},
+                }),
+                span,
+            ),
+            span,
+        );
+        let session = json::nu_to_json_value(&session);
+
+        assert_eq!(session["task"]["objective"], json_value!("solve"));
+        assert_eq!(session["input"]["strategy"], json_value!("bounded"));
+        assert_eq!(session["attempt"]["attempt"], json_value!("attempt-7"));
+        assert_eq!(session["limits"]["model_calls"], json_value!("4"));
+        assert!(session["tools"]["model"]
+            .as_array()
+            .unwrap()
+            .contains(&json_value!("model_call")));
+        assert!(session["tools"]["attempts"]
+            .as_array()
+            .unwrap()
+            .contains(&json_value!("attempt_fork")));
     }
 
     #[test]

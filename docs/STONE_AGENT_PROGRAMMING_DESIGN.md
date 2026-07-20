@@ -957,6 +957,23 @@ multiple child entrypoints; the parent launches a bounded portfolio, observes
 and joins every child, accepts one result, discards the others, and exits with
 no manual source-string construction or leaked lifecycle state.
 
+The first implementation slice now establishes the control seam:
+
+- `waymark-runtime` exposes a public Rust `AgentControl` trait and
+  `AgentSession::run_control` driver;
+- the optimized JSON-action ReAct loop and deterministic scripted controller
+  both implement that trait;
+- controls can wrap/delegate to another control over the same session, with a
+  deterministic trace conformance test;
+- Stone exposes `agent_session()` plus `help("agent_control")`, so an ordinary
+  `def control(session)` receives structured task, input, current attempt,
+  limits, and discoverable resource-tool families.
+
+This does not yet make the Rust ReAct implementation a first-class callable
+value inside Stone. Native builtin controls, Stone-defined controls, and
+control adapters still need one runtime invocation surface before parity and
+stacking can be tested across that language boundary.
+
 ### M3: Typed Inference
 
 1. Add JSON Schema validation to the Waymark runtime.

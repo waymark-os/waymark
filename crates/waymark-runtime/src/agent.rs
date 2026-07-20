@@ -89,6 +89,51 @@ pub struct AgentSession {
     completion_path: Option<String>,
 }
 
+/// User-space control policy executed inside one attempt.
+///
+/// Implementations may be optimized Rust builtins or adapters around another
+/// control. They receive the same [`AgentSession`] resource surface; Gateway
+/// authority remains in the tools and model gateway rather than in the
+/// control implementation.
+pub trait AgentControl {
+    fn name(&self) -> &'static str;
+
+    fn run(
+        &mut self,
+        session: &mut AgentSession,
+        guest: &mut StoneGuest,
+        gateway: Option<&mut dyn AgentModelGateway>,
+    ) -> AgentRunResult;
+}
+
+/// The optimized builtin JSON-action ReAct control.
+pub struct ReactAgentControl {
+    task: String,
+    model: Option<String>,
+}
+
+impl ReactAgentControl {
+    pub fn new(task: impl Into<String>, model: Option<&str>) -> Self {
+        Self {
+            task: task.into(),
+            model: model.map(str::to_owned),
+        }
+    }
+}
+
+/// A deterministic control useful for fixtures and pre-authored action lists.
+pub struct ScriptedAgentControl {
+    actions: Vec<AgentAction>,
+}
+
+impl ScriptedAgentControl {
+    pub fn new(actions: impl IntoIterator<Item = AgentAction>) -> Self {
+        Self {
+            actions: actions.into_iter().collect(),
+        }
+    }
+}
+
 pub trait AgentModelGateway {
     fn request_model(&mut self, request: &JsonValue) -> Result<JsonValue, AgentError>;
 
@@ -149,6 +194,35 @@ impl AgentSession {
         &self.trace
     }
 
+    pub fn max_rounds(&self) -> usize {
+        self.max_rounds
+    }
+
+    pub fn max_turns(&self) -> usize {
+        self.max_turns
+    }
+
+    pub fn record_event(&mut self, event: &str, value: JsonValue) {
+        self.push_event(event, value);
+    }
+
+    pub fn run_control(
+        &mut self,
+        guest: &mut StoneGuest,
+        control: &mut dyn AgentControl,
+        gateway: Option<&mut dyn AgentModelGateway>,
+    ) -> AgentRunResult {
+        self.trace.clear();
+        self.next_seq = 0;
+        self.push_event(
+            "episode_start",
+            json!({
+                "control": control.name(),
+            }),
+        );
+        control.run(self, guest, gateway)
+    }
+
     pub fn run_model_task(
         &mut self,
         guest: &mut StoneGuest,
@@ -156,10 +230,17 @@ impl AgentSession {
         model: Option<&str>,
         gateway: &mut dyn AgentModelGateway,
     ) -> AgentRunResult {
-        self.trace.clear();
-        self.next_seq = 0;
-        self.push_event("episode_start", json!({}));
+        let mut control = ReactAgentControl::new(task, model);
+        self.run_control(guest, &mut control, Some(gateway))
+    }
 
+    fn run_react_after_episode_start(
+        &mut self,
+        guest: &mut StoneGuest,
+        task: &str,
+        model: Option<&str>,
+        gateway: &mut dyn AgentModelGateway,
+    ) -> AgentRunResult {
         let mut messages = initial_model_messages(task);
         let mut rounds = 0;
         let mut turns = 0;
@@ -284,10 +365,8 @@ impl AgentSession {
         guest: &mut StoneGuest,
         actions: impl IntoIterator<Item = AgentAction>,
     ) -> AgentRunResult {
-        self.trace.clear();
-        self.next_seq = 0;
-        self.push_event("episode_start", json!({}));
-        self.run_actions_after_episode_start(guest, actions)
+        let mut control = ScriptedAgentControl::new(actions);
+        self.run_control(guest, &mut control, None)
     }
 
     fn run_actions_after_episode_start(
@@ -473,7 +552,7 @@ impl AgentSession {
         }
     }
 
-    fn push_event(&mut self, event: &'static str, value: JsonValue) {
+    fn push_event(&mut self, event: &str, value: JsonValue) {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.trace.push(json!({
@@ -481,6 +560,46 @@ impl AgentSession {
             "event": event,
             "value": value,
         }));
+    }
+}
+
+impl AgentControl for ReactAgentControl {
+    fn name(&self) -> &'static str {
+        "react_json_v0"
+    }
+
+    fn run(
+        &mut self,
+        session: &mut AgentSession,
+        guest: &mut StoneGuest,
+        gateway: Option<&mut dyn AgentModelGateway>,
+    ) -> AgentRunResult {
+        let Some(gateway) = gateway else {
+            return session.finish_with_error(
+                0,
+                0,
+                AgentError {
+                    code: "model_gateway_unavailable",
+                    message: "react control requires a model gateway".to_owned(),
+                },
+            );
+        };
+        session.run_react_after_episode_start(guest, &self.task, self.model.as_deref(), gateway)
+    }
+}
+
+impl AgentControl for ScriptedAgentControl {
+    fn name(&self) -> &'static str {
+        "scripted_v0"
+    }
+
+    fn run(
+        &mut self,
+        session: &mut AgentSession,
+        guest: &mut StoneGuest,
+        _gateway: Option<&mut dyn AgentModelGateway>,
+    ) -> AgentRunResult {
+        session.run_actions_after_episode_start(guest, self.actions.drain(..))
     }
 }
 
@@ -745,6 +864,56 @@ mod tests {
             .iter()
             .any(|entry| entry["event"] == json!("episode_end")
                 && entry["value"]["ok"] == json!(false)));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_controls_are_stackable_over_one_session_contract() {
+        struct EventWrapper<C> {
+            inner: C,
+        }
+
+        impl<C: AgentControl> AgentControl for EventWrapper<C> {
+            fn name(&self) -> &'static str {
+                "event_wrapper_v0"
+            }
+
+            fn run(
+                &mut self,
+                session: &mut AgentSession,
+                guest: &mut StoneGuest,
+                gateway: Option<&mut dyn AgentModelGateway>,
+            ) -> AgentRunResult {
+                session.record_event("control_enter", json!({"inner": self.inner.name()}));
+                let mut result = self.inner.run(session, guest, gateway);
+                session.record_event("control_exit", json!({"ok": result.ok}));
+                result.trace = session.trace().to_vec();
+                result
+            }
+        }
+
+        let root = temp_root("stacked-agent-control");
+        fs::create_dir_all(root.join("work")).unwrap();
+        let mut guest = StoneGuest::new(root.join("work")).unwrap();
+        let mut session = AgentSession::new(TaskTools::for_host_root(&root));
+        let inner = ScriptedAgentControl::new([AgentAction::Final(json!({"answer": "ok"}))]);
+        let mut control = EventWrapper { inner };
+
+        let result = session.run_control(&mut guest, &mut control, None);
+
+        assert!(result.ok);
+        assert_eq!(result.final_value, Some(json!({"answer": "ok"})));
+        assert_eq!(result.trace[0]["event"], json!("episode_start"));
+        assert_eq!(
+            result.trace[0]["value"]["control"],
+            json!("event_wrapper_v0")
+        );
+        assert!(result.trace.iter().any(|entry| {
+            entry["event"] == json!("control_enter")
+                && entry["value"]["inner"] == json!("scripted_v0")
+        }));
+        assert_eq!(result.trace.last().unwrap()["event"], json!("control_exit"));
 
         let _ = fs::remove_dir_all(root);
     }
