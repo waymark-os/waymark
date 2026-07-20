@@ -43,6 +43,7 @@ use crate::stone_ast::{
     FormattedStringPart, FunctionDef, Program, Stmt, StoneFormatSpec, StoneType,
 };
 use crate::stone_attempt_scope::AttemptScopeValue;
+use crate::stone_attempt_value::{AttemptHandleValue, AttemptOutcomeValue};
 use crate::stone_builtins::{
     add_values, bitwise_int_values, compare_values, div_values, enumerate_builtin,
     find_method_builtin, first_builtin, float_builtin, floor_div_values, format_builtin,
@@ -652,7 +653,7 @@ enum EvalFlow {
     Output(PipelineData),
     Break,
     Continue,
-    Return(Value),
+    Return(RuntimeValue),
 }
 
 impl Evaluator<'_> {
@@ -810,10 +811,8 @@ impl Evaluator<'_> {
             }
             Stmt::Return(value) => {
                 let value = match value {
-                    Some(value) => self
-                        .eval_expr_value(value, input)?
-                        .into_nu_value("return value")?,
-                    None => Value::nothing(Span::unknown()),
+                    Some(value) => self.eval_expr_value(value, input)?,
+                    None => RuntimeValue::Nu(Value::nothing(Span::unknown())),
                 };
                 Ok(EvalFlow::Return(value))
             }
@@ -1990,6 +1989,8 @@ impl Evaluator<'_> {
             "attempt_start" => self.eval_attempt_start_call(call),
             "attempt_wait" => self.eval_attempt_wait_call(call),
             "attempt_join" => self.eval_attempt_join_call(call),
+            "attempt_wait_any" => self.eval_attempt_wait_set_call(call, false),
+            "attempt_wait_all" => self.eval_attempt_wait_set_call(call, true),
             "attempt_terminate" => self.eval_attempt_terminate_call(call),
             "attempt_scope" => self.eval_attempt_scope_call(call),
             "attempt_scope_add" => self.eval_attempt_scope_add_call(call),
@@ -2082,43 +2083,39 @@ impl Evaluator<'_> {
         let mut args = Vec::with_capacity(function.params.len());
         for (index, param) in function.params.iter().enumerate() {
             let value = match call.positional.get(index) {
-                Some(expr) => self
-                    .eval_expr_value(expr, PipelineData::empty())?
-                    .into_nu_value("function argument")?,
-                None => self
-                    .eval_expr_value(
-                        param.default.as_ref().ok_or_else(|| {
-                            stone_error(
-                                "function call",
-                                format!("missing required argument `{}`", param.name),
-                            )
-                        })?,
-                        PipelineData::empty(),
-                    )?
-                    .into_nu_value("function default")?,
+                Some(expr) => self.eval_expr_value(expr, PipelineData::empty())?,
+                None => self.eval_expr_value(
+                    param.default.as_ref().ok_or_else(|| {
+                        stone_error(
+                            "function call",
+                            format!("missing required argument `{}`", param.name),
+                        )
+                    })?,
+                    PipelineData::empty(),
+                )?,
             };
-            ensure_type(&value, param.ty, &format!("argument `{}`", param.name))?;
+            ensure_runtime_type(&value, param.ty, &format!("argument `{}`", param.name))?;
             args.push((param.name.clone(), value));
         }
 
         self.state.push_scope();
         for (name, value) in args {
-            self.state.set_local(name, RuntimeValue::Nu(value));
+            self.state.set_local(name, value);
         }
         let flow = self.eval_block(&function.body, PipelineData::empty(), false);
         self.state.pop_scope()?;
         let value = match flow? {
             EvalFlow::Return(value) => value,
-            EvalFlow::Output(_) => Value::nothing(Span::unknown()),
+            EvalFlow::Output(_) => RuntimeValue::Nu(Value::nothing(Span::unknown())),
             EvalFlow::Break => return Err(stone_error("break", "break outside loop")),
             EvalFlow::Continue => return Err(stone_error("continue", "continue outside loop")),
         };
-        ensure_type(
+        ensure_runtime_type(
             &value,
             function.return_type,
             &format!("{}() return value", function.name),
         )?;
-        Ok(RuntimeValue::Nu(value))
+        Ok(value)
     }
 
     fn eval_named_callable_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -2185,6 +2182,12 @@ impl Evaluator<'_> {
                 }
             };
             return Ok(RuntimeValue::Nu(value));
+        }
+        if let RuntimeValue::AttemptHandle(handle) = receiver {
+            return handle.attribute(attr).map(RuntimeValue::Nu);
+        }
+        if let RuntimeValue::AttemptOutcome(outcome) = receiver {
+            return outcome.attribute(attr).map(RuntimeValue::Nu);
         }
         let receiver = receiver.into_nu_value("attribute")?;
         let Value::Record { val, .. } = receiver else {
@@ -3867,6 +3870,7 @@ impl Evaluator<'_> {
         pop_result?;
         let result = match flow? {
             EvalFlow::Return(value) => {
+                let value = value.into_nu_value("helper return value")?;
                 ensure_type(
                     &value,
                     function.return_type,
@@ -4432,12 +4436,12 @@ impl Evaluator<'_> {
         }
         let mut attempt = positional
             .first()
-            .map(|value| value_to_string(value, "attempt_info attempt"))
+            .map(|value| attempt_id_from_value(value, "attempt_info attempt"))
             .transpose()?
             .unwrap_or_default();
         for (name, value) in named {
             match name.as_str() {
-                "attempt" => attempt = value_to_string(&value, "attempt_info attempt")?,
+                "attempt" => attempt = attempt_id_from_value(&value, "attempt_info attempt")?,
                 _ => {
                     return Err(stone_error(
                         "attempt_info",
@@ -4459,12 +4463,12 @@ impl Evaluator<'_> {
         }
         let mut attempt = positional
             .first()
-            .map(|value| value_to_string(value, "attempt_start attempt"))
+            .map(|value| attempt_id_from_value(value, "attempt_start attempt"))
             .transpose()?
             .unwrap_or_default();
         for (name, value) in named {
             match name.as_str() {
-                "attempt" => attempt = value_to_string(&value, "attempt_start attempt")?,
+                "attempt" => attempt = attempt_id_from_value(&value, "attempt_start attempt")?,
                 _ => {
                     return Err(stone_error(
                         "attempt_start",
@@ -4486,7 +4490,7 @@ impl Evaluator<'_> {
         }
         let mut attempt = positional
             .first()
-            .map(|value| value_to_string(value, "attempt_state attempt"))
+            .map(|value| attempt_id_from_value(value, "attempt_state attempt"))
             .transpose()?
             .unwrap_or_default();
         let mut sample_limit = positional
@@ -4499,7 +4503,7 @@ impl Evaluator<'_> {
             .unwrap_or(100);
         for (name, value) in named {
             match name.as_str() {
-                "attempt" => attempt = value_to_string(&value, "attempt_state attempt")?,
+                "attempt" => attempt = attempt_id_from_value(&value, "attempt_state attempt")?,
                 "sample_limit" => {
                     sample_limit =
                         u32::try_from(value_to_u64(&value, "attempt_state sample_limit")?)
@@ -4601,7 +4605,7 @@ impl Evaluator<'_> {
                     workspace_mount = value_to_string(&value, "attempt_spawn workspace_mount")?
                 }
                 "parent_attempt" => {
-                    parent_attempt = value_to_string(&value, "attempt_spawn parent_attempt")?
+                    parent_attempt = attempt_id_from_value(&value, "attempt_spawn parent_attempt")?
                 }
                 "resource_limits" | "limits" => {
                     resource_limits =
@@ -4680,10 +4684,13 @@ impl Evaluator<'_> {
             metadata,
             spawn_v1,
         )?;
+        let attempt = attempt_id_from_value(&child, "attempt_spawn result")?;
         if let Some(scope) = scope {
-            scope.register(attempt_id_from_value(&child, "attempt_spawn result")?)?;
+            scope.register(attempt.clone())?;
         }
-        Ok(RuntimeValue::Nu(child))
+        Ok(RuntimeValue::AttemptHandle(AttemptHandleValue::new(
+            attempt, child,
+        )))
     }
 
     fn eval_attempt_fork_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -4696,7 +4703,7 @@ impl Evaluator<'_> {
         }
         let mut parent_attempt = positional
             .first()
-            .map(|value| value_to_string(value, "attempt_fork parent_attempt"))
+            .map(|value| attempt_id_from_value(value, "attempt_fork parent_attempt"))
             .transpose()?
             .unwrap_or_default();
         let mut task = String::new();
@@ -4712,7 +4719,7 @@ impl Evaluator<'_> {
         for (name, value) in named {
             match name.as_str() {
                 "parent_attempt" | "attempt" => {
-                    parent_attempt = value_to_string(&value, "attempt_fork parent_attempt")?
+                    parent_attempt = attempt_id_from_value(&value, "attempt_fork parent_attempt")?
                 }
                 "task" => task = value_to_string(&value, "attempt_fork task")?,
                 "controller" => controller = value_to_string(&value, "attempt_fork controller")?,
@@ -4753,10 +4760,13 @@ impl Evaluator<'_> {
             program,
             start,
         )?;
+        let attempt = attempt_id_from_value(&child, "attempt_fork result")?;
         if let Some(scope) = scope {
-            scope.register(attempt_id_from_value(&child, "attempt_fork result")?)?;
+            scope.register(attempt.clone())?;
         }
-        Ok(RuntimeValue::Nu(child))
+        Ok(RuntimeValue::AttemptHandle(AttemptHandleValue::new(
+            attempt, child,
+        )))
     }
 
     fn eval_attempt_finish_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -4773,7 +4783,7 @@ impl Evaluator<'_> {
             .transpose()?;
         let mut attempt = positional
             .get(1)
-            .map(|value| value_to_string(value, "attempt_finish attempt"))
+            .map(|value| attempt_id_from_value(value, "attempt_finish attempt"))
             .transpose()?
             .unwrap_or_default();
         let mut message = String::new();
@@ -4782,7 +4792,7 @@ impl Evaluator<'_> {
         for (name, value) in named {
             match name.as_str() {
                 "action" => action = Some(value_to_string(&value, "attempt_finish action")?),
-                "attempt" => attempt = value_to_string(&value, "attempt_finish attempt")?,
+                "attempt" => attempt = attempt_id_from_value(&value, "attempt_finish attempt")?,
                 "message" => message = value_to_string(&value, "attempt_finish message")?,
                 "reason" => reason = value_to_string(&value, "attempt_finish reason")?,
                 "allow_risky" => allow_risky = value_to_bool(&value, "attempt_finish allow_risky")?,
@@ -4810,7 +4820,7 @@ impl Evaluator<'_> {
         }
         let mut attempt = positional
             .first()
-            .map(|value| value_to_string(value, "attempt_wait attempt"))
+            .map(|value| attempt_id_from_value(value, "attempt_wait attempt"))
             .transpose()?
             .unwrap_or_default();
         let mut timeout_ms = positional
@@ -4824,7 +4834,7 @@ impl Evaluator<'_> {
             .transpose()?;
         for (name, value) in named {
             match name.as_str() {
-                "attempt" => attempt = value_to_string(&value, "attempt_wait attempt")?,
+                "attempt" => attempt = attempt_id_from_value(&value, "attempt_wait attempt")?,
                 "timeout_ms" => {
                     timeout_ms = Some(
                         u32::try_from(value_to_u64(&value, "attempt_wait timeout_ms")?)
@@ -4896,15 +4906,156 @@ impl Evaluator<'_> {
                 scope.mark_joined(&attempt)?;
             }
         }
+        Ok(RuntimeValue::AttemptOutcome(AttemptOutcomeValue {
+            attempt,
+            joined,
+            timed_out: !joined,
+            state,
+            controller_state,
+            record: waited,
+        }))
+    }
+
+    fn eval_attempt_wait_set_call(
+        &mut self,
+        call: &Call,
+        wait_all: bool,
+    ) -> Result<RuntimeValue, ShellError> {
+        if call.positional.len() > 2 {
+            return Err(stone_error(
+                &call.name,
+                format!(
+                    "{}() accepts at most children and timeout_ms arguments",
+                    call.name
+                ),
+            ));
+        }
+        let mut children = call
+            .positional
+            .first()
+            .map(|expr| self.eval_attempt_set_expr(expr, &call.name))
+            .transpose()?;
+        let mut timeout_ms = call
+            .positional
+            .get(1)
+            .map(|expr| {
+                self.eval_expr_value(expr, PipelineData::empty())?
+                    .into_nu_value(&call.name)
+                    .and_then(|value| value_to_optional_timeout(&value, &call.name))
+            })
+            .transpose()?
+            .flatten();
+        for (name, expr) in &call.named {
+            match name.as_str() {
+                "children" | "attempts" | "scope" => {
+                    if children.is_some() {
+                        return Err(stone_error(
+                            &call.name,
+                            "children may be supplied only once",
+                        ));
+                    }
+                    children = Some(self.eval_attempt_set_expr(expr, &call.name)?);
+                }
+                "timeout_ms" => {
+                    let value = self
+                        .eval_expr_value(expr, PipelineData::empty())?
+                        .into_nu_value(&call.name)?;
+                    timeout_ms = value_to_optional_timeout(&value, &call.name)?;
+                }
+                _ => {
+                    return Err(stone_error(
+                        &call.name,
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        let children = children
+            .ok_or_else(|| stone_error(&call.name, format!("{}() requires children", call.name)))?;
+        if children.is_empty() {
+            return Err(stone_error(
+                &call.name,
+                "attempt wait set requires at least one child",
+            ));
+        }
+        let waited = gateway_env::attempt_wait_set(children.clone(), wait_all, timeout_ms)?;
+        let mut outcomes = Vec::with_capacity(waited.ready.len());
+        for record in waited.ready {
+            let attempt = attempt_id_from_value(&record, "attempt wait set result")?;
+            for scope in &self.state.attempt_scopes {
+                scope.mark_joined(&attempt)?;
+            }
+            outcomes.push(attempt_outcome_value(attempt, record));
+        }
+        if !wait_all {
+            return Ok(RuntimeValue::AttemptOutcome(
+                outcomes.into_iter().next().unwrap_or(AttemptOutcomeValue {
+                    attempt: String::new(),
+                    joined: false,
+                    timed_out: waited.timed_out,
+                    state: "waiting".to_string(),
+                    controller_state: "running".to_string(),
+                    record: Value::nothing(Span::unknown()),
+                }),
+            ));
+        }
+
+        let ready_ids = outcomes
+            .iter()
+            .map(|outcome| outcome.attempt.as_str())
+            .collect::<HashSet<_>>();
+        let pending = children
+            .into_iter()
+            .filter(|attempt| !ready_ids.contains(attempt.as_str()))
+            .map(|attempt| Value::string(attempt, Span::unknown()))
+            .collect();
         let span = Span::unknown();
-        let mut outcome = Record::new();
-        outcome.push("attempt", Value::string(attempt, span));
-        outcome.push("joined", Value::bool(joined, span));
-        outcome.push("timed_out", Value::bool(!joined, span));
-        outcome.push("state", Value::string(state, span));
-        outcome.push("controller_state", Value::string(controller_state, span));
-        outcome.push("record", waited);
-        Ok(RuntimeValue::Nu(Value::record(outcome, span)))
+        let mut result = Record::new();
+        result.push("completed", Value::bool(waited.completed, span));
+        result.push("timed_out", Value::bool(waited.timed_out, span));
+        result.push(
+            "outcomes",
+            Value::list(
+                outcomes
+                    .into_iter()
+                    .map(|outcome| outcome.materialize())
+                    .collect(),
+                span,
+            ),
+        );
+        result.push("pending", Value::list(pending, span));
+        Ok(RuntimeValue::Nu(Value::record(result, span)))
+    }
+
+    fn eval_attempt_set_expr(
+        &mut self,
+        expr: &Expr,
+        context: &str,
+    ) -> Result<Vec<String>, ShellError> {
+        let value = self.eval_expr_value(expr, PipelineData::empty())?;
+        match value {
+            RuntimeValue::AttemptScope(scope) => Ok(scope
+                .lock()?
+                .children
+                .iter()
+                .filter(|child| !child.joined)
+                .map(|child| child.attempt.clone())
+                .collect()),
+            RuntimeValue::AttemptHandle(handle) => Ok(vec![handle.attempt]),
+            RuntimeValue::AttemptOutcome(outcome) => Ok(vec![outcome.attempt]),
+            RuntimeValue::Nu(Value::List { vals, .. }) => vals
+                .iter()
+                .map(|value| attempt_id_from_value(value, context))
+                .collect(),
+            RuntimeValue::Nu(value) => attempt_id_from_value(&value, context).map(|id| vec![id]),
+            other => Err(stone_error(
+                context,
+                format!(
+                    "expected attempt_scope, attempt_handle, attempt id, or list; got {}",
+                    runtime_type_name(&other)
+                ),
+            )),
+        }
     }
 
     fn eval_attempt_terminate_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5233,7 +5384,7 @@ impl Evaluator<'_> {
         let mut metadata = Vec::new();
         for (name, value) in named {
             match name.as_str() {
-                "attempt" => attempt = value_to_string(&value, "attempt_report attempt")?,
+                "attempt" => attempt = attempt_id_from_value(&value, "attempt_report attempt")?,
                 "status" => status = Some(value_to_string(&value, "attempt_report status")?),
                 "result" => result_json = nu_to_json_value(&value).to_string(),
                 "error" => error_json = nu_to_json_value(&value).to_string(),
@@ -5263,18 +5414,18 @@ impl Evaluator<'_> {
         }
         let mut parent = positional
             .first()
-            .map(|value| value_to_string(value, "attempt_accept parent"))
+            .map(|value| attempt_id_from_value(value, "attempt_accept parent"))
             .transpose()?
             .unwrap_or_default();
         let mut child = positional
             .get(1)
-            .map(|value| value_to_string(value, "attempt_accept child"))
+            .map(|value| attempt_id_from_value(value, "attempt_accept child"))
             .transpose()?
             .unwrap_or_default();
         for (name, value) in named {
             match name.as_str() {
-                "parent" => parent = value_to_string(&value, "attempt_accept parent")?,
-                "child" => child = value_to_string(&value, "attempt_accept child")?,
+                "parent" => parent = attempt_id_from_value(&value, "attempt_accept parent")?,
+                "child" => child = attempt_id_from_value(&value, "attempt_accept child")?,
                 _ => {
                     return Err(stone_error(
                         "attempt_accept",
@@ -5300,7 +5451,7 @@ impl Evaluator<'_> {
         }
         let mut attempt = positional
             .first()
-            .map(|value| value_to_string(value, "attempt_discard attempt"))
+            .map(|value| attempt_id_from_value(value, "attempt_discard attempt"))
             .transpose()?
             .unwrap_or_default();
         let mut reason = positional
@@ -5310,7 +5461,7 @@ impl Evaluator<'_> {
             .unwrap_or_default();
         for (name, value) in named {
             match name.as_str() {
-                "attempt" => attempt = value_to_string(&value, "attempt_discard attempt")?,
+                "attempt" => attempt = attempt_id_from_value(&value, "attempt_discard attempt")?,
                 "reason" => reason = value_to_string(&value, "attempt_discard reason")?,
                 _ => {
                     return Err(stone_error(
@@ -5337,7 +5488,7 @@ impl Evaluator<'_> {
         }
         let mut attempt = positional
             .first()
-            .map(|value| value_to_string(value, "attempt_publish attempt"))
+            .map(|value| attempt_id_from_value(value, "attempt_publish attempt"))
             .transpose()?
             .unwrap_or_default();
         let mut expected_generation = positional
@@ -5349,7 +5500,7 @@ impl Evaluator<'_> {
         let mut allow_risky = false;
         for (name, value) in named {
             match name.as_str() {
-                "attempt" => attempt = value_to_string(&value, "attempt_publish attempt")?,
+                "attempt" => attempt = attempt_id_from_value(&value, "attempt_publish attempt")?,
                 "expected_generation" => {
                     expected_generation =
                         value_to_string(&value, "attempt_publish expected_generation")?
@@ -5380,7 +5531,7 @@ impl Evaluator<'_> {
         }
         let mut attempt = positional
             .first()
-            .map(|value| value_to_string(value, "attempt_run_process attempt"))
+            .map(|value| attempt_id_from_value(value, "attempt_run_process attempt"))
             .transpose()?
             .unwrap_or_default();
         let mut argv = positional
@@ -5394,7 +5545,9 @@ impl Evaluator<'_> {
             .unwrap_or_default();
         for (name, value) in named {
             match name.as_str() {
-                "attempt" => attempt = value_to_string(&value, "attempt_run_process attempt")?,
+                "attempt" => {
+                    attempt = attempt_id_from_value(&value, "attempt_run_process attempt")?
+                }
                 "argv" => argv = Some(value_to_string_list(&value, "attempt_run_process argv")?),
                 "env" => env = value_to_string_pairs(&value, "attempt_run_process env")?,
                 _ => {
@@ -7106,6 +7259,8 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "attempt_join",
     "attempt_terminate",
     "attempt_wait",
+    "attempt_wait_all",
+    "attempt_wait_any",
     "attempts",
     "env_checkpoint",
     "env_checkpoint_gc",
@@ -7419,6 +7574,17 @@ impl MinMax {
     }
 }
 
+fn ensure_runtime_type(
+    value: &RuntimeValue,
+    expected: StoneType,
+    context: &str,
+) -> Result<(), ShellError> {
+    if expected == StoneType::Any {
+        return Ok(());
+    }
+    ensure_type(&value.clone().into_nu_value(context)?, expected, context)
+}
+
 fn ensure_type(value: &Value, expected: StoneType, context: &str) -> Result<(), ShellError> {
     let ok = match expected {
         StoneType::Any => true,
@@ -7666,6 +7832,8 @@ fn runtime_type_name(value: &RuntimeValue) -> &'static str {
         RuntimeValue::Callable(_) => "function",
         RuntimeValue::AgentControl(_) => "agent_control",
         RuntimeValue::AttemptScope(_) => "attempt_scope",
+        RuntimeValue::AttemptHandle(_) => "attempt_handle",
+        RuntimeValue::AttemptOutcome(_) => "attempt_outcome",
     }
 }
 
@@ -7841,6 +8009,12 @@ fn value_to_iter_values(value: &RuntimeValue) -> Result<Vec<Value>, ShellError> 
                 scope.scope_id
             ),
         )),
+        RuntimeValue::AttemptHandle(handle) => {
+            value_to_iter_values(&RuntimeValue::Nu(handle.materialize()))
+        }
+        RuntimeValue::AttemptOutcome(outcome) => {
+            value_to_iter_values(&RuntimeValue::Nu(outcome.materialize()))
+        }
     }
 }
 
@@ -7912,8 +8086,13 @@ fn agent_session_value(task: Value, input: Value, attempt: Value, span: Span) ->
         names(&[
             "attempt_spawn",
             "attempt_fork",
+            "attempt_scope",
+            "attempt_scope_close",
             "attempt_state",
             "attempt_wait",
+            "attempt_join",
+            "attempt_wait_any",
+            "attempt_wait_all",
             "attempt_report",
             "attempt_accept",
             "attempt_discard",
@@ -7970,6 +8149,27 @@ fn attempt_id_from_value(value: &Value, context: &str) -> Result<String, ShellEr
             context,
             format!("expected attempt id or record, got {}", value.get_type()),
         )),
+    }
+}
+
+fn attempt_outcome_value(attempt: String, record: Value) -> AttemptOutcomeValue {
+    let state = attempt_record_state(&record)
+        .unwrap_or("unknown")
+        .to_string();
+    let controller_state = attempt_controller_state(&record)
+        .unwrap_or("unknown")
+        .to_string();
+    let joined = matches!(
+        controller_state.as_str(),
+        "exited" | "failed" | "terminated"
+    );
+    AttemptOutcomeValue {
+        attempt,
+        joined,
+        timed_out: !joined,
+        state,
+        controller_state,
+        record,
     }
 }
 

@@ -10,6 +10,7 @@ use super::stone_json_view::{
 };
 use crate::stone_agent_control::AgentControlValue;
 use crate::stone_attempt_scope::AttemptScopeValue;
+use crate::stone_attempt_value::{AttemptHandleValue, AttemptOutcomeValue};
 
 #[derive(Clone)]
 pub(super) enum RuntimeValue {
@@ -23,6 +24,8 @@ pub(super) enum RuntimeValue {
     Callable(CallableValue),
     AgentControl(AgentControlValue),
     AttemptScope(AttemptScopeValue),
+    AttemptHandle(AttemptHandleValue),
+    AttemptOutcome(AttemptOutcomeValue),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +40,8 @@ pub(super) enum RuntimeValueTag {
     Callable,
     AgentControl,
     AttemptScope,
+    AttemptHandle,
+    AttemptOutcome,
 }
 
 impl RuntimeValueTag {
@@ -53,6 +58,8 @@ impl RuntimeValueTag {
             RuntimeValueTag::Callable => 8,
             RuntimeValueTag::AgentControl => 9,
             RuntimeValueTag::AttemptScope => 10,
+            RuntimeValueTag::AttemptHandle => 11,
+            RuntimeValueTag::AttemptOutcome => 12,
         }
     }
 }
@@ -84,6 +91,8 @@ impl RuntimeValue {
                 .all(|(_, value)| value.is_session_persistable()),
             RuntimeValue::AgentControl(_) => true,
             RuntimeValue::AttemptScope(_) => false,
+            RuntimeValue::AttemptHandle(_) => false,
+            RuntimeValue::AttemptOutcome(_) => true,
             RuntimeValue::File(_) => false,
         }
     }
@@ -101,6 +110,8 @@ impl RuntimeValue {
             RuntimeValue::Callable(_) => RuntimeValueTag::Callable,
             RuntimeValue::AgentControl(_) => RuntimeValueTag::AgentControl,
             RuntimeValue::AttemptScope(_) => RuntimeValueTag::AttemptScope,
+            RuntimeValue::AttemptHandle(_) => RuntimeValueTag::AttemptHandle,
+            RuntimeValue::AttemptOutcome(_) => RuntimeValueTag::AttemptOutcome,
         }
     }
 
@@ -145,6 +156,8 @@ impl RuntimeValue {
                     scope.scope_id
                 ),
             )),
+            RuntimeValue::AttemptHandle(handle) => Ok(handle.materialize()),
+            RuntimeValue::AttemptOutcome(outcome) => Ok(outcome.materialize()),
         }
     }
 }
@@ -156,6 +169,7 @@ mod tests {
     use super::super::stone_functions::CallableValue;
     use super::{FileHandle, RuntimeValue, RuntimeValueTag, TextLines};
     use crate::stone_ast::Expr;
+    use crate::stone_attempt_value::AttemptOutcomeValue;
 
     #[test]
     fn runtime_value_tags_have_stable_compact_ids() {
@@ -169,6 +183,8 @@ mod tests {
         assert_eq!(RuntimeValueTag::Callable.id(), 8);
         assert_eq!(RuntimeValueTag::AgentControl.id(), 9);
         assert_eq!(RuntimeValueTag::AttemptScope.id(), 10);
+        assert_eq!(RuntimeValueTag::AttemptHandle.id(), 11);
+        assert_eq!(RuntimeValueTag::AttemptOutcome.id(), 12);
     }
 
     #[test]
@@ -245,5 +261,35 @@ mod tests {
         .into_nu_value("callable boundary")
         .expect_err("callables cannot materialize");
         assert!(callable_error.to_string().contains("callable boundary"));
+    }
+
+    #[test]
+    fn attempt_outcome_materializes_separated_phase_views() {
+        let span = Span::unknown();
+        let mut metadata = nu_protocol::Record::new();
+        metadata.push("controller_result_status", Value::string("succeeded", span));
+        let mut attempt = nu_protocol::Record::new();
+        attempt.push("metadata", Value::record(metadata, span));
+        let value = RuntimeValue::AttemptOutcome(AttemptOutcomeValue {
+            attempt: "attempt-1".to_string(),
+            joined: true,
+            timed_out: false,
+            state: "active".to_string(),
+            controller_state: "exited".to_string(),
+            record: Value::record(attempt, span),
+        })
+        .into_nu_value("test")
+        .expect("attempt outcome should materialize");
+        let record = value.as_record().expect("outcome record");
+        for (phase, expected) in [
+            ("execution", "exited"),
+            ("result", "succeeded"),
+            ("evaluation", "not_evaluated"),
+            ("selection", "pending"),
+            ("cleanup", "pending"),
+        ] {
+            let phase = record.get(phase).unwrap().as_record().unwrap();
+            assert_eq!(phase.get("status").unwrap().as_str().unwrap(), expected);
+        }
     }
 }

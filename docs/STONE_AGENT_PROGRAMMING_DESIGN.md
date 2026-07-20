@@ -1003,11 +1003,26 @@ The M2.5 implementation now establishes the control and supervision seams:
 - `examples/scripts/attempt_module_entrypoints.stone` is the process-tree
   canary: root `main(input)` forks `worker` from the same admitted source,
   joins it, accepts its workspace, and exits with both attempts cleanly closed.
+- `attempt_spawn` and `attempt_fork` now return nominal `attempt_handle`
+  runtime values. Direct attributes remain record-shaped for compatibility,
+  while `type(child)` distinguishes a handle and untyped Stone functions
+  preserve it without stringifying or flattening it.
+- `attempt_join` and `attempt_wait_any` return immutable `attempt_outcome`
+  snapshots. The outcome keeps compatibility fields and separates execution,
+  reported result, evaluation, selection, and cleanup views; unavailable phases
+  are explicit (`not_evaluated`, `pending`) rather than inferred as success.
+- `attempt_wait_any` and `attempt_wait_all` use the Gateway
+  `AttemptWaitSet` syscall. The Gateway observes all controller processes as
+  one wait set, so Stone does not implement biased sequential polling.
+- `examples/scripts/attempt_wait_set.stone` is the composition canary: one
+  admitted module forks two named workers, passes the winning typed outcome
+  through an ordinary Stone function, accepts it, waits for and discards the
+  remaining child, and closes the supervision scope.
 
 This closes the native-to-Stone invocation seam. It does not yet provide the
 standard Stone adapter library (`with_tools`, `with_context`, budgets, retry,
-verification, and event hooks), typed attempt handles/full outcomes,
-wait-any/wait-all, per-fork input, or aggregate budget/event views.
+verification, and event hooks), verifier-populated evaluation outcomes,
+per-fork input, or aggregate budget/event views.
 Those are the remaining M2.5 composition and attempt-tree ergonomics, rather
 than another agent execution representation.
 
@@ -1147,10 +1162,11 @@ Continue M2.5 before another broad Terminal-Bench comparison. The shared
 `AgentControl` contract and first-class optimized Stone controls now establish
 the invocation seam, and task-owned scopes now provide bounded automatic child
 cleanup, and current-module named entrypoints remove escaped child source.
-Next expose ordinary control adapters, typed attempt handles/outcomes,
-wait-any/wait-all, per-fork task input, and aggregate budget/event views.
-Untyped ids and per-operation timeouts are still not the intended final
-programming model. After deterministic fixtures, run validation plan C
+Typed attempt handles, structured outcome snapshots, and Gateway wait sets now
+cover the basic process-tree control path. Next expose ordinary control
+adapters, per-fork task input, verifier-populated evaluation outcomes, and
+aggregate budget/event views. Compatibility ids remain accepted at syscall
+boundaries, but new Stone control should retain handles. After deterministic fixtures, run validation plan C
 followed by untouched, historically unresolved Terminal-Bench tasks. Do not treat the
 deterministic mechanism cohort as validation of the broader attempt-first OS
 hypothesis.

@@ -25,6 +25,7 @@ mod server;
 mod stone_agent_control;
 mod stone_ast;
 mod stone_attempt_scope;
+mod stone_attempt_value;
 mod stone_builtins;
 mod stone_eval;
 mod stone_file_ops;
@@ -960,6 +961,32 @@ emit({"before": before, "clean": cleanup.clean, "closed": scope.closed})"#,
                 "clean": true,
                 "closed": true,
             })
+        );
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn stone_task_owned_values_pass_through_untyped_functions() -> Result<(), ShellError> {
+        let start_dir = test_root("stone-task-owned-function-value");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let result = guest.stone_command_response(
+            r#"def identity(value):
+    return value
+
+scope = attempt_scope()
+same = identity(scope)
+kind = type(same)
+cleanup = attempt_scope_close(same)
+emit({"kind": kind, "clean": cleanup.clean})"#,
+        );
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(
+            result["value"],
+            json!({"kind": "attempt_scope", "clean": true})
         );
 
         cleanup_dir(&start_dir);

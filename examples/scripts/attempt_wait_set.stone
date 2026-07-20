@@ -1,0 +1,56 @@
+def worker_a():
+    write_file("/app/candidate-a.txt", "candidate a\n")
+    return {"answer": "a"}
+
+
+def worker_b():
+    write_file("/app/candidate-b.txt", "candidate b\n")
+    return {"answer": "b"}
+
+
+def preserve(value):
+    return value
+
+
+def main(input):
+    probe = model_call([{"role": "user", "content": "Return the fixture marker."}])
+    root = attempt_info()
+    scope = attempt_scope(join_timeout_ms=30000)
+    first_child = attempt_fork(
+        program=current_program(),
+        entrypoint="worker_a",
+        start=True,
+        scope=scope,
+    )
+    second_child = attempt_fork(
+        program=current_program(),
+        entrypoint="worker_b",
+        start=True,
+        scope=scope,
+    )
+    if type(first_child) != "attempt_handle" or type(second_child) != "attempt_handle":
+        fail("fork did not return typed handles", code="attempt_handle_type_failed")
+
+    winner = preserve(attempt_wait_any(scope, timeout_ms=30000))
+    if type(winner) != "attempt_outcome" or not winner.joined:
+        fail("wait-any did not return a joined outcome", code="attempt_wait_any_failed")
+    accepted = attempt_accept(root.attempt, winner)
+
+    remaining = attempt_wait_all(scope, timeout_ms=30000)
+    if not remaining.completed or len(remaining.outcomes) != 1:
+        fail("wait-all did not join the remaining child", code="attempt_wait_all_failed")
+    attempt_discard(remaining.outcomes[0], reason="non-selected candidate")
+
+    cleanup = attempt_scope_close(scope)
+    if not cleanup.clean:
+        fail("wait-set scope cleanup failed", code="attempt_wait_set_cleanup_failed")
+
+    return {
+        "answer": input.answer,
+        "model_probe": probe.content,
+        "winner_type": type(winner),
+        "winner": winner.attempt,
+        "accepted": accepted.child.attempt,
+        "remaining_count": len(remaining.outcomes),
+        "clean": cleanup.clean,
+    }

@@ -303,7 +303,7 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
     },
     "attempt_spawn": {
         "name": "attempt_spawn",
-        "signature": "attempt_spawn(task: str = '', workspace: str = '', task_spec: record = {}, task_input: Any = None, program: record = {}, entrypoint: str = '', workspace_source: record = {}, context_source: record = {}, capabilities: record = {}, start: bool = false, scope: attempt_scope? = None, controller: str = '', capability_profile: str = '', container: str = '', workspace_mount: str = '', parent_attempt: str = '', resource_limits: record = {}, metadata: record = {}) -> record",
+        "signature": "attempt_spawn(task: str = '', workspace: str = '', task_spec: record = {}, task_input: Any = None, program: record = {}, entrypoint: str = '', workspace_source: record = {}, context_source: record = {}, capabilities: record = {}, start: bool = false, scope: attempt_scope? = None, controller: str = '', capability_profile: str = '', container: str = '', workspace_mount: str = '', parent_attempt: str = '', resource_limits: record = {}, metadata: record = {}) -> attempt_handle",
         "effects": ["write_file"],
         "example": 'child = attempt_spawn(task_spec={"id": "task-debug", "objective": "write hello.txt"}, workspace_source={"workspace": "repo"}, program={"kind": "stone", "source": "write_file(\\"hello.txt\\", \\"hello\\")"})',
     },
@@ -321,9 +321,21 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
     },
     "attempt_join": {
         "name": "attempt_join",
-        "signature": "attempt_join(attempt: str | record, timeout_ms: int? = None) -> record",
+        "signature": "attempt_join(attempt: attempt_handle | str | record, timeout_ms: int? = None) -> attempt_outcome",
         "effects": ["read_env", "process"],
         "example": "outcome = attempt_join(child, timeout_ms=30000)",
+    },
+    "attempt_wait_any": {
+        "name": "attempt_wait_any",
+        "signature": "attempt_wait_any(children: attempt_scope | list[attempt_handle | str | record], timeout_ms: int? = None) -> attempt_outcome",
+        "effects": ["read_env", "process"],
+        "example": "first = attempt_wait_any(scope, timeout_ms=30000)",
+    },
+    "attempt_wait_all": {
+        "name": "attempt_wait_all",
+        "signature": "attempt_wait_all(children: attempt_scope | list[attempt_handle | str | record], timeout_ms: int? = None) -> record",
+        "effects": ["read_env", "process"],
+        "example": "batch = attempt_wait_all(scope, timeout_ms=30000)",
     },
     "attempt_terminate": {
         "name": "attempt_terminate",
@@ -351,7 +363,7 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
     },
     "attempt_fork": {
         "name": "attempt_fork",
-        "signature": "attempt_fork(parent_attempt: str = '', task: str = '', program: record? = None, entrypoint: str = '', start: bool = False, scope: attempt_scope? = None, controller: str = '', capability_profile: str = '', container: str = '', workspace_mount: str = '', resource_limits: record = {}, metadata: record = {}) -> record",
+        "signature": "attempt_fork(parent_attempt: attempt_handle | str | record = '', task: str = '', program: record? = None, entrypoint: str = '', start: bool = False, scope: attempt_scope? = None, controller: str = '', capability_profile: str = '', container: str = '', workspace_mount: str = '', resource_limits: record = {}, metadata: record = {}) -> attempt_handle",
         "effects": ["write_file"],
         "example": 'branch = attempt_fork(task="try-alt-fix", controller="codex")',
     },
@@ -657,6 +669,8 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
     "attempt_start": ("attempt", "wait", "timeout_ms"),
     "attempt_wait": ("attempt", "timeout_ms"),
     "attempt_join": ("attempt", "timeout_ms"),
+    "attempt_wait_any": ("children", "timeout_ms"),
+    "attempt_wait_all": ("children", "timeout_ms"),
     "attempt_terminate": ("attempt",),
     "attempt_scope": ("exit_policy", "join_timeout_ms"),
     "attempt_scope_add": ("scope", "child"),

@@ -68,6 +68,33 @@ pub(crate) fn attempt_wait(attempt: String, timeout_ms: Option<u32>) -> Result<V
     Ok(attempt_record_value(record, Span::unknown()))
 }
 
+pub(crate) struct AttemptWaitSetValue {
+    pub(crate) ready: Vec<Value>,
+    pub(crate) completed: bool,
+    pub(crate) timed_out: bool,
+}
+
+pub(crate) fn attempt_wait_set(
+    attempts: Vec<String>,
+    wait_all: bool,
+    timeout_ms: Option<u32>,
+) -> Result<AttemptWaitSetValue, ShellError> {
+    let config = required_config()?;
+    let response = with_client(&config, |client| {
+        client.attempt_wait_set(attempts, wait_all, timeout_ms)
+    })?;
+    let span = Span::unknown();
+    Ok(AttemptWaitSetValue {
+        ready: response
+            .ready
+            .into_iter()
+            .map(|attempt| attempt_record_value(attempt, span))
+            .collect(),
+        completed: response.completed,
+        timed_out: response.timed_out,
+    })
+}
+
 pub(crate) fn attempt_terminate(attempt: String) -> Result<Value, ShellError> {
     let config = required_config()?;
     let attempt = effective_attempt(&config, attempt)?;
