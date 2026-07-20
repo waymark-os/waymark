@@ -12,6 +12,12 @@ same code compiles for Hermit allocation domains. It is not yet wired into the
 LibOS vsock task server, does not host child processes, and does not yet prove
 the complete production cleanliness gate.
 
+Gateway runtime configuration and the attached shared RPC client are now
+thread-local rather than process-global, with a concurrency test proving that
+two Stone process threads retain distinct attempt bindings. A future lease must
+install its binding inside the new process thread; process environment fallback
+remains only a compatibility bootstrap path.
+
 ## Decision
 
 Stone execution inside Waymark LibOS should be forkable and cheaply disposable

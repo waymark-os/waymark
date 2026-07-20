@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, Value};
@@ -44,24 +44,28 @@ pub(crate) struct GatewayRuntimeConfig {
     pub(crate) control: Option<AttemptControlBlock>,
 }
 
-static CONFIG: OnceLock<RwLock<Option<GatewayRuntimeConfig>>> = OnceLock::new();
+#[derive(Default)]
+enum ProcessGatewayConfig {
+    #[default]
+    InheritProcessEnvironment,
+    Bound(Option<GatewayRuntimeConfig>),
+}
+
+thread_local! {
+    static CONFIG: RefCell<ProcessGatewayConfig> =
+        const { RefCell::new(ProcessGatewayConfig::InheritProcessEnvironment) };
+}
 
 #[allow(dead_code)]
 pub(crate) fn set_config(config: Option<GatewayRuntimeConfig>) {
-    let lock = CONFIG.get_or_init(|| RwLock::new(None));
-    if let Ok(mut guard) = lock.write() {
-        *guard = config;
-    }
+    CONFIG.with(|slot| *slot.borrow_mut() = ProcessGatewayConfig::Bound(config));
 }
 
 pub(crate) fn config() -> Option<GatewayRuntimeConfig> {
-    if let Some(config) = CONFIG
-        .get()
-        .and_then(|lock| lock.read().ok().and_then(|guard| guard.clone()))
-    {
-        return Some(config);
-    }
-    config_from_process_env()
+    CONFIG.with(|slot| match &*slot.borrow() {
+        ProcessGatewayConfig::InheritProcessEnvironment => config_from_process_env(),
+        ProcessGatewayConfig::Bound(config) => config.clone(),
+    })
 }
 
 pub(crate) fn enabled() -> bool {
@@ -117,10 +121,7 @@ impl GatewayAgentModelGateway {
         self.ensure_client()?;
         set_config(Some(self.config.clone()));
         if let Some(client) = self.client.take() {
-            shared_gateway_client()
-                .lock()
-                .map_err(|_| stone_error("gateway client", "shared Gateway client lock poisoned"))?
-                .replace(client);
+            SHARED_GATEWAY_CLIENT.with(|slot| slot.borrow_mut().replace(client));
         }
         Ok(())
     }
@@ -1739,19 +1740,16 @@ pub(crate) enum GatewayClientStream {
 }
 
 #[cfg(any(unix, target_os = "hermit"))]
-static SHARED_GATEWAY_CLIENT: OnceLock<Mutex<Option<GatewayRpcClient<GatewayClientStream>>>> =
-    OnceLock::new();
-
-#[cfg(any(unix, target_os = "hermit"))]
-fn shared_gateway_client() -> &'static Mutex<Option<GatewayRpcClient<GatewayClientStream>>> {
-    SHARED_GATEWAY_CLIENT.get_or_init(|| Mutex::new(None))
+thread_local! {
+    static SHARED_GATEWAY_CLIENT: RefCell<Option<GatewayRpcClient<GatewayClientStream>>> =
+        const { RefCell::new(None) };
 }
 
 #[cfg(any(unix, target_os = "hermit"))]
 fn clear_shared_gateway_client() {
-    if let Ok(mut guard) = shared_gateway_client().lock() {
-        guard.take();
-    }
+    SHARED_GATEWAY_CLIENT.with(|slot| {
+        slot.borrow_mut().take();
+    });
 }
 
 #[cfg(any(unix, target_os = "hermit"))]
@@ -1915,12 +1913,11 @@ fn with_runtime_client<T>(
     config: &GatewayRuntimeConfig,
     call: impl FnOnce(&mut GatewayRpcClient<GatewayClientStream>) -> Result<T, ShellError>,
 ) -> Result<T, ShellError> {
-    if let Some(client) = shared_gateway_client()
-        .lock()
-        .map_err(|_| stone_error("gateway client", "shared Gateway client lock poisoned"))?
-        .as_mut()
-    {
-        return call(client);
+    let shared = SHARED_GATEWAY_CLIENT.with(|slot| slot.borrow_mut().take());
+    if let Some(mut client) = shared {
+        let result = call(&mut client);
+        SHARED_GATEWAY_CLIENT.with(|slot| slot.borrow_mut().replace(client));
+        return result;
     }
     let mut config = config.clone();
     let mut client = connect_attached_gateway_client(&mut config)?;
@@ -2118,11 +2115,48 @@ fn shell_error_detail(err: &ShellError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
     use super::*;
     use waymark_gateway_client::proto::{
         AttemptProgram, BuiltinWorkflow, StoneProgram, SuccessCriterion, TaskConstraint, TaskInput,
         TaskOutput,
     };
+
+    #[test]
+    fn gateway_bindings_are_isolated_between_stone_process_threads() {
+        let barrier = Arc::new(Barrier::new(2));
+        let workers = ["attempt-left", "attempt-right"].map(|attempt| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                set_config(Some(test_config(attempt)));
+                barrier.wait();
+                let observed = config().expect("thread-local Gateway config");
+                set_config(None);
+                observed.attempt
+            })
+        });
+
+        let observed = workers.map(|worker| worker.join().expect("Gateway binding worker"));
+        assert_eq!(observed, ["attempt-left", "attempt-right"]);
+    }
+
+    fn test_config(attempt: &str) -> GatewayRuntimeConfig {
+        GatewayRuntimeConfig {
+            endpoint: GatewayEndpoint::Unix(PathBuf::from("/tmp/gateway.sock")),
+            attempt: attempt.to_owned(),
+            controller_run: format!("controller-{attempt}"),
+            boot_token: String::new(),
+            tx: format!("tx-{attempt}"),
+            image: "python:3.12".to_owned(),
+            container: None,
+            workspace_mount: "/app".to_owned(),
+            host_workspace_path: None,
+            capability_profile: "local".to_owned(),
+            model_class: "agent".to_owned(),
+            control: None,
+        }
+    }
 
     #[test]
     fn structured_task_views_preserve_spec_and_dynamic_input() {
