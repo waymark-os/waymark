@@ -37,6 +37,7 @@ mod stone_vm;
 mod stone_vm_tests;
 mod task;
 pub mod tools;
+mod vm_supervisor;
 mod vsock;
 
 pub use frontend::{Frontend, StoneFrontend};
@@ -46,6 +47,10 @@ pub use stone_ast::{
     Program as StoneProgram, Stmt as StoneStmt,
 };
 pub use stone_frontend::parse_stone_source;
+pub use vm_supervisor::{
+    BulkResetSafe, ProcessBox, ProcessId, ProcessScope, ResourceId, VmCleanlinessReport,
+    VmDispatchError, VmDispatchResult, VmLifecycleState, VmSupervisor,
+};
 pub use vsock::run_vsock_task_server;
 
 pub struct StoneGuest {

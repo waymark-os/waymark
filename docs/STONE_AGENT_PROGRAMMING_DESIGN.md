@@ -55,6 +55,13 @@ Attempt
   algorithm itself
 ```
 
+Inside Waymark LibOS, the controller for an attempt should eventually be a
+forkable Stone process running on an ordinary Hermit thread. That runtime
+mechanism, its single-address-space trust model, and cleanup rules are defined
+in [`STONE_PROCESS_FORK_DESIGN.md`](STONE_PROCESS_FORK_DESIGN.md). It does not
+change the Stone agent-control interface or make local process placement
+visible to programs.
+
 The first milestone should expose a low-level `model_call(...)` builtin and
 prove that an ordinary Stone program can implement and modify a ReAct loop. A
 later typed-inference and native-tool protocol should reduce plumbing without

@@ -26,3 +26,7 @@ For the host-authority placement used by LibOS guests and sandboxed agents, see
 For the proposed LLM-oriented authoring layer in which an outer agent generates
 Stone programs that directly control model calls, tools, and child attempts, see
 [`STONE_AGENT_PROGRAMMING_DESIGN.md`](STONE_AGENT_PROGRAMMING_DESIGN.md).
+
+For the target single-address-space LibOS execution model in which Stone process
+state is explicitly forkable, runs on ordinary Hermit threads, and has bounded
+cleanup, see [`STONE_PROCESS_FORK_DESIGN.md`](STONE_PROCESS_FORK_DESIGN.md).
