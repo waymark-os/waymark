@@ -77,6 +77,31 @@ emit(control(agent_session()))"#],
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "react_control",
+        signature: r#"react_control(model: str = "", max_rounds: int = 16, max_turns: int = 16, max_tool_ms: int? = None, completion_path: str = "") -> agent_control"#,
+        use_when: "Gateway mode only. Create the optimized builtin JSON-action ReAct control as a first-class callable Stone value, then invoke it with an agent_session() record.",
+        examples: &[r#"control = react_control(max_rounds=4, max_turns=8)
+emit(control(agent_session()))"#],
+        avoid: &[
+            "Do not treat this builtin as privileged policy; it uses the attached attempt's ordinary model and Shell capabilities.",
+            "Do not use react_control when a small direct Stone loop expresses the task-specific policy more clearly.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "scripted_control",
+        signature: r#"scripted_control(actions: list[record], max_turns: int = 16, max_tool_ms: int? = None, completion_path: str = "") -> agent_control"#,
+        use_when: "Use for deterministic fixtures or pre-authored action sequences through the same first-class AgentControl callable contract as optimized model controls.",
+        examples: &[r#"control = scripted_control([{"final": {"answer": "ok"}}])
+session = {"task": {"objective": "fixture"}, "input": None}
+emit(control(session).value)"#],
+        avoid: &[
+            "Do not use scripted_control as a hidden workflow format; ordinary Stone is the expressive control language.",
+            "Do not embed unbounded generated action lists; use a bounded Stone loop or react_control for dynamic decisions.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "emit",
         signature: "emit(value: Any? = pipeline_value) -> Any",
         use_when: "Use to return a structured result from an Stone script or MCP call.",

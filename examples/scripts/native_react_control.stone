@@ -1,0 +1,7 @@
+control = react_control(max_rounds=2, max_turns=2)
+outcome = control(agent_session())
+
+if not outcome.ok:
+    fail(outcome.error.message, code=outcome.error.code)
+
+emit(outcome.value)

@@ -80,6 +80,25 @@ pub struct AgentRunResult {
     pub error: Option<AgentError>,
 }
 
+impl AgentRunResult {
+    pub fn to_json(&self) -> JsonValue {
+        let error = self.error.as_ref().map(|error| {
+            json!({
+                "code": error.code,
+                "message": error.message,
+            })
+        });
+        json!({
+            "ok": self.ok,
+            "value": self.final_value,
+            "rounds": self.rounds,
+            "turns": self.turns,
+            "trace": self.trace,
+            "error": error,
+        })
+    }
+}
+
 pub struct AgentSession {
     tools: TaskTools,
     max_rounds: usize,

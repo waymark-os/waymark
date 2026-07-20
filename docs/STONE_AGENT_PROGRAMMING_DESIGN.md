@@ -968,11 +968,23 @@ The first implementation slice now establishes the control seam:
 - Stone exposes `agent_session()` plus `help("agent_control")`, so an ordinary
   `def control(session)` receives structured task, input, current attempt,
   limits, and discoverable resource-tool families.
+- `react_control(...)` and `scripted_control(...)` construct opaque,
+  task-owned `agent_control` values inside Stone. They are ordinary callables,
+  survive warm evaluations, and can be captured and delegated to by Stone
+  functions and lambdas.
+- invoking an optimized control delegates to the same public Rust
+  `AgentControl` contract over a nested Stone guest and the current resource
+  capabilities. The value is an implementation handle, not an agent-program
+  IR, and the Gateway still sees only resource syscalls.
+- `examples/scripts/native_react_control.stone` is the boundary canary: its
+  fixture-backed LibOS run exercises admitted Stone -> callable control ->
+  Gateway `model.call` and returns the model-selected structured final value.
 
-This does not yet make the Rust ReAct implementation a first-class callable
-value inside Stone. Native builtin controls, Stone-defined controls, and
-control adapters still need one runtime invocation surface before parity and
-stacking can be tested across that language boundary.
+This closes the native-to-Stone invocation seam. It does not yet provide the
+standard Stone adapter library (`with_tools`, `with_context`, budgets, retry,
+verification, and event hooks), module-entrypoint spawning, or structured
+attempt scopes. Those are the remaining M2.5 composition and attempt-tree
+ergonomics, rather than another agent execution representation.
 
 ### M3: Typed Inference
 
@@ -1106,13 +1118,14 @@ helps agent computer use. A successful Stone ReAct demo alone does not.
 M1 and the M2 mechanism gate are complete. The evidence and remaining claim
 boundary are recorded in `STONE_AGENT_AUTHORSHIP_M2_PILOT.md`.
 
-Implement and validate M2.5 before another broad Terminal-Bench comparison.
-First define `AgentControl` and refactor the optimized Rust loop to the same
-observable contract that Stone controls use. Then expose the coherent Shell
-resource tool families, current-module entrypoint launch, and structured scope
-vertical slice. The current raw fork/start/wait/accept calls prove only that
-Gateway can execute a tree; escaped child source, untyped ids, manual cleanup,
-and per-operation timeouts are not yet the intended programming model. After
-deterministic fixtures, run validation plan C followed by untouched,
-historically unresolved Terminal-Bench tasks. Do not treat the deterministic
-mechanism cohort as validation of the broader attempt-first OS hypothesis.
+Continue M2.5 before another broad Terminal-Bench comparison. The shared
+`AgentControl` contract and first-class optimized Stone controls now establish
+the invocation seam. Next expose the coherent Shell resource tool families,
+ordinary control adapters, current-module entrypoint launch, and a structured
+scope vertical slice. The current raw fork/start/wait/accept calls prove only
+that Gateway can execute a tree; escaped child source, untyped ids, manual
+cleanup, and per-operation timeouts are not yet the intended programming
+model. After deterministic fixtures, run validation plan C followed by
+untouched, historically unresolved Terminal-Bench tasks. Do not treat the
+deterministic mechanism cohort as validation of the broader attempt-first OS
+hypothesis.

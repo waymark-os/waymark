@@ -18,6 +18,7 @@ use waymark_gateway_client::proto::{
     ContextSource, StoneProgram, TaskSpec as GatewayTaskSpec, WorkspaceSource,
 };
 
+use crate::agent::{AgentAction, AgentSession, ReactAgentControl, ScriptedAgentControl};
 use crate::commands::{stone_help_overview, stone_help_topic};
 use crate::gateway_env;
 use crate::gateway_runtime;
@@ -36,6 +37,7 @@ use crate::linux_tools::{
     },
     process::resolve_command_call_values,
 };
+use crate::stone_agent_control::{AgentControlKind, AgentControlValue};
 use crate::stone_ast::{
     AssignTarget, AugOp, BoolOp, Call, CompareOp, ComprehensionClause, ExceptHandler, Expr,
     FormattedStringPart, FunctionDef, Program, Stmt, StoneFormatSpec, StoneType,
@@ -73,6 +75,7 @@ use crate::stone_vm::{
     HotLoopPlan, LoopIrFusedKernel, LoopIrOptimizationDiagnostic, StoneConst, StoneIrFunction,
     StoneLoopIrOptimizationResult,
 };
+use crate::StoneGuest;
 
 #[path = "stone_functions.rs"]
 mod stone_functions;
@@ -1822,6 +1825,8 @@ impl Evaluator<'_> {
             "task_spec" => self.eval_task_spec_call(call),
             "task_input" => self.eval_task_input_call(call),
             "agent_session" => self.eval_agent_session_call(call),
+            "react_control" => self.eval_react_control_call(call),
+            "scripted_control" => self.eval_scripted_control_call(call),
             "max" => self.eval_min_max_call(call, MinMax::Max),
             "min" => self.eval_min_max_call(call, MinMax::Min),
             "open" => self.eval_open_call(call),
@@ -2001,15 +2006,23 @@ impl Evaluator<'_> {
                 "lambda calls only support positional arguments for now",
             ));
         }
-        let Some(RuntimeValue::Callable(callable)) = self.state.get_local(&call.name) else {
-            return Err(unknown_stone_call_error(&call.name));
-        };
+        let callable = self
+            .state
+            .get_local(&call.name)
+            .ok_or_else(|| unknown_stone_call_error(&call.name))?;
         let args = call
             .positional
             .iter()
             .map(|arg| self.eval_expr_value(arg, PipelineData::empty()))
             .collect::<Result<Vec<_>, _>>()?;
-        self.invoke_callable(&callable, args)
+        match callable {
+            RuntimeValue::Callable(callable) => self.invoke_callable(&callable, args),
+            RuntimeValue::AgentControl(control) => self.invoke_agent_control(&control, args),
+            _ => Err(stone_error(
+                "callable",
+                format!("{} is not callable", call.name),
+            )),
+        }
     }
 
     fn eval_attribute_expr(
@@ -3948,6 +3961,191 @@ impl Evaluator<'_> {
         let attempt = gateway_env::attempt_info(String::new())?;
         Ok(RuntimeValue::Nu(agent_session_value(
             task, input, attempt, span,
+        )))
+    }
+
+    fn eval_react_control_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 1 {
+            return Err(stone_error(
+                "react_control",
+                "react_control() accepts at most one positional model argument",
+            ));
+        }
+        let mut model = positional
+            .first()
+            .map(|value| value_to_string(value, "react_control model"))
+            .transpose()?
+            .filter(|value| !value.is_empty());
+        let mut max_rounds = 16;
+        let mut max_turns = 16;
+        let mut max_tool_ms = None;
+        let mut completion_path = None;
+        for (name, value) in named {
+            match name.as_str() {
+                "model" => {
+                    model = value_to_string(&value, "react_control model")
+                        .map(|value| (!value.is_empty()).then_some(value))?
+                }
+                "max_rounds" => max_rounds = value_to_limit(&value, "react_control max_rounds")?,
+                "max_turns" => max_turns = value_to_limit(&value, "react_control max_turns")?,
+                "max_tool_ms" => {
+                    max_tool_ms = if matches!(value, Value::Nothing { .. }) {
+                        None
+                    } else {
+                        Some(value_to_u64(&value, "react_control max_tool_ms")?)
+                    }
+                }
+                "completion_path" => {
+                    completion_path = value_to_string(&value, "react_control completion_path")
+                        .map(|value| (!value.is_empty()).then_some(value))?
+                }
+                _ => {
+                    return Err(stone_error(
+                        "react_control",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        if max_rounds == 0 || max_turns == 0 {
+            return Err(stone_error(
+                "react_control",
+                "max_rounds and max_turns must be greater than zero",
+            ));
+        }
+        Ok(RuntimeValue::AgentControl(AgentControlValue {
+            control_id: self.state.next_callable_id(),
+            kind: AgentControlKind::React { model },
+            max_rounds,
+            max_turns,
+            max_tool_ms,
+            completion_path,
+        }))
+    }
+
+    fn eval_scripted_control_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let [actions] = call.positional.as_slice() else {
+            return Err(stone_error(
+                "scripted_control",
+                "scripted_control() requires exactly one actions list",
+            ));
+        };
+        let actions = self
+            .eval_expr_value(actions, PipelineData::empty())?
+            .into_nu_value("scripted_control actions")?;
+        let actions = nu_to_json_value(&actions);
+        let Some(actions) = actions.as_array() else {
+            return Err(stone_error(
+                "scripted_control",
+                "scripted_control actions must be a list of action records",
+            ));
+        };
+        let actions = actions
+            .iter()
+            .enumerate()
+            .map(|(index, action)| {
+                AgentAction::from_json(action).map_err(|error| {
+                    stone_error(
+                        "scripted_control",
+                        format!("actions[{index}]: {}", error.message),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut max_turns = 16;
+        let mut max_tool_ms = None;
+        let mut completion_path = None;
+        for (name, expression) in &call.named {
+            let value = self
+                .eval_expr_value(expression, PipelineData::empty())?
+                .into_nu_value("scripted_control option")?;
+            match name.as_str() {
+                "max_turns" => max_turns = value_to_limit(&value, "scripted_control max_turns")?,
+                "max_tool_ms" => {
+                    max_tool_ms = if matches!(value, Value::Nothing { .. }) {
+                        None
+                    } else {
+                        Some(value_to_u64(&value, "scripted_control max_tool_ms")?)
+                    }
+                }
+                "completion_path" => {
+                    completion_path = value_to_string(&value, "scripted_control completion_path")
+                        .map(|value| (!value.is_empty()).then_some(value))?
+                }
+                _ => {
+                    return Err(stone_error(
+                        "scripted_control",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        if max_turns == 0 {
+            return Err(stone_error(
+                "scripted_control",
+                "max_turns must be greater than zero",
+            ));
+        }
+        Ok(RuntimeValue::AgentControl(AgentControlValue {
+            control_id: self.state.next_callable_id(),
+            kind: AgentControlKind::Scripted { actions },
+            max_rounds: 0,
+            max_turns,
+            max_tool_ms,
+            completion_path,
+        }))
+    }
+
+    fn invoke_agent_control(
+        &mut self,
+        control: &AgentControlValue,
+        mut args: Vec<RuntimeValue>,
+    ) -> Result<RuntimeValue, ShellError> {
+        if args.len() != 1 {
+            return Err(stone_error(
+                "agent control",
+                format!(
+                    "{}#{} expected one session argument, got {}",
+                    control.name(),
+                    control.control_id,
+                    args.len()
+                ),
+            ));
+        }
+        let session = args
+            .pop()
+            .expect("agent control argument length checked")
+            .into_nu_value("agent control session")?;
+        let session = nu_to_json_value(&session);
+        let cwd = self.current_cwd_path("agent control")?;
+        let tools = crate::task::agent_control_tools(&cwd, control.max_tool_ms);
+        let mut guest = StoneGuest::new(cwd)?;
+        let mut runtime = AgentSession::new(tools)
+            .with_max_turns(control.max_turns)
+            .with_max_rounds(control.max_rounds.max(1))
+            .with_completion_path(control.completion_path.clone());
+
+        let result = match &control.kind {
+            AgentControlKind::Scripted { actions } => {
+                let mut builtin = ScriptedAgentControl::new(actions.clone());
+                runtime.run_control(&mut guest, &mut builtin, None)
+            }
+            AgentControlKind::React { model } => {
+                let task = agent_task_prompt(&session)?;
+                let mut builtin = ReactAgentControl::new(task, model.as_deref());
+                match gateway_runtime::GatewayAgentModelGateway::active() {
+                    Some(mut gateway) => {
+                        runtime.run_control(&mut guest, &mut builtin, Some(&mut gateway))
+                    }
+                    None => runtime.run_control(&mut guest, &mut builtin, None),
+                }
+            }
+        };
+        Ok(RuntimeValue::Nu(json_to_nu_value(
+            result.to_json(),
+            Span::unknown(),
         )))
     }
 
@@ -6326,6 +6524,8 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "min",
     "model_call",
     "agent_session",
+    "react_control",
+    "scripted_control",
     "task_spec",
     "task_input",
     "mkdir",
@@ -6843,6 +7043,7 @@ fn runtime_type_name(value: &RuntimeValue) -> &'static str {
         RuntimeValue::JsonArrayView(_) => "list",
         RuntimeValue::JsonScalarView(_) => "json",
         RuntimeValue::Callable(_) => "function",
+        RuntimeValue::AgentControl(_) => "agent_control",
     }
 }
 
@@ -7003,6 +7204,14 @@ fn value_to_iter_values(value: &RuntimeValue) -> Result<Vec<Value>, ShellError> 
             "iteration",
             format!("cannot iterate callable lambda#{}", callable.function_id),
         )),
+        RuntimeValue::AgentControl(control) => Err(stone_error(
+            "iteration",
+            format!(
+                "cannot iterate agent control {}#{}",
+                control.name(),
+                control.control_id
+            ),
+        )),
     }
 }
 
@@ -7076,6 +7285,35 @@ fn agent_session_value(task: Value, input: Value, attempt: Value, span: Span) ->
     session.push("limits", limits);
     session.push("tools", Value::record(tools, span));
     Value::record(session, span)
+}
+
+fn agent_task_prompt(session: &JsonValue) -> Result<String, ShellError> {
+    let session = session.as_object().ok_or_else(|| {
+        stone_error(
+            "agent control",
+            "agent control session must be a record, normally from agent_session()",
+        )
+    })?;
+    let task = session.get("task").ok_or_else(|| {
+        stone_error(
+            "agent control",
+            "agent control session requires a structured `task` field",
+        )
+    })?;
+    let input = session.get("input").cloned().unwrap_or(JsonValue::Null);
+    let objective = task
+        .get("objective")
+        .and_then(JsonValue::as_str)
+        .or_else(|| task.as_str())
+        .unwrap_or("Complete the admitted task");
+    let structured = serde_json::to_string(&json!({
+        "task": task,
+        "input": input,
+    }))
+    .map_err(|error| stone_error("agent control", error.to_string()))?;
+    Ok(format!(
+        "{objective}\nStructured task and input: {structured}"
+    ))
 }
 
 fn value_to_string_list(value: &Value, context: &str) -> Result<Vec<String>, ShellError> {

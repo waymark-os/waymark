@@ -8,6 +8,7 @@ use super::stone_json_view::{
     materialize_json_array_view, materialize_json_object_view, materialize_json_scalar_view,
     materialize_jsonl_rows, JsonArrayView, JsonObjectView, JsonScalarView, JsonlRows,
 };
+use crate::stone_agent_control::AgentControlValue;
 
 #[derive(Clone)]
 pub(super) enum RuntimeValue {
@@ -19,6 +20,7 @@ pub(super) enum RuntimeValue {
     JsonArrayView(JsonArrayView),
     JsonScalarView(JsonScalarView),
     Callable(CallableValue),
+    AgentControl(AgentControlValue),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +33,7 @@ pub(super) enum RuntimeValueTag {
     JsonArrayView,
     JsonScalarView,
     Callable,
+    AgentControl,
 }
 
 impl RuntimeValueTag {
@@ -45,6 +48,7 @@ impl RuntimeValueTag {
             RuntimeValueTag::JsonArrayView => 6,
             RuntimeValueTag::JsonScalarView => 7,
             RuntimeValueTag::Callable => 8,
+            RuntimeValueTag::AgentControl => 9,
         }
     }
 }
@@ -74,6 +78,7 @@ impl RuntimeValue {
                 .captures
                 .iter()
                 .all(|(_, value)| value.is_session_persistable()),
+            RuntimeValue::AgentControl(_) => true,
             RuntimeValue::File(_) => false,
         }
     }
@@ -89,6 +94,7 @@ impl RuntimeValue {
             RuntimeValue::JsonArrayView(_) => RuntimeValueTag::JsonArrayView,
             RuntimeValue::JsonScalarView(_) => RuntimeValueTag::JsonScalarView,
             RuntimeValue::Callable(_) => RuntimeValueTag::Callable,
+            RuntimeValue::AgentControl(_) => RuntimeValueTag::AgentControl,
         }
     }
 
@@ -118,6 +124,14 @@ impl RuntimeValue {
                     callable.function_id
                 ),
             )),
+            RuntimeValue::AgentControl(control) => Err(stone_error(
+                context,
+                format!(
+                    "agent control {}#{} is a task-owned callable and cannot cross this boundary",
+                    control.name(),
+                    control.control_id
+                ),
+            )),
         }
     }
 }
@@ -140,6 +154,7 @@ mod tests {
         assert_eq!(RuntimeValueTag::JsonArrayView.id(), 6);
         assert_eq!(RuntimeValueTag::JsonScalarView.id(), 7);
         assert_eq!(RuntimeValueTag::Callable.id(), 8);
+        assert_eq!(RuntimeValueTag::AgentControl.id(), 9);
     }
 
     #[test]

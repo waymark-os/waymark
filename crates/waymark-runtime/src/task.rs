@@ -244,6 +244,10 @@ fn task_tools_for_current_runtime(work_dir: &Path) -> TaskTools {
 }
 
 fn agent_task_tools(work_dir: &Path, spec: &AgentSpec) -> TaskTools {
+    agent_control_tools(work_dir, spec.max_tool_ms)
+}
+
+pub(crate) fn agent_control_tools(work_dir: &Path, max_tool_ms: Option<u64>) -> TaskTools {
     let tools = task_tools_for_current_runtime(work_dir);
     let mut limits: ToolLimits = tools.limits().clone();
     // Model observations are replayed in every subsequent turn. Keep the
@@ -251,7 +255,7 @@ fn agent_task_tools(work_dir: &Path, spec: &AgentSpec) -> TaskTools {
     // or OCR command cannot consume the remaining context window.
     limits.max_stdout_bytes = limits.max_stdout_bytes.min(16 * 1024);
     limits.max_stderr_bytes = limits.max_stderr_bytes.min(8 * 1024);
-    if let Some(max_tool_ms) = spec.max_tool_ms {
+    if let Some(max_tool_ms) = max_tool_ms {
         limits.max_tool_ms = max_tool_ms;
     }
     tools.with_limits(limits)

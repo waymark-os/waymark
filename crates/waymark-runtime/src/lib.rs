@@ -23,6 +23,7 @@ mod json;
 mod linux_tools;
 mod server;
 mod stone_ast;
+mod stone_agent_control;
 mod stone_builtins;
 mod stone_eval;
 mod stone_file_ops;
@@ -849,6 +850,75 @@ emit(double(3))"#,
         let second = guest.stone_command_response(r#"emit(double(5))"#);
         assert_eq!(second["ok"], json!(true));
         assert_eq!(second["value"], json!(10));
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn stone_agent_controls_are_first_class_persistable_and_wrappable() -> Result<(), ShellError> {
+        let start_dir = test_root("stone-session-agent-controls");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let defined = guest.stone_command_response(
+            r#"base = scripted_control([{"final": {"answer": "wrapped"}}])
+wrapped = lambda session: base(session)"#,
+        );
+        assert_eq!(defined["ok"], json!(true));
+        assert_eq!(
+            defined["diagnostics"]["session"]["bound"],
+            json!(["base", "wrapped"])
+        );
+
+        let result = guest.stone_command_response(
+            r#"session = {"task": {"objective": "fixture"}, "input": None}
+outcome = wrapped(session)
+emit({
+    "control_type": type(base),
+    "answer": outcome.value.answer,
+    "control": outcome.trace[0].value.control,
+})"#,
+        );
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(
+            result["value"],
+            json!({
+                "control_type": "agent_control",
+                "answer": "wrapped",
+                "control": "scripted_v0",
+            })
+        );
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn stone_react_control_uses_shared_runtime_contract_without_gateway() -> Result<(), ShellError>
+    {
+        let start_dir = test_root("stone-react-control-contract");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let result = guest.stone_command_response(
+            r#"control = react_control(max_rounds=2, max_turns=3)
+outcome = control({"task": {"objective": "fixture"}, "input": None})
+emit({
+    "ok": outcome.ok,
+    "error": outcome.error.code,
+    "control": outcome.trace[0].value.control,
+})"#,
+        );
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(
+            result["value"],
+            json!({
+                "ok": false,
+                "error": "model_gateway_unavailable",
+                "control": "react_json_v0",
+            })
+        );
 
         cleanup_dir(&start_dir);
         Ok(())
