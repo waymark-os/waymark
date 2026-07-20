@@ -14,6 +14,11 @@ making model inference an explicit, typed effect. It should not make one ReAct
 loop, one graph scheduler, or one multi-agent protocol part of the language
 semantics.
 
+Common agent loops should be available as optimized builtin templates that
+implement the same `AgentControl` interface as ordinary Stone functions. They
+must remain extensible through Stone composition and receive the same Shell
+tools for CPU, memory, files, Linux, models, context, and other attempts.
+
 The primary author is another language agent. A typical execution is:
 
 ```text
@@ -341,10 +346,11 @@ Use an ordinary model call for another perspective inside the same state. Use a
 child attempt when work needs independent workspace state, lifecycle,
 capability/budget attenuation, cancellation, or candidate acceptance.
 
-The attempt and attempt-tree semantics are language-independent. Stone is the
-Python-shaped language used to compile `AttemptSpec` values and implement the
-parent controller; it must not redefine an attempt around ReAct, critic loops,
-or any other policy. The normative process analogy is specified in
+The attempt and attempt-tree semantics are Gateway kernel mechanisms. Stone is
+the Python-shaped language used to implement the parent and child controllers;
+Waymark Shell maps its protected resource operations onto Gateway syscalls.
+Neither layer should redefine an attempt around ReAct, critic loops, or any
+other policy. The normative process analogy is specified in
 [Attempt Process And Process-Tree Model](../../waymark-gateway/docs/ATTEMPT_PROCESS_TREE_MODEL.md).
 
 ### 7. Failures Are Values At Policy Boundaries
@@ -539,12 +545,86 @@ agent_trace_summary(...) -> record
 agent_context_size(messages) -> record
 ```
 
-A standard ReAct program can be shipped as versioned Stone source or a formal
-skill, and an outer agent can synthesize a smaller task-specific variant. Both
-must remain copyable and editable. The current Rust `AgentSession`
-can remain a compatibility frontend until the Stone implementation reaches
-parity, then delegate to the versioned Stone program rather than define the
-semantic center.
+A standard ReAct program can be shipped as Stone source, a skill, or an
+optimized builtin template. An outer agent can synthesize a smaller
+task-specific variant. The current Rust `AgentSession` may remain as an
+optimized builtin, but it must implement the same public control contract as a
+Stone-defined agent rather than define a closed harness mode.
+
+### Layer 4: Composable Agent Control
+
+Agent control is a Waymark user-space abstraction. Its smallest semantic
+contract is an ordinary callable:
+
+```stone
+interface AgentControl[I, O]:
+    def run(session: AgentSession[I]) -> O
+
+AgentSession[I] = {
+    task: TaskView[I],
+    self: AttemptHandle,
+    context: ContextView,
+    tools: ResourceTools,
+    limits: ResourceLimits,
+    events: EventSink,
+}
+```
+
+This is an ordinary Stone interface/protocol, not a Gateway object or IR. The
+exact representation may initially use records and callables. A Stone
+function, skill-provided control, or optimized Rust builtin can implement it.
+`run_agent` invokes any conforming control, while builtins such as
+`react_control`, `tool_agent_control`, `critic_control`, and
+`supervisor_control` are simply optimized implementations.
+
+Control state is ordinary local Stone state or explicit context state.
+Returning reports a result; raising a structured error reports failure; the
+runtime observes cancellation at Shell call/yield boundaries. Waymark may use
+an internal poll/resume ABI for suspension or an optimized native control, but
+that is an execution detail rather than an agent-program representation.
+
+The protocol separates four things that the current fixed loop conflates:
+
+- control state and stopping policy;
+- context construction and observation projection;
+- available resource tools;
+- the attempt lifecycle that owns the running controller.
+
+Controls must be extensible, stackable, and composable through ordinary Stone
+adapters:
+
+```stone
+control = react_control(model="default")
+control = with_tools(control, shell_tools("file", "linux", "attempt"))
+control = with_context(control, context_window(max_tokens=32000))
+control = with_budget(control, tokens=100000, wall_time_ms=300000)
+control = with_retry(control, transient_only=True, max_attempts=2)
+control = guard_actions(control, deny=["publish"])
+control = on_event(control, record_progress)
+result = run_agent(control, task_spec())
+```
+
+Further combinators may include `map_observation`, `with_verifier`,
+`with_critic`, `then`, and `fallback`. These are library policies. A task may
+also write a direct loop and call the same tools without using `AgentControl`.
+
+### Shell Resource Tool Families
+
+Both builtin and Stone-defined controls receive capability-scoped tools from
+Waymark Shell:
+
+| Resource | Representative operations |
+| --- | --- |
+| CPU and memory | usage, limits, reservations, operation concurrency |
+| files/workspace | read, write, list, search, diff, checkpoint |
+| Linux/processes | run, run-wait, status, signal, join |
+| models | call, stream, structured infer, usage |
+| context | task input, read, append, project, summarize |
+| attempts | spawn/fork, state/events, wait/join, signal, report, accept/discard |
+
+Some helpers execute locally in Waymark. Protected effects become Gateway
+RPCs/syscalls. The wire request is syscall ABI; it is not an agent-program
+representation and Gateway does not interpret the surrounding control flow.
 
 ## Example: ReAct In Ordinary Stone
 
@@ -627,9 +707,10 @@ AttemptProgram(kind=stone, source=...)
   = one executable agent-program instance
 ```
 
-The program source, referenced skills, tool schemas, compiler/runtime version,
-and model-class requirement contribute to program identity. The concrete model
-and provider are execution metadata selected by Gateway policy.
+The program source, referenced skills, tool schemas, Stone/runtime version, and
+model-class requirement contribute to program identity. The concrete model and
+provider are execution metadata selected by Gateway policy. Gateway may record
+that identity without parsing the program into another IR.
 
 Child attempts remain appropriate for:
 
@@ -665,10 +746,9 @@ The current inline form:
 attempt_fork(program={"kind": "stone", "source": "..."}, start=True)
 ```
 
-is bootstrap IR exposed as source. It forces an outer model to generate and
-escape nested programs and gives the compiler little opportunity to check
-entrypoints or data capture. The target is one content-addressed Stone module
-with multiple named entrypoints:
+is a bootstrap executable form. It forces an outer model to generate and
+escape nested programs. The target is one loaded Stone module with multiple
+named entrypoints:
 
 ```stone
 def worker(input):
@@ -677,17 +757,16 @@ def worker(input):
 
 def main(input):
     scope = attempt_scope(exit_policy="cancel_then_join")
-    spec = attempt_spec(
-        task=task_refine(task_spec(), objective="Try alternate solver"),
-        program=program_entry("worker"),
+    child = attempt_spawn(
+        program=current_program(),
+        entrypoint="worker",
         input={"strategy": "alternate"},
-        workspace=workspace_fork(),
-        context=context_summary(),
+        workspace_source=workspace_fork(),
+        context_source=context_summary(),
         capabilities=attenuate(["workspace", "linux.exec", "model.call"]),
-        budget={"wall_time_ms": 120000, "model_calls": 4},
-        result_schema=CANDIDATE_SCHEMA,
+        limits={"wall_time_ms": 120000, "model_calls": 4},
+        scope=scope,
     )
-    child = attempt_spawn(spec, scope=scope)
     outcome = attempt_join(child)
     if outcome.evaluation.status == "passed":
         attempt_accept(attempt_info().attempt, child, import="workspace_all_allowed")
@@ -697,16 +776,16 @@ def main(input):
     return inspect_parent_result()
 ```
 
-This remains ordinary Python-shaped Stone with structured values. The compiler
-lowers the module entrypoint and `attempt_spec` value to the Gateway's
-language-independent AgentProgram/AttemptSpec IR. It rejects unknown
-entrypoints, unserializable captures, missing cleanup policy, invalid source
-planes, and statically visible authority or budget amplification. Gateway
-rechecks all authority and lifecycle constraints at admission and runtime.
+This remains ordinary Python-shaped Stone with structured values. Waymark
+resolves `current_program()`, checks the named entrypoint and serializable
+input, and invokes the Gateway spawn syscall. The syscall arguments describe
+the executable, resource views, authority, limits, and lifecycle; they are not
+a control-flow IR. Gateway enforces authority and lifecycle constraints at
+admission and runtime.
 
 The first process-tree surface should include:
 
-- `program_entry`, `attempt_spec`, and typed `AttemptHandle`;
+- current/named module entrypoint launch and typed `AttemptHandle`;
 - `attempt_scope`, child sets, `attempt_wait_any`, `attempt_wait_all`, and
   `attempt_join`;
 - cancel/terminate/kill signals and mandatory cancel-then-join scope cleanup;
@@ -860,16 +939,18 @@ The first GPT-5.5 authorship observation and its deliberately limited
 interpretation are recorded in `STONE_AGENT_AUTHORSHIP_M2_PILOT.md`. That pilot
 does not yet meet this exit criterion.
 
-### M2.5: Attempt Process-Tree Surface
+### M2.5: Composable Agent And Attempt Control Surface
 
-1. Compile multiple named entrypoints from one Stone module and address them by
-   program digest plus entrypoint.
-2. Add typed `attempt_spec`, attempt handles, and immutable attempt outcomes.
-3. Add structured child scopes with wait-any/wait-all, join, and automatic
-   cancel-then-join cleanup.
-4. Expose aggregate budget/usage and attempt-owned operation history as
-   structured values.
-5. Add a bounded child progress event stream.
+1. Define the common `AgentControl` protocol and drive both Rust/builtin ReAct
+   and Stone-defined controls through it.
+2. Add ordinary Stone adapters for tools, context, budgets, retry, event hooks,
+   verification, critic, sequencing, and fallback.
+3. Launch multiple named entrypoints from the current or another Stone module
+   using the Gateway spawn syscall, without embedded child source strings.
+4. Add typed attempt handles/outcomes and structured child scopes with
+   wait-any/wait-all, join, and automatic cancel-then-join cleanup.
+5. Expose aggregate budget/usage, attempt-owned operation history, and bounded
+   child progress events as structured values.
 
 Exit criterion: an outer model writes one Stone module containing a parent and
 multiple child entrypoints; the parent launches a bounded portfolio, observes
@@ -1009,10 +1090,12 @@ M1 and the M2 mechanism gate are complete. The evidence and remaining claim
 boundary are recorded in `STONE_AGENT_AUTHORSHIP_M2_PILOT.md`.
 
 Implement and validate M2.5 before another broad Terminal-Bench comparison.
-The current raw fork/start/wait/accept calls prove that Gateway can execute a
-tree, but escaped child source, untyped ids, manual cleanup, and per-operation
-timeouts are not yet the intended attempt programming model. First prove the
-module-entrypoint and structured-scope vertical slice with deterministic
-fixtures. Then run validation plan C using that surface, followed by untouched,
+First define `AgentControl` and refactor the optimized Rust loop to the same
+observable contract that Stone controls use. Then expose the coherent Shell
+resource tool families, current-module entrypoint launch, and structured scope
+vertical slice. The current raw fork/start/wait/accept calls prove only that
+Gateway can execute a tree; escaped child source, untyped ids, manual cleanup,
+and per-operation timeouts are not yet the intended programming model. After
+deterministic fixtures, run validation plan C followed by untouched,
 historically unresolved Terminal-Bench tasks. Do not treat the deterministic
 mechanism cohort as validation of the broader attempt-first OS hypothesis.
