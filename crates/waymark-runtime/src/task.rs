@@ -249,11 +249,15 @@ fn task_tools_for_current_runtime(work_dir: &Path) -> TaskTools {
 
 fn agent_task_tools(work_dir: &Path, spec: &AgentSpec) -> TaskTools {
     let tools = task_tools_for_current_runtime(work_dir);
-    let Some(max_tool_ms) = spec.max_tool_ms else {
-        return tools;
-    };
     let mut limits: ToolLimits = tools.limits().clone();
-    limits.max_tool_ms = max_tool_ms;
+    // Model observations are replayed in every subsequent turn. Keep the
+    // builtin loop's defaults small enough that one package install, download,
+    // or OCR command cannot consume the remaining context window.
+    limits.max_stdout_bytes = limits.max_stdout_bytes.min(16 * 1024);
+    limits.max_stderr_bytes = limits.max_stderr_bytes.min(8 * 1024);
+    if let Some(max_tool_ms) = spec.max_tool_ms {
+        limits.max_tool_ms = max_tool_ms;
+    }
     tools.with_limits(limits)
 }
 
@@ -690,7 +694,7 @@ fn required_object<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::TaskSpec;
+    use super::{agent_task_tools, AgentSpec, TaskSpec};
     use crate::agent::{AgentError, AgentModelGateway};
     use crate::tools::TaskTools;
     use crate::StoneGuest;
@@ -698,6 +702,22 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn builtin_agent_tools_bound_replayed_command_output() {
+        let root = temp_dir("agent-output-limits");
+        let spec = AgentSpec {
+            max_tool_ms: Some(12_345),
+            ..AgentSpec::default()
+        };
+        let tools = agent_task_tools(&root, &spec);
+
+        assert_eq!(tools.limits().max_stdout_bytes, 16 * 1024);
+        assert_eq!(tools.limits().max_stderr_bytes, 8 * 1024);
+        assert_eq!(tools.limits().max_tool_ms, 12_345);
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn gateway_task_errors_include_generic_error_detail() {

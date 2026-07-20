@@ -122,6 +122,11 @@ impl GatewayAgentModelGateway {
     #[cfg(any(unix, target_os = "hermit"))]
     pub(crate) fn attempt_task_value(&mut self) -> Result<JsonValue, ShellError> {
         self.ensure_client()?;
+        // Boot-token attachment resolves the authoritative attempt, tx, and
+        // capability profile. Publish that resolved configuration before the
+        // builtin agent runs so Stone snippets invoked through its `run` tool
+        // see the same attempt identity as direct model/Linux RPCs.
+        set_config(Some(self.config.clone()));
         control_task_value(&self.config)
     }
 
