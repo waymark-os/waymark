@@ -740,6 +740,47 @@ Workspace, context, artifact, and evidence lineage may form DAGs and must be
 specified separately. A child exit is not a merge, and a parent wait is not an
 acceptance decision.
 
+### Fork Versus Spawn
+
+At the Stone surface, `attempt_fork` means “continue from exactly here in an
+isolated child.” Waymark asks Gateway to create one coherent current-parent
+frontier, then starts a named child entrypoint against that state. The parent
+continues after the call. The child shares the immutable past, receives private
+writable workspace/context tails, and cannot affect the parent until explicit
+acceptance.
+
+`attempt_spawn` instead constructs a child from explicit resource sources. A
+spawned child can have a lifecycle parent without being a state continuation of
+that parent. Choosing a parent workspace checkpoint and a context summary
+independently remains spawn because those sources need not describe one atomic
+parent revision.
+
+The target LLM-friendly form is:
+
+```stone
+child = attempt_fork(
+    entrypoint="worker",
+    input={"strategy": "alternate"},
+    budget={"model_calls": 4, "wall_time_ms": 120000},
+    scope=scope,
+)
+```
+
+The attached parent and current admitted module are implicit. Fork starts the
+child by default and registers it with the current structured-concurrency
+scope. The raw syscall retains create-without-start for supervisors. Arbitrary
+workspace/context source selection, host provider identities, and credentials
+are not fork arguments.
+
+Fork does not clone the live Stone stack, a model invocation, or an in-flight
+Linux RPC. V1 requires the parent's provider operations to be idle and starts
+the child at `entrypoint(input)`. A future resumable controller mode must be
+explicit and must fail when no compatible controller checkpoint exists.
+
+The Gateway-side state frontier, conservation, accept/discard, and failure
+contract is specified in the gateway repository's
+`docs/ATTEMPT_FORK_DESIGN.md`.
+
 The current inline form:
 
 ```stone
