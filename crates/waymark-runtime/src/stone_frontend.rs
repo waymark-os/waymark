@@ -35,8 +35,34 @@ pub(crate) fn eval_stone_source_with_output_and_session(
     input: PipelineData,
     session: &mut StoneSession,
 ) -> Result<EvalProgramOutput, ShellError> {
+    eval_stone_source_with_output_session_and_entrypoint(
+        engine_state,
+        stack,
+        source,
+        input,
+        session,
+        None,
+    )
+}
+
+pub(crate) fn eval_stone_source_with_output_session_and_entrypoint(
+    engine_state: &EngineState,
+    stack: &mut Stack,
+    source: &str,
+    input: PipelineData,
+    session: &mut StoneSession,
+    entrypoint: Option<&str>,
+) -> Result<EvalProgramOutput, ShellError> {
     let program = lower_stone_source(source)?;
-    eval_program_with_output_and_session(engine_state, stack, &program, input, Some(session))
+    eval_program_with_output_and_session(
+        engine_state,
+        stack,
+        &program,
+        input,
+        Some(session),
+        Some(source),
+        entrypoint,
+    )
 }
 
 #[cfg(test)]

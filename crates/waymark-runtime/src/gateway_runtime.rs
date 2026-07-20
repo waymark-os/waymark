@@ -1531,7 +1531,8 @@ fn control_task_value(config: &GatewayRuntimeConfig) -> Result<JsonValue, ShellE
             "version": 0,
             "id": id,
             "runtime": {"frontend": "stone"},
-            "script": {"source": stone.source},
+            "script": {"source": stone.source, "entrypoint": stone.entrypoint},
+            "input": parse_task_input_json(&control.task_input_json)?,
             "artifacts": control_artifacts(task_spec, &config.workspace_mount),
         })),
         Some(attempt_program::Program::Builtin(builtin))
@@ -2120,7 +2121,8 @@ fn shell_error_detail(err: &ShellError) -> String {
 mod tests {
     use super::*;
     use waymark_gateway_client::proto::{
-        AttemptProgram, BuiltinWorkflow, SuccessCriterion, TaskConstraint, TaskInput, TaskOutput,
+        AttemptProgram, BuiltinWorkflow, StoneProgram, SuccessCriterion, TaskConstraint, TaskInput,
+        TaskOutput,
     };
 
     #[test]
@@ -2423,5 +2425,40 @@ mod tests {
         assert_eq!(task["agent"]["max_turns"], json!(4));
         assert_eq!(task["agent"]["max_rounds"], json!(2));
         assert_eq!(task["artifacts"][0]["guest_path"], json!("/app/hello.txt"));
+    }
+
+    #[test]
+    fn control_block_preserves_stone_entrypoint_and_input() {
+        let config = GatewayRuntimeConfig {
+            endpoint: GatewayEndpoint::Unix(PathBuf::from("/tmp/gateway.sock")),
+            attempt: "attempt-1".to_string(),
+            controller_run: "process-1".to_string(),
+            boot_token: String::new(),
+            tx: "tx-1".to_string(),
+            image: "python:3.12".to_string(),
+            container: None,
+            workspace_mount: "/app".to_string(),
+            host_workspace_path: None,
+            capability_profile: "local".to_string(),
+            model_class: "agent".to_string(),
+            control: Some(AttemptControlBlock {
+                task_spec: Some(GatewayTaskSpec {
+                    id: "task-from-gateway".to_string(),
+                    ..Default::default()
+                }),
+                program: Some(AttemptProgram {
+                    program: Some(attempt_program::Program::Stone(StoneProgram {
+                        source: "def worker(input):\n    return input".to_string(),
+                        entrypoint: "worker".to_string(),
+                    })),
+                }),
+                task_input_json: r#"{"value":21}"#.to_string(),
+                ..Default::default()
+            }),
+        };
+
+        let task = control_task_value(&config).unwrap();
+        assert_eq!(task["script"]["entrypoint"], json!("worker"));
+        assert_eq!(task["input"], json!({"value": 21}));
     }
 }

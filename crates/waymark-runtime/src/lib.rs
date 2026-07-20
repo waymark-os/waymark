@@ -163,13 +163,24 @@ impl StoneGuest {
         source: &str,
         input: PipelineData,
     ) -> JsonValue {
+        self.command_response_with_frontend_entrypoint(frontend, source, input, None)
+    }
+
+    pub(crate) fn command_response_with_frontend_entrypoint(
+        &mut self,
+        frontend: FrontendKind,
+        source: &str,
+        input: PipelineData,
+        entrypoint: Option<&str>,
+    ) -> JsonValue {
         let response = if frontend == FrontendKind::Stone {
-            match stone_frontend::eval_stone_source_with_output_and_session(
+            match stone_frontend::eval_stone_source_with_output_session_and_entrypoint(
                 &self.engine_state,
                 &mut self.stack,
                 source,
                 input,
                 &mut self.stone_session,
+                entrypoint,
             ) {
                 Ok(output) => {
                     match json::pipeline_to_json_value(output.pipeline, Span::unknown()) {
@@ -461,7 +472,7 @@ pub fn pipeline_input_from_bytes(bytes: Vec<u8>) -> PipelineData {
 
 #[cfg(test)]
 mod tests {
-    use super::{pipeline_input_from_bytes, run_vsock_task_server, StoneGuest};
+    use super::{pipeline_input_from_bytes, run_vsock_task_server, FrontendKind, StoneGuest};
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -995,6 +1006,107 @@ fail("primary failure", code="primary_failure")"#,
             .is_some_and(|errors| errors.iter().any(|error| error["detail"]
                 .as_str()
                 .is_some_and(|detail| detail.contains("automatic cancel-then-join cleanup")))));
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn stone_current_program_returns_current_source_and_selected_entrypoint(
+    ) -> Result<(), ShellError> {
+        let start_dir = test_root("stone-current-program");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let source = r#"def worker(input):
+    return input
+
+program = current_program(entrypoint="worker")
+emit({"kind": program.kind, "entrypoint": program.stone.entrypoint, "source": program.stone.source})"#;
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let result = guest.stone_command_response(source);
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(result["value"]["kind"], json!("stone"));
+        assert_eq!(result["value"]["entrypoint"], json!("worker"));
+        assert_eq!(result["value"]["source"], json!(source));
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn stone_named_entrypoint_receives_structured_task_input() -> Result<(), ShellError> {
+        let start_dir = test_root("stone-named-entrypoint");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let source = r#"def worker(input):
+    return {"answer": input.value * 2, "entrypoint": current_program().stone.entrypoint}
+
+def unused(input):
+    return {"answer": 0}"#;
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let input = pipeline_input_from_bytes(serde_json::to_vec(&json!({"value": 21})).unwrap());
+        let result = guest.command_response_with_frontend_entrypoint(
+            FrontendKind::Stone,
+            source,
+            input,
+            Some("worker"),
+        );
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(
+            result["value"],
+            json!({"answer": 42, "entrypoint": "worker"})
+        );
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn stone_named_entrypoint_rejects_top_level_execution() -> Result<(), ShellError> {
+        let start_dir = test_root("stone-entrypoint-top-level-rejection");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let result = guest.command_response_with_frontend_entrypoint(
+            FrontendKind::Stone,
+            r#"marker = "must not run"
+def worker():
+    return marker"#,
+            PipelineData::empty(),
+            Some("worker"),
+        );
+        assert_eq!(result["ok"], json!(false));
+        assert!(result["error"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("only top-level def and pass")));
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn stone_named_entrypoint_does_not_resolve_stale_session_function() -> Result<(), ShellError> {
+        let start_dir = test_root("stone-entrypoint-stale-session-function");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let first = guest.stone_command_response(
+            r#"def stale_worker():
+    return {"answer": "stale"}"#,
+        );
+        assert_eq!(first["ok"], json!(true));
+
+        let result = guest.command_response_with_frontend_entrypoint(
+            FrontendKind::Stone,
+            r#"def current_worker():
+    return {"answer": "current"}"#,
+            PipelineData::empty(),
+            Some("stale_worker"),
+        );
+        assert_eq!(result["ok"], json!(false));
+        assert!(result["error"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("available entrypoints: current_worker")));
 
         cleanup_dir(&start_dir);
         Ok(())

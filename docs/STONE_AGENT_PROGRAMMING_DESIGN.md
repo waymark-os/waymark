@@ -760,7 +760,7 @@ def main(input):
     child = attempt_spawn(
         program=current_program(),
         entrypoint="worker",
-        input={"strategy": "alternate"},
+        task_input={"strategy": "alternate"},
         workspace_source=workspace_fork(),
         context_source=context_summary(),
         capabilities=attenuate(["workspace", "linux.exec", "model.call"]),
@@ -992,11 +992,22 @@ The M2.5 implementation now establishes the control and supervision seams:
   former proves explicit join and rollback; the latter intentionally fails
   after spawn and proves automatic child rollback while preserving the
   original declared failure.
+- `current_program()` returns the exact currently loaded Stone module as the
+  existing structured Gateway program argument. `attempt_spawn` and
+  `attempt_fork` accept `entrypoint=...`, and the LibOS task adapter now
+  preserves `StoneProgram.entrypoint` plus structured task input.
+- named-entrypoint modules currently allow only top-level `def` and `pass`;
+  this makes child startup unambiguous and prevents parent bootstrap effects
+  from running in a worker. Entrypoints accept zero arguments or one structured
+  task input.
+- `examples/scripts/attempt_module_entrypoints.stone` is the process-tree
+  canary: root `main(input)` forks `worker` from the same admitted source,
+  joins it, accepts its workspace, and exits with both attempts cleanly closed.
 
 This closes the native-to-Stone invocation seam. It does not yet provide the
 standard Stone adapter library (`with_tools`, `with_context`, budgets, retry,
-verification, and event hooks), module-entrypoint spawning, typed attempt
-handles/full outcomes, wait-any/wait-all, or aggregate budget/event views.
+verification, and event hooks), typed attempt handles/full outcomes,
+wait-any/wait-all, per-fork input, or aggregate budget/event views.
 Those are the remaining M2.5 composition and attempt-tree ergonomics, rather
 than another agent execution representation.
 
@@ -1135,11 +1146,11 @@ boundary are recorded in `STONE_AGENT_AUTHORSHIP_M2_PILOT.md`.
 Continue M2.5 before another broad Terminal-Bench comparison. The shared
 `AgentControl` contract and first-class optimized Stone controls now establish
 the invocation seam, and task-owned scopes now provide bounded automatic child
-cleanup. Next expose ordinary control adapters, current-module entrypoint
-launch, typed attempt handles/outcomes, wait-any/wait-all, and aggregate
-budget/event views. Escaped child source, untyped ids, and per-operation
-timeouts are still not the intended final programming model. After
-deterministic fixtures, run validation plan C followed by
-untouched, historically unresolved Terminal-Bench tasks. Do not treat the
+cleanup, and current-module named entrypoints remove escaped child source.
+Next expose ordinary control adapters, typed attempt handles/outcomes,
+wait-any/wait-all, per-fork task input, and aggregate budget/event views.
+Untyped ids and per-operation timeouts are still not the intended final
+programming model. After deterministic fixtures, run validation plan C
+followed by untouched, historically unresolved Terminal-Bench tasks. Do not treat the
 deterministic mechanism cohort as validation of the broader attempt-first OS
 hypothesis.

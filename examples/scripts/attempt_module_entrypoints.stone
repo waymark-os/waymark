@@ -1,0 +1,32 @@
+def worker():
+    write_file("/app/candidate.txt", "same admitted Stone module\n")
+    return {"answer": "worker complete"}
+
+
+def main(input):
+    probe = model_call([{"role": "user", "content": "Return the fixture marker."}])
+    root = attempt_info()
+    scope = attempt_scope(join_timeout_ms=30000)
+    child = attempt_fork(
+        program=current_program(),
+        entrypoint="worker",
+        start=True,
+        scope=scope,
+    )
+    outcome = attempt_join(child, timeout_ms=30000)
+    if not outcome.joined:
+        fail("worker did not join", code="entrypoint_join_failed", detail=outcome)
+
+    accepted = attempt_accept(root.attempt, child.attempt)
+    cleanup = attempt_scope_close(scope)
+    if not cleanup.clean:
+        fail("entrypoint scope cleanup failed", code="entrypoint_cleanup_failed", detail=cleanup)
+
+    return {
+        "answer": input.answer,
+        "model_probe": probe.content,
+        "worker": child.attempt,
+        "worker_controller_state": outcome.controller_state,
+        "accepted_child": accepted.child.attempt,
+        "candidate": read_text("/app/candidate.txt"),
+    }

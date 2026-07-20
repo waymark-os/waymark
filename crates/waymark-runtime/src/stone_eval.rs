@@ -113,6 +113,8 @@ pub struct EvalState {
     next_file_id: u64,
     next_callable_id: u64,
     attempt_scopes: Vec<AttemptScopeValue>,
+    current_program_source: Option<String>,
+    current_program_entrypoint: Option<String>,
     stdout: String,
     session_bound_names: Vec<String>,
     profiler: EvalProfiler,
@@ -484,7 +486,7 @@ pub fn eval_program_with_output(
     program: &Program,
     input: PipelineData,
 ) -> Result<EvalProgramOutput, ShellError> {
-    eval_program_with_output_and_session(engine_state, stack, program, input, None)
+    eval_program_with_output_and_session(engine_state, stack, program, input, None, None, None)
 }
 
 pub(crate) fn eval_program_with_output_and_session(
@@ -493,8 +495,10 @@ pub(crate) fn eval_program_with_output_and_session(
     program: &Program,
     input: PipelineData,
     session: Option<&mut StoneSession>,
+    source: Option<&str>,
+    entrypoint: Option<&str>,
 ) -> Result<EvalProgramOutput, ShellError> {
-    eval_program_with_options(
+    eval_program_with_source_options(
         engine_state,
         stack,
         program,
@@ -506,6 +510,8 @@ pub(crate) fn eval_program_with_output_and_session(
                 .is_some(),
             session,
         },
+        source,
+        entrypoint,
     )
 }
 
@@ -516,12 +522,25 @@ struct EvalOptions<'a> {
     session: Option<&'a mut StoneSession>,
 }
 
+#[cfg(test)]
 fn eval_program_with_options(
     engine_state: &EngineState,
     stack: &mut Stack,
     program: &Program,
     input: PipelineData,
+    options: EvalOptions<'_>,
+) -> Result<EvalProgramOutput, ShellError> {
+    eval_program_with_source_options(engine_state, stack, program, input, options, None, None)
+}
+
+fn eval_program_with_source_options(
+    engine_state: &EngineState,
+    stack: &mut Stack,
+    program: &Program,
+    input: PipelineData,
     mut options: EvalOptions<'_>,
+    source: Option<&str>,
+    entrypoint: Option<&str>,
 ) -> Result<EvalProgramOutput, ShellError> {
     #[cfg(not(target_os = "hermit"))]
     let stone_helper_registry = {
@@ -549,6 +568,8 @@ fn eval_program_with_options(
             next_file_id: 0,
             next_callable_id: 0,
             attempt_scopes: Vec::new(),
+            current_program_source: source.map(str::to_string),
+            current_program_entrypoint: entrypoint.map(str::to_string),
             stdout: String::new(),
             session_bound_names: Vec::new(),
             profiler: EvalProfiler::default(),
@@ -560,7 +581,12 @@ fn eval_program_with_options(
             stone_helper_registry,
         },
     };
-    let pipeline = evaluator.eval_program(program, input);
+    let pipeline = match entrypoint {
+        Some(entrypoint) if !entrypoint.is_empty() => {
+            evaluator.eval_entrypoint_program(program, input, entrypoint)
+        }
+        _ => evaluator.eval_program(program, input),
+    };
     let cleanup = evaluator.close_open_attempt_scopes("Stone evaluation ended");
     evaluator.state.profiler.emit();
     let hot_loop_diagnostics = evaluator.state.hot_loop_diagnostics.json_value(
@@ -641,6 +667,85 @@ impl Evaluator<'_> {
             EvalFlow::Continue => Err(stone_error("continue", "continue outside loop")),
             EvalFlow::Return(_) => Err(stone_error("return", "return outside function")),
         }
+    }
+
+    fn eval_entrypoint_program(
+        &mut self,
+        program: &Program,
+        input: PipelineData,
+        entrypoint: &str,
+    ) -> Result<PipelineData, ShellError> {
+        let mut module_functions = Vec::new();
+        for (index, statement) in program.statements.iter().enumerate() {
+            match statement {
+                Stmt::FunctionDef(function) => module_functions.push(function.clone()),
+                Stmt::Pass => {}
+                _ => {
+                    return Err(stone_error(
+                        "entrypoint",
+                        format!(
+                            "named-entrypoint modules currently allow only top-level def and pass; executable statement {} would run ambiguously",
+                            index + 1
+                        ),
+                    ));
+                }
+            }
+        }
+        let function = module_functions
+            .iter()
+            .find(|function| function.name == entrypoint)
+            .cloned()
+            .ok_or_else(|| {
+                let mut names = module_functions
+                    .iter()
+                    .map(|function| function.name.clone())
+                    .collect::<Vec<_>>();
+                names.sort();
+                stone_error(
+                    "entrypoint",
+                    format!(
+                        "unknown Stone entrypoint `{entrypoint}`; available entrypoints: {}",
+                        if names.is_empty() {
+                            "none".to_string()
+                        } else {
+                            names.join(", ")
+                        }
+                    ),
+                )
+            })?;
+        for function in module_functions {
+            self.state.functions.insert(function.name.clone(), function);
+        }
+        if function.params.len() > 1 {
+            return Err(stone_error(
+                "entrypoint",
+                format!(
+                    "{}() has {} parameters; a Stone entrypoint must accept zero arguments or one structured task input",
+                    function.name,
+                    function.params.len()
+                ),
+            ));
+        }
+
+        const ENTRY_INPUT: &str = "__waymark_entrypoint_input";
+        let positional = if function.params.is_empty() {
+            Vec::new()
+        } else {
+            let input = input.into_value(Span::unknown())?;
+            self.state
+                .set_local(ENTRY_INPUT.to_string(), RuntimeValue::Nu(input));
+            vec![Expr::Name(ENTRY_INPUT.to_string())]
+        };
+        let call = Call {
+            name: entrypoint.to_string(),
+            positional,
+            named: Vec::new(),
+        };
+        let result = self.eval_user_function_call(&call);
+        self.state.remove_local(ENTRY_INPUT);
+        result?
+            .into_nu_value("entrypoint result")
+            .map(IntoPipelineData::into_pipeline_data)
     }
 
     fn eval_block(
@@ -1836,6 +1941,7 @@ impl Evaluator<'_> {
             "task_spec" => self.eval_task_spec_call(call),
             "task_input" => self.eval_task_input_call(call),
             "agent_session" => self.eval_agent_session_call(call),
+            "current_program" => self.eval_current_program_call(call),
             "react_control" => self.eval_react_control_call(call),
             "scripted_control" => self.eval_scripted_control_call(call),
             "max" => self.eval_min_max_call(call, MinMax::Max),
@@ -4099,6 +4205,47 @@ impl Evaluator<'_> {
         }))
     }
 
+    fn eval_current_program_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 1 {
+            return Err(stone_error(
+                "current_program",
+                "current_program() accepts at most one entrypoint argument",
+            ));
+        }
+        let mut entrypoint = positional
+            .first()
+            .map(|value| value_to_string(value, "current_program entrypoint"))
+            .transpose()?
+            .or_else(|| self.state.current_program_entrypoint.clone())
+            .unwrap_or_default();
+        for (name, value) in named {
+            match name.as_str() {
+                "entrypoint" => entrypoint = value_to_string(&value, "current_program entrypoint")?,
+                _ => {
+                    return Err(stone_error(
+                        "current_program",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        let source = self.state.current_program_source.clone().ok_or_else(|| {
+            stone_error(
+                "current_program",
+                "the current evaluator was not created from Stone source",
+            )
+        })?;
+        let span = Span::unknown();
+        let mut stone = Record::new();
+        stone.push("source", Value::string(source, span));
+        stone.push("entrypoint", Value::string(entrypoint, span));
+        let mut program = Record::new();
+        program.push("kind", Value::string("stone", span));
+        program.push("stone", Value::record(stone, span));
+        Ok(RuntimeValue::Nu(Value::record(program, span)))
+    }
+
     fn eval_scripted_control_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let [actions] = call.positional.as_slice() else {
             return Err(stone_error(
@@ -4436,6 +4583,7 @@ impl Evaluator<'_> {
         let mut parent_attempt = String::new();
         let mut resource_limits = Vec::new();
         let mut metadata = Vec::new();
+        let mut entrypoint = String::new();
         let mut spawn_v1 = gateway_env::AttemptSpawnV1::default();
         for (name, value) in named {
             match name.as_str() {
@@ -4481,6 +4629,7 @@ impl Evaluator<'_> {
                 "program" => {
                     spawn_v1.program = Some(program_from_value(&value, "attempt_spawn program")?);
                 }
+                "entrypoint" => entrypoint = value_to_string(&value, "attempt_spawn entrypoint")?,
                 "workspace_source" => {
                     let source =
                         workspace_source_from_value(&value, "attempt_spawn workspace_source")?;
@@ -4514,6 +4663,11 @@ impl Evaluator<'_> {
         let task = task.ok_or_else(|| stone_error("attempt_spawn", "missing task argument"))?;
         let workspace =
             workspace.ok_or_else(|| stone_error("attempt_spawn", "missing workspace argument"))?;
+        apply_stone_entrypoint(
+            &mut spawn_v1.program,
+            &entrypoint,
+            "attempt_spawn entrypoint",
+        )?;
         let child = gateway_env::attempt_spawn(
             task,
             workspace,
@@ -4553,6 +4707,7 @@ impl Evaluator<'_> {
         let mut resource_limits = Vec::new();
         let mut metadata = Vec::new();
         let mut program = None;
+        let mut entrypoint = String::new();
         let mut start = false;
         for (name, value) in named {
             match name.as_str() {
@@ -4575,6 +4730,7 @@ impl Evaluator<'_> {
                     metadata = value_to_string_pairs(&value, "attempt_fork metadata")?
                 }
                 "program" => program = Some(program_from_value(&value, "attempt_fork program")?),
+                "entrypoint" => entrypoint = value_to_string(&value, "attempt_fork entrypoint")?,
                 "start" => start = value_to_bool(&value, "attempt_fork start")?,
                 _ => {
                     return Err(stone_error(
@@ -4584,6 +4740,7 @@ impl Evaluator<'_> {
                 }
             }
         }
+        apply_stone_entrypoint(&mut program, &entrypoint, "attempt_fork entrypoint")?;
         let child = gateway_env::attempt_fork(
             parent_attempt,
             task,
@@ -6987,6 +7144,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "min",
     "model_call",
     "agent_session",
+    "current_program",
     "react_control",
     "scripted_control",
     "task_spec",
@@ -7965,6 +8123,35 @@ fn program_from_value(value: &Value, context: &str) -> Result<AttemptProgram, Sh
         other => Err(stone_error(
             context,
             format!("unknown attempt program kind `{other}`"),
+        )),
+    }
+}
+
+fn apply_stone_entrypoint(
+    program: &mut Option<AttemptProgram>,
+    entrypoint: &str,
+    context: &str,
+) -> Result<(), ShellError> {
+    if entrypoint.is_empty() {
+        return Ok(());
+    }
+    let Some(program) = program
+        .as_mut()
+        .and_then(|program| program.program.as_mut())
+    else {
+        return Err(stone_error(
+            context,
+            "entrypoint requires an explicit Stone program",
+        ));
+    };
+    match program {
+        attempt_program::Program::Stone(stone) => {
+            stone.entrypoint = entrypoint.to_string();
+            Ok(())
+        }
+        _ => Err(stone_error(
+            context,
+            "entrypoint is currently supported only for Stone programs",
         )),
     }
 }

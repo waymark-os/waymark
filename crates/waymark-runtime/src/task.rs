@@ -94,10 +94,11 @@ impl StoneGuest {
         match spec.resolve() {
             Ok(resolved) => {
                 let response = match resolved.frontend {
-                    TaskFrontend::Stone => self.command_response_with_frontend(
+                    TaskFrontend::Stone => self.command_response_with_frontend_entrypoint(
                         FrontendKind::Stone,
                         &resolved.script,
                         resolved.input,
+                        resolved.entrypoint.as_deref(),
                     ),
                     TaskFrontend::Agent => match resolved.agent.task.as_deref() {
                         Some(_) => match gateway.as_deref_mut() {
@@ -269,6 +270,7 @@ struct TaskSpec {
 struct ResolvedTask {
     frontend: TaskFrontend,
     script: String,
+    entrypoint: Option<String>,
     input: PipelineData,
     agent: AgentSpec,
     artifacts: Vec<ArtifactSpec>,
@@ -334,6 +336,7 @@ impl TaskSpec {
         check_version(&self.root)?;
         let frontend = frontend_kind(&self.root)?;
         let script = self.script_source()?;
+        let entrypoint = self.script_entrypoint()?;
         let input = self.input()?;
         let agent = if frontend == TaskFrontend::Agent {
             self.agent_spec()?
@@ -345,6 +348,7 @@ impl TaskSpec {
         Ok(ResolvedTask {
             frontend,
             script,
+            entrypoint,
             input: input.pipeline,
             agent,
             artifacts,
@@ -370,6 +374,19 @@ impl TaskSpec {
                 Err("task script must not contain both source and guest_path".into())
             }
             (None, None) => Err("task script requires source or guest_path".into()),
+        }
+    }
+
+    fn script_entrypoint(&self) -> Result<Option<String>, String> {
+        if matches!(frontend_kind(&self.root)?, TaskFrontend::Agent) {
+            return Ok(None);
+        }
+        let script = required_object(&self.root, &["script"])?;
+        match script.get("entrypoint") {
+            None | Some(JsonValue::Null) => Ok(None),
+            Some(JsonValue::String(entrypoint)) if entrypoint.is_empty() => Ok(None),
+            Some(JsonValue::String(entrypoint)) => Ok(Some(entrypoint.clone())),
+            Some(_) => Err("task script.entrypoint must be a string".to_string()),
         }
     }
 
