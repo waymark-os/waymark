@@ -1,0 +1,13 @@
+probe = model_call([{"role": "user", "content": "Return the fixture marker."}])
+scope = attempt_scope(join_timeout_ms=30000)
+child = attempt_fork(
+    program={"kind": "stone", "source": "emit({'answer': 'child complete'})"},
+    start=True,
+    scope=scope,
+)
+
+fail(
+    "intentional failure after scoped spawn",
+    code="scope_canary_failure",
+    detail={"child": child.attempt, "model_probe": probe.content},
+)

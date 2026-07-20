@@ -1,0 +1,22 @@
+probe = model_call([{"role": "user", "content": "Return the fixture marker."}])
+scope = attempt_scope(join_timeout_ms=30000)
+child = attempt_fork(
+    program={"kind": "stone", "source": "emit({'answer': 'child complete'})"},
+    start=True,
+    scope=scope,
+)
+outcome = attempt_join(child, timeout_ms=30000)
+cleanup = attempt_scope_close(scope, reason="scope canary complete")
+
+if not outcome.joined:
+    fail("child controller did not join", code="child_join_failed", detail=outcome)
+if not cleanup.clean:
+    fail("attempt scope did not clean every child", code="scope_cleanup_failed", detail=cleanup)
+
+emit({
+    "answer": "attempt scope clean",
+    "model_probe": probe.content,
+    "child": child.attempt,
+    "controller_state": outcome.controller_state,
+    "cleanup": cleanup,
+})

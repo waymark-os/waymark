@@ -42,6 +42,7 @@ use crate::stone_ast::{
     AssignTarget, AugOp, BoolOp, Call, CompareOp, ComprehensionClause, ExceptHandler, Expr,
     FormattedStringPart, FunctionDef, Program, Stmt, StoneFormatSpec, StoneType,
 };
+use crate::stone_attempt_scope::AttemptScopeValue;
 use crate::stone_builtins::{
     add_values, bitwise_int_values, compare_values, div_values, enumerate_builtin,
     find_method_builtin, first_builtin, float_builtin, floor_div_values, format_builtin,
@@ -111,6 +112,7 @@ pub struct EvalState {
     functions: HashMap<String, FunctionDef>,
     next_file_id: u64,
     next_callable_id: u64,
+    attempt_scopes: Vec<AttemptScopeValue>,
     stdout: String,
     session_bound_names: Vec<String>,
     profiler: EvalProfiler,
@@ -546,6 +548,7 @@ fn eval_program_with_options(
                 .unwrap_or_default(),
             next_file_id: 0,
             next_callable_id: 0,
+            attempt_scopes: Vec::new(),
             stdout: String::new(),
             session_bound_names: Vec::new(),
             profiler: EvalProfiler::default(),
@@ -558,6 +561,7 @@ fn eval_program_with_options(
         },
     };
     let pipeline = evaluator.eval_program(program, input);
+    let cleanup = evaluator.close_open_attempt_scopes("Stone evaluation ended");
     evaluator.state.profiler.emit();
     let hot_loop_diagnostics = evaluator.state.hot_loop_diagnostics.json_value(
         evaluator.state.hot_loop_enabled,
@@ -573,7 +577,14 @@ fn eval_program_with_options(
         }
         session.update_functions(&evaluator.state.functions);
     }
-    let pipeline = pipeline?;
+    let pipeline = match (pipeline, cleanup) {
+        (Ok(pipeline), Ok(())) => pipeline,
+        (Ok(_), Err(cleanup_error)) => return Err(cleanup_error),
+        (Err(program_error), Ok(())) => return Err(program_error),
+        (Err(program_error), Err(cleanup_error)) => {
+            return Err(attach_cleanup_error(program_error, cleanup_error));
+        }
+    };
     let mut diagnostics = match hot_loop_diagnostics {
         Some(hot_loop) => json!({ "hot_loop": hot_loop }),
         None => json!({}),
@@ -1872,6 +1883,11 @@ impl Evaluator<'_> {
             "attempt_info" => self.eval_attempt_info_call(call),
             "attempt_start" => self.eval_attempt_start_call(call),
             "attempt_wait" => self.eval_attempt_wait_call(call),
+            "attempt_join" => self.eval_attempt_join_call(call),
+            "attempt_terminate" => self.eval_attempt_terminate_call(call),
+            "attempt_scope" => self.eval_attempt_scope_call(call),
+            "attempt_scope_add" => self.eval_attempt_scope_add_call(call),
+            "attempt_scope_close" => self.eval_attempt_scope_close_call(call),
             "attempt_state" => self.eval_attempt_state_call(call),
             "attempts" | "attempt_list" => self.eval_attempts_call(call),
             "attempt_spawn" => self.eval_attempt_spawn_call(call),
@@ -2039,6 +2055,30 @@ impl Evaluator<'_> {
                 ));
             };
             return Ok(value);
+        }
+        if let RuntimeValue::AttemptScope(scope) = receiver {
+            let state = scope.lock()?;
+            let value = match attr {
+                "id" => Value::int(scope.scope_id as i64, Span::unknown()),
+                "exit_policy" => Value::string(state.exit_policy.clone(), Span::unknown()),
+                "join_timeout_ms" => Value::int(state.join_timeout_ms as i64, Span::unknown()),
+                "closed" => Value::bool(state.closed, Span::unknown()),
+                "children" => Value::list(
+                    state
+                        .children
+                        .iter()
+                        .map(|child| Value::string(child.attempt.clone(), Span::unknown()))
+                        .collect(),
+                    Span::unknown(),
+                ),
+                _ => {
+                    return Err(stone_error(
+                        "attribute",
+                        format!("attempt_scope has no attribute `{attr}`"),
+                    ));
+                }
+            };
+            return Ok(RuntimeValue::Nu(value));
         }
         let receiver = receiver.into_nu_value("attribute")?;
         let Value::Record { val, .. } = receiver else {
@@ -3550,6 +3590,41 @@ impl Evaluator<'_> {
         Ok((positional, named))
     }
 
+    fn eval_attempt_call_values(
+        &mut self,
+        call: &Call,
+    ) -> Result<(Vec<Value>, Vec<(String, Value)>, Option<AttemptScopeValue>), ShellError> {
+        let mut positional = Vec::with_capacity(call.positional.len());
+        for argument in &call.positional {
+            positional.push(
+                self.eval_expr_value(argument, PipelineData::empty())?
+                    .into_nu_value(&call.name)?,
+            );
+        }
+        let mut named = Vec::with_capacity(call.named.len());
+        let mut scope = None;
+        for (name, argument) in &call.named {
+            let value = self.eval_expr_value(argument, PipelineData::empty())?;
+            if name == "scope" {
+                let RuntimeValue::AttemptScope(value) = value else {
+                    return Err(stone_error(
+                        &call.name,
+                        format!(
+                            "scope must be an attempt_scope, got {}",
+                            runtime_type_name(&value)
+                        ),
+                    ));
+                };
+                if scope.replace(value).is_some() {
+                    return Err(stone_error(&call.name, "scope may be supplied only once"));
+                }
+            } else {
+                named.push((name.clone(), value.into_nu_value(&call.name)?));
+            }
+        }
+        Ok((positional, named, scope))
+    }
+
     fn current_cwd_path(&mut self, context: &str) -> Result<PathBuf, ShellError> {
         self.engine_state
             .cwd_as_string(Some(self.stack))
@@ -4339,7 +4414,7 @@ impl Evaluator<'_> {
     }
 
     fn eval_attempt_spawn_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        let (positional, named) = self.eval_call_values(call)?;
+        let (positional, named, scope) = self.eval_attempt_call_values(call)?;
         if positional.len() > 2 {
             return Err(stone_error(
                 "attempt_spawn",
@@ -4439,7 +4514,7 @@ impl Evaluator<'_> {
         let task = task.ok_or_else(|| stone_error("attempt_spawn", "missing task argument"))?;
         let workspace =
             workspace.ok_or_else(|| stone_error("attempt_spawn", "missing workspace argument"))?;
-        gateway_env::attempt_spawn(
+        let child = gateway_env::attempt_spawn(
             task,
             workspace,
             controller,
@@ -4450,12 +4525,15 @@ impl Evaluator<'_> {
             resource_limits,
             metadata,
             spawn_v1,
-        )
-        .map(RuntimeValue::Nu)
+        )?;
+        if let Some(scope) = scope {
+            scope.register(attempt_id_from_value(&child, "attempt_spawn result")?)?;
+        }
+        Ok(RuntimeValue::Nu(child))
     }
 
     fn eval_attempt_fork_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        let (positional, named) = self.eval_call_values(call)?;
+        let (positional, named, scope) = self.eval_attempt_call_values(call)?;
         if positional.len() > 1 {
             return Err(stone_error(
                 "attempt_fork",
@@ -4506,7 +4584,7 @@ impl Evaluator<'_> {
                 }
             }
         }
-        gateway_env::attempt_fork(
+        let child = gateway_env::attempt_fork(
             parent_attempt,
             task,
             controller,
@@ -4517,8 +4595,11 @@ impl Evaluator<'_> {
             metadata,
             program,
             start,
-        )
-        .map(RuntimeValue::Nu)
+        )?;
+        if let Some(scope) = scope {
+            scope.register(attempt_id_from_value(&child, "attempt_fork result")?)?;
+        }
+        Ok(RuntimeValue::Nu(child))
     }
 
     fn eval_attempt_finish_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -4604,6 +4685,375 @@ impl Evaluator<'_> {
         gateway_env::attempt_wait(attempt, timeout_ms).map(RuntimeValue::Nu)
     }
 
+    fn eval_attempt_join_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 2 {
+            return Err(stone_error(
+                "attempt_join",
+                "attempt_join() accepts at most attempt and timeout_ms arguments",
+            ));
+        }
+        let mut attempt = positional
+            .first()
+            .map(|value| attempt_id_from_value(value, "attempt_join attempt"))
+            .transpose()?
+            .unwrap_or_default();
+        let mut timeout_ms = positional
+            .get(1)
+            .map(|value| value_to_optional_timeout(value, "attempt_join timeout_ms"))
+            .transpose()?
+            .flatten();
+        for (name, value) in named {
+            match name.as_str() {
+                "attempt" => attempt = attempt_id_from_value(&value, "attempt_join attempt")?,
+                "timeout_ms" => {
+                    timeout_ms = value_to_optional_timeout(&value, "attempt_join timeout_ms")?
+                }
+                _ => {
+                    return Err(stone_error(
+                        "attempt_join",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        if attempt.is_empty() {
+            return Err(stone_error(
+                "attempt_join",
+                "attempt_join() requires a child attempt",
+            ));
+        }
+        let waited = gateway_env::attempt_wait(attempt.clone(), timeout_ms)?;
+        let state = attempt_record_state(&waited)
+            .unwrap_or("unknown")
+            .to_string();
+        let controller_state = attempt_controller_state(&waited)
+            .unwrap_or("unknown")
+            .to_string();
+        let joined = matches!(
+            controller_state.as_str(),
+            "exited" | "failed" | "terminated"
+        );
+        if joined {
+            for scope in &self.state.attempt_scopes {
+                scope.mark_joined(&attempt)?;
+            }
+        }
+        let span = Span::unknown();
+        let mut outcome = Record::new();
+        outcome.push("attempt", Value::string(attempt, span));
+        outcome.push("joined", Value::bool(joined, span));
+        outcome.push("timed_out", Value::bool(!joined, span));
+        outcome.push("state", Value::string(state, span));
+        outcome.push("controller_state", Value::string(controller_state, span));
+        outcome.push("record", waited);
+        Ok(RuntimeValue::Nu(Value::record(outcome, span)))
+    }
+
+    fn eval_attempt_terminate_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 1 {
+            return Err(stone_error(
+                "attempt_terminate",
+                "attempt_terminate() accepts exactly one attempt argument",
+            ));
+        }
+        let mut attempt = positional
+            .first()
+            .map(|value| attempt_id_from_value(value, "attempt_terminate attempt"))
+            .transpose()?
+            .unwrap_or_default();
+        for (name, value) in named {
+            match name.as_str() {
+                "attempt" => attempt = attempt_id_from_value(&value, "attempt_terminate attempt")?,
+                _ => {
+                    return Err(stone_error(
+                        "attempt_terminate",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        if attempt.is_empty() {
+            return Err(stone_error(
+                "attempt_terminate",
+                "attempt_terminate() requires a child attempt",
+            ));
+        }
+        gateway_env::attempt_terminate(attempt).map(RuntimeValue::Nu)
+    }
+
+    fn eval_attempt_scope_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 1 {
+            return Err(stone_error(
+                "attempt_scope",
+                "attempt_scope() accepts at most one exit_policy argument",
+            ));
+        }
+        let mut exit_policy = positional
+            .first()
+            .map(|value| value_to_string(value, "attempt_scope exit_policy"))
+            .transpose()?
+            .unwrap_or_else(|| "cancel_then_join".to_string());
+        let mut join_timeout_ms = 5_000_u32;
+        for (name, value) in named {
+            match name.as_str() {
+                "exit_policy" => {
+                    exit_policy = value_to_string(&value, "attempt_scope exit_policy")?
+                }
+                "join_timeout_ms" => {
+                    join_timeout_ms =
+                        u32::try_from(value_to_u64(&value, "attempt_scope join_timeout_ms")?)
+                            .map_err(|_| {
+                                stone_error("attempt_scope", "join_timeout_ms is too large")
+                            })?;
+                }
+                _ => {
+                    return Err(stone_error(
+                        "attempt_scope",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        if exit_policy != "cancel_then_join" {
+            return Err(stone_error(
+                "attempt_scope",
+                "attempt_scope currently supports only exit_policy=\"cancel_then_join\"",
+            ));
+        }
+        if join_timeout_ms == 0 {
+            return Err(stone_error(
+                "attempt_scope",
+                "join_timeout_ms must be greater than zero",
+            ));
+        }
+        let scope =
+            AttemptScopeValue::new(self.state.next_callable_id(), exit_policy, join_timeout_ms);
+        self.state.attempt_scopes.push(scope.clone());
+        Ok(RuntimeValue::AttemptScope(scope))
+    }
+
+    fn eval_attempt_scope_add_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if call.positional.len() != 2 || !call.named.is_empty() {
+            return Err(stone_error(
+                "attempt_scope_add",
+                "attempt_scope_add() requires scope and child arguments",
+            ));
+        }
+        let scope = self.eval_attempt_scope_expr(&call.positional[0], "attempt_scope_add")?;
+        let child = self
+            .eval_expr_value(&call.positional[1], PipelineData::empty())?
+            .into_nu_value("attempt_scope_add child")?;
+        let attempt = attempt_id_from_value(&child, "attempt_scope_add child")?;
+        scope.register(attempt)?;
+        Ok(RuntimeValue::AttemptScope(scope))
+    }
+
+    fn eval_attempt_scope_close_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if call.positional.len() != 1 {
+            return Err(stone_error(
+                "attempt_scope_close",
+                "attempt_scope_close() requires exactly one scope argument",
+            ));
+        }
+        let scope = self.eval_attempt_scope_expr(&call.positional[0], "attempt_scope_close")?;
+        let mut reason = "attempt scope closed".to_string();
+        for (name, expression) in &call.named {
+            let value = self
+                .eval_expr_value(expression, PipelineData::empty())?
+                .into_nu_value("attempt_scope_close reason")?;
+            match name.as_str() {
+                "reason" => reason = value_to_string(&value, "attempt_scope_close reason")?,
+                _ => {
+                    return Err(stone_error(
+                        "attempt_scope_close",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        self.close_attempt_scope(&scope, &reason)
+            .map(RuntimeValue::Nu)
+    }
+
+    fn eval_attempt_scope_expr(
+        &mut self,
+        expression: &Expr,
+        context: &str,
+    ) -> Result<AttemptScopeValue, ShellError> {
+        match self.eval_expr_value(expression, PipelineData::empty())? {
+            RuntimeValue::AttemptScope(scope) => Ok(scope),
+            other => Err(stone_error(
+                context,
+                format!("expected attempt_scope, got {}", runtime_type_name(&other)),
+            )),
+        }
+    }
+
+    fn close_attempt_scope(
+        &mut self,
+        scope: &AttemptScopeValue,
+        reason: &str,
+    ) -> Result<Value, ShellError> {
+        let (exit_policy, join_timeout_ms, children, already_closed) = {
+            let state = scope.lock()?;
+            let already_closed = state.closed;
+            (
+                state.exit_policy.clone(),
+                state.join_timeout_ms,
+                state.children.clone(),
+                already_closed,
+            )
+        };
+        if already_closed {
+            return Ok(json_to_nu_value(
+                json!({
+                    "scope": scope.scope_id,
+                    "exit_policy": exit_policy,
+                    "closed": true,
+                    "already_closed": true,
+                    "clean": true,
+                    "children": [],
+                }),
+                Span::unknown(),
+            ));
+        }
+
+        let mut clean = true;
+        let mut reports = Vec::with_capacity(children.len());
+        for child in children {
+            if child.resolved {
+                reports.push(json!({
+                    "attempt": child.attempt,
+                    "joined": child.joined,
+                    "resolved": true,
+                    "action": "already_resolved",
+                    "clean": true,
+                }));
+                continue;
+            }
+
+            let mut errors = Vec::new();
+            let mut terminated = false;
+            let mut joined = child.joined;
+            let mut discarded = false;
+            let mut state_name = "unknown".to_string();
+            let mut controller_state = None;
+            match gateway_env::attempt_state(child.attempt.clone(), 1) {
+                Ok(state) => {
+                    state_name = attempt_record_state(&state)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    controller_state = attempt_controller_state(&state).map(str::to_string);
+                }
+                Err(error) => errors.push(format!("state: {error}")),
+            }
+
+            if state_name == "active" {
+                if controller_state
+                    .as_deref()
+                    .is_some_and(|state| matches!(state, "starting" | "running" | "terminating"))
+                {
+                    match gateway_env::attempt_terminate(child.attempt.clone()) {
+                        Ok(_) => terminated = true,
+                        Err(error) => errors.push(format!("terminate: {error}")),
+                    }
+                }
+                if controller_state.is_some() && !joined {
+                    match gateway_env::attempt_wait(child.attempt.clone(), Some(join_timeout_ms)) {
+                        Ok(waited) => {
+                            joined = attempt_controller_state(&waited).is_some_and(|state| {
+                                matches!(state, "exited" | "failed" | "terminated")
+                            });
+                            if joined {
+                                scope.mark_joined(&child.attempt)?;
+                            }
+                        }
+                        Err(error) => errors.push(format!("join: {error}")),
+                    }
+                }
+            }
+
+            match gateway_env::attempt_state(child.attempt.clone(), 1) {
+                Ok(state) => {
+                    state_name = attempt_record_state(&state)
+                        .unwrap_or("unknown")
+                        .to_string();
+                }
+                Err(error) => errors.push(format!("final state: {error}")),
+            }
+            if state_name == "active" {
+                match gateway_env::attempt_discard(child.attempt.clone(), reason.to_string()) {
+                    Ok(_) => {
+                        discarded = true;
+                        state_name = "rolled_back".to_string();
+                        scope.mark_resolved(&child.attempt)?;
+                    }
+                    Err(error) => errors.push(format!("discard: {error}")),
+                }
+            } else if state_name != "unknown" {
+                scope.mark_resolved(&child.attempt)?;
+            }
+            let child_clean =
+                errors.is_empty() && state_name != "active" && state_name != "unknown";
+            clean &= child_clean;
+            reports.push(json!({
+                "attempt": child.attempt,
+                "joined": joined,
+                "terminated": terminated,
+                "discarded": discarded,
+                "state": state_name,
+                "clean": child_clean,
+                "errors": errors,
+            }));
+        }
+
+        if clean {
+            scope.lock()?.closed = true;
+        }
+
+        Ok(json_to_nu_value(
+            json!({
+                "scope": scope.scope_id,
+                "exit_policy": exit_policy,
+                "closed": clean,
+                "already_closed": false,
+                "clean": clean,
+                "children": reports,
+            }),
+            Span::unknown(),
+        ))
+    }
+
+    fn close_open_attempt_scopes(&mut self, reason: &str) -> Result<(), ShellError> {
+        let scopes = self.state.attempt_scopes.clone();
+        let mut failed = Vec::new();
+        for scope in scopes {
+            let is_closed = scope.lock()?.closed;
+            if is_closed {
+                continue;
+            }
+            let report = self.close_attempt_scope(&scope, reason)?;
+            let report_json = nu_to_json_value(&report);
+            if report_json.get("clean").and_then(JsonValue::as_bool) != Some(true) {
+                failed.push(report_json);
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(stone_error(
+                "attempt scope cleanup",
+                format!(
+                    "automatic cancel-then-join cleanup was incomplete: {}",
+                    JsonValue::Array(failed)
+                ),
+            ))
+        }
+    }
+
     fn eval_attempt_report_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let (positional, named) = self.eval_call_values(call)?;
         if positional.len() > 2 {
@@ -4676,7 +5126,11 @@ impl Evaluator<'_> {
                 }
             }
         }
-        gateway_env::attempt_accept(parent, child).map(RuntimeValue::Nu)
+        let accepted = gateway_env::attempt_accept(parent, child.clone())?;
+        for scope in &self.state.attempt_scopes {
+            scope.mark_resolved(&child)?;
+        }
+        Ok(RuntimeValue::Nu(accepted))
     }
 
     fn eval_attempt_discard_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -4709,7 +5163,11 @@ impl Evaluator<'_> {
                 }
             }
         }
-        gateway_env::attempt_discard(attempt, reason).map(RuntimeValue::Nu)
+        let discarded = gateway_env::attempt_discard(attempt.clone(), reason)?;
+        for scope in &self.state.attempt_scopes {
+            scope.mark_resolved(&attempt)?;
+        }
+        Ok(RuntimeValue::Nu(discarded))
     }
 
     fn eval_attempt_publish_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -6485,6 +6943,11 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "attempt_spawn",
     "attempt_start",
     "attempt_state",
+    "attempt_scope",
+    "attempt_scope_add",
+    "attempt_scope_close",
+    "attempt_join",
+    "attempt_terminate",
     "attempt_wait",
     "attempts",
     "env_checkpoint",
@@ -7044,6 +7507,7 @@ fn runtime_type_name(value: &RuntimeValue) -> &'static str {
         RuntimeValue::JsonScalarView(_) => "json",
         RuntimeValue::Callable(_) => "function",
         RuntimeValue::AgentControl(_) => "agent_control",
+        RuntimeValue::AttemptScope(_) => "attempt_scope",
     }
 }
 
@@ -7212,14 +7676,35 @@ fn value_to_iter_values(value: &RuntimeValue) -> Result<Vec<Value>, ShellError> 
                 control.control_id
             ),
         )),
+        RuntimeValue::AttemptScope(scope) => Err(stone_error(
+            "iteration",
+            format!(
+                "cannot iterate attempt scope #{}; use scope.children",
+                scope.scope_id
+            ),
+        )),
     }
 }
 
-fn stone_error(kind: &str, message: impl Into<String>) -> ShellError {
+pub(super) fn stone_error(kind: &str, message: impl Into<String>) -> ShellError {
     ShellError::Generic(
         GenericError::new_internal(format!("Stone {kind} error"), message.into())
             .with_code("stone_script_error"),
     )
+}
+
+fn attach_cleanup_error(program_error: ShellError, cleanup_error: ShellError) -> ShellError {
+    match program_error {
+        ShellError::Generic(error) => ShellError::Generic(error.with_inner(vec![cleanup_error])),
+        other => ShellError::Generic(
+            GenericError::new_internal(
+                "Stone evaluation and attempt-scope cleanup both failed",
+                "inspect both related errors before resuming the attempt",
+            )
+            .with_code("stone_script_error")
+            .with_inner(vec![other, cleanup_error]),
+        ),
+    }
 }
 
 fn model_call_input_error(message: impl Into<String>) -> ShellError {
@@ -7314,6 +7799,56 @@ fn agent_task_prompt(session: &JsonValue) -> Result<String, ShellError> {
     Ok(format!(
         "{objective}\nStructured task and input: {structured}"
     ))
+}
+
+fn attempt_id_from_value(value: &Value, context: &str) -> Result<String, ShellError> {
+    match value {
+        Value::String { val, .. } => Ok(val.clone()),
+        Value::Record { val, .. } => val
+            .get("attempt")
+            .ok_or_else(|| stone_error(context, "attempt record has no `attempt` field"))
+            .and_then(|value| value_to_string(value, context)),
+        _ => Err(stone_error(
+            context,
+            format!("expected attempt id or record, got {}", value.get_type()),
+        )),
+    }
+}
+
+fn value_to_optional_timeout(value: &Value, context: &str) -> Result<Option<u32>, ShellError> {
+    if matches!(value, Value::Nothing { .. }) {
+        return Ok(None);
+    }
+    u32::try_from(value_to_u64(value, context)?)
+        .map(Some)
+        .map_err(|_| stone_error(context, "timeout_ms is too large"))
+}
+
+fn attempt_record_state(value: &Value) -> Option<&str> {
+    let Value::Record { val, .. } = value else {
+        return None;
+    };
+    let attempt = match val.get("attempt") {
+        Some(Value::Record { val, .. }) => val.as_ref(),
+        _ => val.as_ref(),
+    };
+    attempt.get("state").and_then(|value| value.as_str().ok())
+}
+
+fn attempt_controller_state(value: &Value) -> Option<&str> {
+    let Value::Record { val, .. } = value else {
+        return None;
+    };
+    let attempt = match val.get("attempt") {
+        Some(Value::Record { val, .. }) => val.as_ref(),
+        _ => val.as_ref(),
+    };
+    let Some(Value::Record { val: metadata, .. }) = attempt.get("metadata") else {
+        return None;
+    };
+    metadata
+        .get("controller_state")
+        .and_then(|value| value.as_str().ok())
 }
 
 fn value_to_string_list(value: &Value, context: &str) -> Result<Vec<String>, ShellError> {

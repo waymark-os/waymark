@@ -22,8 +22,9 @@ mod gateway_runtime;
 mod json;
 mod linux_tools;
 mod server;
-mod stone_ast;
 mod stone_agent_control;
+mod stone_ast;
+mod stone_attempt_scope;
 mod stone_builtins;
 mod stone_eval;
 mod stone_file_ops;
@@ -919,6 +920,81 @@ emit({
                 "control": "react_json_v0",
             })
         );
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn stone_attempt_scope_is_structured_and_closes_cleanly() -> Result<(), ShellError> {
+        let start_dir = test_root("stone-attempt-scope-empty");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let result = guest.stone_command_response(
+            r#"scope = attempt_scope(join_timeout_ms=1234)
+before = {"type": type(scope), "policy": scope.exit_policy, "children": scope.children}
+cleanup = attempt_scope_close(scope)
+emit({"before": before, "clean": cleanup.clean, "closed": scope.closed})"#,
+        );
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(
+            result["value"],
+            json!({
+                "before": {
+                    "type": "attempt_scope",
+                    "policy": "cancel_then_join",
+                    "children": [],
+                },
+                "clean": true,
+                "closed": true,
+            })
+        );
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn stone_attempt_scope_auto_closes_at_evaluation_boundary() -> Result<(), ShellError> {
+        let start_dir = test_root("stone-attempt-scope-auto-close");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let result = guest.stone_command_response(
+            r#"scope = attempt_scope()
+emit({"scope": scope.id, "closed_during_body": scope.closed})"#,
+        );
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(result["value"]["closed_during_body"], json!(false));
+        assert_eq!(result["diagnostics"]["session"]["bound"], json!(null));
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn stone_attempt_scope_cleanup_failure_is_related_to_primary_error() -> Result<(), ShellError> {
+        let start_dir = test_root("stone-attempt-scope-related-cleanup-error");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let result = guest.stone_command_response(
+            r#"scope = attempt_scope()
+registered = attempt_scope_add(scope, "missing-child")
+fail("primary failure", code="primary_failure")"#,
+        );
+        assert_eq!(result["ok"], json!(false));
+        assert_eq!(
+            result["error"]["declared_code"],
+            json!("primary_failure"),
+            "{result}"
+        );
+        assert!(result["error"]["related"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|error| error["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("automatic cancel-then-join cleanup")))));
 
         cleanup_dir(&start_dir);
         Ok(())

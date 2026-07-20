@@ -9,6 +9,7 @@ use super::stone_json_view::{
     materialize_jsonl_rows, JsonArrayView, JsonObjectView, JsonScalarView, JsonlRows,
 };
 use crate::stone_agent_control::AgentControlValue;
+use crate::stone_attempt_scope::AttemptScopeValue;
 
 #[derive(Clone)]
 pub(super) enum RuntimeValue {
@@ -21,6 +22,7 @@ pub(super) enum RuntimeValue {
     JsonScalarView(JsonScalarView),
     Callable(CallableValue),
     AgentControl(AgentControlValue),
+    AttemptScope(AttemptScopeValue),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +36,7 @@ pub(super) enum RuntimeValueTag {
     JsonScalarView,
     Callable,
     AgentControl,
+    AttemptScope,
 }
 
 impl RuntimeValueTag {
@@ -49,6 +52,7 @@ impl RuntimeValueTag {
             RuntimeValueTag::JsonScalarView => 7,
             RuntimeValueTag::Callable => 8,
             RuntimeValueTag::AgentControl => 9,
+            RuntimeValueTag::AttemptScope => 10,
         }
     }
 }
@@ -79,6 +83,7 @@ impl RuntimeValue {
                 .iter()
                 .all(|(_, value)| value.is_session_persistable()),
             RuntimeValue::AgentControl(_) => true,
+            RuntimeValue::AttemptScope(_) => false,
             RuntimeValue::File(_) => false,
         }
     }
@@ -95,6 +100,7 @@ impl RuntimeValue {
             RuntimeValue::JsonScalarView(_) => RuntimeValueTag::JsonScalarView,
             RuntimeValue::Callable(_) => RuntimeValueTag::Callable,
             RuntimeValue::AgentControl(_) => RuntimeValueTag::AgentControl,
+            RuntimeValue::AttemptScope(_) => RuntimeValueTag::AttemptScope,
         }
     }
 
@@ -132,6 +138,13 @@ impl RuntimeValue {
                     control.control_id
                 ),
             )),
+            RuntimeValue::AttemptScope(scope) => Err(stone_error(
+                context,
+                format!(
+                    "attempt scope #{} is a task-owned supervision value and cannot cross this boundary",
+                    scope.scope_id
+                ),
+            )),
         }
     }
 }
@@ -155,6 +168,7 @@ mod tests {
         assert_eq!(RuntimeValueTag::JsonScalarView.id(), 7);
         assert_eq!(RuntimeValueTag::Callable.id(), 8);
         assert_eq!(RuntimeValueTag::AgentControl.id(), 9);
+        assert_eq!(RuntimeValueTag::AttemptScope.id(), 10);
     }
 
     #[test]

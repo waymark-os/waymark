@@ -957,7 +957,7 @@ multiple child entrypoints; the parent launches a bounded portfolio, observes
 and joins every child, accepts one result, discards the others, and exits with
 no manual source-string construction or leaked lifecycle state.
 
-The first implementation slice now establishes the control seam:
+The M2.5 implementation now establishes the control and supervision seams:
 
 - `waymark-runtime` exposes a public Rust `AgentControl` trait and
   `AgentSession::run_control` driver;
@@ -979,12 +979,26 @@ The first implementation slice now establishes the control seam:
 - `examples/scripts/native_react_control.stone` is the boundary canary: its
   fixture-backed LibOS run exercises admitted Stone -> callable control ->
   Gateway `model.call` and returns the model-selected structured final value.
+- `attempt_scope(...)` now creates an opaque task-owned supervision value.
+  Passing `scope=scope` to `attempt_spawn` or `attempt_fork` registers the
+  child; `attempt_join` distinguishes controller completion from the still
+  active candidate-selection state; accept/discard resolves scope ownership.
+- `attempt_scope_close` performs bounded cancel-then-join cleanup and rolls
+  back every unresolved child. The evaluator closes all remaining scopes on
+  both successful and exceptional exit, and reports incomplete cleanup as a
+  primary or related structured error rather than silently leaking it.
+- `examples/scripts/attempt_scope_cleanup.stone` and
+  `attempt_scope_error_cleanup.stone` are LibOS/Gateway boundary canaries. The
+  former proves explicit join and rollback; the latter intentionally fails
+  after spawn and proves automatic child rollback while preserving the
+  original declared failure.
 
 This closes the native-to-Stone invocation seam. It does not yet provide the
 standard Stone adapter library (`with_tools`, `with_context`, budgets, retry,
-verification, and event hooks), module-entrypoint spawning, or structured
-attempt scopes. Those are the remaining M2.5 composition and attempt-tree
-ergonomics, rather than another agent execution representation.
+verification, and event hooks), module-entrypoint spawning, typed attempt
+handles/full outcomes, wait-any/wait-all, or aggregate budget/event views.
+Those are the remaining M2.5 composition and attempt-tree ergonomics, rather
+than another agent execution representation.
 
 ### M3: Typed Inference
 
@@ -1120,12 +1134,12 @@ boundary are recorded in `STONE_AGENT_AUTHORSHIP_M2_PILOT.md`.
 
 Continue M2.5 before another broad Terminal-Bench comparison. The shared
 `AgentControl` contract and first-class optimized Stone controls now establish
-the invocation seam. Next expose the coherent Shell resource tool families,
-ordinary control adapters, current-module entrypoint launch, and a structured
-scope vertical slice. The current raw fork/start/wait/accept calls prove only
-that Gateway can execute a tree; escaped child source, untyped ids, manual
-cleanup, and per-operation timeouts are not yet the intended programming
-model. After deterministic fixtures, run validation plan C followed by
+the invocation seam, and task-owned scopes now provide bounded automatic child
+cleanup. Next expose ordinary control adapters, current-module entrypoint
+launch, typed attempt handles/outcomes, wait-any/wait-all, and aggregate
+budget/event views. Escaped child source, untyped ids, and per-operation
+timeouts are still not the intended final programming model. After
+deterministic fixtures, run validation plan C followed by
 untouched, historically unresolved Terminal-Bench tasks. Do not treat the
 deterministic mechanism cohort as validation of the broader attempt-first OS
 hypothesis.
