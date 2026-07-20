@@ -341,6 +341,12 @@ Use an ordinary model call for another perspective inside the same state. Use a
 child attempt when work needs independent workspace state, lifecycle,
 capability/budget attenuation, cancellation, or candidate acceptance.
 
+The attempt and attempt-tree semantics are language-independent. Stone is the
+Python-shaped language used to compile `AttemptSpec` values and implement the
+parent controller; it must not redefine an attempt around ReAct, critic loops,
+or any other policy. The normative process analogy is specified in
+[Attempt Process And Process-Tree Model](../../waymark-gateway/docs/ATTEMPT_PROCESS_TREE_MODEL.md).
+
 ### 7. Failures Are Values At Policy Boundaries
 
 Transport, rate-limit, malformed-output, tool, timeout, cancellation, and
@@ -637,6 +643,83 @@ Do not create child attempts merely to represent every prompt persona or every
 model call. That would make the process abstraction too expensive and obscure
 the actual state boundary.
 
+### Process-Tree Mapping
+
+Stone needs to distinguish three levels:
+
+```text
+Stone function/loop       local deterministic or model-driven control
+operation handle          asynchronous Linux/model/browser/device effect owned
+                          by the current attempt
+attempt handle            independently isolated and supervised computation
+```
+
+The supervision tree owns lifetime, signals, budget reservations, and reaping.
+Workspace, context, artifact, and evidence lineage may form DAGs and must be
+specified separately. A child exit is not a merge, and a parent wait is not an
+acceptance decision.
+
+The current inline form:
+
+```stone
+attempt_fork(program={"kind": "stone", "source": "..."}, start=True)
+```
+
+is bootstrap IR exposed as source. It forces an outer model to generate and
+escape nested programs and gives the compiler little opportunity to check
+entrypoints or data capture. The target is one content-addressed Stone module
+with multiple named entrypoints:
+
+```stone
+def worker(input):
+    return candidate(value=solve(input), evidence=[])
+
+
+def main(input):
+    scope = attempt_scope(exit_policy="cancel_then_join")
+    spec = attempt_spec(
+        task=task_refine(task_spec(), objective="Try alternate solver"),
+        program=program_entry("worker"),
+        input={"strategy": "alternate"},
+        workspace=workspace_fork(),
+        context=context_summary(),
+        capabilities=attenuate(["workspace", "linux.exec", "model.call"]),
+        budget={"wall_time_ms": 120000, "model_calls": 4},
+        result_schema=CANDIDATE_SCHEMA,
+    )
+    child = attempt_spawn(spec, scope=scope)
+    outcome = attempt_join(child)
+    if outcome.evaluation.status == "passed":
+        attempt_accept(attempt_info().attempt, child, import="workspace_all_allowed")
+    else:
+        attempt_discard(child, reason="candidate did not pass")
+    attempt_scope_close(scope)
+    return inspect_parent_result()
+```
+
+This remains ordinary Python-shaped Stone with structured values. The compiler
+lowers the module entrypoint and `attempt_spec` value to the Gateway's
+language-independent AgentProgram/AttemptSpec IR. It rejects unknown
+entrypoints, unserializable captures, missing cleanup policy, invalid source
+planes, and statically visible authority or budget amplification. Gateway
+rechecks all authority and lifecycle constraints at admission and runtime.
+
+The first process-tree surface should include:
+
+- `program_entry`, `attempt_spec`, and typed `AttemptHandle`;
+- `attempt_scope`, child sets, `attempt_wait_any`, `attempt_wait_all`, and
+  `attempt_join`;
+- cancel/terminate/kill signals and mandatory cancel-then-join scope cleanup;
+- typed `AttemptOutcome` separating execution, result, evaluation, selection,
+  and cleanup;
+- aggregate root/child budget views and attempt-owned operation ledgers;
+- bounded progress events before general peer messaging.
+
+Portfolio selection, semantic duplicate detection, critic placement, retry
+strategy, and scoring remain Stone library/program policy. Scope cleanup,
+budget conservation, authority attenuation, and immutable outcome delivery are
+attempt-runtime semantics.
+
 ## Errors, Cancellation, And Resume
 
 ### Error Taxonomy
@@ -777,6 +860,22 @@ The first GPT-5.5 authorship observation and its deliberately limited
 interpretation are recorded in `STONE_AGENT_AUTHORSHIP_M2_PILOT.md`. That pilot
 does not yet meet this exit criterion.
 
+### M2.5: Attempt Process-Tree Surface
+
+1. Compile multiple named entrypoints from one Stone module and address them by
+   program digest plus entrypoint.
+2. Add typed `attempt_spec`, attempt handles, and immutable attempt outcomes.
+3. Add structured child scopes with wait-any/wait-all, join, and automatic
+   cancel-then-join cleanup.
+4. Expose aggregate budget/usage and attempt-owned operation history as
+   structured values.
+5. Add a bounded child progress event stream.
+
+Exit criterion: an outer model writes one Stone module containing a parent and
+multiple child entrypoints; the parent launches a bounded portfolio, observes
+and joins every child, accepts one result, discards the others, and exits with
+no manual source-string construction or leaked lifecycle state.
+
 ### M3: Typed Inference
 
 1. Add JSON Schema validation to the Waymark runtime.
@@ -909,10 +1008,11 @@ helps agent computer use. A successful Stone ReAct demo alone does not.
 M1 and the M2 mechanism gate are complete. The evidence and remaining claim
 boundary are recorded in `STONE_AGENT_AUTHORSHIP_M2_PILOT.md`.
 
-Run validation plan C next: freeze the Rust loop and require a control behavior
-that is not one of its configuration options, such as invoking a critic only
-after a failed verifier. The outer agent must express the change entirely as
-admitted Stone, and the runtime must remain unchanged. Then move to untouched,
-historically unresolved Terminal-Bench tasks for outcome evidence. Do not treat
-the deterministic M2 fixture cohort as validation of the broader attempt-first
-OS hypothesis.
+Implement and validate M2.5 before another broad Terminal-Bench comparison.
+The current raw fork/start/wait/accept calls prove that Gateway can execute a
+tree, but escaped child source, untyped ids, manual cleanup, and per-operation
+timeouts are not yet the intended attempt programming model. First prove the
+module-entrypoint and structured-scope vertical slice with deterministic
+fixtures. Then run validation plan C using that surface, followed by untouched,
+historically unresolved Terminal-Bench tasks. Do not treat the deterministic
+mechanism cohort as validation of the broader attempt-first OS hypothesis.
