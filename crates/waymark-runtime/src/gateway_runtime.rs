@@ -730,6 +730,39 @@ fn gateway_linux_request(
     client: &mut GatewayRpcClient<GatewayClientStream>,
     request: &JsonValue,
 ) -> Result<JsonValue, ShellError> {
+    let operation = request
+        .get("op")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("exec");
+    if operation == "terminate" {
+        let run_id = request
+            .get("run_id")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| stone_error("gateway linux", "terminate requires run_id"))?;
+        let output = client
+            .linux_exec_terminate(run_id)
+            .map_err(|err| stone_error("gateway rpc", err.to_string()))?;
+        let record = linux_exec_record(output, Span::unknown(), usize::MAX, usize::MAX)?;
+        let value = nu_to_json_value(&Value::record(record, Span::unknown()));
+        return Ok(json!({
+            "ok": value.get("ok").and_then(JsonValue::as_bool).unwrap_or(false),
+            "kind": value.get("kind").cloned().unwrap_or_else(|| json!("terminated")),
+            "value": {
+                "run_id": run_id,
+                "still_running": value.get("still_running").cloned().unwrap_or_else(|| json!(false)),
+                "exit_code": value.get("exit_code").cloned().unwrap_or(JsonValue::Null),
+            },
+            "stdout": value.get("stdout").cloned().unwrap_or_else(|| json!("")),
+            "stderr": value.get("stderr").cloned().unwrap_or_else(|| json!("")),
+            "duration_ms": value.get("duration_ms").cloned().unwrap_or_else(|| json!(0)),
+        }));
+    }
+    if operation != "exec" {
+        return Err(stone_error(
+            "gateway linux",
+            format!("unsupported linux operation {operation:?}"),
+        ));
+    }
     let command = request
         .get("command")
         .and_then(JsonValue::as_str)
@@ -776,6 +809,9 @@ fn gateway_linux_request(
             "exit_code": value.get("exit_code").cloned().unwrap_or(JsonValue::Null),
             "cwd": cwd,
             "command": command,
+            "run_id": value.get("run_id").cloned().unwrap_or(JsonValue::Null),
+            "still_running": value.get("still_running").cloned().unwrap_or_else(|| json!(false)),
+            "timed_out": value.get("timed_out").cloned().unwrap_or_else(|| json!(false)),
         },
         "stdout": value.get("stdout").cloned().unwrap_or_else(|| json!("")),
         "stderr": value.get("stderr").cloned().unwrap_or_else(|| json!("")),

@@ -211,11 +211,13 @@ impl AgentSession {
                     AgentAction::Tool(call) => {
                         saw_tool = true;
                         self.push_event("tool_call", call.clone());
-                        let mut host_rpc = AgentHostCapabilityRpc(gateway);
-                        let result =
+                        let result = {
+                            let mut host_rpc = AgentHostCapabilityRpc(gateway);
                             self.tools
-                                .invoke_json_with_host_rpc(guest, &call, Some(&mut host_rpc));
-                        let result_json = result.to_json();
+                                .invoke_json_with_host_rpc(guest, &call, Some(&mut host_rpc))
+                        };
+                        let mut result_json = result.to_json();
+                        terminate_active_linux_run(&mut result_json, gateway);
                         self.push_event("tool_result", result_json.clone());
                         messages.push(tool_observation_message(&call, &result_json));
                         if result_json.get("ok") == Some(&JsonValue::Bool(true)) {
@@ -528,6 +530,28 @@ fn tool_observation_message(call: &JsonValue, result: &JsonValue) -> JsonValue {
     })
 }
 
+fn terminate_active_linux_run(result: &mut JsonValue, gateway: &mut dyn AgentModelGateway) {
+    let value = result.get("value").unwrap_or(&JsonValue::Null);
+    if value.get("still_running").and_then(JsonValue::as_bool) != Some(true) {
+        return;
+    }
+    let Some(run_id) = value.get("run_id").and_then(JsonValue::as_str) else {
+        return;
+    };
+    let cleanup = gateway
+        .request_linux_rpc(&json!({"op": "terminate", "run_id": run_id}))
+        .unwrap_or_else(|error| {
+            json!({
+                "ok": false,
+                "kind": "linux_terminate_failed",
+                "error": {"message": error},
+            })
+        });
+    if let Some(fields) = result.as_object_mut() {
+        fields.insert("active_run_cleanup".to_owned(), cleanup);
+    }
+}
+
 pub fn parse_model_actions(content: &str) -> Result<Vec<AgentAction>, AgentError> {
     let decoded = parse_model_json(content)?;
     if decoded.get("tool").and_then(JsonValue::as_str) == Some("finish")
@@ -766,6 +790,46 @@ mod tests {
                 "answer": "done",
                 "answer_path": "/work/out.txt",
             }))]
+        );
+    }
+
+    #[test]
+    fn builtin_agent_terminates_active_linux_run_handles() {
+        struct CleanupGateway {
+            requests: Vec<JsonValue>,
+        }
+
+        impl AgentModelGateway for CleanupGateway {
+            fn request_model(&mut self, _request: &JsonValue) -> Result<JsonValue, AgentError> {
+                unreachable!("cleanup test does not call the model")
+            }
+
+            fn request_linux_rpc(&mut self, request: &JsonValue) -> Result<JsonValue, String> {
+                self.requests.push(request.clone());
+                Ok(json!({
+                    "ok": true,
+                    "kind": "terminated",
+                    "value": {"run_id": "run-7", "still_running": false},
+                }))
+            }
+        }
+
+        let mut gateway = CleanupGateway { requests: vec![] };
+        let mut result = json!({
+            "ok": false,
+            "kind": "linux_exec_timeout",
+            "value": {"run_id": "run-7", "still_running": true},
+        });
+        terminate_active_linux_run(&mut result, &mut gateway);
+
+        assert_eq!(
+            gateway.requests,
+            vec![json!({"op": "terminate", "run_id": "run-7"})]
+        );
+        assert_eq!(result["active_run_cleanup"]["ok"], json!(true));
+        assert_eq!(
+            result["active_run_cleanup"]["value"]["still_running"],
+            json!(false)
         );
     }
 
