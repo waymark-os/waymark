@@ -102,24 +102,6 @@ impl GatewayAgentModelGateway {
     }
 
     #[cfg(any(unix, target_os = "hermit"))]
-    fn client_and_config(
-        &mut self,
-    ) -> Result<
-        (
-            GatewayRuntimeConfig,
-            &mut GatewayRpcClient<GatewayClientStream>,
-        ),
-        ShellError,
-    > {
-        self.ensure_client()?;
-        let config = self.config.clone();
-        Ok((
-            config,
-            self.client.as_mut().expect("gateway client initialized"),
-        ))
-    }
-
-    #[cfg(any(unix, target_os = "hermit"))]
     pub(crate) fn attempt_task_value(&mut self) -> Result<JsonValue, ShellError> {
         self.ensure_client()?;
         // Boot-token attachment resolves the authoritative attempt, tx, and
@@ -185,45 +167,31 @@ impl GatewayAgentModelGateway {
         ))
     }
 
-    #[cfg(not(any(unix, target_os = "hermit")))]
-    fn client_and_config(
-        &mut self,
-    ) -> Result<
-        (
-            GatewayRuntimeConfig,
-            &mut GatewayRpcClient<UnsupportedGatewayStream>,
-        ),
-        ShellError,
-    > {
-        Err(stone_error(
-            "gateway connect",
-            "Gateway transport is not wired in this build",
-        ))
-    }
 }
 
 impl AgentModelGateway for GatewayAgentModelGateway {
     fn request_model(&mut self, request: &JsonValue) -> Result<JsonValue, AgentError> {
-        let (config, client) = self.client_and_config().map_err(agent_gateway_error)?;
-        gateway_model_request(&config, client, request).map_err(agent_gateway_error)
+        let config = self.config.clone();
+        with_runtime_client(&config, |client| {
+            gateway_model_request(&config, client, request)
+        })
+        .map_err(agent_gateway_error)
     }
 
     fn request_workspace_rpc(&mut self, request: &JsonValue) -> Result<JsonValue, String> {
-        match self.client_and_config() {
-            Ok((config, client)) => {
-                gateway_workspace_request(&config, client, request).map_err(|err| err.to_string())
-            }
-            Err(err) => Err(err.to_string()),
-        }
+        let config = self.config.clone();
+        with_runtime_client(&config, |client| {
+            gateway_workspace_request(&config, client, request)
+        })
+        .map_err(|err| err.to_string())
     }
 
     fn request_linux_rpc(&mut self, request: &JsonValue) -> Result<JsonValue, String> {
-        match self.client_and_config() {
-            Ok((config, client)) => {
-                gateway_linux_request(&config, client, request).map_err(|err| err.to_string())
-            }
-            Err(err) => Err(err.to_string()),
-        }
+        let config = self.config.clone();
+        with_runtime_client(&config, |client| {
+            gateway_linux_request(&config, client, request)
+        })
+        .map_err(|err| err.to_string())
     }
 }
 
@@ -1937,16 +1905,26 @@ pub(crate) fn with_client<T>(
     config: &GatewayRuntimeConfig,
     call: impl FnOnce(&mut GatewayRpcClient<GatewayClientStream>) -> waymark_gateway_client::Result<T>,
 ) -> Result<T, ShellError> {
+    with_runtime_client(config, |client| {
+        call(client).map_err(|err| stone_error("gateway rpc", err.to_string()))
+    })
+}
+
+#[cfg(any(unix, target_os = "hermit"))]
+fn with_runtime_client<T>(
+    config: &GatewayRuntimeConfig,
+    call: impl FnOnce(&mut GatewayRpcClient<GatewayClientStream>) -> Result<T, ShellError>,
+) -> Result<T, ShellError> {
     if let Some(client) = shared_gateway_client()
         .lock()
         .map_err(|_| stone_error("gateway client", "shared Gateway client lock poisoned"))?
         .as_mut()
     {
-        return call(client).map_err(|err| stone_error("gateway rpc", err.to_string()));
+        return call(client);
     }
     let mut config = config.clone();
     let mut client = connect_attached_gateway_client(&mut config)?;
-    call(&mut client).map_err(|err| stone_error("gateway rpc", err.to_string()))
+    call(&mut client)
 }
 
 #[cfg(not(any(unix, target_os = "hermit")))]

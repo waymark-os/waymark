@@ -52,20 +52,16 @@ impl StoneGuest {
         };
         match gateway.attempt_task_value() {
             Ok(task) => {
-                if task
-                    .get("runtime")
-                    .and_then(JsonValue::as_object)
-                    .and_then(|runtime| runtime.get("frontend"))
-                    .and_then(JsonValue::as_str)
-                    == Some("stone")
-                {
-                    if let Err(err) = gateway.install_shared_client() {
-                        return task_error(
-                            None,
-                            "gateway_attempt_unavailable",
-                            shell_error_message(&err),
-                        );
-                    }
+                // A Gateway attempt owns one attached controller channel. Both
+                // admitted Stone programs and the builtin model loop may run
+                // Stone snippets, so all frontends must share that channel
+                // with model, workspace, and Linux RPCs.
+                if let Err(err) = gateway.install_shared_client() {
+                    return task_error(
+                        None,
+                        "gateway_attempt_unavailable",
+                        shell_error_message(&err),
+                    );
                 }
                 let response = self.task_response_from_value_with_model_gateway(task, &mut gateway);
                 if let Err(err) = gateway.report_attempt_result(&response) {
