@@ -1060,10 +1060,11 @@ The M2.5 implementation now establishes the control and supervision seams:
   through an ordinary Stone function, accepts it, waits for and discards the
   remaining child, and closes the supervision scope.
 
-This closes the native-to-Stone invocation seam. It does not yet provide the
-standard Stone adapter library (`with_tools`, `with_context`, budgets, retry,
-verification, and event hooks), verifier-populated evaluation outcomes,
-per-fork input, or aggregate budget/event views.
+This closes the native-to-Stone invocation seam. Forked named entrypoints now
+also receive structured per-fork input through ordinary `input=...` syntax. It
+does not yet provide the standard Stone adapter library (`with_tools`,
+`with_context`, budgets, retry, verification, and event hooks),
+verifier-populated evaluation outcomes, or aggregate budget/event views.
 Those are the remaining M2.5 composition and attempt-tree ergonomics, rather
 than another agent execution representation.
 
@@ -1205,7 +1206,7 @@ the invocation seam, and task-owned scopes now provide bounded automatic child
 cleanup, and current-module named entrypoints remove escaped child source.
 Typed attempt handles, structured outcome snapshots, and Gateway wait sets now
 cover the basic process-tree control path. Next expose ordinary control
-adapters, per-fork task input, verifier-populated evaluation outcomes, and
+adapters, verifier-populated evaluation outcomes, and
 aggregate budget/event views. Compatibility ids remain accepted at syscall
 boundaries, but new Stone control should retain handles. After deterministic fixtures, run validation plan C
 followed by untouched, historically unresolved Terminal-Bench tasks. Do not treat the

@@ -1,0 +1,31 @@
+def worker(input):
+    write_file("/app/candidate.txt", input.message + "\n")
+    return {"answer": "worker complete", "strategy": input.strategy}
+
+
+def main(input):
+    root = attempt_info()
+    scope = attempt_scope(join_timeout_ms=30000)
+    child = attempt_fork(
+        program=current_program(),
+        entrypoint="worker",
+        input={"message": input.message, "strategy": "fork-input"},
+        start=True,
+        scope=scope,
+    )
+    outcome = attempt_join(child, timeout_ms=30000)
+    if not outcome.joined:
+        fail("worker did not join", code="fork_input_join_failed", detail=outcome)
+
+    accepted = attempt_accept(root.attempt, child.attempt)
+    cleanup = attempt_scope_close(scope)
+    if not cleanup.clean:
+        fail("fork input scope cleanup failed", code="fork_input_cleanup_failed", detail=cleanup)
+
+    return {
+        "answer": input.answer,
+        "worker": child.attempt,
+        "worker_controller_state": outcome.controller_state,
+        "accepted_child": accepted.child.attempt,
+        "candidate": read_text("/app/candidate.txt"),
+    }

@@ -175,6 +175,7 @@ pub(crate) fn attempt_fork(
     workspace_mount: String,
     resource_limits: Vec<(String, String)>,
     metadata: Vec<(String, String)>,
+    task_input_json: String,
     program: Option<AttemptProgram>,
     start: bool,
 ) -> Result<Value, ShellError> {
@@ -192,6 +193,7 @@ pub(crate) fn attempt_fork(
             metadata: metadata.clone().into_iter().collect(),
             program: program.clone(),
             start,
+            task_input_json: task_input_json.clone(),
         })
     })?;
     Ok(attempt_record_value(attempt, Span::unknown()))

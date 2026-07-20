@@ -930,11 +930,11 @@ emit(attempt_scope_close(scope).clean)"#],
     },
     StoneHelpEntry {
         name: "attempt_fork",
-        signature: r#"attempt_fork(parent_attempt: attempt_handle | str | record = "", task: str = "", program: record? = None, entrypoint: str = "", start: bool = False, scope: attempt_scope? = None, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", resource_limits: record = {}, metadata: record = {}) -> attempt_handle"#,
+        signature: r#"attempt_fork(parent_attempt: attempt_handle | str | record = "", task: str = "", input: Any = None, program: record? = None, entrypoint: str = "", start: bool = False, scope: attempt_scope? = None, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", resource_limits: record = {}, metadata: record = {}) -> attempt_handle"#,
         use_when: "Use in Gateway mode to create a child attempt from the current or specified parent attempt workspace state.",
         examples: &[
             r#"branch = attempt_fork(task="try-alt-fix", metadata={"strategy": "alternate"})"#,
-            r#"branch = attempt_fork(program=current_program(), entrypoint="worker", start=True, scope=scope)"#,
+            r#"branch = attempt_fork(input={"strategy": "alternate"}, program=current_program(), entrypoint="worker", start=True, scope=scope)"#,
         ],
         avoid: &["Do not assume a fork mutates the parent attempt; it returns a separate attempt and transaction."],
         aliases: &[],

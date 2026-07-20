@@ -166,7 +166,6 @@ impl GatewayAgentModelGateway {
             "Gateway transport is not wired in this build",
         ))
     }
-
 }
 
 impl AgentModelGateway for GatewayAgentModelGateway {

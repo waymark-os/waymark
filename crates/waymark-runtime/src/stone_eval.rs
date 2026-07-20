@@ -4713,6 +4713,7 @@ impl Evaluator<'_> {
         let mut workspace_mount = String::new();
         let mut resource_limits = Vec::new();
         let mut metadata = Vec::new();
+        let mut task_input_json = String::new();
         let mut program = None;
         let mut entrypoint = String::new();
         let mut start = false;
@@ -4736,6 +4737,15 @@ impl Evaluator<'_> {
                 "metadata" | "meta" => {
                     metadata = value_to_string_pairs(&value, "attempt_fork metadata")?
                 }
+                "input" | "task_input" => {
+                    task_input_json =
+                        serde_json::to_string(&nu_to_json_value(&value)).map_err(|error| {
+                            stone_error(
+                                "attempt_fork",
+                                format!("failed to encode task input: {error}"),
+                            )
+                        })?
+                }
                 "program" => program = Some(program_from_value(&value, "attempt_fork program")?),
                 "entrypoint" => entrypoint = value_to_string(&value, "attempt_fork entrypoint")?,
                 "start" => start = value_to_bool(&value, "attempt_fork start")?,
@@ -4757,6 +4767,7 @@ impl Evaluator<'_> {
             workspace_mount,
             resource_limits,
             metadata,
+            task_input_json,
             program,
             start,
         )?;
