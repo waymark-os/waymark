@@ -1,0 +1,3 @@
+# nu-utils is patched so its only global cache is scoped to a Stone process
+# thread. New dependency globals fail every waymark-runtime build.
+quoting.rs NEEDS_QUOTING_REGEX dependency_tls

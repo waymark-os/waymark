@@ -7,6 +7,9 @@ license.workspace = true
 [lib]
 name = "waymark_runtime"
 
+[build-dependencies]
+waymark-global-audit = { path = "../waymark-global-audit" }
+
 [dependencies]
 asset-image = { path = "../asset-image" }
 waymark-gateway-client = { path = "../../../waymark-gateway/crates/waymark-gateway-client" }
@@ -14,8 +17,9 @@ waymark-runtime-support = { path = "../waymark-runtime-support" }
 libc = "0.2.186"
 md5 = { version = "0.10", package = "md-5" }
 memchr = "2.8.0"
-nu-protocol = { version = "0.112.2", default-features = false }
-nu-system = "0.112.2"
+nu-protocol = { version = "=0.112.2", default-features = false }
+nu-system = "=0.112.2"
+nu-utils = { version = "=0.112.2", default-features = false }
 regex = "1.12.2"
 ruff_python_parser = { git = "https://github.com/astral-sh/ruff", tag = "0.15.11", package = "ruff_python_parser" }
 ruff_python_ast = { git = "https://github.com/astral-sh/ruff", tag = "0.15.11", package = "ruff_python_ast" }

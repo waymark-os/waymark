@@ -10,6 +10,7 @@ use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, 
 use regex::bytes::Regex;
 
 use crate::gateway_runtime;
+use crate::global_state::{FreezeSafe, VmFrozen};
 use crate::json::{json_to_nu_value, nu_to_json_value};
 
 pub(crate) const STONE_MAX_FIND_ENTRIES: usize = 4096;
@@ -794,10 +795,14 @@ struct StoneFileWrite {
 
 struct StdStoneFileAdapter;
 
-static STD_STONE_FILE_ADAPTER: StdStoneFileAdapter = StdStoneFileAdapter;
+// SAFETY: this adapter is a zero-sized immutable dispatcher. It owns no state
+// and resolves every operation from the calling Stone process.
+unsafe impl FreezeSafe for StdStoneFileAdapter {}
+
+static STD_STONE_FILE_ADAPTER: VmFrozen<StdStoneFileAdapter> = VmFrozen::new(StdStoneFileAdapter);
 
 fn stone_file_adapter() -> &'static dyn StoneFileAdapter {
-    &STD_STONE_FILE_ADAPTER
+    &*STD_STONE_FILE_ADAPTER
 }
 
 impl StoneFileAdapter for StdStoneFileAdapter {

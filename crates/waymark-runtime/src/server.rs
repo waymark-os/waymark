@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::cell::RefCell;
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind, Read, Seek, Write};
 use std::path::Path;
@@ -9,6 +8,7 @@ use std::thread;
 use serde_json::{json, Value as JsonValue};
 
 use crate::agent::{AgentError, AgentModelGateway};
+use crate::global_state::{ProcessLocalState, ProcessTls};
 use crate::StoneGuest;
 
 const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
@@ -17,8 +17,16 @@ const DEBUG_TLS_BYTES: usize = 1024 * 1024;
 #[cfg(all(target_os = "hermit", debug_assertions))]
 const ALLOC_SITE_LIVE_LIMIT: usize = 16384;
 
+#[derive(Default)]
+struct DebugTlsPayload(Vec<u8>);
+
+// SAFETY: the diagnostic byte buffer is owned by and dropped with its worker
+// thread. It never publishes a reference outside that thread.
+unsafe impl ProcessLocalState for DebugTlsPayload {}
+
 thread_local! {
-    static DEBUG_TLS_PAYLOAD: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static DEBUG_TLS_PAYLOAD: ProcessTls<DebugTlsPayload> =
+        const { ProcessTls::new(DebugTlsPayload(Vec::new())) };
 }
 
 pub fn run_task_server<R, W>(
@@ -492,7 +500,7 @@ fn debug_thread_tls_response(guest: &mut StoneGuest, frame: &JsonValue) -> JsonV
         .stack_size(1024 * 1024)
         .spawn(|| {
             DEBUG_TLS_PAYLOAD.with(|payload| {
-                *payload.borrow_mut() = vec![0x5a; DEBUG_TLS_BYTES];
+                payload.with_mut(|payload| payload.0 = vec![0x5a; DEBUG_TLS_BYTES]);
             });
             work_memory_stats(Path::new("/work")).unwrap_or_else(|err| {
                 json!({

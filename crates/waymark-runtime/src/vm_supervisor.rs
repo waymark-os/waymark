@@ -10,12 +10,14 @@
 use std::fmt;
 use std::marker::PhantomData;
 use std::path::PathBuf;
-#[cfg(not(target_os = "hermit"))]
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use serde_json::{json, Value as JsonValue};
 
+use crate::gateway_runtime;
+use crate::global_state::prewarm_vm_globals;
+#[cfg(not(target_os = "hermit"))]
+use crate::global_state::VmAtomicU64;
 use crate::{StoneGuest, TaskScopeSnapshot};
 
 const STONE_PROCESS_STACK_SIZE: usize = 8 * 1024 * 1024;
@@ -105,8 +107,20 @@ pub struct VmSupervisor {
     poison_reason: Option<String>,
 }
 
+pub(crate) struct ControlScope {
+    _private: (),
+}
+
+impl ControlScope {
+    fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
 impl VmSupervisor {
     pub fn new(start_dir: PathBuf) -> Self {
+        let control = ControlScope::new();
+        prewarm_vm_globals(&control);
         Self {
             start_dir,
             state: VmLifecycleState::Ready,
@@ -349,6 +363,7 @@ fn run_fresh_root_process(
     task: JsonValue,
 ) -> WorkerExit {
     let process_exit = with_process_scope(domain, |_scope| {
+        gateway_runtime::reset_process_state();
         let (response, scope, cleanup_error) = match StoneGuest::new(start_dir) {
             Ok(mut guest) => {
                 let response = guest.task_response_from_value(task);
@@ -369,6 +384,7 @@ fn run_fresh_root_process(
                 None,
             ),
         };
+        gateway_runtime::reset_process_state();
         let response = serde_json::to_vec(&response).unwrap_or_else(|err| {
             serde_json::to_vec(&json!({
                 "ok": false,
@@ -473,8 +489,8 @@ fn create_process_domain() -> u64 {
 
 #[cfg(not(target_os = "hermit"))]
 fn create_process_domain() -> u64 {
-    static NEXT_HOST_DOMAIN: AtomicU64 = AtomicU64::new(1);
-    NEXT_HOST_DOMAIN.fetch_add(1, Ordering::Relaxed)
+    static NEXT_HOST_DOMAIN: VmAtomicU64 = VmAtomicU64::new(1);
+    NEXT_HOST_DOMAIN.fetch_add_relaxed(1)
 }
 
 #[cfg(target_os = "hermit")]

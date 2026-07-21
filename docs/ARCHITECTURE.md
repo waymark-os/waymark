@@ -30,3 +30,7 @@ Stone programs that directly control model calls, tools, and child attempts, see
 For the target single-address-space LibOS execution model in which Stone process
 state is explicitly forkable, runs on ordinary Hermit threads, and has bounded
 cleanup, see [`STONE_PROCESS_FORK_DESIGN.md`](STONE_PROCESS_FORK_DESIGN.md).
+
+For the compile-time and runtime policy preventing process allocations from
+escaping into Rust globals, see
+[`VM_GLOBAL_STATE_POLICY.md`](VM_GLOBAL_STATE_POLICY.md).

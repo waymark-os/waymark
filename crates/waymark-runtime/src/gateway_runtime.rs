@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -15,6 +14,7 @@ use waymark_gateway_client::proto::{
 use waymark_gateway_client::{GatewayRpcClient, LinuxExecOptions, LinuxProbeOptions};
 
 use crate::agent::{AgentError, AgentModelGateway};
+use crate::global_state::{ProcessLocalState, ProcessTls};
 use crate::json::json_to_nu_value;
 use crate::json::nu_to_json_value;
 
@@ -51,25 +51,39 @@ enum ProcessGatewayConfig {
     Bound(Option<GatewayRuntimeConfig>),
 }
 
+// SAFETY: the configuration is cloned from process-owned attachment data and
+// dropped with that Stone process thread. It contains no borrowed references.
+unsafe impl ProcessLocalState for ProcessGatewayConfig {}
+
 thread_local! {
-    static CONFIG: RefCell<ProcessGatewayConfig> =
-        const { RefCell::new(ProcessGatewayConfig::InheritProcessEnvironment) };
+    static CONFIG: ProcessTls<ProcessGatewayConfig> =
+        const { ProcessTls::new(ProcessGatewayConfig::InheritProcessEnvironment) };
 }
 
 #[allow(dead_code)]
 pub(crate) fn set_config(config: Option<GatewayRuntimeConfig>) {
-    CONFIG.with(|slot| *slot.borrow_mut() = ProcessGatewayConfig::Bound(config));
+    CONFIG.with(|slot| slot.replace(ProcessGatewayConfig::Bound(config)));
 }
 
 pub(crate) fn config() -> Option<GatewayRuntimeConfig> {
-    CONFIG.with(|slot| match &*slot.borrow() {
-        ProcessGatewayConfig::InheritProcessEnvironment => config_from_process_env(),
-        ProcessGatewayConfig::Bound(config) => config.clone(),
+    CONFIG.with(|slot| {
+        slot.with(|slot| match slot {
+            ProcessGatewayConfig::InheritProcessEnvironment => config_from_process_env(),
+            ProcessGatewayConfig::Bound(config) => config.clone(),
+        })
     })
 }
 
 pub(crate) fn enabled() -> bool {
     config().is_some()
+}
+
+/// Clear attempt-specific Gateway state owned by the current Stone process
+/// thread. The supervisor calls this before execution and before releasing the
+/// process allocation domain.
+pub(crate) fn reset_process_state() {
+    clear_shared_gateway_client();
+    CONFIG.with(|slot| slot.replace(ProcessGatewayConfig::InheritProcessEnvironment));
 }
 
 /// Return the virtual workspace root used by Gateway-backed filesystem and
@@ -121,7 +135,7 @@ impl GatewayAgentModelGateway {
         self.ensure_client()?;
         set_config(Some(self.config.clone()));
         if let Some(client) = self.client.take() {
-            SHARED_GATEWAY_CLIENT.with(|slot| slot.borrow_mut().replace(client));
+            SHARED_GATEWAY_CLIENT.with(|slot| slot.replace(Some(client)));
         }
         Ok(())
     }
@@ -1740,17 +1754,25 @@ pub(crate) enum GatewayClientStream {
 }
 
 #[cfg(any(unix, target_os = "hermit"))]
+// SAFETY: the attached client is owned by one Stone process thread and is
+// closed/dropped before that thread's allocation domain is released.
+unsafe impl ProcessLocalState for Option<GatewayRpcClient<GatewayClientStream>> {}
+
+#[cfg(any(unix, target_os = "hermit"))]
 thread_local! {
-    static SHARED_GATEWAY_CLIENT: RefCell<Option<GatewayRpcClient<GatewayClientStream>>> =
-        const { RefCell::new(None) };
+    static SHARED_GATEWAY_CLIENT: ProcessTls<Option<GatewayRpcClient<GatewayClientStream>>> =
+        const { ProcessTls::new(None) };
 }
 
 #[cfg(any(unix, target_os = "hermit"))]
 fn clear_shared_gateway_client() {
     SHARED_GATEWAY_CLIENT.with(|slot| {
-        slot.borrow_mut().take();
+        slot.with_mut(Option::take);
     });
 }
+
+#[cfg(not(any(unix, target_os = "hermit")))]
+fn clear_shared_gateway_client() {}
 
 #[cfg(any(unix, target_os = "hermit"))]
 impl std::io::Read for GatewayClientStream {
@@ -1913,10 +1935,10 @@ fn with_runtime_client<T>(
     config: &GatewayRuntimeConfig,
     call: impl FnOnce(&mut GatewayRpcClient<GatewayClientStream>) -> Result<T, ShellError>,
 ) -> Result<T, ShellError> {
-    let shared = SHARED_GATEWAY_CLIENT.with(|slot| slot.borrow_mut().take());
+    let shared = SHARED_GATEWAY_CLIENT.with(|slot| slot.with_mut(Option::take));
     if let Some(mut client) = shared {
         let result = call(&mut client);
-        SHARED_GATEWAY_CLIENT.with(|slot| slot.borrow_mut().replace(client));
+        SHARED_GATEWAY_CLIENT.with(|slot| slot.replace(Some(client)));
         return result;
     }
     let mut config = config.clone();
@@ -2139,6 +2161,21 @@ mod tests {
 
         let observed = workers.map(|worker| worker.join().expect("Gateway binding worker"));
         assert_eq!(observed, ["attempt-left", "attempt-right"]);
+    }
+
+    #[test]
+    fn process_reset_restores_environment_bootstrap_state() {
+        set_config(Some(test_config("attempt-before-reset")));
+        reset_process_state();
+
+        CONFIG.with(|slot| {
+            slot.with(|config| {
+                assert!(matches!(
+                    config,
+                    ProcessGatewayConfig::InheritProcessEnvironment
+                ));
+            });
+        });
     }
 
     fn test_config(attempt: &str) -> GatewayRuntimeConfig {

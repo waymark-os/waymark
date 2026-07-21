@@ -1183,8 +1183,6 @@ dependencies = [
 [[package]]
 name = "nu-utils"
 version = "0.112.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46dbde833d407a88a82d170597ed73626d9a8e198f51ee16886343c0c3479e81"
 dependencies = [
  "byteyarn",
  "crossterm_winapi",
@@ -2438,6 +2436,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "waymark-global-audit"
+version = "0.1.0"
+dependencies = [
+ "syn",
+]
+
+[[package]]
 name = "waymark-runtime"
 version = "0.1.0"
 dependencies = [
@@ -2448,6 +2453,7 @@ dependencies = [
  "memchr",
  "nu-protocol",
  "nu-system",
+ "nu-utils",
  "regex",
  "ruff_python_ast",
  "ruff_python_parser",
@@ -2456,6 +2462,7 @@ dependencies = [
  "sha2",
  "sysinfo",
  "waymark-gateway-client",
+ "waymark-global-audit",
  "waymark-runtime-support",
 ]
 

@@ -2,10 +2,12 @@
 resolver = "2"
 members = [
     "crates/asset-image",
+    "crates/waymark-global-audit",
     "crates/waymark-runtime-support",
     "crates/waymark",
     "crates/waymark-runtime",
 ]
+exclude = ["vendor/nu-utils"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,3 +15,4 @@ license = "MIT OR Apache-2.0"
 
 [patch.crates-io]
 dirs = { path = "vendor/dirs" }
+nu-utils = { path = "vendor/nu-utils" }

@@ -18,6 +18,11 @@ two Stone process threads retain distinct attempt bindings. A future lease must
 install its binding inside the new process thread; process environment fallback
 remains only a compatibility bootstrap path.
 
+Runtime globals now use audited wrapper types, and a build-time AST audit
+rejects unclassified globals. The active `nu-utils` lazy quoting cache is
+patched to process-thread TLS. See `docs/VM_GLOBAL_STATE_POLICY.md` for the
+enforced policy and resolved Nu dependency inventory.
+
 ## Decision
 
 Stone execution inside Waymark LibOS should be forkable and cheaply disposable
@@ -336,6 +341,12 @@ child, resource, and waiter relationships use an owned DAG, weak back-references
 or generation-tagged registry indices. Shared caches must be bounded, must not
 hold strong process references, and must expose their retained-byte count to the
 cleanliness report.
+
+Raw runtime globals are also forbidden. VM-lifetime values must use the audited
+`VmAtomicU64`, `VmFrozen`, or `VmOnce` wrappers; process-thread state must use
+`ProcessTls`. Every build compares the source AST with a reviewed fail-closed
+allow-list. Future lazy VM initialization requires a supervisor-owned
+`ControlScope`, which is unavailable to a `ProcessScope<'process>`.
 
 RAII remains useful but is not sufficient by itself. Dropping an
 `AttemptTreeLease` begins bounded drain; it must not silently transition the VM

@@ -16,10 +16,6 @@ use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "hermit"))]
 use std::process::{Command, ExitStatus, Stdio};
 #[cfg(not(target_os = "hermit"))]
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-#[cfg(not(target_os = "hermit"))]
-use std::sync::Once;
-#[cfg(not(target_os = "hermit"))]
 use std::thread;
 use std::time::Duration;
 #[cfg(not(target_os = "hermit"))]
@@ -30,6 +26,8 @@ use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, 
 use serde_json::Value as JsonValue;
 
 use crate::gateway_runtime;
+#[cfg(not(target_os = "hermit"))]
+use crate::global_state::{VmAtomicU64, VmOnce};
 #[cfg(not(target_os = "hermit"))]
 use crate::stone_helpers::attach_service_helper_observation;
 
@@ -713,11 +711,11 @@ fn daemon_log_path(value: &Value) -> Option<PathBuf> {
 
 #[cfg(not(target_os = "hermit"))]
 fn daemon_temp_path(suffix: &str) -> PathBuf {
-    static DAEMON_ID: AtomicU64 = AtomicU64::new(0);
+    static DAEMON_ID: VmAtomicU64 = VmAtomicU64::new(0);
     let temp_prefix = format!(
         "stone-daemon-{}-{}",
         std::process::id(),
-        DAEMON_ID.fetch_add(1, AtomicOrdering::Relaxed)
+        DAEMON_ID.fetch_add_relaxed(1)
     );
     env::temp_dir().join(format!("{temp_prefix}.{suffix}"))
 }
@@ -1426,7 +1424,7 @@ fn command_explanation(
 
 #[cfg(not(target_os = "hermit"))]
 fn cleanup_stale_run_temp_files_once() {
-    static CLEANUP: Once = Once::new();
+    static CLEANUP: VmOnce = VmOnce::new();
     CLEANUP.call_once(|| {
         cleanup_stale_run_temp_files(&env::temp_dir(), Duration::from_secs(6 * 60 * 60));
     });
@@ -1526,7 +1524,7 @@ fn run_posix_command(
             "run(background=True) is only available in Gateway-backed runtime; use start_daemon() for local long-lived services",
         ));
         }
-        static RUN_ID: AtomicU64 = AtomicU64::new(0);
+        static RUN_ID: VmAtomicU64 = VmAtomicU64::new(0);
 
         let span = Span::unknown();
         let started = Instant::now();
@@ -1535,7 +1533,7 @@ fn run_posix_command(
         let temp_prefix = format!(
             "stone-run-{}-{}",
             std::process::id(),
-            RUN_ID.fetch_add(1, AtomicOrdering::Relaxed)
+            RUN_ID.fetch_add_relaxed(1)
         );
         let mut stdout_file = (stdout_target == RunOutputTarget::Capture)
             .then(|| create_command_capture_file("run", "stdout", &temp_prefix, "stdout"))

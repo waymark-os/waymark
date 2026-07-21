@@ -19,6 +19,7 @@ mod commands;
 mod frontend;
 mod gateway_env;
 mod gateway_runtime;
+mod global_state;
 mod json;
 mod linux_tools;
 mod server;

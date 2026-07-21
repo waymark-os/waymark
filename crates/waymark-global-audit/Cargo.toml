@@ -1,0 +1,8 @@
+[package]
+name = "waymark-global-audit"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "parsing", "visit"] }

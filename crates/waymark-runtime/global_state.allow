@@ -1,0 +1,10 @@
+# Every runtime global must use one of the audited wrapper classes.
+# Format: relative/source.rs SYMBOL CLASS
+gateway_runtime.rs CONFIG process_tls
+gateway_runtime.rs SHARED_GATEWAY_CLIENT process_tls
+linux_tools/process.rs CLEANUP vm_once
+linux_tools/process.rs DAEMON_ID vm_atomic
+linux_tools/process.rs RUN_ID vm_atomic
+server.rs DEBUG_TLS_PAYLOAD process_tls
+stone_file_ops.rs STD_STONE_FILE_ADAPTER vm_frozen
+vm_supervisor.rs NEXT_HOST_DOMAIN vm_atomic
