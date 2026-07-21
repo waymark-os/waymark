@@ -56,6 +56,7 @@ pub struct VmCleanlinessReport {
     pub process_domain_allocations_before_release: u64,
     pub completed_dispatches: u64,
     pub exercised: Vec<String>,
+    pub gateway_release: Option<JsonValue>,
     pub reasons: Vec<String>,
 }
 
@@ -76,6 +77,7 @@ impl VmCleanlinessReport {
             "process_domain_allocations_before_release": self.process_domain_allocations_before_release,
             "completed_dispatches": self.completed_dispatches,
             "exercised": self.exercised,
+            "gateway_release": self.gateway_release,
             "reasons": self.reasons,
         })
     }
@@ -156,7 +158,9 @@ impl VmSupervisor {
     /// domain, failed domain release, or invalid promoted result does poison it.
     pub fn dispatch_task(&mut self, task: JsonValue) -> Result<VmDispatchResult, VmDispatchError> {
         let probes = ProcessProbes::from_task(&task);
-        self.dispatch_operation(probes, move |guest| guest.task_response_from_value(task))
+        self.dispatch_operation(probes, false, move |guest| {
+            guest.task_response_from_value(task)
+        })
     }
 
     /// Runs one root task with a process-scoped model and host-capability
@@ -170,14 +174,32 @@ impl VmSupervisor {
         G: AgentModelGateway + Send,
     {
         let probes = ProcessProbes::from_task(&task);
-        self.dispatch_operation(probes, move |guest| {
+        self.dispatch_operation(probes, false, move |guest| {
             guest.task_response_from_value_with_model_gateway(task, gateway)
         })
+    }
+
+    pub(crate) fn dispatch_gateway_attempt_lease(
+        &mut self,
+        config: gateway_runtime::GatewayRuntimeConfig,
+        touch_nu_quoting_tls: bool,
+    ) -> Result<VmDispatchResult, VmDispatchError> {
+        self.dispatch_operation(
+            ProcessProbes {
+                nu_quoting_tls: touch_nu_quoting_tls,
+            },
+            true,
+            move |guest| {
+                gateway_runtime::set_config(Some(config));
+                guest.task_response_from_gateway_attempt()
+            },
+        )
     }
 
     fn dispatch_operation<F>(
         &mut self,
         probes: ProcessProbes,
+        release_gateway_lease: bool,
         operation: F,
     ) -> Result<VmDispatchResult, VmDispatchError>
     where
@@ -214,7 +236,13 @@ impl VmSupervisor {
                 .name(format!("stone-root-{}", process.generation))
                 .stack_size(STONE_PROCESS_STACK_SIZE)
                 .spawn_scoped(scope, move || {
-                    run_fresh_root_process(domain_id, start_dir, probes, operation)
+                    run_fresh_root_process(
+                        domain_id,
+                        start_dir,
+                        probes,
+                        release_gateway_lease,
+                        operation,
+                    )
                 });
             match worker {
                 Ok(worker) => {
@@ -246,12 +274,14 @@ impl VmSupervisor {
         let mut exercised = Vec::new();
         let mut process_domain_bytes = 0;
         let mut process_domain_allocations = 0;
+        let mut gateway_release = None;
         let promoted = match worker_exit {
             Some(exit) => {
                 live_resources = exit.live_resources;
                 exercised = exit.exercised;
                 process_domain_bytes = exit.process_domain_bytes;
                 process_domain_allocations = exit.process_domain_allocations;
+                gateway_release = exit.gateway_release;
                 if let Some(reason) = exit.cleanup_error {
                     reasons.push(reason);
                 }
@@ -304,6 +334,7 @@ impl VmSupervisor {
             process_domain_allocations_before_release: process_domain_allocations,
             completed_dispatches: self.completed_dispatches,
             exercised,
+            gateway_release,
             reasons,
         };
 
@@ -437,6 +468,7 @@ struct WorkerExit {
     exercised: Vec<String>,
     process_domain_bytes: u64,
     process_domain_allocations: u64,
+    gateway_release: Option<JsonValue>,
 }
 
 struct ProcessExit {
@@ -446,12 +478,14 @@ struct ProcessExit {
     exercised: Vec<String>,
     process_domain_bytes: u64,
     process_domain_allocations: u64,
+    gateway_release: Option<JsonValue>,
 }
 
 fn run_fresh_root_process<F>(
     domain: ProcessDomainId,
     start_dir: PathBuf,
     probes: ProcessProbes,
+    release_gateway_lease: bool,
     operation: F,
 ) -> WorkerExit
 where
@@ -464,7 +498,7 @@ where
             assert!(nu_utils::needs_quoting("two words"));
             exercised.push("nu_quoting_tls".to_owned());
         }
-        let (response, scope, cleanup_error) = match StoneGuest::new(start_dir) {
+        let (response, scope, mut cleanup_error) = match StoneGuest::new(start_dir) {
             Ok(mut guest) => {
                 let response = operation(&mut guest);
                 let cleanup_error = guest.reset_task_state().err().map(|err| err.to_string());
@@ -483,6 +517,33 @@ where
                 TaskScopeSnapshot::default(),
                 None,
             ),
+        };
+        let gateway_release = if release_gateway_lease {
+            match gateway_runtime::release_provider_lease() {
+                Ok(evidence) => {
+                    if !evidence.clean {
+                        let reason = format!(
+                            "Gateway provider lease cleanup failed: {}",
+                            evidence.reasons.join("; ")
+                        );
+                        cleanup_error = Some(match cleanup_error {
+                            Some(existing) => format!("{existing}; {reason}"),
+                            None => reason,
+                        });
+                    }
+                    Some(evidence.to_json())
+                }
+                Err(err) => {
+                    let reason = format!("Gateway provider lease release failed: {err}");
+                    cleanup_error = Some(match cleanup_error {
+                        Some(existing) => format!("{existing}; {reason}"),
+                        None => reason,
+                    });
+                    None
+                }
+            }
+        } else {
+            None
         };
         gateway_runtime::reset_process_state();
         let response = serde_json::to_vec(&response).unwrap_or_else(|err| {
@@ -504,6 +565,7 @@ where
             exercised,
             process_domain_bytes,
             process_domain_allocations,
+            gateway_release,
         }
     });
 
@@ -515,6 +577,7 @@ where
     let exercised = process_exit.exercised.clone();
     let process_domain_bytes = process_exit.process_domain_bytes;
     let process_domain_allocations = process_exit.process_domain_allocations;
+    let gateway_release = process_exit.gateway_release.clone();
     let live_resources = process_exit.scope.live.len();
     drop(process_exit);
 
@@ -525,6 +588,7 @@ where
         exercised,
         process_domain_bytes,
         process_domain_allocations,
+        gateway_release,
     }
 }
 

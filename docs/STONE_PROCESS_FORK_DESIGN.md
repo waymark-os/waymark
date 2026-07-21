@@ -19,11 +19,19 @@ returned the supervisor to `ready`; post-warmup control-memory samples stayed
 within the configured bound. The canary is maintained by
 `waymark-gateway/host/runner/run_waymark_libos_reuse_canary.py`.
 
-This is the reusable **root-process** boundary, not completion of process fork
-or the production provider contract. The supervisor does not yet host child
-Stone processes, and the canary's host stream is a temporary provider adapter:
-it does not prove per-root Gateway attempt attachment, lease revocation,
-Gateway transaction cleanup, or the complete production cleanliness gate.
+The root boundary now also has a Gateway-leased treatment. A second Firecracker
+canary ran six independent Gateway attempts through one VM: Stone workspace,
+Stone-plus-Linux, and model-driven agent roots twice each. Every root fetched
+its authoritative control block after one-use boot attachment, released and
+fenced its own RPC stream, returned structured Gateway cleanup evidence, and
+closed its host-owned transaction before the VM id was leased again. The
+maintained runner is
+`waymark-gateway/host/runner/run_waymark_libos_gateway_lease_canary.py`.
+
+This is the reusable **root-process** and V0 provider-lease boundary, not
+completion of process fork. The supervisor does not yet host child Stone
+processes, and timeout/crash reconciliation plus a durable multi-VM idle pool
+remain outside the validated contract.
 
 Gateway runtime configuration and the attached shared RPC client are now
 thread-local rather than process-global, with a concurrency test proving that
@@ -176,8 +184,10 @@ The provider-internal control sequence is:
 5. the supervisor freezes the root outcome, drains and joins the complete tree,
    and releases its process domains;
 6. the guest emits a structured cleanliness report;
-7. only a clean guest returns to `ready`; a dirty or unverifiable guest becomes
-   `poisoned` and is terminated and replaced.
+7. a clean local and Gateway release returns the supervisor to `ready`;
+8. the host resolves the attempt transaction and only then may Gateway issue a
+   new lease for that VM id; a dirty or unverifiable release poisons the id and
+   requires VM replacement.
 
 `ready`, `leased`, `draining`, and `poisoned` are provider lifecycle states,
 not agent-visible attempt states or new Stone operations. Boot and dispatch
@@ -546,7 +556,10 @@ After a root tree finishes, the supervisor produces a typed
   the VM is not reusable);
 - control-domain live objects/bytes are within a recorded steady-state bound;
 - every surviving shared cache is both bounded and semantically transparent;
-- Gateway reports the leased attempt tree terminal and clean.
+- Gateway reports no live descendant, operation, Linux-run, or attached-channel
+  authority at lease release;
+- before the provider admits another root, Gateway reports the prior attempt
+  terminal and its transaction closed.
 
 The report contains counters and reasons, not just a Boolean. A failed,
 incomplete, timed-out, or unsupported check transitions the VM to `poisoned`.
@@ -573,10 +586,10 @@ cleanliness is destroyed rather than reused.
 
 ### P1: Reusable supervisor and fresh root process
 
-Implemented for the single-root-at-a-time LibOS task stream. The remaining P1
-work is to replace the temporary host-stream attachment with a Gateway provider
-lease and extend the cleanliness report with Gateway-owned terminal-state
-evidence.
+Implemented for the single-root-at-a-time LibOS task stream and the V0 Gateway
+root-controller lease. The guest cleanliness report now includes Gateway-owned
+release evidence, and Gateway prevents reuse of the VM id until host attempt
+finalization closes the transaction.
 
 1. Introduce `VmSupervisor`, `AttemptTreeLease`, `StoneProcess`, and
    `ProcessImage` as explicit ownership boundaries.
@@ -609,12 +622,15 @@ Diagnostic quarantine and complete stale-root scanning remain open.
 
 ### P4: Gateway attempt integration
 
-1. Let one LibOS instance host multiple attempt controller channels.
+1. Let one LibOS instance host multiple sequential root attempt controller
+   channels. (Implemented and exercised across six roots.)
 2. Bind a forked Stone process to the child attempt returned by Gateway.
 3. Prove start, join, accept/discard, cancellation, and parent-death cleanup.
 4. Keep controller placement behind the Gateway provider boundary.
+   (Implemented for root placement.)
 5. Let Gateway lease a clean VM for another unrelated root attempt after the
-   first root tree exits.
+   first root tree exits. (Implemented for clean sequential roots; injected
+   timeout/crash replacement remains.)
 
 ### P5: Measured object/chunk CoW
 

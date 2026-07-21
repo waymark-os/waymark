@@ -98,6 +98,7 @@ where
         let frame_type = frame.get("type").and_then(JsonValue::as_str);
         let response = match frame_type {
             Some("task") => supervisor_task_frame_response_stream(supervisor, stream, &frame)?,
+            Some("lease") => supervisor_lease_frame_response(supervisor, &frame),
             Some("hello") => json!({
                 "version": 0,
                 "type": "hello",
@@ -105,6 +106,7 @@ where
                     "payload_encodings": ["json-inline"],
                     "single_flight": true,
                     "process_model": "fresh-root",
+                    "gateway_provider_leases": true,
                     "allocation_domains": cfg!(target_os = "hermit"),
                     "cleanliness_report": true,
                 }
@@ -192,6 +194,112 @@ where
     };
     let memory_after = supervisor_memory_stats(supervisor);
 
+    Ok(supervisor_dispatch_response(
+        supervisor,
+        id,
+        dispatch,
+        effects,
+        memory_before,
+        memory_after,
+    ))
+}
+
+fn supervisor_lease_frame_response(supervisor: &mut VmSupervisor, frame: &JsonValue) -> JsonValue {
+    let Some(id) = frame_id(frame) else {
+        return protocol_error(None, "lease request requires id");
+    };
+    if frame.get("version").and_then(JsonValue::as_u64) != Some(0) {
+        return protocol_error(Some(id), "request requires version=0");
+    }
+    let Some(payload) = frame.get("payload").and_then(JsonValue::as_object) else {
+        return protocol_error(Some(id), "lease request requires object payload");
+    };
+    if payload.get("encoding").and_then(JsonValue::as_str) != Some("gateway-provider-lease-v0") {
+        return protocol_error(
+            Some(id),
+            "lease payload requires encoding=gateway-provider-lease-v0",
+        );
+    }
+    let Some(gateway) = payload.get("gateway").and_then(JsonValue::as_object) else {
+        return protocol_error(Some(id), "lease payload requires gateway object");
+    };
+    if gateway.get("transport").and_then(JsonValue::as_str) != Some("vsock") {
+        return protocol_error(Some(id), "provider lease requires gateway transport=vsock");
+    }
+    let required_string = |field: &str| {
+        gateway
+            .get(field)
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("provider lease gateway requires {field}"))
+    };
+    let required_u32 = |field: &str| {
+        gateway
+            .get(field)
+            .and_then(JsonValue::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| format!("provider lease gateway requires positive u32 {field}"))
+    };
+    let config = (|| {
+        Ok::<_, String>(crate::gateway_runtime::GatewayRuntimeConfig {
+            endpoint: crate::gateway_runtime::GatewayEndpoint::Vsock {
+                cid: required_u32("cid")?,
+                port: required_u32("port")?,
+            },
+            attempt: String::new(),
+            controller_run: String::new(),
+            boot_token: required_string("boot_token")?,
+            channel_id: String::new(),
+            channel_epoch: required_string("channel_epoch")?,
+            provider_lease_id: required_string("provider_lease_id")?,
+            provider_vm_id: required_string("provider_vm_id")?,
+            tx: String::new(),
+            image: String::new(),
+            container: None,
+            workspace_mount: "/app".to_string(),
+            host_workspace_path: None,
+            capability_profile: String::new(),
+            model_class: String::new(),
+            control: None,
+        })
+    })();
+    let config = match config {
+        Ok(config) => config,
+        Err(message) => return protocol_error(Some(id), message),
+    };
+    let touch_nu_quoting_tls = payload
+        .get("diagnostics")
+        .and_then(|value| value.get("touch_nu_quoting_tls"))
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    let effects = json!({
+        "transport": "gateway_provider_lease",
+        "provider_lease_id": config.provider_lease_id.clone(),
+        "provider_vm_id": config.provider_vm_id.clone(),
+    });
+    let memory_before = supervisor_memory_stats(supervisor);
+    let dispatch = supervisor.dispatch_gateway_attempt_lease(config, touch_nu_quoting_tls);
+    let memory_after = supervisor_memory_stats(supervisor);
+    supervisor_dispatch_response(
+        supervisor,
+        id,
+        dispatch,
+        effects,
+        memory_before,
+        memory_after,
+    )
+}
+
+fn supervisor_dispatch_response(
+    supervisor: &VmSupervisor,
+    id: &str,
+    dispatch: Result<crate::VmDispatchResult, crate::VmDispatchError>,
+    effects: JsonValue,
+    memory_before: JsonValue,
+    memory_after: JsonValue,
+) -> JsonValue {
     match dispatch {
         Ok(dispatch) => {
             let cleanliness = dispatch.cleanliness.to_json();
@@ -214,7 +322,7 @@ where
                     }),
                 );
             }
-            Ok(json!({
+            json!({
                 "version": 0,
                 "type": "result",
                 "id": id,
@@ -225,7 +333,7 @@ where
                     "work": false,
                     "fresh_process": true,
                 }
-            }))
+            })
         }
         Err(error) => {
             let cleanliness = error
@@ -233,7 +341,7 @@ where
                 .as_ref()
                 .map(|report| report.to_json())
                 .unwrap_or(JsonValue::Null);
-            Ok(json!({
+            json!({
                 "version": 0,
                 "type": "result",
                 "id": id,
@@ -263,7 +371,7 @@ where
                     "work": false,
                     "fresh_process": true,
                 }
-            }))
+            })
         }
     }
 }

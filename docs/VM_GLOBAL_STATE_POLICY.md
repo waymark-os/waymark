@@ -128,11 +128,19 @@ empty reason list, and a post-warmup control-memory bound. The 24-root run at
 passed with 24 clean roots, eight expected task failures, eight agent roots,
 and no retained non-control allocation domain.
 
+The companion Gateway-leased gate,
+`waymark-gateway/host/runner/run_waymark_libos_gateway_lease_canary.py`, replaces
+the host adapter with a distinct attached Gateway stream for every fresh root.
+Its six-root Firecracker run exercised Stone workspace RPC, Gateway Linux RPC,
+and a model-driven agent twice each. Every process-local Gateway configuration
+and client was cleared before domain release; every stream was explicitly
+released and fenced; Gateway reported no live descendants, operations, or runs;
+the host closed each attempt transaction before the VM id was leased again;
+and the final attempt/transaction census was empty.
+
 This is a dynamic backstop, not a proof that arbitrary dependencies cannot
-retain state. It also does not yet validate Gateway attempt/transaction lease
-cleanup because the canary uses the existing Helix host stream as a provider
-adapter. Those checks must be added before Gateway can pool the VM in
-production.
+retain state. Child Stone processes, fault-injected disconnect/timeout cleanup,
+and long-duration pool operation remain unvalidated.
 
 ## Adding Global State
 

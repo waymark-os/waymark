@@ -7,9 +7,10 @@ use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, 
 use serde_json::{json, Value as JsonValue};
 use waymark_gateway_client::proto::{
     attempt_program, AttemptChannelAttachBootRequest, AttemptChannelAttachRequest,
-    AttemptChannelAttachResponse, AttemptControlBlock, AttemptReportResultRequest,
-    ModelCallRequest, ModelCallResponse, ModelMessage, ModelSampling, TaskSpec as GatewayTaskSpec,
-    WorkspaceEntry, WorkspaceEntryKind,
+    AttemptChannelAttachResponse, AttemptControlBlock, AttemptProviderLeaseReleaseRequest,
+    AttemptProviderLeaseReleaseResponse, AttemptReportResultRequest, ModelCallRequest,
+    ModelCallResponse, ModelMessage, ModelSampling, TaskSpec as GatewayTaskSpec, WorkspaceEntry,
+    WorkspaceEntryKind,
 };
 use waymark_gateway_client::{GatewayRpcClient, LinuxExecOptions, LinuxProbeOptions};
 
@@ -34,6 +35,10 @@ pub(crate) struct GatewayRuntimeConfig {
     pub(crate) attempt: String,
     pub(crate) controller_run: String,
     pub(crate) boot_token: String,
+    pub(crate) channel_id: String,
+    pub(crate) channel_epoch: String,
+    pub(crate) provider_lease_id: String,
+    pub(crate) provider_vm_id: String,
     pub(crate) tx: String,
     pub(crate) image: String,
     pub(crate) container: Option<String>,
@@ -84,6 +89,105 @@ pub(crate) fn enabled() -> bool {
 pub(crate) fn reset_process_state() {
     clear_shared_gateway_client();
     CONFIG.with(|slot| slot.replace(ProcessGatewayConfig::InheritProcessEnvironment));
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GatewayLeaseReleaseEvidence {
+    pub(crate) attempt: String,
+    pub(crate) provider_lease_id: String,
+    pub(crate) provider_vm_id: String,
+    pub(crate) channel_id: String,
+    pub(crate) channel_epoch: String,
+    pub(crate) released: bool,
+    pub(crate) clean: bool,
+    pub(crate) result_reported: bool,
+    pub(crate) result_status: String,
+    pub(crate) active_descendants: u64,
+    pub(crate) active_operations: u64,
+    pub(crate) active_runs: u64,
+    pub(crate) transaction_open: bool,
+    pub(crate) reasons: Vec<String>,
+}
+
+impl GatewayLeaseReleaseEvidence {
+    pub(crate) fn to_json(&self) -> JsonValue {
+        json!({
+            "attempt": self.attempt,
+            "provider_lease_id": self.provider_lease_id,
+            "provider_vm_id": self.provider_vm_id,
+            "channel_id": self.channel_id,
+            "channel_epoch": self.channel_epoch,
+            "released": self.released,
+            "clean": self.clean,
+            "result_reported": self.result_reported,
+            "result_status": self.result_status,
+            "active_descendants": self.active_descendants,
+            "active_operations": self.active_operations,
+            "active_runs": self.active_runs,
+            "transaction_open": self.transaction_open,
+            "reasons": self.reasons,
+        })
+    }
+}
+
+impl From<AttemptProviderLeaseReleaseResponse> for GatewayLeaseReleaseEvidence {
+    fn from(response: AttemptProviderLeaseReleaseResponse) -> Self {
+        Self {
+            attempt: response.attempt,
+            provider_lease_id: response.provider_lease_id,
+            provider_vm_id: response.provider_vm_id,
+            channel_id: response.channel_id,
+            channel_epoch: response.channel_epoch,
+            released: response.released,
+            clean: response.clean,
+            result_reported: response.result_reported,
+            result_status: response.result_status,
+            active_descendants: response.active_descendants,
+            active_operations: response.active_operations,
+            active_runs: response.active_runs,
+            transaction_open: response.transaction_open,
+            reasons: response.reasons,
+        }
+    }
+}
+
+#[cfg(any(unix, target_os = "hermit"))]
+pub(crate) fn release_provider_lease() -> Result<GatewayLeaseReleaseEvidence, ShellError> {
+    let config = required_config()?;
+    if config.provider_lease_id.is_empty()
+        || config.channel_id.is_empty()
+        || config.channel_epoch.is_empty()
+    {
+        return Err(stone_error(
+            "gateway provider lease release",
+            "attached Gateway configuration has no complete provider lease binding",
+        ));
+    }
+    let mut client = SHARED_GATEWAY_CLIENT
+        .with(|slot| slot.with_mut(Option::take))
+        .ok_or_else(|| {
+            stone_error(
+                "gateway provider lease release",
+                "attached Gateway client was closed before lease release",
+            )
+        })?;
+    let response = client
+        .attempt_provider_lease_release(AttemptProviderLeaseReleaseRequest {
+            provider_lease_id: config.provider_lease_id,
+            channel_id: config.channel_id,
+            channel_epoch: config.channel_epoch,
+        })
+        .map_err(|err| stone_error("gateway provider lease release", err.to_string()))?;
+    drop(client);
+    Ok(response.into())
+}
+
+#[cfg(not(any(unix, target_os = "hermit")))]
+pub(crate) fn release_provider_lease() -> Result<GatewayLeaseReleaseEvidence, ShellError> {
+    Err(stone_error(
+        "gateway provider lease release",
+        "Gateway transport is not wired in this build",
+    ))
 }
 
 /// Return the virtual workspace root used by Gateway-backed filesystem and
@@ -147,11 +251,15 @@ impl GatewayAgentModelGateway {
             client
                 .attempt_report_result(request)
                 .map_err(|err| stone_error("gateway report", err.to_string()))?;
-            self.client.take();
+            if self.config.provider_lease_id.is_empty() {
+                self.client.take();
+            }
             return Ok(());
         }
         let result = with_client(&self.config, |client| client.attempt_report_result(request));
-        clear_shared_gateway_client();
+        if self.config.provider_lease_id.is_empty() {
+            clear_shared_gateway_client();
+        }
         result.map(|_| ())
     }
 
@@ -1709,6 +1817,10 @@ fn config_from_process_env() -> Option<GatewayRuntimeConfig> {
             })
             .unwrap_or_default(),
         boot_token,
+        channel_id: String::new(),
+        channel_epoch: std::env::var("WAYMARK_GATEWAY_CHANNEL_EPOCH").unwrap_or_default(),
+        provider_lease_id: String::new(),
+        provider_vm_id: String::new(),
         tx,
         image,
         container,
@@ -1863,7 +1975,7 @@ fn attach_gateway_client(
             client
                 .attempt_channel_attach_boot(AttemptChannelAttachBootRequest {
                     boot_token: config.boot_token.clone(),
-                    channel_epoch: String::new(),
+                    channel_epoch: config.channel_epoch.clone(),
                     metadata: [("source".to_string(), "waymark-runtime".to_string())].into(),
                 })
                 .map_err(|err| stone_error("gateway attach", err.to_string()))?,
@@ -1874,7 +1986,7 @@ fn attach_gateway_client(
                 .attempt_channel_attach(AttemptChannelAttachRequest {
                     attempt: config.attempt.clone(),
                     controller_run: config.controller_run.clone(),
-                    channel_epoch: String::new(),
+                    channel_epoch: config.channel_epoch.clone(),
                     metadata: [("source".to_string(), "waymark-runtime".to_string())].into(),
                 })
                 .map_err(|err| stone_error("gateway attach", err.to_string()))?,
@@ -1883,6 +1995,26 @@ fn attach_gateway_client(
         None
     };
     if let Some(response) = response {
+        if !config.provider_lease_id.is_empty()
+            && response.provider_lease_id != config.provider_lease_id
+        {
+            return Err(stone_error(
+                "gateway attach",
+                format!(
+                    "provider lease mismatch: expected {:?}, Gateway returned {:?}",
+                    config.provider_lease_id, response.provider_lease_id
+                ),
+            ));
+        }
+        if !config.provider_vm_id.is_empty() && response.provider_vm_id != config.provider_vm_id {
+            return Err(stone_error(
+                "gateway attach",
+                format!(
+                    "provider VM mismatch: expected {:?}, Gateway returned {:?}",
+                    config.provider_vm_id, response.provider_vm_id
+                ),
+            ));
+        }
         apply_attach_response(config, response);
     }
     Ok(())
@@ -1898,6 +2030,10 @@ fn apply_attach_response(
         }
     }
     config.boot_token.clear();
+    config.channel_id = response.channel_id;
+    config.channel_epoch = response.channel_epoch;
+    config.provider_lease_id = response.provider_lease_id;
+    config.provider_vm_id = response.provider_vm_id;
     if !response.controller_run.is_empty() {
         config.controller_run = response.controller_run;
     }
@@ -2184,6 +2320,10 @@ mod tests {
             attempt: attempt.to_owned(),
             controller_run: format!("controller-{attempt}"),
             boot_token: String::new(),
+            channel_id: String::new(),
+            channel_epoch: String::new(),
+            provider_lease_id: String::new(),
+            provider_vm_id: String::new(),
             tx: format!("tx-{attempt}"),
             image: "python:3.12".to_owned(),
             container: None,
@@ -2248,6 +2388,10 @@ mod tests {
             attempt: "attempt-1".to_string(),
             controller_run: "process-1".to_string(),
             boot_token: String::new(),
+            channel_id: String::new(),
+            channel_epoch: String::new(),
+            provider_lease_id: String::new(),
+            provider_vm_id: String::new(),
             tx: "tx-1".to_string(),
             image: "python:3.12".to_string(),
             container: None,
@@ -2302,6 +2446,10 @@ mod tests {
             attempt: "attempt-1".to_string(),
             controller_run: "process-1".to_string(),
             boot_token: String::new(),
+            channel_id: String::new(),
+            channel_epoch: String::new(),
+            provider_lease_id: String::new(),
+            provider_vm_id: String::new(),
             tx: "tx-1".to_string(),
             image: "python:3.12".to_string(),
             container: None,
@@ -2389,6 +2537,10 @@ mod tests {
             attempt: "attempt-1".to_string(),
             controller_run: "process-1".to_string(),
             boot_token: String::new(),
+            channel_id: String::new(),
+            channel_epoch: String::new(),
+            provider_lease_id: String::new(),
+            provider_vm_id: String::new(),
             tx: "tx-1".to_string(),
             image: "python:3.12".to_string(),
             container: None,
@@ -2454,6 +2606,10 @@ mod tests {
             attempt: "attempt-1".to_string(),
             controller_run: "process-1".to_string(),
             boot_token: String::new(),
+            channel_id: String::new(),
+            channel_epoch: String::new(),
+            provider_lease_id: String::new(),
+            provider_vm_id: String::new(),
             tx: "tx-1".to_string(),
             image: "python:3.12".to_string(),
             container: None,
@@ -2504,6 +2660,10 @@ mod tests {
             attempt: "attempt-1".to_string(),
             controller_run: "process-1".to_string(),
             boot_token: String::new(),
+            channel_id: String::new(),
+            channel_epoch: String::new(),
+            provider_lease_id: String::new(),
+            provider_vm_id: String::new(),
             tx: "tx-1".to_string(),
             image: "python:3.12".to_string(),
             container: None,
