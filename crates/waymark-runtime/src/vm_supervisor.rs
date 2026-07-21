@@ -14,6 +14,7 @@ use std::thread;
 
 use serde_json::{json, Value as JsonValue};
 
+use crate::agent::AgentModelGateway;
 use crate::gateway_runtime;
 use crate::global_state::prewarm_vm_globals;
 #[cfg(not(target_os = "hermit"))]
@@ -51,7 +52,10 @@ pub struct VmCleanlinessReport {
     pub live_threads: usize,
     pub live_resources: usize,
     pub live_domains: usize,
+    pub process_domain_bytes_before_release: u64,
+    pub process_domain_allocations_before_release: u64,
     pub completed_dispatches: u64,
+    pub exercised: Vec<String>,
     pub reasons: Vec<String>,
 }
 
@@ -68,7 +72,10 @@ impl VmCleanlinessReport {
             "live_threads": self.live_threads,
             "live_resources": self.live_resources,
             "live_domains": self.live_domains,
+            "process_domain_bytes_before_release": self.process_domain_bytes_before_release,
+            "process_domain_allocations_before_release": self.process_domain_allocations_before_release,
             "completed_dispatches": self.completed_dispatches,
+            "exercised": self.exercised,
             "reasons": self.reasons,
         })
     }
@@ -138,12 +145,44 @@ impl VmSupervisor {
         self.poison_reason.as_deref()
     }
 
+    pub(crate) fn start_dir(&self) -> &std::path::Path {
+        &self.start_dir
+    }
+
     /// Runs one unrelated root task in a fresh Stone process.
     ///
     /// A task-level failure is an ordinary JSON response and does not poison the
     /// VM. A failed spawn/join, live process resource, exhausted allocation
     /// domain, failed domain release, or invalid promoted result does poison it.
     pub fn dispatch_task(&mut self, task: JsonValue) -> Result<VmDispatchResult, VmDispatchError> {
+        let probes = ProcessProbes::from_task(&task);
+        self.dispatch_operation(probes, move |guest| guest.task_response_from_value(task))
+    }
+
+    /// Runs one root task with a process-scoped model and host-capability
+    /// gateway. The borrowed gateway cannot escape the scoped worker thread.
+    pub fn dispatch_task_with_model_gateway<G>(
+        &mut self,
+        task: JsonValue,
+        gateway: &mut G,
+    ) -> Result<VmDispatchResult, VmDispatchError>
+    where
+        G: AgentModelGateway + Send,
+    {
+        let probes = ProcessProbes::from_task(&task);
+        self.dispatch_operation(probes, move |guest| {
+            guest.task_response_from_value_with_model_gateway(task, gateway)
+        })
+    }
+
+    fn dispatch_operation<F>(
+        &mut self,
+        probes: ProcessProbes,
+        operation: F,
+    ) -> Result<VmDispatchResult, VmDispatchError>
+    where
+        F: FnOnce(&mut StoneGuest) -> JsonValue + Send,
+    {
         if self.state != VmLifecycleState::Ready {
             return Err(VmDispatchError {
                 code: "vm_not_ready",
@@ -170,14 +209,28 @@ impl VmSupervisor {
         };
         let domain_id = domain.id();
         let start_dir = self.start_dir.clone();
-        let worker = thread::Builder::new()
-            .name(format!("stone-root-{}", process.generation))
-            .stack_size(STONE_PROCESS_STACK_SIZE)
-            .spawn(move || run_fresh_root_process(domain_id, start_dir, task));
+        let worker_run = thread::scope(|scope| {
+            let worker = thread::Builder::new()
+                .name(format!("stone-root-{}", process.generation))
+                .stack_size(STONE_PROCESS_STACK_SIZE)
+                .spawn_scoped(scope, move || {
+                    run_fresh_root_process(domain_id, start_dir, probes, operation)
+                });
+            match worker {
+                Ok(worker) => {
+                    self.state = VmLifecycleState::Draining;
+                    match worker.join() {
+                        Ok(exit) => WorkerRun::Exited(exit),
+                        Err(_) => WorkerRun::Panicked,
+                    }
+                }
+                Err(err) => WorkerRun::SpawnFailed(err.to_string()),
+            }
+        });
 
-        let worker = match worker {
-            Ok(worker) => worker,
-            Err(err) => {
+        let worker_exit = match worker_run {
+            WorkerRun::Exited(exit) => Some(exit),
+            WorkerRun::SpawnFailed(err) => {
                 let release_error = domain.release().err();
                 let mut message = format!("failed to spawn Stone process: {err}");
                 if let Some(release_error) = release_error {
@@ -185,20 +238,26 @@ impl VmSupervisor {
                 }
                 return Err(self.poison("process_spawn_failed", message));
             }
+            WorkerRun::Panicked => None,
         };
 
-        self.state = VmLifecycleState::Draining;
         let mut reasons = Vec::new();
         let mut live_resources = 0;
-        let promoted = match worker.join() {
-            Ok(exit) => {
+        let mut exercised = Vec::new();
+        let mut process_domain_bytes = 0;
+        let mut process_domain_allocations = 0;
+        let promoted = match worker_exit {
+            Some(exit) => {
                 live_resources = exit.live_resources;
+                exercised = exit.exercised;
+                process_domain_bytes = exit.process_domain_bytes;
+                process_domain_allocations = exit.process_domain_allocations;
                 if let Some(reason) = exit.cleanup_error {
                     reasons.push(reason);
                 }
                 Some(exit.response)
             }
-            Err(_) => {
+            None => {
                 reasons.push("Stone process thread panicked".to_owned());
                 None
             }
@@ -241,7 +300,10 @@ impl VmSupervisor {
             live_threads: 0,
             live_resources,
             live_domains,
+            process_domain_bytes_before_release: process_domain_bytes,
+            process_domain_allocations_before_release: process_domain_allocations,
             completed_dispatches: self.completed_dispatches,
+            exercised,
             reasons,
         };
 
@@ -273,6 +335,29 @@ impl VmSupervisor {
             cleanliness: None,
         }
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ProcessProbes {
+    nu_quoting_tls: bool,
+}
+
+impl ProcessProbes {
+    fn from_task(task: &JsonValue) -> Self {
+        Self {
+            nu_quoting_tls: task
+                .get("diagnostics")
+                .and_then(|diagnostics| diagnostics.get("touch_nu_quoting_tls"))
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+        }
+    }
+}
+
+enum WorkerRun {
+    Exited(WorkerExit),
+    SpawnFailed(String),
+    Panicked,
 }
 
 /// A lifetime brand for one process-domain execution. Process-local references
@@ -349,24 +434,39 @@ struct WorkerExit {
     response: Promoted<Vec<u8>>,
     live_resources: usize,
     cleanup_error: Option<String>,
+    exercised: Vec<String>,
+    process_domain_bytes: u64,
+    process_domain_allocations: u64,
 }
 
 struct ProcessExit {
     response: Vec<u8>,
     scope: TaskScopeSnapshot,
     cleanup_error: Option<String>,
+    exercised: Vec<String>,
+    process_domain_bytes: u64,
+    process_domain_allocations: u64,
 }
 
-fn run_fresh_root_process(
+fn run_fresh_root_process<F>(
     domain: ProcessDomainId,
     start_dir: PathBuf,
-    task: JsonValue,
-) -> WorkerExit {
+    probes: ProcessProbes,
+    operation: F,
+) -> WorkerExit
+where
+    F: FnOnce(&mut StoneGuest) -> JsonValue,
+{
     let process_exit = with_process_scope(domain, |_scope| {
         gateway_runtime::reset_process_state();
+        let mut exercised = Vec::new();
+        if probes.nu_quoting_tls {
+            assert!(nu_utils::needs_quoting("two words"));
+            exercised.push("nu_quoting_tls".to_owned());
+        }
         let (response, scope, cleanup_error) = match StoneGuest::new(start_dir) {
             Ok(mut guest) => {
-                let response = guest.task_response_from_value(task);
+                let response = operation(&mut guest);
                 let cleanup_error = guest.reset_task_state().err().map(|err| err.to_string());
                 let scope = guest.task_scope_snapshot();
                 (response, scope, cleanup_error)
@@ -396,10 +496,14 @@ fn run_fresh_root_process(
             }))
             .expect("static process encode error response is valid JSON")
         });
+        let (process_domain_bytes, process_domain_allocations) = current_process_domain_usage();
         ProcessExit {
             response,
             scope,
             cleanup_error,
+            exercised,
+            process_domain_bytes,
+            process_domain_allocations,
         }
     });
 
@@ -408,6 +512,9 @@ fn run_fresh_root_process(
     // still alive. The supervisor releases the domain only after joining us.
     let response = Promoted(process_exit.response.clone());
     let cleanup_error = process_exit.cleanup_error.clone();
+    let exercised = process_exit.exercised.clone();
+    let process_domain_bytes = process_exit.process_domain_bytes;
+    let process_domain_allocations = process_exit.process_domain_allocations;
     let live_resources = process_exit.scope.live.len();
     drop(process_exit);
 
@@ -415,7 +522,31 @@ fn run_fresh_root_process(
         response,
         live_resources,
         cleanup_error,
+        exercised,
+        process_domain_bytes,
+        process_domain_allocations,
     }
+}
+
+#[cfg(target_os = "hermit")]
+fn current_process_domain_usage() -> (u64, u64) {
+    let mut stats = hermit_abi::mem_stats::default();
+    // SAFETY: the kernel writes one plain `repr(C)` statistics value and does
+    // not retain the pointer.
+    let status = unsafe { hermit_abi::mem_stats(&mut stats) };
+    if status < 0 {
+        (0, 0)
+    } else {
+        (
+            stats.alloc_domain_current_bytes,
+            stats.alloc_domain_current_count,
+        )
+    }
+}
+
+#[cfg(not(target_os = "hermit"))]
+fn current_process_domain_usage() -> (u64, u64) {
+    (0, 0)
 }
 
 fn with_process_scope<T, F>(domain: ProcessDomainId, operation: F) -> T

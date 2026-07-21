@@ -16,7 +16,10 @@ mod imp {
         AF_VSOCK, SOCK_STREAM, VMADDR_CID_ANY,
     };
 
-    use crate::{server::run_task_server_stream, StoneGuest};
+    use crate::{
+        server::{run_supervisor_task_server_stream, run_task_server_stream},
+        StoneGuest, VmSupervisor,
+    };
 
     pub fn run_vsock_task_server(guest: &mut StoneGuest, port: u32) -> io::Result<()> {
         eprintln!(
@@ -52,6 +55,42 @@ mod imp {
             })
         );
         run_task_server_stream(guest, &mut stream)
+    }
+
+    pub fn run_vsock_supervisor_server(supervisor: &mut VmSupervisor, port: u32) -> io::Result<()> {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "waymark_log": true,
+                "level": "info",
+                "target": "supervisor_vsock",
+                "message": "binding reusable VM supervisor",
+                "port": port,
+            })
+        );
+        let listener = VsockListener::bind(port)?;
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "waymark_log": true,
+                "level": "info",
+                "target": "supervisor_vsock",
+                "message": "listening for reusable VM lease connection",
+                "port": port,
+            })
+        );
+        let mut stream = listener.accept()?;
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "waymark_log": true,
+                "level": "info",
+                "target": "supervisor_vsock",
+                "message": "accepted reusable VM lease connection",
+                "port": port,
+            })
+        );
+        run_supervisor_task_server_stream(supervisor, &mut stream)
     }
 
     fn check_i32(result: i32) -> io::Result<i32> {
@@ -181,10 +220,29 @@ pub fn run_vsock_task_server(guest: &mut StoneGuest, port: u32) -> io::Result<()
     imp::run_vsock_task_server(guest, port)
 }
 
+#[cfg(target_os = "hermit")]
+pub fn run_vsock_supervisor_server(
+    supervisor: &mut crate::VmSupervisor,
+    port: u32,
+) -> io::Result<()> {
+    imp::run_vsock_supervisor_server(supervisor, port)
+}
+
 #[cfg(not(target_os = "hermit"))]
 pub fn run_vsock_task_server(_guest: &mut StoneGuest, _port: u32) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "vsock task server is not included in this waymark build",
+    ))
+}
+
+#[cfg(not(target_os = "hermit"))]
+pub fn run_vsock_supervisor_server(
+    _supervisor: &mut crate::VmSupervisor,
+    _port: u32,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "vsock supervisor server is not included in this waymark build",
     ))
 }

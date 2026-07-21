@@ -4,13 +4,26 @@
 
 ## Status
 
-Design target, 2026-07-20. `waymark-runtime::VmSupervisor` now implements the
-host-native P1 lifecycle skeleton: a fresh root `StoneGuest` per dispatch, one
-worker thread, generation-tagged process id, promoted serialized result,
-non-cloneable domain owner, cleanliness report, and ready/poisoned gate. The
-same code compiles for Hermit allocation domains. It is not yet wired into the
-LibOS vsock task server, does not host child processes, and does not yet prove
-the complete production cleanliness gate.
+Design target with an implemented fresh-root boundary, 2026-07-20.
+`waymark-runtime::VmSupervisor` now owns the LibOS vsock task-server lifecycle:
+every dispatch creates a fresh `StoneGuest` on a scoped worker thread with a
+generation-tagged process id and Hermit allocation domain, promotes the
+serialized result, joins the worker, releases the domain, emits a typed
+cleanliness report, and returns only a clean VM to `ready`.
+
+A 24-root Firecracker canary exercised unrelated Stone programs, deliberate
+task failures, Nu process TLS, and agent programs using model, workspace, and
+Linux host-stream capabilities through one connection and one MicroVM. All 24
+roots advanced process generations, populated and released their domains, and
+returned the supervisor to `ready`; post-warmup control-memory samples stayed
+within the configured bound. The canary is maintained by
+`waymark-gateway/host/runner/run_waymark_libos_reuse_canary.py`.
+
+This is the reusable **root-process** boundary, not completion of process fork
+or the production provider contract. The supervisor does not yet host child
+Stone processes, and the canary's host stream is a temporary provider adapter:
+it does not prove per-root Gateway attempt attachment, lease revocation,
+Gateway transaction cleanup, or the complete production cleanliness gate.
 
 Gateway runtime configuration and the attached shared RPC client are now
 thread-local rather than process-global, with a concurrency test proving that
@@ -170,12 +183,11 @@ The provider-internal control sequence is:
 not agent-visible attempt states or new Stone operations. Boot and dispatch
 messages are a provider control protocol, not attempt-program IR.
 
-The existing task-server loop is a useful transport and measurement
-predecessor, but not the desired ownership model. It repeatedly mutates and
-partially resets one `StoneGuest`. The reusable design instead constructs a new
-root `StoneProcess`, session, resource table, and process-local adapters for
-every dispatch. Only the supervisor and audited immutable/bounded shared state
-survive.
+The legacy task-server loop remains a compatibility API and repeatedly mutates
+and resets one `StoneGuest`; the Waymark LibOS `--task-server-vsock` entrypoint
+no longer uses it. Its active supervisor path constructs a new root runtime,
+session, resource table, and process-local adapters for every dispatch. Only
+the supervisor, connection, and audited immutable/bounded shared state survive.
 
 ## Process State
 
@@ -561,6 +573,11 @@ cleanliness is destroyed rather than reused.
 
 ### P1: Reusable supervisor and fresh root process
 
+Implemented for the single-root-at-a-time LibOS task stream. The remaining P1
+work is to replace the temporary host-stream attachment with a Gateway provider
+lease and extend the cleanliness report with Gateway-owned terminal-state
+evidence.
+
 1. Introduce `VmSupervisor`, `AttemptTreeLease`, `StoneProcess`, and
    `ProcessImage` as explicit ownership boundaries.
 2. Make the existing server loop construct a fresh root process/session and
@@ -572,6 +589,9 @@ cleanliness is destroyed rather than reused.
    process count, resource count, and memory plateau.
 
 ### P2: Hermit threads and allocation domains
+
+Items 1--3 are implemented for fresh roots and exercised in Firecracker.
+Diagnostic quarantine and complete stale-root scanning remain open.
 
 1. Add small safe wrappers for create/enter/restore/release domain operations.
 2. Run each Stone process on one Hermit thread in its own domain.

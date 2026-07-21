@@ -9,7 +9,7 @@ use serde_json::{json, Value as JsonValue};
 
 use crate::agent::{AgentError, AgentModelGateway};
 use crate::global_state::{ProcessLocalState, ProcessTls};
-use crate::StoneGuest;
+use crate::{StoneGuest, VmSupervisor};
 
 const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 const FRAME_WRITE_CHUNK_LEN: usize = 2048;
@@ -82,10 +82,233 @@ where
     Ok(())
 }
 
+/// Serve task frames by creating a fresh Stone root process for every task.
+///
+/// The vsock connection and `VmSupervisor` remain in the control domain. Model,
+/// workspace, and Linux requests borrow that connection only for the lifetime
+/// of the scoped Stone worker and cannot be retained by the process.
+pub fn run_supervisor_task_server_stream<S>(
+    supervisor: &mut VmSupervisor,
+    stream: &mut S,
+) -> io::Result<()>
+where
+    S: Read + Write + Send,
+{
+    while let Some(frame) = read_frame(stream)? {
+        let frame_type = frame.get("type").and_then(JsonValue::as_str);
+        let response = match frame_type {
+            Some("task") => supervisor_task_frame_response_stream(supervisor, stream, &frame)?,
+            Some("hello") => json!({
+                "version": 0,
+                "type": "hello",
+                "features": {
+                    "payload_encodings": ["json-inline"],
+                    "single_flight": true,
+                    "process_model": "fresh-root",
+                    "allocation_domains": cfg!(target_os = "hermit"),
+                    "cleanliness_report": true,
+                }
+            }),
+            Some("ping") => json!({
+                "version": 0,
+                "type": "pong",
+            }),
+            Some("shutdown") => json!({
+                "version": 0,
+                "type": "shutdown_ack",
+                "vm_state": vm_state_name(supervisor.state()),
+            }),
+            Some(message_type) => protocol_error(
+                frame_id(&frame),
+                format!("unsupported supervisor message type `{message_type}`"),
+            ),
+            None => protocol_error(frame_id(&frame), "request requires type"),
+        };
+        write_frame(stream, &response)?;
+
+        if frame_type == Some("shutdown") {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn supervisor_task_frame_response_stream<S>(
+    supervisor: &mut VmSupervisor,
+    stream: &mut S,
+    frame: &JsonValue,
+) -> io::Result<JsonValue>
+where
+    S: Read + Write + Send,
+{
+    let Some(id) = frame_id(frame) else {
+        return Ok(protocol_error(None, "task request requires id"));
+    };
+    if frame.get("version").and_then(JsonValue::as_u64) != Some(0) {
+        return Ok(protocol_error(Some(id), "request requires version=0"));
+    }
+    let Some(payload) = frame.get("payload").and_then(JsonValue::as_object) else {
+        return Ok(protocol_error(
+            Some(id),
+            "task request requires object payload",
+        ));
+    };
+    match payload.get("encoding").and_then(JsonValue::as_str) {
+        Some("json-inline") => {}
+        Some(encoding) => {
+            return Ok(protocol_error(
+                Some(id),
+                format!("unsupported payload encoding `{encoding}`"),
+            ))
+        }
+        None => return Ok(protocol_error(Some(id), "payload requires encoding")),
+    }
+    let Some(task) = payload.get("task") else {
+        return Ok(protocol_error(
+            Some(id),
+            "json-inline payload requires task",
+        ));
+    };
+    if task.get("id").and_then(JsonValue::as_str) != Some(id) {
+        return Ok(protocol_error(Some(id), "task id must match request id"));
+    }
+
+    let memory_before = supervisor_memory_stats(supervisor);
+    let (dispatch, effects) = if crate::gateway_runtime::enabled() {
+        (
+            supervisor.dispatch_task(task.clone()),
+            StreamEffectCounts::default().to_json("attached_gateway"),
+        )
+    } else {
+        let mut gateway = StreamModelGateway {
+            stream,
+            task_id: id.to_owned(),
+            next_seq: 0,
+            effects: StreamEffectCounts::default(),
+        };
+        let dispatch = supervisor.dispatch_task_with_model_gateway(task.clone(), &mut gateway);
+        (dispatch, gateway.effects.to_json("host_stream"))
+    };
+    let memory_after = supervisor_memory_stats(supervisor);
+
+    match dispatch {
+        Ok(dispatch) => {
+            let cleanliness = dispatch.cleanliness.to_json();
+            let mut result = dispatch.response;
+            if let Some(fields) = result.as_object_mut() {
+                fields.insert(
+                    "vm".to_owned(),
+                    json!({
+                        "state": vm_state_name(supervisor.state()),
+                        "process": {
+                            "slot": dispatch.process.slot,
+                            "generation": dispatch.process.generation,
+                        },
+                        "cleanliness": cleanliness,
+                        "effects": effects,
+                        "memory": {
+                            "before": memory_before,
+                            "after": memory_after,
+                        },
+                    }),
+                );
+            }
+            Ok(json!({
+                "version": 0,
+                "type": "result",
+                "id": id,
+                "result": result,
+                "reset": {
+                    "ok": dispatch.cleanliness.reusable,
+                    "task_state": true,
+                    "work": false,
+                    "fresh_process": true,
+                }
+            }))
+        }
+        Err(error) => {
+            let cleanliness = error
+                .cleanliness
+                .as_ref()
+                .map(|report| report.to_json())
+                .unwrap_or(JsonValue::Null);
+            Ok(json!({
+                "version": 0,
+                "type": "result",
+                "id": id,
+                "result": {
+                    "version": 0,
+                    "id": id,
+                    "ok": false,
+                    "kind": "vm_error",
+                    "error": {
+                        "code": error.code,
+                        "message": error.message,
+                    },
+                    "artifacts": [],
+                    "vm": {
+                        "state": vm_state_name(supervisor.state()),
+                        "cleanliness": cleanliness,
+                        "effects": effects,
+                        "memory": {
+                            "before": memory_before,
+                            "after": memory_after,
+                        },
+                    },
+                },
+                "reset": {
+                    "ok": false,
+                    "task_state": false,
+                    "work": false,
+                    "fresh_process": true,
+                }
+            }))
+        }
+    }
+}
+
+fn supervisor_memory_stats(supervisor: &VmSupervisor) -> JsonValue {
+    work_memory_stats(supervisor.start_dir()).unwrap_or_else(|err| {
+        json!({
+            "source": "unavailable",
+            "error": err.to_string(),
+        })
+    })
+}
+
+fn vm_state_name(state: crate::VmLifecycleState) -> &'static str {
+    match state {
+        crate::VmLifecycleState::Ready => "ready",
+        crate::VmLifecycleState::Leased => "leased",
+        crate::VmLifecycleState::Draining => "draining",
+        crate::VmLifecycleState::Poisoned => "poisoned",
+    }
+}
+
 struct StreamModelGateway<'a, S> {
     stream: &'a mut S,
     task_id: String,
     next_seq: u64,
+    effects: StreamEffectCounts,
+}
+
+#[derive(Clone, Copy, Default)]
+struct StreamEffectCounts {
+    model: u64,
+    workspace: u64,
+    linux: u64,
+}
+
+impl StreamEffectCounts {
+    fn to_json(self, transport: &'static str) -> JsonValue {
+        json!({
+            "transport": transport,
+            "model": self.model,
+            "workspace": self.workspace,
+            "linux": self.linux,
+        })
+    }
 }
 
 impl<S> AgentModelGateway for StreamModelGateway<'_, S>
@@ -93,6 +316,7 @@ where
     S: Read + Write,
 {
     fn request_model(&mut self, request: &JsonValue) -> Result<JsonValue, AgentError> {
+        self.effects.model = self.effects.model.saturating_add(1);
         let request_id = format!("{}:model:{}", self.task_id, self.next_seq);
         self.next_seq += 1;
         write_frame(
@@ -151,6 +375,7 @@ where
     }
 
     fn request_workspace_rpc(&mut self, request: &JsonValue) -> Result<JsonValue, String> {
+        self.effects.workspace = self.effects.workspace.saturating_add(1);
         let request_id = format!("{}:workspace:{}", self.task_id, self.next_seq);
         self.next_seq += 1;
         write_frame(
@@ -181,6 +406,7 @@ where
     }
 
     fn request_linux_rpc(&mut self, request: &JsonValue) -> Result<JsonValue, String> {
+        self.effects.linux = self.effects.linux.saturating_add(1);
         let request_id = format!("{}:linux:{}", self.task_id, self.next_seq);
         self.next_seq += 1;
         write_frame(
@@ -406,6 +632,7 @@ where
             stream,
             task_id: id.to_owned(),
             next_seq: 0,
+            effects: StreamEffectCounts::default(),
         };
         guest.task_response_from_value_with_model_gateway(task.clone(), &mut gateway)
     };
@@ -1138,13 +1365,124 @@ fn write_all_chunked<W: Write>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_task_server, run_task_server_stream};
-    use crate::StoneGuest;
+    use super::{run_supervisor_task_server_stream, run_task_server, run_task_server_stream};
+    use crate::{StoneGuest, VmSupervisor};
     use serde_json::{json, Value as JsonValue};
     use std::fs;
     use std::io::{Cursor, Read, Write};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn supervisor_server_uses_fresh_roots_and_survives_task_failure() {
+        let mut input = Vec::new();
+        push_frame(
+            &mut input,
+            &json!({
+                "version": 0,
+                "type": "task",
+                "id": "root-one",
+                "payload": {
+                    "encoding": "json-inline",
+                    "task": {
+                        "version": 0,
+                        "id": "root-one",
+                        "runtime": { "frontend": "stone" },
+                        "diagnostics": { "touch_nu_quoting_tls": true },
+                        "script": { "source": "secret = 41\nemit(secret + 1)" }
+                    }
+                }
+            }),
+        );
+        push_frame(
+            &mut input,
+            &json!({
+                "version": 0,
+                "type": "task",
+                "id": "root-two",
+                "payload": {
+                    "encoding": "json-inline",
+                    "task": {
+                        "version": 0,
+                        "id": "root-two",
+                        "runtime": { "frontend": "stone" },
+                        "diagnostics": { "touch_nu_quoting_tls": true },
+                        "script": { "source": "emit(secret)" }
+                    }
+                }
+            }),
+        );
+        push_frame(
+            &mut input,
+            &json!({
+                "version": 0,
+                "type": "task",
+                "id": "root-three",
+                "payload": {
+                    "encoding": "json-inline",
+                    "task": {
+                        "version": 0,
+                        "id": "root-three",
+                        "runtime": { "frontend": "agent" },
+                        "diagnostics": { "touch_nu_quoting_tls": true },
+                        "agent": {
+                            "model": "fixture-model",
+                            "task": "Return the fresh-root answer."
+                        }
+                    }
+                }
+            }),
+        );
+        push_frame(
+            &mut input,
+            &json!({
+                "version": 0,
+                "type": "model_response",
+                "id": "root-three:model:0",
+                "ok": true,
+                "response": {
+                    "ok": true,
+                    "text": "{\"actions\":[{\"final\":{\"answer\":\"fresh-root\"}}]}"
+                }
+            }),
+        );
+        push_frame(&mut input, &json!({"version": 0, "type": "shutdown"}));
+
+        crate::gateway_runtime::set_config(None);
+        let root = temp_dir("supervisor-fresh-roots");
+        let mut supervisor = VmSupervisor::new(root.clone());
+        let mut stream = Duplex::new(input);
+
+        run_supervisor_task_server_stream(&mut supervisor, &mut stream).expect("server");
+        let frames = read_output_frames(&stream.output);
+
+        assert_eq!(frames[0]["result"]["ok"], json!(true));
+        assert_eq!(frames[0]["result"]["value"], json!(42));
+        assert_eq!(frames[0]["result"]["vm"]["state"], json!("ready"));
+        assert_eq!(
+            frames[0]["result"]["vm"]["cleanliness"]["exercised"],
+            json!(["nu_quoting_tls"])
+        );
+        assert_eq!(frames[0]["reset"]["fresh_process"], json!(true));
+
+        assert_eq!(frames[1]["result"]["ok"], json!(false));
+        assert_eq!(frames[1]["result"]["vm"]["state"], json!("ready"));
+        assert_eq!(frames[1]["result"]["vm"]["process"]["generation"], json!(2));
+        assert_eq!(
+            frames[1]["result"]["vm"]["cleanliness"]["reusable"],
+            json!(true)
+        );
+        assert_eq!(frames[2]["type"], json!("model_request"));
+        assert_eq!(frames[2]["id"], json!("root-three:model:0"));
+        assert_eq!(frames[3]["result"]["ok"], json!(true));
+        assert_eq!(frames[3]["result"]["value"]["answer"], json!("fresh-root"));
+        assert_eq!(frames[3]["result"]["vm"]["effects"]["model"], json!(1));
+        assert_eq!(frames[3]["result"]["vm"]["process"]["generation"], json!(3));
+        assert_eq!(frames[4]["type"], json!("shutdown_ack"));
+        assert_eq!(frames[4]["vm_state"], json!("ready"));
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn task_server_runs_json_inline_task() {

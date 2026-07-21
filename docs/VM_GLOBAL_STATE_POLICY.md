@@ -107,6 +107,33 @@ No single type, lint, or allocator supplies the guarantee. The guarantee comes
 from the compile-time root inventory, typed ownership boundaries, allocation
 domains, ordered teardown, and the reuse cleanliness gate together.
 
+### Reusable LibOS canary
+
+The dynamic gate is implemented by
+`waymark-gateway/host/runner/run_waymark_libos_reuse_canary.py`. It builds the
+guest with opt-in Hermit allocation statistics and runs, by default, 24
+unrelated roots through one vsock connection and one Firecracker MicroVM. Each
+three-root cycle checks:
+
+1. a Stone root allocates process-owned values and installs a top-level binding;
+2. a fresh root fails to resolve that binding without poisoning the VM;
+3. an agent root completes one model call, two workspace calls, and one Linux
+   call through the host capability stream.
+
+Every root also initializes the patched Nu quoting TLS inside its process
+domain. The validator requires a fresh generation, nonzero domain allocation,
+join and domain release, zero live process/thread/resource/domain counters, an
+empty reason list, and a post-warmup control-memory bound. The 24-root run at
+`waymark-gateway/target/runs/waymark-libos-reuse-canary-24roots/summary.json`
+passed with 24 clean roots, eight expected task failures, eight agent roots,
+and no retained non-control allocation domain.
+
+This is a dynamic backstop, not a proof that arbitrary dependencies cannot
+retain state. It also does not yet validate Gateway attempt/transaction lease
+cleanup because the canary uses the existing Helix host stream as a provider
+adapter. Those checks must be added before Gateway can pool the VM in
+production.
+
 ## Adding Global State
 
 1. Prefer making the value a field of `StoneProcess` or `VmSupervisor`.

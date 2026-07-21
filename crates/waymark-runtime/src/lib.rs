@@ -42,7 +42,7 @@ mod vm_supervisor;
 mod vsock;
 
 pub use frontend::{Frontend, StoneFrontend};
-pub use server::{run_task_server, run_task_server_stream};
+pub use server::{run_supervisor_task_server_stream, run_task_server, run_task_server_stream};
 pub use stone_ast::{
     lower_source as lower_stone_source, Call as StoneCall, Expr as StoneExpr,
     Program as StoneProgram, Stmt as StoneStmt,
@@ -52,7 +52,7 @@ pub use vm_supervisor::{
     BulkResetSafe, ProcessBox, ProcessId, ProcessScope, ResourceId, VmCleanlinessReport,
     VmDispatchError, VmDispatchResult, VmLifecycleState, VmSupervisor,
 };
-pub use vsock::run_vsock_task_server;
+pub use vsock::{run_vsock_supervisor_server, run_vsock_task_server};
 
 pub struct StoneGuest {
     engine_state: EngineState,
