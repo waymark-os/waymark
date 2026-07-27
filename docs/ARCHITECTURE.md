@@ -23,8 +23,9 @@ choice, not a separate user-facing shell contract.
 For the host-authority placement used by LibOS guests and sandboxed agents, see
 [`GATEWAY_RUNTIME.md`](GATEWAY_RUNTIME.md).
 
-For the proposed LLM-oriented authoring layer in which an outer agent generates
-Stone programs that directly control model calls, tools, and child attempts, see
+For the LLM-primary authoring model in which an outer agent generates Stone
+programs that directly control model calls, tools, context, and child attempts,
+see
 [`STONE_AGENT_PROGRAMMING_DESIGN.md`](STONE_AGENT_PROGRAMMING_DESIGN.md).
 
 For the target single-address-space LibOS execution model in which Stone process

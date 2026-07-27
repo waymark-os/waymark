@@ -2,9 +2,12 @@
 
 # Waymark Shell
 
-Waymark Shell is a structured shell for coding agents and automation. Stone is the
-shell language: scripts read and write files, run Linux commands, transform
-JSON-shaped data, and return structured JSON envelopes.
+Waymark Shell is a structured shell for coding agents and automation. Stone is
+the language primarily designed for LLMs to program Waymark attempts: programs
+read and write files, run Linux commands, transform structured data, call
+models, manage context, compose child attempts, and return typed results.
+Humans remain important readers and debuggers, but are not Stone's primary
+author.
 
 This repository contains the current `waymark` shell implementation. It is
 designed to run as an ordinary POSIX-oriented process on the host, in containers,
@@ -27,6 +30,11 @@ primary user is a coding agent, not a human sitting at a terminal. That changes
 the shell contract: the interface should make context easy to retrieve, reduce
 probing, avoid fragile quoting and escaping, expose typed state, and make common
 errors recoverable.
+
+In the larger Waymark architecture, an attempt plays the role of an OS process
+and Stone is the language an LLM uses to program that process abstraction. A
+task-specific agent harness is therefore an ordinary Stone attempt program,
+not a separate runtime layer.
 
 Stone uses Python-shaped syntax for the parts agents and humans write most often:
 literals, records, lists, loops, conditionals, and small functions. The goal is

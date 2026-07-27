@@ -14,10 +14,17 @@ making model inference an explicit, typed effect. It should not make one ReAct
 loop, one graph scheduler, or one multi-agent protocol part of the language
 semantics.
 
-Common agent loops should be available as optimized builtin templates that
-implement the same `AgentControl` interface as ordinary Stone functions. They
-must remain extensible through Stone composition and receive the same Shell
-tools for CPU, memory, files, Linux, models, context, and other attempts.
+In the OS analogy, Waymark provides computing resources, an attempt is the
+process abstraction and programming model, and Stone is the language primarily
+designed for an LLM to program attempts. A task harness is simply a Stone
+program specialized for a task; it is not an additional architectural layer.
+
+Common agent loops should first be available as visible, executable Stone
+reference programs. Once a flow is stable and profiling justifies it, an
+optimized builtin template may implement the same `AgentControl` interface as
+the ordinary Stone function. Either form must remain extensible through Stone
+composition and receive the same Shell tools for CPU, memory, files, Linux,
+models, context, and other attempts.
 
 The primary author is another language agent. A typical execution is:
 
@@ -34,6 +41,11 @@ roles. The outer agent writes or repairs control code. The generated Stone
 program performs bounded task-specific control. A human may inspect the source
 and trace, but human typing convenience is not the language's primary
 optimization target.
+
+In the long term, an explicit formal task contract may lower into checked Stone
+interfaces, evidence monitors, and success gates. The current research question
+comes first: can existing language agents author and repair effective Stone
+attempt programs from task requirements, available APIs, and prior traces?
 
 The division is:
 
