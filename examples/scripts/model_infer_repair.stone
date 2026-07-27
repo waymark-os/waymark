@@ -1,0 +1,42 @@
+# Minimal conformance example: the fixture returns a schema-invalid object
+# first and a valid object second. Both calls remain visible model transitions.
+
+schema = {
+    "type": "object",
+    "properties": {"ready": {"type": "boolean"}},
+    "required": ["ready"],
+    "additionalProperties": False,
+}
+
+
+def record_model_transition(step):
+    retained = context_read(keys=["model_infer.transitions"], limit=1)
+    transition_ids = []
+    if len(retained) > 0:
+        transition_ids = retained[0].content
+    transition_ids.append(step.transition_id)
+    return context_write(
+        "model_infer.transitions",
+        "outcome",
+        transition_ids,
+        evidence=["transition:" + step.transition_id],
+    )
+
+
+inference = model_infer(
+    [{"role": "user", "content": "Return readiness as one JSON object."}],
+    schema,
+    retries=1,
+    repair_prompt="Correct the ready field.",
+    max_output_tokens=64,
+    hooks={"post": record_model_transition},
+)
+transitions = context_read(keys=["model_infer.transitions"], limit=1)
+emit({
+    "ready": inference.value.ready,
+    "validation_attempts": inference.validation_attempts,
+    "errors": inference.errors,
+    "usage": inference.usage,
+    "transition_id": inference.response.transition_id,
+    "model_transitions": transitions[0].content,
+})

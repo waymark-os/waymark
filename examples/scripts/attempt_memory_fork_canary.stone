@@ -1,0 +1,123 @@
+# End-to-end canary for the attempt-memory v1 fork contract.
+
+
+def worker(input):
+    inherited = context_read(keys=["shared.parent"], limit=1)
+    if len(inherited) != 1:
+        fail("child did not inherit parent memory", code="fork_memory_missing")
+    inherited_value = inherited[0].content.value
+    context_write(
+        "candidate.child",
+        "candidate",
+        {"value": inherited_value + 1},
+        evidence=["child:derived"],
+    )
+    write_file("child-memory.json", json_dumps({
+        "inherited_value": inherited_value,
+        "child_keys": map(lambda item: item.key, context_read(limit=20)),
+    }))
+    return {"inherited_value": inherited_value}
+
+
+def main(input):
+    root = attempt_info()
+    context_write(
+        "shared.parent",
+        "fact",
+        {"value": 1},
+        status="verified",
+        evidence=["parent:seed"],
+    )
+    scope = attempt_scope(join_timeout_ms=30000)
+    child = attempt_fork(
+        program=current_program(),
+        entrypoint="worker",
+        input={},
+        start=True,
+        scope=scope,
+    )
+
+    # This write happens after the fork and must stay on the parent branch.
+    context_write(
+        "parent.after",
+        "fact",
+        {"value": 2},
+        status="verified",
+        evidence=["parent:after-fork"],
+    )
+    outcome = attempt_join(child, timeout_ms=30000)
+    if not outcome.joined:
+        fail("child did not join", code="fork_memory_join_failed", detail=outcome)
+    if outcome.controller_state != "exited":
+        fail(
+            "child controller failed",
+            code="fork_memory_child_failed",
+            detail={
+                "outcome": outcome,
+                "child": attempt_info(child.attempt),
+            },
+        )
+
+    accepted = attempt_accept(root.attempt, child.attempt)
+    cleanup = attempt_scope_close(scope)
+    if not cleanup.clean:
+        fail("fork memory scope cleanup failed", code="fork_memory_cleanup_failed", detail=cleanup)
+
+    parent_memory_before_promotion = context_read(limit=20)
+    child_observation = read_json("child-memory.json")
+    context_write(
+        "candidate.accepted",
+        "candidate",
+        {"value": child_observation.inherited_value + 1},
+        status="verified",
+        evidence=["accepted-child:" + child.attempt],
+    )
+    parent_memory_after_promotion = context_read(limit=20)
+    return {
+        "child": child.attempt,
+        "child_observation": child_observation,
+        "fork_memory_ref": child.fork_origin.memory_ref,
+        "fork_memory_revision": child.fork_origin.memory_revision,
+        "parent_memory_ref": root.memory_ref,
+        "parent_memory_revision": attempt_info().memory_revision,
+        "parent_keys_before_promotion": map(
+            lambda item: item.key,
+            parent_memory_before_promotion,
+        ),
+        "parent_keys_after_promotion": map(
+            lambda item: item.key,
+            parent_memory_after_promotion,
+        ),
+        "accepted_child_memory_ref": get(
+            accepted.parent.metadata,
+            "last_accepted_child_memory_ref",
+            "",
+        ),
+        "accepted_child_memory_revision": get(
+            accepted.parent.metadata,
+            "last_accepted_child_memory_revision",
+            "",
+        ),
+        "accept_memory_policy": get(
+            accepted.parent.metadata,
+            "last_accepted_child_memory_policy",
+            "",
+        ),
+    }
+
+
+# The local development controller currently launches the admitted source as a
+# script. Dispatch from the recorded entrypoint so the same source exercises
+# both parent and child without a hidden harness loop.
+control = attempt_info()
+entrypoint = get(control.metadata, "program_entrypoint", "main")
+if entrypoint == "worker":
+    result = worker(task_input())
+else:
+    result = main(task_input())
+attempt_report(
+    status="succeeded",
+    result=result,
+    metadata={"control": "attempt_memory_fork_v1"},
+)
+emit(result)

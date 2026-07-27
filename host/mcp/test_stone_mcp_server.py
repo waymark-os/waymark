@@ -115,6 +115,59 @@ class StoneMcpServerTests(unittest.TestCase):
         )
         self.assertEqual(result["diagnostics"]["session"], {"bound": ["rows"]})
 
+    def test_normalizes_bounded_correction_from_warm_task_error(self) -> None:
+        correction = {
+            "version": 1,
+            "mode": "suggest",
+            "phase": "evaluation",
+            "execution_state": "started_or_unknown",
+            "class": "name",
+            "safety": "suggest_only",
+            "auto_apply": False,
+            "retry": "explicit_only",
+            "source_sha256": "a" * 64,
+            "received": "context_projet",
+            "expected": [f"name_{index}" for index in range(20)],
+            "candidates": [
+                {
+                    "replacement": f"context_project_{index}",
+                    "confidence": "high",
+                    "distance": 1,
+                    "edit": {
+                        "start": 0,
+                        "end": 14,
+                        "replacement": f"context_project_{index}",
+                    },
+                }
+                for index in range(4)
+            ],
+            "guidance": "replace the callable",
+            "choices": ["apply", "edit", "reject", "abort", "extra"],
+        }
+        frame = {
+            "version": 0,
+            "type": "result",
+            "id": "stone-mcp-1",
+            "result": {
+                "ok": False,
+                "error": {
+                    "kind": "generic",
+                    "code": "stone_script_error",
+                    "message": "Stone function call error",
+                    "correction": correction,
+                },
+            },
+        }
+
+        result = server.normalize_task_frame_result(frame, 1024, 11)
+
+        normalized = result["error"]["correction"]
+        self.assertEqual(normalized["source_sha256"], "a" * 64)
+        self.assertEqual(normalized["execution_state"], "started_or_unknown")
+        self.assertEqual(len(normalized["expected"]), 16)
+        self.assertEqual(len(normalized["candidates"]), 3)
+        self.assertEqual(normalized["choices"], ["apply", "edit", "reject", "abort"])
+
     def test_large_eval_result_is_replaced_with_peek(self) -> None:
         backend = FakeBackend({"ok": True, "value": list(range(30)), "diagnostics": {"backend": "fake"}})
         mcp = server.McpServer(backend, io.BytesIO(), io.BytesIO(), io.StringIO())
@@ -909,6 +962,21 @@ class StoneMcpServerTests(unittest.TestCase):
         source = server.stone_call_source("resolve_command", {"name": "python3"})
 
         self.assertEqual(source, 'emit(resolve_command("python3"))\n')
+
+    def test_stone_call_supports_explicit_correction_application(self) -> None:
+        source = server.stone_call_source(
+            "correction_apply",
+            {
+                "source": "context_projet()",
+                "correction": {"version": 1},
+                "candidate": 0,
+            },
+        )
+
+        self.assertEqual(
+            source,
+            'emit(correction_apply("context_projet()", {"version": 1}, 0))\n',
+        )
 
     def test_stone_call_supports_recent_system_helpers(self) -> None:
         ps = server.stone_call_source("ps", {"interval_ms": 0})

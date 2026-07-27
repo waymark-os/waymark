@@ -1,0 +1,73 @@
+def prepare_decision(step):
+    projection = context_project(
+        focus="release codename requirement",
+        max_tokens=96,
+    )
+    return {
+        "messages": step.input.messages + [
+            {
+                "role": "user",
+                "content": "Active attempt memory:\n" + projection.text,
+            }
+        ]
+    }
+
+
+def record_decision(step):
+    if step.outcome.ok:
+        return context_write(
+            "outcome.last_model",
+            "outcome",
+            {
+                "transition_id": step.transition_id,
+                "ok": True,
+                "content": step.outcome.value.content,
+            },
+        )
+    return context_write(
+        "outcome.last_model",
+        "outcome",
+        {
+            "transition_id": step.transition_id,
+            "ok": False,
+            "error": step.outcome.error,
+        },
+    )
+
+
+context_write(
+    "requirement.release_codename",
+    "requirement",
+    {"text": "The required release codename is cobalt."},
+    status="verified",
+    evidence=["fixture:task"],
+)
+
+messages = [
+    {"role": "system", "content": "Answer from the currently visible information."},
+]
+for index in range(12):
+    messages.append({
+        "role": "user",
+        "content": "Distractor note " + str(index) + ": no release information here.",
+    })
+messages.append({
+    "role": "user",
+    "content": "Which release codename must be used?",
+})
+
+control = model_call(messages, max_output_tokens=64)
+treatment = model_call(
+    messages,
+    max_output_tokens=64,
+    hooks={"pre": prepare_decision, "post": record_decision},
+)
+retained = context_read(keys=["outcome.last_model"])
+
+emit({
+    "control": control.content,
+    "treatment": treatment.content,
+    "control_transition_id": control.transition_id,
+    "treatment_transition_id": treatment.transition_id,
+    "retained": retained,
+})

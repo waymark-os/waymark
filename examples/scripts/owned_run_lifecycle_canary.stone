@@ -1,0 +1,67 @@
+# Deterministic Gateway-backed lifecycle canary for an attempt-owned task run.
+#
+# This exercises the substrate directly. The standard attempt controller exposes
+# the same four effects to the model as run_start/run_status/run_wait/run_terminate.
+
+session = agent_session()
+started = run(
+    [
+        "/bin/sh",
+        "-lc",
+        "sleep 1; printf 'TASK-DONE\\n' > /app/task-result.txt",
+    ],
+    background=True,
+    max_stdout_bytes=4096,
+    max_stderr_bytes=4096,
+)
+if not started.still_running or len(started.run_id) == 0:
+    fail(
+        "background task did not return an active owned run",
+        code="owned_run_start_failed",
+        detail=started,
+    )
+
+context_write(
+    "progress.active_runs",
+    "progress",
+    {
+        "count": 1,
+        "runs": [{"run_id": started.run_id, "status": "running"}],
+    },
+    status="active",
+    evidence=["run:" + started.run_id],
+)
+observed = run_status(started.run_id)
+finished = run_wait(started.run_id, timeout_ms=10000)
+if finished.still_running:
+    cleanup = run_terminate(started.run_id)
+    fail(
+        "background task did not settle within the bounded wait",
+        code="owned_run_wait_failed",
+        detail={"wait": finished, "cleanup": cleanup},
+    )
+
+content = read_file("/app/task-result.txt", max_bytes=64)
+if not finished.ok or content != "TASK-DONE\n":
+    fail(
+        "terminal run result or workspace output is wrong",
+        code="owned_run_result_failed",
+        detail={"wait": finished, "content": content},
+    )
+context_write(
+    "progress.active_runs",
+    "progress",
+    {"count": 0, "runs": []},
+    status="verified",
+    evidence=["run:" + started.run_id],
+)
+emit({
+    "answer": "owned-run-lifecycle-ok",
+    "complete": True,
+    "run_id": started.run_id,
+    "initial_status_still_running": observed.still_running,
+    "done": finished.done,
+    "exit_code": finished.exit_code,
+    "content": content,
+    "task_id": get(session.task, "id", ""),
+})

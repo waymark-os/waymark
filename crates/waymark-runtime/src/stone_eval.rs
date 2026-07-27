@@ -6,6 +6,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(not(target_os = "hermit"))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use nu_protocol::{
     engine::{EngineState, Stack},
@@ -40,7 +42,7 @@ use crate::linux_tools::{
 use crate::stone_agent_control::{AgentControlKind, AgentControlValue};
 use crate::stone_ast::{
     AssignTarget, AugOp, BoolOp, Call, CompareOp, ComprehensionClause, ExceptHandler, Expr,
-    FormattedStringPart, FunctionDef, Program, Stmt, StoneFormatSpec, StoneType,
+    FormattedStringPart, FunctionDef, Program, StageDecorator, Stmt, StoneFormatSpec, StoneType,
 };
 use crate::stone_attempt_scope::AttemptScopeValue;
 use crate::stone_attempt_value::{AttemptHandleValue, AttemptOutcomeValue};
@@ -57,12 +59,13 @@ use crate::stone_builtins::{
     value_to_path_string, value_to_string, value_to_u64, value_truthy, value_type_name,
     where_builtin, where_compare_builtin, zfill_text,
 };
+use crate::stone_correction;
 use crate::stone_file_ops::{
-    cat_text, create_dir_all, diff_record_for_paths, edit_text_file, find_records, io_stone_error,
-    list_dir_records, open_runtime_file, read_bytes_for_jsonl, read_csv_file, read_json_file,
-    read_text as stone_read_text, remove_path, save_value_file, search_records, stat_record,
-    write_json_file, write_jsonl_file, write_text as stone_write_text, RuntimeFile,
-    StoneFindOptions,
+    cat_text, create_dir_all, diff_record_for_paths, edit_text_file, file_nonempty_probe,
+    find_records, io_stone_error, list_dir_records, open_runtime_file, read_bytes_for_jsonl,
+    read_csv_file, read_json_file, read_text as stone_read_text, remove_path, save_value_file,
+    search_records, stat_record, write_json_file, write_jsonl_file, write_text as stone_write_text,
+    RuntimeFile, StoneFindOptions,
 };
 use crate::stone_hash::hash_builtin;
 #[cfg(not(target_os = "hermit"))]
@@ -70,6 +73,9 @@ use crate::stone_helpers::{
     helper_error_observation, stone_helper_observations_from_value, stone_helper_registry,
     stone_run_event_from_record, stone_run_event_value, StoneHelperHandlerKind, StoneHelperHook,
     StoneHelperRegistry, StoneRunEvent,
+};
+use crate::stone_json_schema::{
+    validate_instance as validate_json_schema_instance, validate_schema_definition, ValidationIssue,
 };
 use crate::stone_vm::{
     match_hot_jsonl_aggregation_body, match_outer_jsonl_file_loop_body, try_lower_generic_loop,
@@ -79,6 +85,8 @@ use crate::stone_vm::{
 };
 use crate::StoneGuest;
 
+#[path = "stone_context.rs"]
+mod stone_context;
 #[path = "stone_functions.rs"]
 mod stone_functions;
 #[path = "stone_json_view.rs"]
@@ -93,8 +101,14 @@ mod stone_vm_interp;
 mod stone_vm_jsonl_runtime;
 #[path = "stone_vm/runtime.rs"]
 mod stone_vm_runtime;
-use stone_functions::CallableValue;
+use stone_context::ContextState;
 pub(crate) use stone_functions::StoneSession;
+use stone_functions::{
+    CallableValue, TransitionHookHandlerValue as TransitionHookHandler,
+    TransitionHooksValue as TransitionHooks, WorkflowEvidenceSourceValue as WorkflowEvidenceSource,
+    WorkflowHandlerValue as WorkflowHandler, WorkflowStageValue as WorkflowStage,
+    WorkflowValue as Workflow,
+};
 use stone_json_view::{
     eval_json_object_view_method, eval_runtime_subscript, json_array_view_iter_values,
     json_object_view_get, json_scalar_view_to_f64, json_scalar_view_to_i64, jsonl_row_view,
@@ -113,9 +127,15 @@ pub struct EvalState {
     functions: HashMap<String, FunctionDef>,
     next_file_id: u64,
     next_callable_id: u64,
+    next_transition_id: u64,
+    agent_time_anchor: Option<(Instant, u64)>,
+    active_transition_hook: bool,
+    active_workflow_run: bool,
+    transition_events: Vec<JsonValue>,
     attempt_scopes: Vec<AttemptScopeValue>,
     current_program_source: Option<String>,
     current_program_entrypoint: Option<String>,
+    context: ContextState,
     stdout: String,
     session_bound_names: Vec<String>,
     profiler: EvalProfiler,
@@ -445,6 +465,15 @@ impl EvalState {
         id
     }
 
+    fn next_transition_id(&mut self) -> String {
+        self.next_transition_id = self.next_transition_id.checked_add(1).unwrap_or(1);
+        transition_id(self.next_transition_id)
+    }
+
+    fn record_transition_event(&mut self, event: JsonValue) {
+        self.transition_events.push(event);
+    }
+
     fn capture_locals(&self) -> Vec<(String, RuntimeValue)> {
         let mut seen = HashSet::new();
         let mut captures = Vec::new();
@@ -463,6 +492,20 @@ impl EvalState {
             .get_mut(handle.scope_index)
             .and_then(|scope| scope.files.get_mut(&handle.file_id))
             .ok_or_else(|| stone_error("file", "file handle is no longer valid"))
+    }
+}
+
+fn transition_id(sequence: u64) -> String {
+    let controller_run = std::env::var("WAYMARK_GATEWAY_CONTROLLER_RUN_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    transition_id_for_scope(sequence, controller_run)
+}
+
+fn transition_id_for_scope(sequence: u64, controller_run: Option<u64>) -> String {
+    match controller_run {
+        Some(controller_run) => format!("run-{controller_run}-transition-{sequence}"),
+        _ => format!("transition-{sequence}"),
     }
 }
 
@@ -568,9 +611,23 @@ fn eval_program_with_source_options(
                 .unwrap_or_default(),
             next_file_id: 0,
             next_callable_id: 0,
+            next_transition_id: options
+                .session
+                .as_ref()
+                .map(|session| session.next_transition_id)
+                .unwrap_or_default(),
+            agent_time_anchor: None,
+            active_transition_hook: false,
+            active_workflow_run: false,
+            transition_events: Vec::new(),
             attempt_scopes: Vec::new(),
             current_program_source: source.map(str::to_string),
             current_program_entrypoint: entrypoint.map(str::to_string),
+            context: options
+                .session
+                .as_ref()
+                .map(|session| session.context.clone())
+                .unwrap_or_default(),
             stdout: String::new(),
             session_bound_names: Vec::new(),
             profiler: EvalProfiler::default(),
@@ -603,6 +660,8 @@ fn eval_program_with_source_options(
             session.update_from_root_scope(root_scope);
         }
         session.update_functions(&evaluator.state.functions);
+        session.update_context(&evaluator.state.context);
+        session.update_transition_id(evaluator.state.next_transition_id);
     }
     let pipeline = match (pipeline, cleanup) {
         (Ok(pipeline), Ok(())) => pipeline,
@@ -616,6 +675,12 @@ fn eval_program_with_source_options(
         Some(hot_loop) => json!({ "hot_loop": hot_loop }),
         None => json!({}),
     };
+    if let Some(context) = evaluator.state.context.diagnostics() {
+        diagnostics["context"] = context;
+    }
+    if !evaluator.state.transition_events.is_empty() {
+        diagnostics["transitions"] = JsonValue::Array(evaluator.state.transition_events.clone());
+    }
     if let Some(root_scope) = evaluator.state.scopes.first() {
         let mut bound = evaluator
             .state
@@ -654,6 +719,28 @@ enum EvalFlow {
     Break,
     Continue,
     Return(RuntimeValue),
+}
+
+enum TransitionPreHookDecision {
+    Continue(Option<Record>),
+    Reject(String),
+}
+
+enum RunPreHookDecision {
+    Continue { changed: bool },
+    Reject { reason: String },
+}
+
+#[derive(Clone)]
+struct WorkflowEvidence {
+    satisfied: bool,
+    summary: String,
+    references: Vec<String>,
+}
+
+struct WorkflowActionResult {
+    full: Value,
+    compact: Value,
 }
 
 impl Evaluator<'_> {
@@ -714,8 +801,30 @@ impl Evaluator<'_> {
                     ),
                 )
             })?;
-        for function in module_functions {
-            self.state.functions.insert(function.name.clone(), function);
+        if function.stage.is_some() {
+            return Err(stone_error(
+                "entrypoint",
+                format!(
+                    "{} is a @stage declaration, not a callable task entrypoint",
+                    function.name
+                ),
+            ));
+        }
+        for module_function in module_functions {
+            let stage = module_function
+                .stage
+                .as_ref()
+                .map(|decorator| self.eval_stage_declaration(&module_function, decorator))
+                .transpose()?;
+            self.state
+                .functions
+                .insert(module_function.name.clone(), module_function.clone());
+            if let Some(stage) = stage {
+                self.state.set_local(
+                    module_function.name.clone(),
+                    RuntimeValue::WorkflowStage(stage),
+                );
+            }
         }
         if function.params.len() > 1 {
             return Err(stone_error(
@@ -801,12 +910,21 @@ impl Evaluator<'_> {
             }
             Stmt::Pass => Ok(EvalFlow::Output(PipelineData::empty())),
             Stmt::FunctionDef(function) => {
+                let stage = function
+                    .stage
+                    .as_ref()
+                    .map(|decorator| self.eval_stage_declaration(function, decorator))
+                    .transpose()?;
                 if record_session_bindings {
                     self.state.record_session_binding(&function.name);
                 }
                 self.state
                     .functions
                     .insert(function.name.clone(), function.clone());
+                if let Some(stage) = stage {
+                    self.state
+                        .set_local(function.name.clone(), RuntimeValue::WorkflowStage(stage));
+                }
                 Ok(EvalFlow::Output(PipelineData::empty()))
             }
             Stmt::Return(value) => {
@@ -1619,10 +1737,18 @@ impl Evaluator<'_> {
                     }
                     Ok(RuntimeValue::Nu(Value::record(record, span)))
                 }
-                Expr::Name(name) => self
-                    .state
-                    .get_local(name)
-                    .ok_or_else(|| stone_error("name", format!("unknown name `{name}`"))),
+                Expr::Name(name) => {
+                    if let Some(value) = self.state.get_local(name) {
+                        Ok(value)
+                    } else if let Some(function) = self.state.functions.get(name).cloned() {
+                        Ok(RuntimeValue::Callable(CallableValue::named(
+                            self.state.next_callable_id(),
+                            function,
+                        )))
+                    } else {
+                        Err(stone_error("name", format!("unknown name `{name}`")))
+                    }
+                }
                 Expr::Subscript { value, index } => {
                     match self.try_eval_json_object_literal_subscript(value, index)? {
                         Some(value) => Ok(value),
@@ -1795,12 +1921,14 @@ impl Evaluator<'_> {
                     "generator expression",
                     "generator expressions are only supported inside sum(...), any(...), all(...), join(...), and set(...) for now; use a list comprehension like [expr for x in items] when you need a list",
                 )),
-                Expr::Lambda { params, body } => Ok(RuntimeValue::Callable(CallableValue {
-                    function_id: self.state.next_callable_id(),
-                    params: params.clone(),
-                    body: body.clone(),
-                    captures: self.state.capture_locals(),
-                })),
+                Expr::Lambda { params, body } => {
+                    Ok(RuntimeValue::Callable(CallableValue::lambda(
+                        self.state.next_callable_id(),
+                        params.clone(),
+                        body.clone(),
+                        self.state.capture_locals(),
+                    )))
+                }
                 Expr::Call(call) if self.state.functions.contains_key(&call.name) => {
                     self.eval_user_function_call(call)
                 }
@@ -1936,7 +2064,19 @@ impl Evaluator<'_> {
             "json_dumps" => self.eval_json_dumps_call(call),
             "json_loads" => self.eval_json_loads_call(call),
             "help" => self.eval_help_call(call),
+            "transition_hooks" => self.eval_transition_hooks_call(call),
+            "workflow_evidence" => self.eval_workflow_evidence_call(call),
+            "file_nonempty" => self.eval_file_nonempty_call(call),
+            "stage" => self.eval_stage_marker_call(call),
+            "workflow_stage" => self.eval_workflow_stage_call(call),
+            "workflow" => self.eval_workflow_call(call),
+            "workflow_run" => self.eval_workflow_run_call(call),
             "model_call" => self.eval_model_call_call(call),
+            "model_infer" => self.eval_model_infer_call(call),
+            "context_write" => self.eval_context_write_call(call),
+            "context_read" => self.eval_context_read_call(call),
+            "context_project" => self.eval_context_project_call(call),
+            "correction_apply" => self.eval_correction_apply_call(call),
             "task_spec" => self.eval_task_spec_call(call),
             "task_input" => self.eval_task_input_call(call),
             "agent_session" => self.eval_agent_session_call(call),
@@ -1996,6 +2136,7 @@ impl Evaluator<'_> {
             "attempt_scope_add" => self.eval_attempt_scope_add_call(call),
             "attempt_scope_close" => self.eval_attempt_scope_close_call(call),
             "attempt_state" => self.eval_attempt_state_call(call),
+            "attempt_inspect" => self.eval_attempt_inspect_call(call),
             "attempts" | "attempt_list" => self.eval_attempts_call(call),
             "attempt_spawn" => self.eval_attempt_spawn_call(call),
             "attempt_fork" => self.eval_attempt_fork_call(call),
@@ -2062,12 +2203,25 @@ impl Evaluator<'_> {
             .ok_or_else(|| {
                 stone_error("function call", format!("unknown function `{}`", call.name))
             })?;
+        let args = call
+            .positional
+            .iter()
+            .map(|expression| self.eval_expr_value(expression, PipelineData::empty()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.invoke_user_function_values(&function, args)
+    }
+
+    fn invoke_user_function_values(
+        &mut self,
+        function: &FunctionDef,
+        args: Vec<RuntimeValue>,
+    ) -> Result<RuntimeValue, ShellError> {
         let required = function
             .params
             .iter()
             .filter(|param| param.default.is_none())
             .count();
-        if call.positional.len() < required || call.positional.len() > function.params.len() {
+        if args.len() < required || args.len() > function.params.len() {
             return Err(stone_error(
                 "function call",
                 format!(
@@ -2075,15 +2229,16 @@ impl Evaluator<'_> {
                     function.name,
                     required,
                     function.params.len(),
-                    call.positional.len()
+                    args.len()
                 ),
             ));
         }
 
-        let mut args = Vec::with_capacity(function.params.len());
-        for (index, param) in function.params.iter().enumerate() {
-            let value = match call.positional.get(index) {
-                Some(expr) => self.eval_expr_value(expr, PipelineData::empty())?,
+        let mut supplied = args.into_iter();
+        let mut bindings = Vec::with_capacity(function.params.len());
+        for param in &function.params {
+            let value = match supplied.next() {
+                Some(value) => value,
                 None => self.eval_expr_value(
                     param.default.as_ref().ok_or_else(|| {
                         stone_error(
@@ -2095,11 +2250,11 @@ impl Evaluator<'_> {
                 )?,
             };
             ensure_runtime_type(&value, param.ty, &format!("argument `{}`", param.name))?;
-            args.push((param.name.clone(), value));
+            bindings.push((param.name.clone(), value));
         }
 
         self.state.push_scope();
-        for (name, value) in args {
+        for (name, value) in bindings {
             self.state.set_local(name, value);
         }
         let flow = self.eval_block(&function.body, PipelineData::empty(), false);
@@ -2196,10 +2351,21 @@ impl Evaluator<'_> {
                 format!("{} has no attribute `{attr}`", receiver.get_type()),
             ));
         };
-        val.get(attr)
-            .cloned()
-            .map(RuntimeValue::Nu)
-            .ok_or_else(|| stone_error("attribute", format!("record has no attribute `{attr}`")))
+        if let Some(value) = val.get(attr).cloned() {
+            return Ok(RuntimeValue::Nu(value));
+        }
+        let available = val
+            .columns()
+            .take(16)
+            .map(|field| format!("`{field}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let detail = if available.is_empty() {
+            format!("record has no attribute `{attr}`")
+        } else {
+            format!("record has no attribute `{attr}`; available fields: {available}")
+        };
+        Err(stone_error("attribute", detail))
     }
 
     fn eval_callable_expr(&mut self, expression: &Expr) -> Result<CallableValue, ShellError> {
@@ -2220,27 +2386,38 @@ impl Evaluator<'_> {
         callable: &CallableValue,
         args: Vec<RuntimeValue>,
     ) -> Result<RuntimeValue, ShellError> {
-        if args.len() != callable.params.len() {
-            return Err(stone_error(
-                "callable",
-                format!(
-                    "lambda#{} expected {} argument(s), got {}",
-                    callable.function_id,
-                    callable.params.len(),
-                    args.len()
-                ),
-            ));
+        match callable {
+            CallableValue::Named { function, .. } => {
+                self.invoke_user_function_values(function, args)
+            }
+            CallableValue::Lambda {
+                function_id,
+                params,
+                body,
+                captures,
+            } => {
+                if args.len() != params.len() {
+                    return Err(stone_error(
+                        "callable",
+                        format!(
+                            "lambda#{function_id} expected {} argument(s), got {}",
+                            params.len(),
+                            args.len()
+                        ),
+                    ));
+                }
+                self.state.push_scope();
+                for (name, value) in captures {
+                    self.state.set_local(name.clone(), value.clone());
+                }
+                for (name, value) in params.iter().zip(args) {
+                    self.state.set_local(name.clone(), value);
+                }
+                let result = self.eval_expr_value(body, PipelineData::empty());
+                self.state.pop_scope()?;
+                result
+            }
         }
-        self.state.push_scope();
-        for (name, value) in &callable.captures {
-            self.state.set_local(name.clone(), value.clone());
-        }
-        for (name, value) in callable.params.iter().zip(args) {
-            self.state.set_local(name.clone(), value);
-        }
-        let result = self.eval_expr_value(&callable.body, PipelineData::empty());
-        self.state.pop_scope()?;
-        result
     }
 
     fn eval_open_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -3699,6 +3876,712 @@ impl Evaluator<'_> {
         Ok((positional, named))
     }
 
+    fn eval_call_values_with_transition_hooks(
+        &mut self,
+        call: &Call,
+    ) -> Result<(Vec<Value>, Vec<(String, Value)>, TransitionHooks), ShellError> {
+        let mut positional = Vec::with_capacity(call.positional.len());
+        for argument in &call.positional {
+            positional.push(
+                self.eval_expr_value(argument, PipelineData::empty())?
+                    .into_nu_value(&call.name)?,
+            );
+        }
+        let mut named = Vec::with_capacity(call.named.len());
+        let mut hooks = None;
+        for (name, argument) in &call.named {
+            if name == "hooks" {
+                if hooks.is_some() {
+                    return Err(transition_hook_error(
+                        &call.name,
+                        "hooks may be supplied only once",
+                    ));
+                }
+                hooks = Some(self.eval_transition_hooks(&call.name, argument)?);
+            } else {
+                named.push((
+                    name.clone(),
+                    self.eval_expr_value(argument, PipelineData::empty())?
+                        .into_nu_value(&call.name)?,
+                ));
+            }
+        }
+        Ok((positional, named, hooks.unwrap_or_default()))
+    }
+
+    fn eval_transition_hooks(
+        &mut self,
+        effect: &str,
+        expression: &Expr,
+    ) -> Result<TransitionHooks, ShellError> {
+        if matches!(expression, Expr::None) {
+            return Ok(TransitionHooks::default());
+        }
+        if let Expr::Record(entries) = expression {
+            return self.eval_transition_hook_entries(effect, entries);
+        }
+        match self.eval_expr_value(expression, PipelineData::empty())? {
+            RuntimeValue::TransitionHooks(hooks) => Ok(hooks),
+            other => Err(transition_hook_error(
+                effect,
+                format!(
+                    "hooks must be a transition_hooks() value or a record literal containing pre and/or post handlers; got {}",
+                    runtime_type_name(&other)
+                ),
+            )),
+        }
+    }
+
+    fn eval_transition_hooks_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.positional.is_empty() {
+            return Err(transition_hook_error(
+                "transition_hooks",
+                "transition_hooks() accepts only pre= and post= keyword arguments",
+            ));
+        }
+        self.eval_transition_hook_entries("transition_hooks", &call.named)
+            .map(RuntimeValue::TransitionHooks)
+    }
+
+    fn eval_transition_hook_entries(
+        &mut self,
+        effect: &str,
+        entries: &[(String, Expr)],
+    ) -> Result<TransitionHooks, ShellError> {
+        let mut hooks = TransitionHooks::default();
+        let mut seen = HashSet::new();
+        for (phase, handler) in entries {
+            if !seen.insert(phase.as_str()) {
+                return Err(transition_hook_error(
+                    effect,
+                    format!("duplicate hooks field `{phase}`"),
+                ));
+            }
+            let slot = match phase.as_str() {
+                "pre" => &mut hooks.pre,
+                "post" => &mut hooks.post,
+                other => {
+                    return Err(transition_hook_error(
+                        effect,
+                        format!("unsupported hooks field `{other}`; expected pre or post"),
+                    ));
+                }
+            };
+            if matches!(handler, Expr::None) {
+                continue;
+            }
+            *slot = Some(self.eval_transition_hook_handler(effect, phase, handler)?);
+        }
+        Ok(hooks)
+    }
+
+    fn eval_transition_hook_handler(
+        &mut self,
+        effect: &str,
+        phase: &str,
+        expression: &Expr,
+    ) -> Result<TransitionHookHandler, ShellError> {
+        if let Expr::Name(name) = expression {
+            if self.state.get_local(name).is_none() && self.state.functions.contains_key(name) {
+                return Ok(TransitionHookHandler::NamedFunction(name.clone()));
+            }
+        }
+        match self.eval_expr_value(expression, PipelineData::empty())? {
+            RuntimeValue::Callable(callable) => Ok(TransitionHookHandler::Callable(callable)),
+            other => Err(transition_hook_error(
+                effect,
+                format!(
+                    "{phase} hook must be a lambda, callable local, or named Stone function; got {}",
+                    runtime_type_name(&other)
+                ),
+            )),
+        }
+    }
+
+    fn invoke_transition_hook(
+        &mut self,
+        effect: &str,
+        phase: &str,
+        handler: &TransitionHookHandler,
+        event: Value,
+    ) -> Result<RuntimeValue, ShellError> {
+        if self.state.active_transition_hook {
+            return Err(transition_hook_error(
+                effect,
+                "transition hooks cannot recursively invoke another transition hook",
+            ));
+        }
+        self.state.active_transition_hook = true;
+        let result = match handler {
+            TransitionHookHandler::Callable(callable) => {
+                self.invoke_callable(callable, vec![RuntimeValue::Nu(event)])
+            }
+            TransitionHookHandler::NamedFunction(name) => {
+                const EVENT_LOCAL: &str = "__waymark_transition_event";
+                self.state.push_scope();
+                self.state
+                    .set_local(EVENT_LOCAL.to_string(), RuntimeValue::Nu(event));
+                let call = Call {
+                    name: name.clone(),
+                    positional: vec![Expr::Name(EVENT_LOCAL.to_string())],
+                    named: Vec::new(),
+                };
+                let result = self.eval_user_function_call(&call);
+                let pop_result = self.state.pop_scope();
+                match (result, pop_result) {
+                    (Ok(value), Ok(())) => Ok(value),
+                    (Err(error), _) => Err(error),
+                    (Ok(_), Err(error)) => Err(error),
+                }
+            }
+        };
+        self.state.active_transition_hook = false;
+        result.map_err(|error| {
+            transition_hook_error(effect, format!("{phase} hook failed: {error:?}"))
+        })
+    }
+
+    fn eval_workflow_evidence_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.named.is_empty() || !(2..=3).contains(&call.positional.len()) {
+            return Err(workflow_error(
+                "workflow_evidence() requires satisfied, summary, and an optional evidence-reference list as positional arguments",
+            ));
+        }
+        let values = call
+            .positional
+            .iter()
+            .map(|argument| {
+                self.eval_expr_value(argument, PipelineData::empty())?
+                    .into_nu_value("workflow_evidence")
+            })
+            .collect::<Result<Vec<_>, ShellError>>()?;
+        let satisfied = value_to_bool(&values[0], "workflow_evidence satisfied")?;
+        let summary = value_to_string(&values[1], "workflow_evidence summary")?;
+        let references = match values.get(2) {
+            Some(value) => workflow_evidence_references(value)?,
+            None => Vec::new(),
+        };
+        let evidence = validate_workflow_evidence(satisfied, summary, references)?;
+        Ok(RuntimeValue::Nu(workflow_evidence_value(&evidence)))
+    }
+
+    fn eval_file_nonempty_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let [path] = call.positional.as_slice() else {
+            return Err(workflow_error(
+                "file_nonempty() requires exactly one positional path",
+            ));
+        };
+        if !call.named.is_empty() {
+            return Err(workflow_error(
+                "file_nonempty() does not accept keyword arguments",
+            ));
+        }
+        let path = self
+            .eval_expr_value(path, PipelineData::empty())?
+            .into_nu_value("file_nonempty")
+            .and_then(|value| value_to_path_string(&value, "file_nonempty path"))?;
+        let length = path.chars().count();
+        if path.trim().is_empty() {
+            return Err(workflow_error("file_nonempty path must be non-empty"));
+        }
+        if length > 200 {
+            return Err(workflow_error(
+                "file_nonempty path must contain at most 200 characters",
+            ));
+        }
+        Ok(RuntimeValue::WorkflowEvidenceSource(
+            WorkflowEvidenceSource::FileNonempty { path },
+        ))
+    }
+
+    fn eval_stage_marker_call(&mut self, _call: &Call) -> Result<RuntimeValue, ShellError> {
+        Err(workflow_error(
+            "stage(...) is declaration syntax and must be written as @stage(...) immediately above a def",
+        ))
+    }
+
+    fn eval_stage_declaration(
+        &mut self,
+        function: &FunctionDef,
+        decorator: &StageDecorator,
+    ) -> Result<WorkflowStage, ShellError> {
+        validate_workflow_name(&function.name, "stage")?;
+        if !function_accepts_arity(function, 1) {
+            return Err(workflow_error(format!(
+                "@stage action `{}` must accept one workflow context argument",
+                function.name
+            )));
+        }
+        let evidence = self.eval_workflow_evidence_source(&decorator.evidence)?;
+        let repair = decorator
+            .repair
+            .as_ref()
+            .filter(|expression| !matches!(expression, Expr::None))
+            .map(|expression| self.eval_workflow_handler("repair", expression))
+            .transpose()?;
+        let max_attempts = decorator
+            .max_attempts
+            .as_ref()
+            .map(|expression| self.eval_workflow_max_attempts(expression, "@stage"))
+            .transpose()?
+            .unwrap_or(1);
+        Ok(WorkflowStage {
+            name: function.name.clone(),
+            evidence,
+            action: WorkflowHandler::NamedFunction(function.name.clone()),
+            repair,
+            max_attempts,
+        })
+    }
+
+    fn eval_workflow_stage_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let [name] = call.positional.as_slice() else {
+            return Err(workflow_error(
+                "workflow_stage() requires exactly one positional stage name",
+            ));
+        };
+        let name = self
+            .eval_expr_value(name, PipelineData::empty())?
+            .into_nu_value("workflow_stage")
+            .and_then(|value| value_to_string(&value, "workflow_stage name"))?;
+        validate_workflow_name(&name, "stage")?;
+
+        let mut evidence = None;
+        let mut action = None;
+        let mut repair = None;
+        let mut max_attempts = 1_u32;
+        let mut seen = HashSet::new();
+        for (field, expression) in &call.named {
+            if !seen.insert(field.as_str()) {
+                return Err(workflow_error(format!(
+                    "workflow_stage() field `{field}` may be supplied only once"
+                )));
+            }
+            match field.as_str() {
+                "evidence" => {
+                    evidence = Some(self.eval_workflow_evidence_source(expression)?);
+                }
+                "action" => {
+                    action = Some(self.eval_workflow_handler("action", expression)?);
+                }
+                "repair" if matches!(expression, Expr::None) => {}
+                "repair" => {
+                    repair = Some(self.eval_workflow_handler("repair", expression)?);
+                }
+                "max_attempts" => {
+                    max_attempts = self.eval_workflow_max_attempts(expression, "workflow_stage")?;
+                }
+                other => {
+                    return Err(workflow_error(format!(
+                        "unsupported workflow_stage() field `{other}`; expected evidence, action, repair, or max_attempts"
+                    )));
+                }
+            }
+        }
+        let evidence =
+            evidence.ok_or_else(|| workflow_error("workflow_stage() requires evidence="))?;
+        let action = action.ok_or_else(|| workflow_error("workflow_stage() requires action="))?;
+        Ok(RuntimeValue::WorkflowStage(WorkflowStage {
+            name,
+            evidence,
+            action,
+            repair,
+            max_attempts,
+        }))
+    }
+
+    fn eval_workflow_evidence_source(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<WorkflowEvidenceSource, ShellError> {
+        if let Expr::Name(name) = expression {
+            if self.state.get_local(name).is_none() {
+                if let Some(function) = self.state.functions.get(name) {
+                    if !function_accepts_arity(function, 1) {
+                        return Err(workflow_error(format!(
+                            "evidence handler `{name}` must accept one workflow context argument"
+                        )));
+                    }
+                    return Ok(WorkflowEvidenceSource::Handler(
+                        WorkflowHandler::NamedFunction(name.clone()),
+                    ));
+                }
+            }
+        }
+        match self.eval_expr_value(expression, PipelineData::empty())? {
+            RuntimeValue::WorkflowEvidenceSource(source) => Ok(source),
+            RuntimeValue::Callable(callable) if callable.accepts_arity(1) => Ok(
+                WorkflowEvidenceSource::Handler(WorkflowHandler::Callable(callable)),
+            ),
+            RuntimeValue::Callable(callable) => Err(workflow_error(format!(
+                "evidence handler {} must accept one workflow context argument",
+                callable.display_name()
+            ))),
+            other => Err(workflow_error(format!(
+                "evidence must be a typed evidence specification, lambda, callable local, or named Stone function; got {}",
+                runtime_type_name(&other)
+            ))),
+        }
+    }
+
+    fn eval_workflow_max_attempts(
+        &mut self,
+        expression: &Expr,
+        context: &str,
+    ) -> Result<u32, ShellError> {
+        let value = self
+            .eval_expr_value(expression, PipelineData::empty())?
+            .into_nu_value(&format!("{context} max_attempts"))?;
+        let attempts = value_to_limit(&value, &format!("{context} max_attempts"))?;
+        let attempts =
+            u32::try_from(attempts).map_err(|_| workflow_error("max_attempts is too large"))?;
+        if !(1..=8).contains(&attempts) {
+            return Err(workflow_error(format!(
+                "{context} max_attempts must be between 1 and 8"
+            )));
+        }
+        Ok(attempts)
+    }
+
+    fn eval_workflow_handler(
+        &mut self,
+        role: &str,
+        expression: &Expr,
+    ) -> Result<WorkflowHandler, ShellError> {
+        if let Expr::Name(name) = expression {
+            if self.state.get_local(name).is_none() {
+                if let Some(function) = self.state.functions.get(name) {
+                    if !function_accepts_arity(function, 1) {
+                        return Err(workflow_error(format!(
+                            "{role} handler `{name}` must accept exactly one workflow context argument"
+                        )));
+                    }
+                    return Ok(WorkflowHandler::NamedFunction(name.clone()));
+                }
+            }
+        }
+        match self.eval_expr_value(expression, PipelineData::empty())? {
+            RuntimeValue::Callable(callable) if callable.accepts_arity(1) => {
+                Ok(WorkflowHandler::Callable(callable))
+            }
+            RuntimeValue::Callable(callable) => Err(workflow_error(format!(
+                "{role} handler {} must accept exactly one workflow context argument",
+                callable.display_name()
+            ))),
+            other => Err(workflow_error(format!(
+                "{role} handler must be a lambda, callable local, or named Stone function; got {}",
+                runtime_type_name(&other)
+            ))),
+        }
+    }
+
+    fn eval_workflow_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.named.is_empty() || call.positional.len() < 2 {
+            return Err(workflow_error(
+                "workflow() requires a name followed by one or more workflow stages and accepts no keyword arguments",
+            ));
+        }
+        if call.positional.len() > 65 {
+            return Err(workflow_error("workflow() accepts at most 64 stages"));
+        }
+        let name = self
+            .eval_expr_value(&call.positional[0], PipelineData::empty())?
+            .into_nu_value("workflow")
+            .and_then(|value| value_to_string(&value, "workflow name"))?;
+        validate_workflow_name(&name, "workflow")?;
+        let mut stages = Vec::with_capacity(call.positional.len() - 1);
+        let mut names = HashSet::new();
+        for expression in &call.positional[1..] {
+            let value = self.eval_expr_value(expression, PipelineData::empty())?;
+            let RuntimeValue::WorkflowStage(stage) = value else {
+                return Err(workflow_error(format!(
+                    "workflow() expected workflow_stage after its name, got {}",
+                    runtime_type_name(&value)
+                )));
+            };
+            if !names.insert(stage.name.clone()) {
+                return Err(workflow_error(format!(
+                    "workflow `{name}` has duplicate stage `{}`",
+                    stage.name
+                )));
+            }
+            stages.push(stage);
+        }
+        Ok(RuntimeValue::Workflow(Workflow { name, stages }))
+    }
+
+    fn eval_workflow_run_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let [workflow] = call.positional.as_slice() else {
+            return Err(workflow_error(
+                "workflow_run() requires exactly one workflow argument",
+            ));
+        };
+        if !call.named.is_empty() {
+            return Err(workflow_error(
+                "workflow_run() does not accept keyword arguments",
+            ));
+        }
+        if self.state.active_workflow_run {
+            return Err(workflow_error(
+                "recursive workflow_run() calls are not supported",
+            ));
+        }
+        let value = self.eval_expr_value(workflow, PipelineData::empty())?;
+        let RuntimeValue::Workflow(workflow) = value else {
+            return Err(workflow_error(format!(
+                "workflow_run() expected workflow, got {}",
+                runtime_type_name(&value)
+            )));
+        };
+
+        self.state.active_workflow_run = true;
+        let result = self.run_workflow(&workflow);
+        self.state.active_workflow_run = false;
+        result.map(RuntimeValue::Nu)
+    }
+
+    fn run_workflow(&mut self, workflow: &Workflow) -> Result<Value, ShellError> {
+        let mut completed = Vec::with_capacity(workflow.stages.len());
+        let mut reports = Vec::with_capacity(workflow.stages.len());
+
+        for (stage_index, stage) in workflow.stages.iter().enumerate() {
+            let mut checks = 0_u32;
+            let mut attempts = 0_u32;
+            let mut repairs = 0_u32;
+            let mut last_action = None;
+            let mut last_repair = None;
+            let mut latest_outcome = None;
+
+            let context = workflow_context_value(
+                workflow,
+                stage,
+                stage_index,
+                "evidence_pre",
+                0,
+                &completed,
+                None,
+                None,
+            );
+            let mut evidence =
+                self.invoke_workflow_evidence_handler(workflow, stage, "evidence_pre", context)?;
+            checks += 1;
+            if evidence.satisfied {
+                completed.push(stage.name.clone());
+                reports.push(workflow_stage_report(
+                    stage,
+                    "already_satisfied",
+                    attempts,
+                    repairs,
+                    checks,
+                    &evidence,
+                    last_action,
+                    last_repair,
+                ));
+                continue;
+            }
+
+            let mut stage_completed = false;
+            for attempt in 1..=stage.max_attempts {
+                attempts = attempt;
+                let context = workflow_context_value(
+                    workflow,
+                    stage,
+                    stage_index,
+                    "action",
+                    attempt,
+                    &completed,
+                    Some(&evidence),
+                    latest_outcome.as_ref(),
+                );
+                let action = self.invoke_workflow_action_handler(
+                    workflow,
+                    stage,
+                    "action",
+                    &stage.action,
+                    context,
+                )?;
+                last_action = Some(action.compact.clone());
+                latest_outcome = Some(action.full);
+
+                let context = workflow_context_value(
+                    workflow,
+                    stage,
+                    stage_index,
+                    "evidence_post_action",
+                    attempt,
+                    &completed,
+                    Some(&evidence),
+                    latest_outcome.as_ref(),
+                );
+                evidence = self.invoke_workflow_evidence_handler(
+                    workflow,
+                    stage,
+                    "evidence_post_action",
+                    context,
+                )?;
+                checks += 1;
+                if evidence.satisfied {
+                    stage_completed = true;
+                    break;
+                }
+
+                if let Some(repair_handler) = stage.repair.as_ref() {
+                    repairs += 1;
+                    let context = workflow_context_value(
+                        workflow,
+                        stage,
+                        stage_index,
+                        "repair",
+                        attempt,
+                        &completed,
+                        Some(&evidence),
+                        latest_outcome.as_ref(),
+                    );
+                    let repair = self.invoke_workflow_action_handler(
+                        workflow,
+                        stage,
+                        "repair",
+                        repair_handler,
+                        context,
+                    )?;
+                    last_repair = Some(repair.compact.clone());
+                    latest_outcome = Some(repair.full);
+
+                    let context = workflow_context_value(
+                        workflow,
+                        stage,
+                        stage_index,
+                        "evidence_post_repair",
+                        attempt,
+                        &completed,
+                        Some(&evidence),
+                        latest_outcome.as_ref(),
+                    );
+                    evidence = self.invoke_workflow_evidence_handler(
+                        workflow,
+                        stage,
+                        "evidence_post_repair",
+                        context,
+                    )?;
+                    checks += 1;
+                    if evidence.satisfied {
+                        stage_completed = true;
+                        break;
+                    }
+                }
+            }
+
+            if stage_completed {
+                completed.push(stage.name.clone());
+                reports.push(workflow_stage_report(
+                    stage,
+                    "completed",
+                    attempts,
+                    repairs,
+                    checks,
+                    &evidence,
+                    last_action,
+                    last_repair,
+                ));
+                continue;
+            }
+
+            reports.push(workflow_stage_report(
+                stage,
+                "failed",
+                attempts,
+                repairs,
+                checks,
+                &evidence,
+                last_action,
+                last_repair,
+            ));
+            return Ok(workflow_report_value(
+                workflow,
+                false,
+                Some(&stage.name),
+                completed,
+                reports,
+            ));
+        }
+
+        Ok(workflow_report_value(
+            workflow, true, None, completed, reports,
+        ))
+    }
+
+    fn invoke_workflow_evidence_handler(
+        &mut self,
+        workflow: &Workflow,
+        stage: &WorkflowStage,
+        phase: &str,
+        context: Value,
+    ) -> Result<WorkflowEvidence, ShellError> {
+        match &stage.evidence {
+            WorkflowEvidenceSource::Handler(handler) => {
+                let value = self
+                    .invoke_workflow_handler(handler, context)
+                    .map_err(|error| workflow_callback_error(workflow, stage, phase, error))?;
+                parse_workflow_evidence(value)
+                    .map_err(|error| workflow_callback_error(workflow, stage, phase, error))
+            }
+            WorkflowEvidenceSource::FileNonempty { path } => {
+                let target = self.resolve_script_path(path).map_err(|error| {
+                    workflow_evidence_source_error(workflow, stage, phase, error)
+                })?;
+                let size = file_nonempty_probe(&target).map_err(|error| {
+                    workflow_evidence_source_error(workflow, stage, phase, error)
+                })?;
+                let satisfied = size.is_some();
+                let summary = if satisfied {
+                    format!("file `{path}` exists and is non-empty")
+                } else {
+                    format!("file `{path}` is missing, empty, or not a regular file")
+                };
+                let references = size
+                    .map(|size| vec![format!("file:{path}:size={size}")])
+                    .unwrap_or_default();
+                validate_workflow_evidence(satisfied, summary, references)
+                    .map_err(|error| workflow_evidence_source_error(workflow, stage, phase, error))
+            }
+        }
+    }
+
+    fn invoke_workflow_action_handler(
+        &mut self,
+        workflow: &Workflow,
+        stage: &WorkflowStage,
+        phase: &str,
+        handler: &WorkflowHandler,
+        context: Value,
+    ) -> Result<WorkflowActionResult, ShellError> {
+        let value = self
+            .invoke_workflow_handler(handler, context)
+            .map_err(|error| workflow_callback_error(workflow, stage, phase, error))?;
+        parse_workflow_action_result(value)
+            .map_err(|error| workflow_callback_error(workflow, stage, phase, error))
+    }
+
+    fn invoke_workflow_handler(
+        &mut self,
+        handler: &WorkflowHandler,
+        context: Value,
+    ) -> Result<RuntimeValue, ShellError> {
+        match handler {
+            WorkflowHandler::Callable(callable) => {
+                self.invoke_callable(callable, vec![RuntimeValue::Nu(context)])
+            }
+            WorkflowHandler::NamedFunction(name) => {
+                let function = self.state.functions.get(name).cloned().ok_or_else(|| {
+                    workflow_error(format!(
+                        "workflow handler function `{name}` is no longer defined"
+                    ))
+                })?;
+                self.invoke_user_function_values(&function, vec![RuntimeValue::Nu(context)])
+            }
+        }
+    }
+
     fn eval_attempt_call_values(
         &mut self,
         call: &Call,
@@ -3742,8 +4625,114 @@ impl Evaluator<'_> {
     }
 
     fn eval_run_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        let record = self.eval_run_record(call, "run")?;
-        Ok(RuntimeValue::Nu(Value::record(record, Span::unknown())))
+        if self.state.active_transition_hook {
+            return Err(transition_hook_error(
+                "run",
+                "run() cannot be called from a transition hook",
+            ));
+        }
+        let (mut positional, named, hooks) = self.eval_call_values_with_transition_hooks(call)?;
+        let transition_id = self.state.next_transition_id();
+        self.state.record_transition_event(json!({
+            "id": transition_id,
+            "kind": "run",
+            "phase": "start",
+            "pre_hook": hooks.pre.is_some(),
+            "post_hook": hooks.post.is_some(),
+        }));
+
+        let mut rejected_reason = None;
+        if let Some(pre) = hooks.pre.as_ref() {
+            let event = transition_event_value(
+                &transition_id,
+                "run",
+                "pre",
+                run_transition_input(&positional, &named),
+                None,
+            );
+            let decision = match self
+                .invoke_transition_hook("run", "pre", pre, event)
+                .and_then(|output| apply_run_pre_hook_output(output, &mut positional))
+            {
+                Ok(decision) => decision,
+                Err(error) => {
+                    self.state.record_transition_event(json!({
+                        "id": transition_id,
+                        "kind": "run",
+                        "phase": "pre",
+                        "ok": false,
+                    }));
+                    return Err(error);
+                }
+            };
+            match decision {
+                RunPreHookDecision::Continue { changed } => {
+                    self.state.record_transition_event(json!({
+                        "id": transition_id,
+                        "kind": "run",
+                        "phase": "pre",
+                        "ok": true,
+                        "changed": changed,
+                    }));
+                }
+                RunPreHookDecision::Reject { reason } => {
+                    self.state.record_transition_event(json!({
+                        "id": transition_id,
+                        "kind": "run",
+                        "phase": "pre",
+                        "ok": false,
+                        "rejected": true,
+                        "reason": reason,
+                    }));
+                    rejected_reason = Some(reason);
+                }
+            }
+        }
+
+        let effective_input = run_transition_input(&positional, &named);
+        let result = match rejected_reason.as_deref() {
+            Some(reason) => Ok(run_policy_rejection_record(&positional, &named, reason)),
+            None => self.eval_run_values(&positional, &named, "run"),
+        }
+        .map(|mut record| {
+            record.push(
+                "transition_id",
+                Value::string(transition_id.clone(), Span::unknown()),
+            );
+            record
+        });
+        let effect_ok = result
+            .as_ref()
+            .map(|record| run_record_ok(record))
+            .unwrap_or(false);
+        self.state.record_transition_event(json!({
+            "id": transition_id,
+            "kind": "run",
+            "phase": "effect",
+            "ok": effect_ok,
+            "skipped": rejected_reason.is_some(),
+        }));
+
+        if let Some(post) = hooks.post.as_ref() {
+            let outcome = run_transition_outcome_value(&result);
+            let event = transition_event_value(
+                &transition_id,
+                "run",
+                "post",
+                effective_input,
+                Some(outcome),
+            );
+            let post_result = self.invoke_transition_hook("run", "post", post, event);
+            self.state.record_transition_event(json!({
+                "id": transition_id,
+                "kind": "run",
+                "phase": "post",
+                "ok": post_result.is_ok(),
+            }));
+            post_result?;
+        }
+
+        result.map(|record| RuntimeValue::Nu(Value::record(record, Span::unknown())))
     }
 
     fn eval_must_run_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -3756,9 +4745,24 @@ impl Evaluator<'_> {
     }
 
     fn eval_run_record(&mut self, call: &Call, context: &str) -> Result<Record, ShellError> {
+        if self.state.active_transition_hook {
+            return Err(transition_hook_error(
+                context,
+                format!("{context}() cannot be called from a transition hook"),
+            ));
+        }
         let (positional, named) = self.eval_call_values(call)?;
+        self.eval_run_values(&positional, &named, context)
+    }
+
+    fn eval_run_values(
+        &mut self,
+        positional: &[Value],
+        named: &[(String, Value)],
+        context: &str,
+    ) -> Result<Record, ShellError> {
         let default_cwd = self.current_cwd_path(context)?;
-        let invocation = run_call_values(context, &positional, &named, default_cwd, |path| {
+        let invocation = run_call_values(context, positional, named, default_cwd, |path| {
             self.resolve_script_path(path)
         })?;
         let mut record = invocation.record;
@@ -3940,179 +4944,447 @@ impl Evaluator<'_> {
     }
 
     fn eval_model_call_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        let (positional, named) = self.eval_call_values(call)?;
+        if self.state.active_transition_hook {
+            return Err(transition_hook_error(
+                "model_call",
+                "model_call() cannot be called from a transition hook",
+            ));
+        }
+        let (positional, named, hooks) = self.eval_call_values_with_transition_hooks(call)?;
         let [messages] = positional.as_slice() else {
             return Err(model_call_input_error(
                 "model_call() requires exactly one positional messages list",
             ));
         };
-        let Value::List { vals, .. } = messages else {
-            return Err(model_call_input_error(format!(
-                "model_call messages must be a list of records, got {}",
-                messages.get_type()
-            )));
-        };
-        if vals.is_empty() {
-            return Err(model_call_input_error(
-                "model_call messages list must not be empty",
+        let request = model_request_from_values(messages, named, "model_call", true)?;
+        self.execute_model_request(request, &hooks)
+            .map(RuntimeValue::Nu)
+    }
+
+    fn eval_model_infer_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        const MAX_RETRIES: i64 = 4;
+        const MAX_SCHEMA_BYTES: usize = 64 * 1024;
+        const MAX_REPAIR_PROMPT_BYTES: usize = 4096;
+        const MAX_SCHEMA_PROMPT_BYTES: usize = 4096;
+        const MAX_REPAIR_CONTENT_CHARS: usize = 32 * 1024;
+
+        if self.state.active_transition_hook {
+            return Err(transition_hook_error(
+                "model_infer",
+                "model_infer() cannot be called from a transition hook",
             ));
         }
-
-        let mut message_values = Vec::with_capacity(vals.len());
-        for (index, value) in vals.iter().enumerate() {
-            let Value::Record { val, .. } = value else {
-                return Err(model_call_input_error(format!(
-                    "model_call message {index} must be a record, got {}",
-                    value.get_type()
-                )));
-            };
-            for key in val.columns() {
-                if !matches!(key.as_str(), "role" | "content" | "name") {
-                    return Err(model_call_input_error(format!(
-                        "unsupported model_call message field {key:?}; expected role, content, or name"
-                    )));
-                }
-            }
-            let role = val.get("role").ok_or_else(|| {
-                model_call_input_error(format!("model_call message {index} requires role"))
-            })?;
-            let role = value_to_string(role, "model_call message role")
-                .map_err(|err| model_call_input_error(err.to_string()))?;
-            if !matches!(role.as_str(), "system" | "user" | "assistant") {
-                return Err(model_call_input_error(format!(
-                    "unsupported model_call message role {role:?}; expected system, user, or assistant"
-                )));
-            }
-            let content = val.get("content").ok_or_else(|| {
-                model_call_input_error(format!("model_call message {index} requires content"))
-            })?;
-            let content = value_to_string(content, "model_call message content")
-                .map_err(|err| model_call_input_error(err.to_string()))?;
-            let mut message = serde_json::Map::new();
-            message.insert("role".to_string(), JsonValue::String(role));
-            message.insert("content".to_string(), JsonValue::String(content));
-            if let Some(name) = val.get("name") {
-                if !matches!(name, Value::Nothing { .. }) {
-                    let name = value_to_string(name, "model_call message name")
-                        .map_err(|err| model_call_input_error(err.to_string()))?;
-                    message.insert("name".to_string(), JsonValue::String(name));
-                }
-            }
-            message_values.push(JsonValue::Object(message));
+        let (positional, named, hooks) = self.eval_call_values_with_transition_hooks(call)?;
+        let [messages, schema] = positional.as_slice() else {
+            return Err(model_infer_input_error(
+                "model_infer() requires exactly two positional arguments: messages and schema",
+            ));
+        };
+        if !matches!(schema, Value::Record { .. }) {
+            return Err(model_infer_input_error(format!(
+                "model_infer schema must be a record, got {}",
+                schema.get_type()
+            )));
         }
+        let schema = nu_to_json_value(schema);
+        let schema_bytes = serde_json::to_vec(&schema).map_err(|error| {
+            model_infer_input_error(format!("model_infer schema is not JSON-encodable: {error}"))
+        })?;
+        if schema_bytes.len() > MAX_SCHEMA_BYTES {
+            return Err(model_infer_input_error(format!(
+                "model_infer schema exceeds the {MAX_SCHEMA_BYTES}-byte limit"
+            )));
+        }
+        validate_schema_definition(&schema).map_err(model_infer_input_error)?;
 
-        let mut request = serde_json::Map::new();
-        request.insert("messages".to_string(), JsonValue::Array(message_values));
+        let mut retries = 0_i64;
+        let mut repair_prompt = String::new();
+        let mut schema_prompt = String::new();
+        let mut model_options = Vec::new();
         let mut seen = HashSet::new();
         for (name, value) in named {
             if !seen.insert(name.clone()) {
-                return Err(model_call_input_error(format!(
-                    "duplicate model_call keyword argument `{name}`"
+                return Err(model_infer_input_error(format!(
+                    "duplicate model_infer keyword argument `{name}`"
                 )));
             }
-            if matches!(value, Value::Nothing { .. }) {
-                continue;
+            match name.as_str() {
+                "retries" => {
+                    retries = match value {
+                        Value::Int { val, .. } if (0..=MAX_RETRIES).contains(&val) => val,
+                        Value::Int { val, .. } => {
+                            return Err(model_infer_input_error(format!(
+                                "model_infer retries must be between 0 and {MAX_RETRIES}, got {val}"
+                            )));
+                        }
+                        other => {
+                            return Err(model_infer_input_error(format!(
+                                "model_infer retries must be an integer, got {}",
+                                other.get_type()
+                            )));
+                        }
+                    };
+                }
+                "repair_prompt" => {
+                    repair_prompt = value_to_string(&value, "model_infer repair_prompt")
+                        .map_err(|error| model_infer_input_error(error.to_string()))?;
+                    if repair_prompt.len() > MAX_REPAIR_PROMPT_BYTES {
+                        return Err(model_infer_input_error(format!(
+                            "model_infer repair_prompt exceeds the {MAX_REPAIR_PROMPT_BYTES}-byte limit"
+                        )));
+                    }
+                }
+                "schema_prompt" => {
+                    schema_prompt = value_to_string(&value, "model_infer schema_prompt")
+                        .map_err(|error| model_infer_input_error(error.to_string()))?;
+                    if schema_prompt.len() > MAX_SCHEMA_PROMPT_BYTES {
+                        return Err(model_infer_input_error(format!(
+                            "model_infer schema_prompt exceeds the {MAX_SCHEMA_PROMPT_BYTES}-byte limit"
+                        )));
+                    }
+                }
+                "response_format" => {
+                    return Err(model_infer_input_error(
+                        "model_infer owns response_format; remove the explicit response_format argument",
+                    ));
+                }
+                _ => model_options.push((name, value)),
             }
-            let json_value = match name.as_str() {
-                "model_class" | "model" => JsonValue::String(
-                    value_to_string(&value, &format!("model_call {name}"))
-                        .map_err(|err| model_call_input_error(err.to_string()))?,
-                ),
-                "temperature" | "top_p" => {
-                    let number = match value {
-                        Value::Int { val, .. } => val as f64,
-                        Value::Float { val, .. } => val,
-                        other => {
-                            return Err(model_call_input_error(format!(
-                                "model_call {name} must be a number, got {}",
-                                other.get_type()
-                            )));
-                        }
-                    };
-                    if !number.is_finite() || number < 0.0 {
-                        return Err(model_call_input_error(format!(
-                            "model_call {name} must be a finite non-negative number"
-                        )));
-                    }
-                    if name == "top_p" && (number <= 0.0 || number > 1.0) {
-                        return Err(model_call_input_error(
-                            "model_call top_p must be greater than 0 and at most 1 with the current Gateway protocol",
-                        ));
-                    }
-                    serde_json::Number::from_f64(number)
-                        .map(JsonValue::Number)
-                        .ok_or_else(|| {
-                            model_call_input_error(format!(
-                                "model_call {name} must be a finite JSON number"
-                            ))
-                        })?
-                }
-                "seed" | "max_output_tokens" => {
-                    let number = match value {
-                        Value::Int { val, .. } if val >= 0 => u64::try_from(val).unwrap_or(0),
-                        Value::Int { .. } => {
-                            return Err(model_call_input_error(format!(
-                                "model_call {name} must be non-negative"
-                            )));
-                        }
-                        other => {
-                            return Err(model_call_input_error(format!(
-                                "model_call {name} must be an integer, got {}",
-                                other.get_type()
-                            )));
-                        }
-                    };
-                    let number = u32::try_from(number).map_err(|_| {
-                        model_call_input_error(format!(
-                            "model_call {name} exceeds the unsigned 32-bit limit"
-                        ))
-                    })?;
-                    if name == "seed" && number == 0 {
-                        return Err(model_call_input_error(
-                            "model_call seed must be positive with the current Gateway protocol",
-                        ));
-                    }
-                    JsonValue::Number(serde_json::Number::from(number))
-                }
-                "response_format" => match value {
-                    value @ (Value::String { .. } | Value::Record { .. }) => {
-                        nu_to_json_value(&value)
-                    }
-                    other => {
-                        return Err(model_call_input_error(format!(
-                            "model_call response_format must be a string or record, got {}",
-                            other.get_type()
-                        )));
-                    }
-                },
-                "metadata" => {
-                    let Value::Record { val, .. } = &value else {
-                        return Err(model_call_input_error(format!(
-                            "model_call metadata must be a record, got {}",
-                            value.get_type()
-                        )));
-                    };
-                    for (key, metadata_value) in val.iter() {
-                        if !matches!(metadata_value, Value::String { .. } | Value::Glob { .. }) {
-                            return Err(model_call_input_error(format!(
-                                "model_call metadata field {key:?} must be a string, got {}",
-                                metadata_value.get_type()
-                            )));
-                        }
-                    }
-                    nu_to_json_value(&value)
-                }
-                other => {
-                    return Err(model_call_input_error(format!(
-                        "unexpected model_call keyword argument `{other}`; expected model_class, model, temperature, top_p, seed, max_output_tokens, response_format, or metadata"
-                    )));
-                }
-            };
-            request.insert(name, json_value);
         }
 
-        gateway_runtime::model_call_value(&JsonValue::Object(request), Span::unknown())
-            .map(RuntimeValue::Nu)
+        let mut request = model_request_from_values(messages, model_options, "model_infer", false)?;
+        let schema_instruction = model_infer_schema_instruction(&schema_bytes, &schema_prompt);
+        let message_values = request
+            .get_mut("messages")
+            .and_then(JsonValue::as_array_mut)
+            .expect("model request builder always supplies messages");
+        let insertion = message_values
+            .iter()
+            .take_while(|message| message.get("role").and_then(JsonValue::as_str) == Some("system"))
+            .count();
+        message_values.insert(
+            insertion,
+            json!({"role": "system", "content": schema_instruction}),
+        );
+        request.insert(
+            "response_format".to_string(),
+            json!({"type": "json_object"}),
+        );
+
+        let mut failures = Vec::new();
+        let mut aggregate_usage = ModelUsage::default();
+        for attempt in 0..=retries {
+            let response = self.execute_model_request(request.clone(), &hooks)?;
+            aggregate_usage.add_response(&response);
+            let content = model_response_content(&response)?;
+            let parsed = serde_json::from_str::<JsonValue>(&content);
+            let (value, issues) = match parsed {
+                Ok(value) => {
+                    let issues = validate_json_schema_instance(&schema, &value);
+                    (Some(value), issues)
+                }
+                Err(error) => (
+                    None,
+                    vec![ValidationIssue {
+                        path: "$".to_string(),
+                        keyword: "json".to_string(),
+                        message: bounded_text(&error.to_string(), 256),
+                    }],
+                ),
+            };
+
+            if let Some(value) = value.filter(|_| issues.is_empty()) {
+                let result = json!({
+                    "value": value,
+                    "response": nu_to_json_value(&response),
+                    "validation_attempts": attempt + 1,
+                    "errors": failures,
+                    "usage": aggregate_usage.to_json(),
+                });
+                return Ok(RuntimeValue::Nu(json_to_nu_value(result, Span::unknown())));
+            }
+
+            let issue_values = issues
+                .iter()
+                .map(ValidationIssue::to_json)
+                .collect::<Vec<_>>();
+            let repair_message =
+                model_infer_repair_message(&repair_prompt, attempt + 1, &issue_values);
+            failures.push(json!({
+                "attempt": attempt + 1,
+                "errors": issue_values,
+                "repair_prompt": repair_message,
+            }));
+            if attempt == retries {
+                let detail = serde_json::to_string(&json!({
+                    "validation_attempts": attempt + 1,
+                    "errors": failures,
+                    "usage": aggregate_usage.to_json(),
+                }))
+                .unwrap_or_else(|_| "validation failure details unavailable".to_string());
+                return Err(model_infer_validation_error(format!(
+                    "model output failed validation after {} attempt(s): {}",
+                    attempt + 1,
+                    bounded_text(&detail, 4096)
+                )));
+            }
+
+            let messages = request
+                .get_mut("messages")
+                .and_then(JsonValue::as_array_mut)
+                .expect("model request builder always supplies messages");
+            messages.push(json!({
+                "role": "assistant",
+                "content": bounded_text(&content, MAX_REPAIR_CONTENT_CHARS),
+            }));
+            messages.push(json!({"role": "user", "content": repair_message}));
+        }
+        unreachable!("bounded inference loop always returns")
+    }
+
+    fn execute_model_request(
+        &mut self,
+        mut request: serde_json::Map<String, JsonValue>,
+        hooks: &TransitionHooks,
+    ) -> Result<Value, ShellError> {
+        let transition_id = self.state.next_transition_id();
+        self.state.record_transition_event(json!({
+            "id": transition_id,
+            "kind": "model_call",
+            "phase": "start",
+            "pre_hook": hooks.pre.is_some(),
+            "post_hook": hooks.post.is_some(),
+        }));
+
+        if let Some(pre) = hooks.pre.as_ref() {
+            let event = transition_event_value(
+                &transition_id,
+                "model_call",
+                "pre",
+                json_to_nu_value(JsonValue::Object(request.clone()), Span::unknown()),
+                None,
+            );
+            let changed = match self
+                .invoke_transition_hook("model_call", "pre", pre, event)
+                .and_then(|output| apply_model_pre_hook_output(output, &mut request))
+            {
+                Ok(changed) => changed,
+                Err(error) => {
+                    self.state.record_transition_event(json!({
+                        "id": transition_id,
+                        "kind": "model_call",
+                        "phase": "pre",
+                        "ok": false,
+                    }));
+                    return Err(error);
+                }
+            };
+            self.state.record_transition_event(json!({
+                "id": transition_id,
+                "kind": "model_call",
+                "phase": "pre",
+                "ok": true,
+                "changed": changed,
+            }));
+        }
+
+        let effective_input = json_to_nu_value(JsonValue::Object(request.clone()), Span::unknown());
+        let result =
+            gateway_runtime::model_call_value(&JsonValue::Object(request), Span::unknown())
+                .and_then(|mut response| {
+                    attach_transition_id(&mut response, &transition_id, "model_call")?;
+                    Ok(response)
+                });
+        self.state.record_transition_event(json!({
+            "id": transition_id,
+            "kind": "model_call",
+            "phase": "effect",
+            "ok": result.is_ok(),
+        }));
+
+        if let Some(post) = hooks.post.as_ref() {
+            let outcome = transition_outcome_value(result.as_ref().map(Clone::clone));
+            let event = transition_event_value(
+                &transition_id,
+                "model_call",
+                "post",
+                effective_input,
+                Some(outcome),
+            );
+            let post_result = self.invoke_transition_hook("model_call", "post", post, event);
+            self.state.record_transition_event(json!({
+                "id": transition_id,
+                "kind": "model_call",
+                "phase": "post",
+                "ok": post_result.is_ok(),
+            }));
+            post_result?;
+        }
+
+        result
+    }
+
+    fn eval_context_write_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 5 {
+            return Err(context_input_error(
+                "context_write accepts key, kind, content, optional status, and optional evidence",
+            ));
+        }
+        let mut key = positional.first().cloned();
+        let mut kind = positional.get(1).cloned();
+        let mut content = positional.get(2).cloned();
+        let mut status = positional.get(3).cloned();
+        let mut evidence = positional.get(4).cloned();
+        for (name, value) in named {
+            match name.as_str() {
+                "key" => set_context_argument(&mut key, value, "key", "context_write")?,
+                "kind" => set_context_argument(&mut kind, value, "kind", "context_write")?,
+                "content" => set_context_argument(&mut content, value, "content", "context_write")?,
+                "status" => set_context_argument(&mut status, value, "status", "context_write")?,
+                "evidence" => {
+                    set_context_argument(&mut evidence, value, "evidence", "context_write")?
+                }
+                other => {
+                    return Err(context_input_error(format!(
+                        "unexpected context_write keyword argument `{other}`"
+                    )));
+                }
+            }
+        }
+        let key = context_required_string(key, "context_write key")?;
+        let kind = context_required_string(kind, "context_write kind")?;
+        let content = content
+            .ok_or_else(|| context_input_error("context_write requires a content argument"))?;
+        let status = status
+            .map(|value| value_to_string(&value, "context_write status"))
+            .transpose()?
+            .unwrap_or_else(|| "active".to_string());
+        let evidence = context_json_list(evidence, "context_write evidence")?;
+        let content = nu_to_json_value(&content);
+        let value = if gateway_runtime::attempt_memory_enabled() {
+            let (value, revision, item_count) = gateway_runtime::context_write(
+                key, kind, content, status, evidence,
+            )
+            .map_err(|error| context_input_error(gateway_runtime::shell_error_detail(&error)))?;
+            self.state
+                .context
+                .observe_gateway_write(&value, revision, item_count);
+            value
+        } else {
+            self.state
+                .context
+                .write(key, kind, content, status, evidence)
+                .map_err(context_input_error)?
+        };
+        Ok(RuntimeValue::Nu(json_to_nu_value(value, Span::unknown())))
+    }
+
+    fn eval_context_read_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 4 {
+            return Err(context_input_error(
+                "context_read accepts optional query, keys, kinds, and limit",
+            ));
+        }
+        let mut query = positional.first().cloned();
+        let mut keys = positional.get(1).cloned();
+        let mut kinds = positional.get(2).cloned();
+        let mut limit = positional.get(3).cloned();
+        for (name, value) in named {
+            match name.as_str() {
+                "query" => set_context_argument(&mut query, value, "query", "context_read")?,
+                "keys" => set_context_argument(&mut keys, value, "keys", "context_read")?,
+                "kinds" => set_context_argument(&mut kinds, value, "kinds", "context_read")?,
+                "limit" => set_context_argument(&mut limit, value, "limit", "context_read")?,
+                other => {
+                    return Err(context_input_error(format!(
+                        "unexpected context_read keyword argument `{other}`"
+                    )));
+                }
+            }
+        }
+        let query = query
+            .map(|value| value_to_string(&value, "context_read query"))
+            .transpose()?
+            .unwrap_or_default();
+        let keys = context_string_list(keys, "context_read keys")?;
+        let kinds = context_string_list(kinds, "context_read kinds")?;
+        let limit = limit
+            .map(|value| value_to_limit(&value, "context_read limit"))
+            .transpose()?
+            .unwrap_or(20);
+        let value = if gateway_runtime::attempt_memory_enabled() {
+            let (items, revision, item_count) =
+                gateway_runtime::context_read(query.clone(), keys.clone(), kinds.clone(), limit)
+                    .map_err(|error| {
+                        context_input_error(gateway_runtime::shell_error_detail(&error))
+                    })?;
+            self.state
+                .context
+                .observe_gateway_read(&query, &keys, &kinds, &items, revision, item_count);
+            JsonValue::Array(items)
+        } else {
+            JsonValue::Array(self.state.context.read(&query, &keys, &kinds, limit))
+        };
+        Ok(RuntimeValue::Nu(json_to_nu_value(value, Span::unknown())))
+    }
+
+    fn eval_context_project_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 2 {
+            return Err(context_input_error(
+                "context_project accepts optional focus, max_tokens, and required_keys",
+            ));
+        }
+        let mut focus = positional.first().cloned();
+        let mut max_tokens = positional.get(1).cloned();
+        let mut required_keys = None;
+        for (name, value) in named {
+            match name.as_str() {
+                "focus" => set_context_argument(&mut focus, value, "focus", "context_project")?,
+                "max_tokens" => {
+                    set_context_argument(&mut max_tokens, value, "max_tokens", "context_project")?
+                }
+                "required_keys" => set_context_argument(
+                    &mut required_keys,
+                    value,
+                    "required_keys",
+                    "context_project",
+                )?,
+                other => {
+                    return Err(context_input_error(format!(
+                        "unexpected context_project keyword argument `{other}`"
+                    )));
+                }
+            }
+        }
+        let focus = focus
+            .map(|value| value_to_string(&value, "context_project focus"))
+            .transpose()?
+            .unwrap_or_default();
+        let max_tokens = max_tokens
+            .map(|value| value_to_limit(&value, "context_project max_tokens"))
+            .transpose()?
+            .unwrap_or(512);
+        let required_keys = context_string_list(required_keys, "context_project required_keys")?;
+        let value = if gateway_runtime::attempt_memory_enabled() {
+            let (value, revision, item_count) =
+                gateway_runtime::context_project(focus.clone(), max_tokens, required_keys.clone())
+                    .map_err(|error| {
+                        context_input_error(gateway_runtime::shell_error_detail(&error))
+                    })?;
+            self.state
+                .context
+                .observe_gateway_project(&focus, max_tokens, &value, revision, item_count);
+            value
+        } else {
+            self.state
+                .context
+                .project(&focus, max_tokens, &required_keys)
+                .map_err(context_input_error)?
+        };
+        Ok(RuntimeValue::Nu(json_to_nu_value(value, Span::unknown())))
     }
 
     fn eval_task_spec_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -4144,8 +5416,9 @@ impl Evaluator<'_> {
         let task = gateway_runtime::task_spec_value(span)?;
         let input = gateway_runtime::task_input_value(span)?;
         let attempt = gateway_env::attempt_info(String::new())?;
-        Ok(RuntimeValue::Nu(agent_session_value(
-            task, input, attempt, span,
+        let now_ms = agent_session_now_ms(&attempt, &mut self.state.agent_time_anchor);
+        Ok(RuntimeValue::Nu(agent_session_value_at(
+            task, input, attempt, now_ms, span,
         )))
     }
 
@@ -4522,6 +5795,69 @@ impl Evaluator<'_> {
         gateway_env::attempt_state(attempt, sample_limit).map(RuntimeValue::Nu)
     }
 
+    fn eval_attempt_inspect_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 4 {
+            return Err(stone_error(
+                "attempt_inspect",
+                "attempt_inspect() accepts at most attempt, include_details, trace_limit, and max_bytes arguments",
+            ));
+        }
+        let mut attempt = positional
+            .first()
+            .map(|value| attempt_id_from_value(value, "attempt_inspect attempt"))
+            .transpose()?
+            .unwrap_or_default();
+        let mut include_details = positional
+            .get(1)
+            .map(|value| value_to_bool(value, "attempt_inspect include_details"))
+            .transpose()?
+            .unwrap_or(false);
+        let mut trace_limit = positional
+            .get(2)
+            .map(|value| {
+                u32::try_from(value_to_u64(value, "attempt_inspect trace_limit")?)
+                    .map_err(|_| stone_error("attempt_inspect", "trace_limit is too large"))
+            })
+            .transpose()?
+            .unwrap_or(20);
+        let mut max_bytes = positional
+            .get(3)
+            .map(|value| {
+                u32::try_from(value_to_u64(value, "attempt_inspect max_bytes")?)
+                    .map_err(|_| stone_error("attempt_inspect", "max_bytes is too large"))
+            })
+            .transpose()?
+            .unwrap_or(32 * 1024);
+        for (name, value) in named {
+            match name.as_str() {
+                "attempt" => attempt = attempt_id_from_value(&value, "attempt_inspect attempt")?,
+                "include_details" => {
+                    include_details = value_to_bool(&value, "attempt_inspect include_details")?
+                }
+                "trace_limit" => {
+                    trace_limit =
+                        u32::try_from(value_to_u64(&value, "attempt_inspect trace_limit")?)
+                            .map_err(|_| {
+                                stone_error("attempt_inspect", "trace_limit is too large")
+                            })?
+                }
+                "max_bytes" => {
+                    max_bytes = u32::try_from(value_to_u64(&value, "attempt_inspect max_bytes")?)
+                        .map_err(|_| stone_error("attempt_inspect", "max_bytes is too large"))?
+                }
+                _ => {
+                    return Err(stone_error(
+                        "attempt_inspect",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        gateway_env::attempt_inspect(attempt, include_details, trace_limit, max_bytes)
+            .map(RuntimeValue::Nu)
+    }
+
     fn eval_attempts_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let (positional, named) = self.eval_call_values(call)?;
         if positional.len() > 3 {
@@ -4713,6 +6049,7 @@ impl Evaluator<'_> {
         let mut workspace_mount = String::new();
         let mut resource_limits = Vec::new();
         let mut metadata = Vec::new();
+        let mut context_prompt_required_keys = None;
         let mut task_input_json = String::new();
         let mut program = None;
         let mut entrypoint = String::new();
@@ -4736,6 +6073,12 @@ impl Evaluator<'_> {
                 }
                 "metadata" | "meta" => {
                     metadata = value_to_string_pairs(&value, "attempt_fork metadata")?
+                }
+                "context_prompt_view" => {
+                    context_prompt_required_keys = Some(context_prompt_required_keys_from_value(
+                        &value,
+                        "attempt_fork context_prompt_view",
+                    )?)
                 }
                 "input" | "task_input" => {
                     task_input_json =
@@ -4767,6 +6110,7 @@ impl Evaluator<'_> {
             workspace_mount,
             resource_limits,
             metadata,
+            context_prompt_required_keys,
             task_input_json,
             program,
             start,
@@ -6031,6 +7375,52 @@ impl Evaluator<'_> {
         Ok(RuntimeValue::Nu(json_to_nu_value(parsed, span)))
     }
 
+    fn eval_correction_apply_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if positional.len() > 3 {
+            return Err(correction_input_error(
+                "correction_apply() accepts source, correction, and optional candidate arguments",
+            ));
+        }
+        let mut source = positional.first().cloned();
+        let mut correction = positional.get(1).cloned();
+        let mut candidate = positional.get(2).cloned();
+        for (name, value) in named {
+            match name.as_str() {
+                "source" => {
+                    set_correction_argument(&mut source, value, "source")?;
+                }
+                "correction" => {
+                    set_correction_argument(&mut correction, value, "correction")?;
+                }
+                "candidate" => {
+                    set_correction_argument(&mut candidate, value, "candidate")?;
+                }
+                _ => {
+                    return Err(correction_input_error(format!(
+                        "unexpected correction_apply keyword argument `{name}`; expected source, correction, or candidate"
+                    )));
+                }
+            }
+        }
+        let source = source
+            .ok_or_else(|| correction_input_error("correction_apply source is required"))
+            .and_then(|value| value_to_string(&value, "correction_apply source"))?;
+        let correction = correction
+            .ok_or_else(|| correction_input_error("correction_apply correction is required"))?;
+        let candidate = candidate
+            .map(|value| value_to_i64(&value, "correction_apply candidate"))
+            .transpose()?
+            .unwrap_or(0);
+        let candidate = usize::try_from(candidate).map_err(|_| {
+            correction_input_error("correction_apply candidate must be non-negative")
+        })?;
+        let correction = nu_to_json_value(&correction);
+        let preview = stone_correction::apply_correction(&source, &correction, candidate)
+            .map_err(correction_input_error)?;
+        Ok(RuntimeValue::Nu(json_to_nu_value(preview, Span::unknown())))
+    }
+
     fn eval_start_daemon_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         #[cfg(target_os = "hermit")]
         {
@@ -6113,7 +7503,7 @@ impl Evaluator<'_> {
             ));
         }
         let predicate = self.eval_callable_expr(&call.positional[0])?;
-        if !predicate.params.is_empty() {
+        if !predicate.accepts_arity(0) {
             return Err(stone_error(
                 "wait_for",
                 "wait_for() predicate must be a zero-argument lambda/callable",
@@ -7264,6 +8654,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "attempt_spawn",
     "attempt_start",
     "attempt_state",
+    "attempt_inspect",
     "attempt_scope",
     "attempt_scope_add",
     "attempt_scope_close",
@@ -7309,12 +8700,24 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "md5",
     "min",
     "model_call",
+    "model_infer",
+    "context_write",
+    "context_read",
+    "context_project",
+    "correction_apply",
     "agent_session",
     "current_program",
     "react_control",
     "scripted_control",
     "task_spec",
     "task_input",
+    "transition_hooks",
+    "workflow_evidence",
+    "file_nonempty",
+    "stage",
+    "workflow_stage",
+    "workflow",
+    "workflow_run",
     "mkdir",
     "must_run",
     "open",
@@ -7381,6 +8784,10 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "any",
     "enumerate",
 ];
+
+pub(crate) fn stone_builtin_names() -> &'static [&'static str] {
+    STONE_BUILTIN_NAMES
+}
 
 fn is_builtin_call(call: &Call) -> bool {
     if matches!(call.name.as_str(), "keys" | "values" | "items") {
@@ -7824,6 +9231,348 @@ fn match_append_key(stmt: &Stmt, key_name: &str) -> Option<String> {
     Some(list_name.clone())
 }
 
+fn workflow_error(message: impl Into<String>) -> ShellError {
+    stone_error("workflow", message)
+}
+
+fn workflow_callback_error(
+    workflow: &Workflow,
+    stage: &WorkflowStage,
+    phase: &str,
+    error: ShellError,
+) -> ShellError {
+    workflow_error(format!(
+        "workflow `{}` stage `{}` {phase} callback failed: {error:?}",
+        workflow.name, stage.name
+    ))
+}
+
+fn workflow_evidence_source_error(
+    workflow: &Workflow,
+    stage: &WorkflowStage,
+    phase: &str,
+    error: ShellError,
+) -> ShellError {
+    workflow_error(format!(
+        "workflow `{}` stage `{}` {phase} evidence probe failed: {error:?}",
+        workflow.name, stage.name
+    ))
+}
+
+fn function_accepts_arity(function: &FunctionDef, arity: usize) -> bool {
+    let required = function
+        .params
+        .iter()
+        .filter(|parameter| parameter.default.is_none())
+        .count();
+    (required..=function.params.len()).contains(&arity)
+}
+
+fn validate_workflow_name(name: &str, kind: &str) -> Result<(), ShellError> {
+    let length = name.chars().count();
+    if name.trim().is_empty() {
+        return Err(workflow_error(format!("{kind} name must be non-empty")));
+    }
+    if length > 128 {
+        return Err(workflow_error(format!(
+            "{kind} name must contain at most 128 characters"
+        )));
+    }
+    Ok(())
+}
+
+fn workflow_evidence_references(value: &Value) -> Result<Vec<String>, ShellError> {
+    let Value::List { vals, .. } = value else {
+        return Err(workflow_error(format!(
+            "workflow evidence references must be a list of strings, got {}",
+            value.get_type()
+        )));
+    };
+    if vals.len() > 16 {
+        return Err(workflow_error(
+            "workflow evidence accepts at most 16 references",
+        ));
+    }
+    vals.iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let reference =
+                value_to_string(value, &format!("workflow evidence reference {index}"))?;
+            let length = reference.chars().count();
+            if reference.trim().is_empty() {
+                return Err(workflow_error(format!(
+                    "workflow evidence reference {index} must be non-empty"
+                )));
+            }
+            if length > 256 {
+                return Err(workflow_error(format!(
+                    "workflow evidence reference {index} must contain at most 256 characters"
+                )));
+            }
+            Ok(reference)
+        })
+        .collect()
+}
+
+fn validate_workflow_evidence(
+    satisfied: bool,
+    summary: String,
+    references: Vec<String>,
+) -> Result<WorkflowEvidence, ShellError> {
+    let length = summary.chars().count();
+    if summary.trim().is_empty() {
+        return Err(workflow_error(
+            "workflow evidence summary must be non-empty",
+        ));
+    }
+    if length > 1_024 {
+        return Err(workflow_error(
+            "workflow evidence summary must contain at most 1024 characters",
+        ));
+    }
+    if satisfied && references.is_empty() {
+        return Err(workflow_error(
+            "satisfied workflow evidence requires at least one evidence reference",
+        ));
+    }
+    Ok(WorkflowEvidence {
+        satisfied,
+        summary,
+        references,
+    })
+}
+
+fn workflow_evidence_value(evidence: &WorkflowEvidence) -> Value {
+    let span = Span::unknown();
+    let mut record = Record::new();
+    record.push("kind", Value::string("workflow_evidence", span));
+    record.push("satisfied", Value::bool(evidence.satisfied, span));
+    record.push("summary", Value::string(evidence.summary.clone(), span));
+    record.push(
+        "evidence",
+        Value::list(
+            evidence
+                .references
+                .iter()
+                .map(|reference| Value::string(reference.clone(), span))
+                .collect(),
+            span,
+        ),
+    );
+    Value::record(record, span)
+}
+
+fn parse_workflow_evidence(value: RuntimeValue) -> Result<WorkflowEvidence, ShellError> {
+    let value = value.into_nu_value("workflow evidence callback")?;
+    let record = value_record(&value, "workflow evidence callback")?;
+    let allowed = ["kind", "satisfied", "summary", "evidence"];
+    for field in record.columns() {
+        if !allowed.contains(&field.as_str()) {
+            return Err(workflow_error(format!(
+                "workflow evidence callback returned unsupported field `{field}`; return workflow_evidence(...)"
+            )));
+        }
+    }
+    for field in allowed {
+        if record.get(field).is_none() {
+            return Err(workflow_error(format!(
+                "workflow evidence callback is missing `{field}`; return workflow_evidence(...)"
+            )));
+        }
+    }
+    let kind = value_to_string(
+        record
+            .get("kind")
+            .expect("required workflow evidence field checked"),
+        "workflow evidence kind",
+    )?;
+    if kind != "workflow_evidence" {
+        return Err(workflow_error(format!(
+            "workflow evidence kind must be `workflow_evidence`, got `{kind}`; return workflow_evidence(...)"
+        )));
+    }
+    let satisfied = value_to_bool(
+        record
+            .get("satisfied")
+            .expect("required workflow evidence field checked"),
+        "workflow evidence satisfied",
+    )?;
+    let summary = value_to_string(
+        record
+            .get("summary")
+            .expect("required workflow evidence field checked"),
+        "workflow evidence summary",
+    )?;
+    let references = workflow_evidence_references(
+        record
+            .get("evidence")
+            .expect("required workflow evidence field checked"),
+    )?;
+    validate_workflow_evidence(satisfied, summary, references)
+}
+
+fn parse_workflow_action_result(value: RuntimeValue) -> Result<WorkflowActionResult, ShellError> {
+    let full = value.into_nu_value("workflow action callback")?;
+    let compact = {
+        let record = value_record(&full, "workflow action callback")?;
+        let Some(ok) = record.get("ok") else {
+            return Err(workflow_error(
+                "workflow action and repair callbacks must return a record with boolean `ok`",
+            ));
+        };
+        value_to_bool(ok, "workflow action ok")?;
+        compact_workflow_action_record(record)
+    };
+    Ok(WorkflowActionResult { full, compact })
+}
+
+fn compact_workflow_action_record(record: &Record) -> Value {
+    const FIELDS: &[&str] = &[
+        "ok",
+        "kind",
+        "exit_code",
+        "still_running",
+        "timed_out",
+        "duration_ms",
+        "run_id",
+        "reason",
+        "message",
+        "code",
+    ];
+    let span = Span::unknown();
+    let mut compact = Record::new();
+    for field in FIELDS {
+        let Some(value) = record.get(field) else {
+            continue;
+        };
+        let bounded = match value {
+            Value::String { val, .. } | Value::Glob { val, .. } => {
+                Some(Value::string(bounded_text(val, 512), span))
+            }
+            Value::Bool { .. }
+            | Value::Int { .. }
+            | Value::Float { .. }
+            | Value::Nothing { .. } => Some(value.clone()),
+            _ => None,
+        };
+        if let Some(value) = bounded {
+            compact.push(*field, value);
+        }
+    }
+    Value::record(compact, span)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn workflow_context_value(
+    workflow: &Workflow,
+    stage: &WorkflowStage,
+    stage_index: usize,
+    phase: &str,
+    attempt: u32,
+    completed_stages: &[String],
+    evidence: Option<&WorkflowEvidence>,
+    outcome: Option<&Value>,
+) -> Value {
+    let span = Span::unknown();
+    let mut record = Record::new();
+    record.push("schema", Value::string("waymark.workflow-context.v1", span));
+    record.push("workflow", Value::string(workflow.name.clone(), span));
+    record.push("stage", Value::string(stage.name.clone(), span));
+    record.push("stage_index", Value::int(stage_index as i64, span));
+    record.push(
+        "stage_count",
+        Value::int(workflow.stages.len() as i64, span),
+    );
+    record.push("phase", Value::string(phase, span));
+    record.push("attempt", Value::int(attempt as i64, span));
+    record.push("max_attempts", Value::int(stage.max_attempts as i64, span));
+    record.push(
+        "completed_stages",
+        Value::list(
+            completed_stages
+                .iter()
+                .map(|name| Value::string(name.clone(), span))
+                .collect(),
+            span,
+        ),
+    );
+    record.push(
+        "evidence",
+        evidence
+            .map(workflow_evidence_value)
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    record.push(
+        "outcome",
+        outcome.cloned().unwrap_or_else(|| Value::nothing(span)),
+    );
+    Value::record(record, span)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn workflow_stage_report(
+    stage: &WorkflowStage,
+    status: &str,
+    attempts: u32,
+    repairs: u32,
+    checks: u32,
+    evidence: &WorkflowEvidence,
+    last_action: Option<Value>,
+    last_repair: Option<Value>,
+) -> Value {
+    let span = Span::unknown();
+    let mut record = Record::new();
+    record.push("name", Value::string(stage.name.clone(), span));
+    record.push("status", Value::string(status, span));
+    record.push("attempts", Value::int(attempts as i64, span));
+    record.push("repairs", Value::int(repairs as i64, span));
+    record.push("checks", Value::int(checks as i64, span));
+    record.push("evidence", workflow_evidence_value(evidence));
+    record.push(
+        "last_action",
+        last_action.unwrap_or_else(|| Value::nothing(span)),
+    );
+    record.push(
+        "last_repair",
+        last_repair.unwrap_or_else(|| Value::nothing(span)),
+    );
+    Value::record(record, span)
+}
+
+fn workflow_report_value(
+    workflow: &Workflow,
+    complete: bool,
+    failed_stage: Option<&str>,
+    completed_stages: Vec<String>,
+    stages: Vec<Value>,
+) -> Value {
+    let span = Span::unknown();
+    let mut record = Record::new();
+    record.push("kind", Value::string("workflow_report", span));
+    record.push("schema", Value::string("waymark.workflow-report.v1", span));
+    record.push("name", Value::string(workflow.name.clone(), span));
+    record.push("ok", Value::bool(complete, span));
+    record.push("complete", Value::bool(complete, span));
+    record.push(
+        "failed_stage",
+        failed_stage
+            .map(|name| Value::string(name, span))
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    record.push(
+        "completed_stages",
+        Value::list(
+            completed_stages
+                .into_iter()
+                .map(|name| Value::string(name, span))
+                .collect(),
+            span,
+        ),
+    );
+    record.push("stages", Value::list(stages, span));
+    Value::record(record, span)
+}
+
 fn stone_const_string(function: &StoneIrFunction, id: ConstId) -> Result<&str, ShellError> {
     match function.constants.get(id.0 as usize) {
         Some(StoneConst::String(value)) => Ok(value),
@@ -7841,6 +9590,10 @@ fn runtime_type_name(value: &RuntimeValue) -> &'static str {
         RuntimeValue::JsonArrayView(_) => "list",
         RuntimeValue::JsonScalarView(_) => "json",
         RuntimeValue::Callable(_) => "function",
+        RuntimeValue::TransitionHooks(_) => "transition_hooks",
+        RuntimeValue::WorkflowEvidenceSource(_) => "workflow_evidence_spec",
+        RuntimeValue::WorkflowStage(_) => "workflow_stage",
+        RuntimeValue::Workflow(_) => "workflow",
         RuntimeValue::AgentControl(_) => "agent_control",
         RuntimeValue::AttemptScope(_) => "attempt_scope",
         RuntimeValue::AttemptHandle(_) => "attempt_handle",
@@ -8003,7 +9756,23 @@ fn value_to_iter_values(value: &RuntimeValue) -> Result<Vec<Value>, ShellError> 
             .and_then(|value| value_to_iter_values(&RuntimeValue::Nu(value))),
         RuntimeValue::Callable(callable) => Err(stone_error(
             "iteration",
-            format!("cannot iterate callable lambda#{}", callable.function_id),
+            format!("cannot iterate callable {}", callable.display_name()),
+        )),
+        RuntimeValue::TransitionHooks(_) => Err(stone_error(
+            "iteration",
+            "cannot iterate transition hooks; pass them to an effect with hooks=...",
+        )),
+        RuntimeValue::WorkflowEvidenceSource(_) => Err(stone_error(
+            "iteration",
+            "cannot iterate a workflow evidence specification; pass it as evidence= to @stage or workflow_stage",
+        )),
+        RuntimeValue::WorkflowStage(_) => Err(stone_error(
+            "iteration",
+            "cannot iterate a workflow stage; pass it to workflow()",
+        )),
+        RuntimeValue::Workflow(_) => Err(stone_error(
+            "iteration",
+            "cannot iterate a workflow; pass it to workflow_run()",
         )),
         RuntimeValue::AgentControl(control) => Err(stone_error(
             "iteration",
@@ -8050,6 +9819,618 @@ fn attach_cleanup_error(program_error: ShellError, cleanup_error: ShellError) ->
     }
 }
 
+fn transition_hook_error(effect: &str, message: impl Into<String>) -> ShellError {
+    ShellError::Generic(
+        GenericError::new_internal(
+            format!("Stone {effect} transition hook error"),
+            message.into(),
+        )
+        .with_code("transition_hook_error")
+        .with_help(
+            "Use hooks={\"pre\": handler, \"post\": handler}; each handler accepts one transition record.",
+        ),
+    )
+}
+
+fn transition_event_value(
+    transition_id: &str,
+    kind: &str,
+    phase: &str,
+    input: Value,
+    outcome: Option<Value>,
+) -> Value {
+    let span = Span::unknown();
+    let mut record = Record::new();
+    record.push("transition_id", Value::string(transition_id, span));
+    record.push("kind", Value::string(kind, span));
+    record.push("phase", Value::string(phase, span));
+    record.push("input", input);
+    if let Some(outcome) = outcome {
+        record.push("outcome", outcome);
+    }
+    Value::record(record, span)
+}
+
+fn transition_outcome_value(result: Result<Value, &ShellError>) -> Value {
+    let span = Span::unknown();
+    let mut record = Record::new();
+    match result {
+        Ok(value) => {
+            record.push("ok", Value::bool(true, span));
+            record.push("value", value);
+        }
+        Err(error) => {
+            record.push("ok", Value::bool(false, span));
+            record.push("error", shell_error_record(error));
+        }
+    }
+    Value::record(record, span)
+}
+
+fn run_transition_outcome_value(result: &Result<Record, ShellError>) -> Value {
+    let span = Span::unknown();
+    let mut outcome = Record::new();
+    match result {
+        Ok(record) => {
+            outcome.push("ok", Value::bool(run_record_ok(record), span));
+            outcome.push("value", Value::record(record.clone(), span));
+        }
+        Err(error) => {
+            outcome.push("ok", Value::bool(false, span));
+            outcome.push("error", shell_error_record(error));
+        }
+    }
+    Value::record(outcome, span)
+}
+
+fn run_transition_input(positional: &[Value], named: &[(String, Value)]) -> Value {
+    let span = Span::unknown();
+    let mut input = Record::new();
+    input.push(
+        "argv",
+        positional
+            .first()
+            .cloned()
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    input.push(
+        "arguments",
+        Value::list(positional.iter().skip(1).cloned().collect(), span),
+    );
+    let mut options = Record::new();
+    for (name, value) in named {
+        options.push(name, value.clone());
+    }
+    input.push("options", Value::record(options, span));
+    Value::record(input, span)
+}
+
+fn run_policy_rejection_record(
+    positional: &[Value],
+    named: &[(String, Value)],
+    reason: &str,
+) -> Record {
+    let span = Span::unknown();
+    let mut flags = Record::new();
+    flags.push("stdout", Value::bool(false, span));
+    flags.push("stderr", Value::bool(false, span));
+    let cwd = named
+        .iter()
+        .find(|(name, _)| name == "cwd")
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| Value::nothing(span));
+    let argv = positional
+        .first()
+        .cloned()
+        .unwrap_or_else(|| Value::list(Vec::new(), span));
+    let mut explanation = Record::new();
+    explanation.push(
+        "summary",
+        Value::string(format!("run policy rejected the command: {reason}"), span),
+    );
+    explanation.push(
+        "next_steps",
+        Value::list(
+            vec![Value::string(
+                "Revise the argv list to satisfy the pre-hook policy, then retry.",
+                span,
+            )],
+            span,
+        ),
+    );
+
+    let mut record = Record::new();
+    record.push("ok", Value::bool(false, span));
+    record.push("kind", Value::string("policy_rejected", span));
+    record.push("exit_code", Value::nothing(span));
+    record.push("duration_ms", Value::int(0, span));
+    record.push("cwd", cwd);
+    record.push("argv", argv);
+    record.push("stdout", Value::string("", span));
+    record.push("stderr", Value::string("", span));
+    record.push("timed_out", Value::bool(false, span));
+    record.push("still_running", Value::bool(false, span));
+    record.push("truncated", Value::record(flags.clone(), span));
+    record.push("suppressed", Value::record(flags, span));
+    record.push("stderr_to_stdout", Value::bool(false, span));
+    record.push("policy_reason", Value::string(reason, span));
+    record.push("explanation", Value::record(explanation, span));
+    record
+}
+
+fn transition_pre_hook_record(
+    effect: &str,
+    output: RuntimeValue,
+) -> Result<TransitionPreHookDecision, ShellError> {
+    let output = output.into_nu_value(&format!("{effect} pre hook result"))?;
+    match output {
+        Value::Nothing { .. } => Ok(TransitionPreHookDecision::Continue(None)),
+        Value::Bool { val: true, .. } => Ok(TransitionPreHookDecision::Continue(None)),
+        Value::Bool { val: false, .. } => Ok(TransitionPreHookDecision::Reject(
+            "pre hook rejected the transition".to_string(),
+        )),
+        Value::Record { val, .. } => {
+            let record = val.into_owned();
+            if let Some(allow) = record.get("allow") {
+                let Value::Bool { val, .. } = allow else {
+                    return Err(transition_hook_error(
+                        effect,
+                        format!(
+                            "pre hook allow field must be bool, got {}",
+                            allow.get_type()
+                        ),
+                    ));
+                };
+                if !val {
+                    let reason = match record.get("reason") {
+                        Some(value) => value_to_string(value, "pre hook reason")
+                            .unwrap_or_else(|_| "pre hook rejected the transition".to_string()),
+                        None => "pre hook rejected the transition".to_string(),
+                    };
+                    return Ok(TransitionPreHookDecision::Reject(reason));
+                }
+            }
+            Ok(TransitionPreHookDecision::Continue(Some(record)))
+        }
+        other => Err(transition_hook_error(
+            effect,
+            format!(
+                "pre hook must return None, bool, or a patch record; got {}",
+                other.get_type()
+            ),
+        )),
+    }
+}
+
+fn apply_run_pre_hook_output(
+    output: RuntimeValue,
+    positional: &mut Vec<Value>,
+) -> Result<RunPreHookDecision, ShellError> {
+    let record = match transition_pre_hook_record("run", output)? {
+        TransitionPreHookDecision::Continue(record) => record,
+        TransitionPreHookDecision::Reject(reason) => {
+            return Ok(RunPreHookDecision::Reject { reason });
+        }
+    };
+    let Some(record) = record else {
+        return Ok(RunPreHookDecision::Continue { changed: false });
+    };
+    for key in record.columns() {
+        if !matches!(key.as_str(), "allow" | "reason" | "argv") {
+            return Err(transition_hook_error(
+                "run",
+                format!(
+                    "unsupported run pre-hook patch field `{key}`; expected allow, reason, or argv"
+                ),
+            ));
+        }
+    }
+    let Some(argv) = record.get("argv") else {
+        return Ok(RunPreHookDecision::Continue { changed: false });
+    };
+    if !matches!(argv, Value::List { .. }) {
+        return Err(transition_hook_error(
+            "run",
+            format!("run pre-hook argv must be a list, got {}", argv.get_type()),
+        ));
+    }
+    if positional.is_empty() {
+        positional.push(argv.clone());
+    } else {
+        positional[0] = argv.clone();
+    }
+    Ok(RunPreHookDecision::Continue { changed: true })
+}
+
+fn apply_model_pre_hook_output(
+    output: RuntimeValue,
+    request: &mut serde_json::Map<String, JsonValue>,
+) -> Result<bool, ShellError> {
+    let record = match transition_pre_hook_record("model_call", output)? {
+        TransitionPreHookDecision::Continue(record) => record,
+        TransitionPreHookDecision::Reject(reason) => {
+            return Err(transition_hook_error("model_call", reason));
+        }
+    };
+    let Some(record) = record else {
+        return Ok(false);
+    };
+    for key in record.columns() {
+        if !matches!(key.as_str(), "allow" | "reason" | "messages") {
+            return Err(transition_hook_error(
+                "model_call",
+                format!(
+                    "unsupported model_call pre-hook patch field `{key}`; expected allow, reason, or messages"
+                ),
+            ));
+        }
+    }
+    let Some(messages) = record.get("messages") else {
+        return Ok(false);
+    };
+    request.insert(
+        "messages".to_string(),
+        JsonValue::Array(model_message_values(messages)?),
+    );
+    Ok(true)
+}
+
+fn attach_transition_id(
+    value: &mut Value,
+    transition_id: &str,
+    effect: &str,
+) -> Result<(), ShellError> {
+    let Value::Record { val, .. } = value else {
+        return Err(transition_hook_error(
+            effect,
+            format!("effect response must be a record, got {}", value.get_type()),
+        ));
+    };
+    val.to_mut().push(
+        "transition_id",
+        Value::string(transition_id, Span::unknown()),
+    );
+    Ok(())
+}
+
+fn model_request_from_values(
+    messages: &Value,
+    named: Vec<(String, Value)>,
+    operation: &str,
+    allow_response_format: bool,
+) -> Result<serde_json::Map<String, JsonValue>, ShellError> {
+    let mut request = serde_json::Map::new();
+    request.insert(
+        "messages".to_string(),
+        JsonValue::Array(model_message_values_for(messages, operation)?),
+    );
+    let mut seen = HashSet::new();
+    for (name, value) in named {
+        if !seen.insert(name.clone()) {
+            return Err(model_input_error(
+                operation,
+                format!("duplicate {operation} keyword argument `{name}`"),
+            ));
+        }
+        if matches!(value, Value::Nothing { .. }) {
+            continue;
+        }
+        let json_value = match name.as_str() {
+            "model_class" | "model" => JsonValue::String(
+                value_to_string(&value, &format!("{operation} {name}"))
+                    .map_err(|error| model_input_error(operation, error.to_string()))?,
+            ),
+            "temperature" | "top_p" => {
+                let number = match value {
+                    Value::Int { val, .. } => val as f64,
+                    Value::Float { val, .. } => val,
+                    other => {
+                        return Err(model_input_error(
+                            operation,
+                            format!(
+                                "{operation} {name} must be a number, got {}",
+                                other.get_type()
+                            ),
+                        ));
+                    }
+                };
+                if !number.is_finite() || number < 0.0 {
+                    return Err(model_input_error(
+                        operation,
+                        format!("{operation} {name} must be a finite non-negative number"),
+                    ));
+                }
+                if name == "top_p" && (number <= 0.0 || number > 1.0) {
+                    return Err(model_input_error(
+                        operation,
+                        format!(
+                            "{operation} top_p must be greater than 0 and at most 1 with the current Gateway protocol"
+                        ),
+                    ));
+                }
+                serde_json::Number::from_f64(number)
+                    .map(JsonValue::Number)
+                    .ok_or_else(|| {
+                        model_input_error(
+                            operation,
+                            format!("{operation} {name} must be a finite JSON number"),
+                        )
+                    })?
+            }
+            "seed" | "max_output_tokens" => {
+                let number = match value {
+                    Value::Int { val, .. } if val >= 0 => u64::try_from(val).unwrap_or(0),
+                    Value::Int { .. } => {
+                        return Err(model_input_error(
+                            operation,
+                            format!("{operation} {name} must be non-negative"),
+                        ));
+                    }
+                    other => {
+                        return Err(model_input_error(
+                            operation,
+                            format!(
+                                "{operation} {name} must be an integer, got {}",
+                                other.get_type()
+                            ),
+                        ));
+                    }
+                };
+                let number = u32::try_from(number).map_err(|_| {
+                    model_input_error(
+                        operation,
+                        format!("{operation} {name} exceeds the unsigned 32-bit limit"),
+                    )
+                })?;
+                if name == "seed" && number == 0 {
+                    return Err(model_input_error(
+                        operation,
+                        format!(
+                            "{operation} seed must be positive with the current Gateway protocol"
+                        ),
+                    ));
+                }
+                JsonValue::Number(serde_json::Number::from(number))
+            }
+            "response_format" if allow_response_format => match value {
+                value @ (Value::String { .. } | Value::Record { .. }) => nu_to_json_value(&value),
+                other => {
+                    return Err(model_input_error(
+                        operation,
+                        format!(
+                            "{operation} response_format must be a string or record, got {}",
+                            other.get_type()
+                        ),
+                    ));
+                }
+            },
+            "metadata" => {
+                let Value::Record { val, .. } = &value else {
+                    return Err(model_input_error(
+                        operation,
+                        format!(
+                            "{operation} metadata must be a record, got {}",
+                            value.get_type()
+                        ),
+                    ));
+                };
+                for (key, metadata_value) in val.iter() {
+                    if !matches!(metadata_value, Value::String { .. } | Value::Glob { .. }) {
+                        return Err(model_input_error(
+                            operation,
+                            format!(
+                                "{operation} metadata field {key:?} must be a string, got {}",
+                                metadata_value.get_type()
+                            ),
+                        ));
+                    }
+                }
+                nu_to_json_value(&value)
+            }
+            other => {
+                let expected = if allow_response_format {
+                    "model_class, model, temperature, top_p, seed, max_output_tokens, response_format, or metadata"
+                } else {
+                    "model_class, model, temperature, top_p, seed, max_output_tokens, or metadata"
+                };
+                return Err(model_input_error(
+                    operation,
+                    format!(
+                        "unexpected {operation} keyword argument `{other}`; expected {expected}"
+                    ),
+                ));
+            }
+        };
+        request.insert(name, json_value);
+    }
+    Ok(request)
+}
+
+fn model_message_values(messages: &Value) -> Result<Vec<JsonValue>, ShellError> {
+    model_message_values_for(messages, "model_call")
+}
+
+fn model_message_values_for(
+    messages: &Value,
+    operation: &str,
+) -> Result<Vec<JsonValue>, ShellError> {
+    let Value::List { vals, .. } = messages else {
+        return Err(model_input_error(
+            operation,
+            format!(
+                "{operation} messages must be a list of records, got {}",
+                messages.get_type()
+            ),
+        ));
+    };
+    if vals.is_empty() {
+        return Err(model_input_error(
+            operation,
+            format!("{operation} messages list must not be empty"),
+        ));
+    }
+
+    let mut message_values = Vec::with_capacity(vals.len());
+    for (index, value) in vals.iter().enumerate() {
+        let Value::Record { val, .. } = value else {
+            return Err(model_input_error(
+                operation,
+                format!(
+                    "{operation} message {index} must be a record, got {}",
+                    value.get_type()
+                ),
+            ));
+        };
+        for key in val.columns() {
+            if !matches!(key.as_str(), "role" | "content" | "name") {
+                return Err(model_input_error(
+                    operation,
+                    format!(
+                        "unsupported {operation} message field {key:?}; expected role, content, or name"
+                    ),
+                ));
+            }
+        }
+        let role = val.get("role").ok_or_else(|| {
+            model_input_error(
+                operation,
+                format!("{operation} message {index} requires role"),
+            )
+        })?;
+        let role = value_to_string(role, &format!("{operation} message role"))
+            .map_err(|error| model_input_error(operation, error.to_string()))?;
+        if !matches!(role.as_str(), "system" | "user" | "assistant") {
+            return Err(model_input_error(
+                operation,
+                format!(
+                    "unsupported {operation} message role {role:?}; expected system, user, or assistant"
+                ),
+            ));
+        }
+        let content = val.get("content").ok_or_else(|| {
+            model_input_error(
+                operation,
+                format!("{operation} message {index} requires content"),
+            )
+        })?;
+        let content = value_to_string(content, &format!("{operation} message content"))
+            .map_err(|error| model_input_error(operation, error.to_string()))?;
+        let mut message = serde_json::Map::new();
+        message.insert("role".to_string(), JsonValue::String(role));
+        message.insert("content".to_string(), JsonValue::String(content));
+        if let Some(name) = val.get("name") {
+            if !matches!(name, Value::Nothing { .. }) {
+                let name = value_to_string(name, &format!("{operation} message name"))
+                    .map_err(|error| model_input_error(operation, error.to_string()))?;
+                message.insert("name".to_string(), JsonValue::String(name));
+            }
+        }
+        message_values.push(JsonValue::Object(message));
+    }
+    Ok(message_values)
+}
+
+#[derive(Default)]
+struct ModelUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+}
+
+impl ModelUsage {
+    fn add_response(&mut self, response: &Value) {
+        let response = nu_to_json_value(response);
+        let Some(usage) = response.get("usage") else {
+            return;
+        };
+        self.input_tokens = self.input_tokens.saturating_add(
+            usage
+                .get("input_tokens")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0),
+        );
+        self.output_tokens = self.output_tokens.saturating_add(
+            usage
+                .get("output_tokens")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0),
+        );
+        self.total_tokens = self.total_tokens.saturating_add(
+            usage
+                .get("total_tokens")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0),
+        );
+    }
+
+    fn to_json(&self) -> JsonValue {
+        json!({
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+        })
+    }
+}
+
+fn model_response_content(response: &Value) -> Result<String, ShellError> {
+    let Value::Record { val, .. } = response else {
+        return Err(model_infer_validation_error(format!(
+            "model response must be a record, got {}",
+            response.get_type()
+        )));
+    };
+    let content = val.get("content").ok_or_else(|| {
+        model_infer_validation_error("model response does not contain string content")
+    })?;
+    value_to_string(content, "model_infer response content")
+        .map_err(|error| model_infer_validation_error(error.to_string()))
+}
+
+fn model_infer_repair_message(repair_prompt: &str, attempt: i64, issues: &[JsonValue]) -> String {
+    let prefix = if repair_prompt.trim().is_empty() {
+        "Your previous response failed JSON Schema validation. Correct it."
+    } else {
+        repair_prompt.trim()
+    };
+    let encoded =
+        serde_json::to_string(issues).unwrap_or_else(|_| "validation details unavailable".into());
+    format!(
+        "{prefix}\nValidation attempt {attempt} errors: {encoded}\nReturn only one corrected JSON object matching the declared schema."
+    )
+}
+
+fn model_infer_schema_instruction(schema_bytes: &[u8], schema_prompt: &str) -> String {
+    let schema_prompt = schema_prompt.trim();
+    if schema_prompt.is_empty() {
+        return format!(
+            "Return exactly one JSON object matching this JSON Schema. Do not add prose or Markdown.\nJSON Schema:\n{}",
+            String::from_utf8_lossy(schema_bytes)
+        );
+    }
+    format!(
+        "Return exactly one JSON object. Do not add prose or Markdown.\nOutput contract:\n{schema_prompt}"
+    )
+}
+
+fn bounded_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut value = text
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    value.push('…');
+    value
+}
+
+fn model_input_error(operation: &str, message: impl Into<String>) -> ShellError {
+    match operation {
+        "model_infer" => model_infer_input_error(message),
+        _ => model_call_input_error(message),
+    }
+}
+
 fn model_call_input_error(message: impl Into<String>) -> ShellError {
     ShellError::Generic(
         GenericError::new_internal("Stone model_call error", message.into())
@@ -8060,13 +10441,209 @@ fn model_call_input_error(message: impl Into<String>) -> ShellError {
     )
 }
 
-fn agent_session_value(task: Value, input: Value, attempt: Value, span: Span) -> Value {
+fn model_infer_input_error(message: impl Into<String>) -> ShellError {
+    ShellError::Generic(
+        GenericError::new_internal("Stone model_infer error", message.into())
+            .with_code("model_infer_invalid_request")
+            .with_help(
+                "Use help(\"model_infer\"); supply a supported strict schema and bounded inference options.",
+            ),
+    )
+}
+
+fn model_infer_validation_error(message: impl Into<String>) -> ShellError {
+    ShellError::Generic(
+        GenericError::new_internal("Stone model_infer validation error", message.into())
+            .with_code("model_schema_validation_failed")
+            .with_help(
+                "Inspect the separately traced model calls and validation summaries; revise the prompt, schema, or explicit retry policy.",
+            ),
+    )
+}
+
+fn context_input_error(message: impl Into<String>) -> ShellError {
+    ShellError::Generic(
+        GenericError::new_internal("Stone context error", message.into())
+            .with_code("context_invalid_request")
+            .with_help(
+                "Use help(\"context_write\"), help(\"context_read\"), or help(\"context_project\") and correct the structured argument.",
+            ),
+    )
+}
+
+fn correction_input_error(message: impl Into<String>) -> ShellError {
+    ShellError::Generic(
+        GenericError::new_internal("Stone correction error", message.into())
+            .with_code("stone_correction_invalid_request")
+            .with_help(
+                "Use a suggest-only error.correction with the exact failed source; correction_apply returns source but never evaluates it.",
+            ),
+    )
+}
+
+fn set_correction_argument(
+    slot: &mut Option<Value>,
+    value: Value,
+    name: &str,
+) -> Result<(), ShellError> {
+    if slot.replace(value).is_some() {
+        return Err(correction_input_error(format!(
+            "correction_apply argument `{name}` was supplied more than once"
+        )));
+    }
+    Ok(())
+}
+
+fn set_context_argument(
+    slot: &mut Option<Value>,
+    value: Value,
+    name: &str,
+    call: &str,
+) -> Result<(), ShellError> {
+    if slot.replace(value).is_some() {
+        return Err(context_input_error(format!(
+            "{call} argument `{name}` was supplied more than once"
+        )));
+    }
+    Ok(())
+}
+
+fn context_required_string(value: Option<Value>, context: &str) -> Result<String, ShellError> {
+    let value = value.ok_or_else(|| context_input_error(format!("{context} is required")))?;
+    value_to_string(&value, context)
+}
+
+fn context_string_list(value: Option<Value>, context: &str) -> Result<Vec<String>, ShellError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if matches!(value, Value::Nothing { .. }) {
+        return Ok(Vec::new());
+    }
+    let Value::List { vals, .. } = value else {
+        return Err(context_input_error(format!(
+            "{context} must be a list of strings"
+        )));
+    };
+    vals.iter()
+        .map(|value| value_to_string(value, context))
+        .collect()
+}
+
+fn context_json_list(value: Option<Value>, context: &str) -> Result<Vec<JsonValue>, ShellError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if matches!(value, Value::Nothing { .. }) {
+        return Ok(Vec::new());
+    }
+    let Value::List { vals, .. } = value else {
+        return Err(context_input_error(format!("{context} must be a list")));
+    };
+    Ok(vals.iter().map(nu_to_json_value).collect())
+}
+
+fn json_u64(value: Option<&JsonValue>) -> Option<u64> {
+    match value {
+        Some(JsonValue::Number(value)) => value.as_u64(),
+        Some(JsonValue::String(value)) => value.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn time_u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+#[cfg(target_os = "hermit")]
+fn agent_time_clock_source() -> &'static str {
+    "attempt-created-at-plus-guest-monotonic"
+}
+
+#[cfg(not(target_os = "hermit"))]
+fn agent_time_clock_source() -> &'static str {
+    "host-wall-clock"
+}
+
+fn agent_time_budget_value(attempt: &Value, now_ms: u64, span: Span) -> Value {
+    let attempt_json = nu_to_json_value(attempt);
+    let metadata = attempt_json.get("metadata").and_then(JsonValue::as_object);
+    let limits = attempt_json
+        .get("resource_limits")
+        .and_then(JsonValue::as_object);
+    let created_at_ms = json_u64(attempt_json.get("created_at_ms"));
+    let declared_total_ms = limits.and_then(|limits| json_u64(limits.get("wall_time_ms")));
+    let explicit_deadline_ms = metadata.and_then(|metadata| json_u64(metadata.get("deadline_ms")));
+    let deadline_ms = explicit_deadline_ms.or_else(|| {
+        created_at_ms
+            .zip(declared_total_ms)
+            .map(|(created, total)| created.saturating_add(total))
+    });
+    let Some(deadline_ms) = deadline_ms else {
+        return Value::nothing(span);
+    };
+    let started_at_ms = declared_total_ms
+        .map(|total| deadline_ms.saturating_sub(total))
+        .or(created_at_ms);
+    let total_ms = declared_total_ms
+        .or_else(|| started_at_ms.map(|started| deadline_ms.saturating_sub(started)));
+    let source = metadata
+        .and_then(|metadata| metadata.get("time_budget_source"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("attempt-resource-limit");
+    let mut budget = Record::new();
+    budget.push("source", Value::string(source, span));
+    budget.push("clock", Value::string(agent_time_clock_source(), span));
+    budget.push(
+        "started_at_ms",
+        started_at_ms
+            .map(|value| Value::int(time_u64_to_i64(value), span))
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    budget.push(
+        "deadline_ms",
+        Value::int(time_u64_to_i64(deadline_ms), span),
+    );
+    budget.push("now_ms", Value::int(time_u64_to_i64(now_ms), span));
+    budget.push(
+        "elapsed_ms",
+        started_at_ms
+            .map(|started| Value::int(time_u64_to_i64(now_ms.saturating_sub(started)), span))
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    budget.push(
+        "remaining_ms",
+        Value::int(time_u64_to_i64(deadline_ms.saturating_sub(now_ms)), span),
+    );
+    budget.push(
+        "total_ms",
+        total_ms
+            .map(|value| Value::int(time_u64_to_i64(value), span))
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    Value::record(budget, span)
+}
+
+fn agent_session_value_at(
+    task: Value,
+    input: Value,
+    attempt: Value,
+    now_ms: u64,
+    span: Span,
+) -> Value {
     let limits = match &attempt {
         Value::Record { val, .. } => val
             .get("resource_limits")
             .cloned()
             .unwrap_or_else(|| Value::record(Record::new(), span)),
         _ => Value::record(Record::new(), span),
+    };
+    let context_prompt_view = match &attempt {
+        Value::Record { val, .. } => val
+            .get("context_prompt_view")
+            .cloned()
+            .unwrap_or_else(|| Value::nothing(span)),
+        _ => Value::nothing(span),
     };
     let names = |items: &[&str]| {
         Value::list(
@@ -8090,8 +10667,17 @@ fn agent_session_value(task: Value, input: Value, attempt: Value, span: Span) ->
         "linux",
         names(&["run", "must_run", "run_status", "run_wait", "run_terminate"]),
     );
-    tools.push("model", names(&["model_call"]));
-    tools.push("context", names(&["task_spec", "task_input"]));
+    tools.push("model", names(&["model_call", "model_infer"]));
+    tools.push(
+        "context",
+        names(&[
+            "task_spec",
+            "task_input",
+            "context_write",
+            "context_read",
+            "context_project",
+        ]),
+    );
     tools.push(
         "attempts",
         names(&[
@@ -8100,6 +10686,7 @@ fn agent_session_value(task: Value, input: Value, attempt: Value, span: Span) ->
             "attempt_scope",
             "attempt_scope_close",
             "attempt_state",
+            "attempt_inspect",
             "attempt_wait",
             "attempt_join",
             "attempt_wait_any",
@@ -8114,10 +10701,34 @@ fn agent_session_value(task: Value, input: Value, attempt: Value, span: Span) ->
     let mut session = Record::new();
     session.push("task", task);
     session.push("input", input);
+    session.push(
+        "time_budget",
+        agent_time_budget_value(&attempt, now_ms, span),
+    );
     session.push("attempt", attempt);
+    session.push("context_prompt_view", context_prompt_view);
     session.push("limits", limits);
     session.push("tools", Value::record(tools, span));
     Value::record(session, span)
+}
+
+#[cfg(target_os = "hermit")]
+fn agent_session_now_ms(attempt: &Value, anchor: &mut Option<(Instant, u64)>) -> u64 {
+    let attempt_json = nu_to_json_value(attempt);
+    let created_at_ms = json_u64(attempt_json.get("created_at_ms")).unwrap_or(0);
+    let (started, host_ms) = anchor.get_or_insert_with(|| (Instant::now(), created_at_ms));
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    host_ms.saturating_add(elapsed_ms)
+}
+
+#[cfg(not(target_os = "hermit"))]
+fn agent_session_now_ms(_attempt: &Value, _anchor: &mut Option<(Instant, u64)>) -> u64 {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    now_ms
 }
 
 fn agent_task_prompt(session: &JsonValue) -> Result<String, ShellError> {
@@ -8245,6 +10856,26 @@ fn value_to_string_pairs(
     val.iter()
         .map(|(key, value)| value_to_string(value, context).map(|value| (key.clone(), value)))
         .collect()
+}
+
+fn context_prompt_required_keys_from_value(
+    value: &Value,
+    context: &str,
+) -> Result<Vec<String>, ShellError> {
+    let record = value_record(value, context)?;
+    for key in record.columns() {
+        if key != "required_keys" {
+            return Err(stone_error(
+                context,
+                format!("unexpected context prompt view field `{key}`"),
+            ));
+        }
+    }
+    record
+        .get("required_keys")
+        .map(|value| value_to_string_list(value, context))
+        .transpose()
+        .map(Option::unwrap_or_default)
 }
 
 fn task_spec_from_value(value: &Value, context: &str) -> Result<GatewayTaskSpec, ShellError> {
@@ -8602,9 +11233,10 @@ mod tests {
     #[cfg(not(target_os = "hermit"))]
     use super::cleanup_stale_run_temp_files;
     use super::{
-        agent_session_value, eval_program, eval_program_with_options, eval_program_with_output,
-        match_fused_map_update_if, EvalHotLoopDiagnostics, EvalOptions, RuntimeValue, TextLines,
-        STONE_BUILTIN_NAMES,
+        agent_session_value_at, context_prompt_required_keys_from_value, eval_program,
+        eval_program_with_options, eval_program_with_output, eval_program_with_output_and_session,
+        match_fused_map_update_if, transition_id_for_scope, EvalHotLoopDiagnostics, EvalOptions,
+        RuntimeValue, StoneSession, TextLines, STONE_BUILTIN_NAMES,
     };
     use crate::{
         commands::{
@@ -8625,6 +11257,12 @@ mod tests {
         path::PathBuf,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn transition_ids_include_controller_run_when_attached() {
+        assert_eq!(transition_id_for_scope(3, Some(2)), "run-2-transition-3");
+        assert_eq!(transition_id_for_scope(3, None), "transition-3");
+    }
 
     #[test]
     fn evaluates_command_call() -> Result<(), ShellError> {
@@ -9041,6 +11679,37 @@ emit(inc(5))
             json_value!(15)
         );
 
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn named_functions_are_first_class_callable_adapters() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("named-function-callable")?;
+        let program = lower_source(
+            r#"def apply(adapter, value):
+    return adapter(value)
+
+def increment(value, amount=1):
+    return value + amount
+
+selected = increment
+emit({
+    "direct_adapter": apply(increment, 2),
+    "stored_adapter": selected(4, 3),
+    "mapped": map(increment, [1, 2, 3]),
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, Span::unknown())?,
+            json_value!({
+                "direct_adapter": 3,
+                "stored_adapter": 7,
+                "mapped": [2, 3, 4],
+            })
+        );
         cleanup_dir(&root);
         Ok(())
     }
@@ -9630,16 +12299,29 @@ emit({
     #[test]
     fn agent_session_value_exposes_structured_control_resources() {
         let span = Span::unknown();
-        let session = agent_session_value(
+        let session = agent_session_value_at(
             json::json_to_nu_value(json_value!({"objective": "solve"}), span),
             json::json_to_nu_value(json_value!({"strategy": "bounded"}), span),
             json::json_to_nu_value(
                 json_value!({
                     "attempt": "attempt-7",
-                    "resource_limits": {"model_calls": "4", "memory": "1GiB"},
+                    "resource_limits": {
+                        "model_calls": "4",
+                        "memory": "1GiB",
+                        "wall_time_ms": "4000"
+                    },
+                    "metadata": {
+                        "deadline_ms": "5000",
+                        "time_budget_source": "test-deadline"
+                    },
+                    "created_at_ms": 1000,
+                    "context_prompt_view": {
+                        "required_keys": ["requirement.target"]
+                    },
                 }),
                 span,
             ),
+            1500,
             span,
         );
         let session = json::nu_to_json_value(&session);
@@ -9647,15 +12329,52 @@ emit({
         assert_eq!(session["task"]["objective"], json_value!("solve"));
         assert_eq!(session["input"]["strategy"], json_value!("bounded"));
         assert_eq!(session["attempt"]["attempt"], json_value!("attempt-7"));
+        assert_eq!(
+            session["context_prompt_view"]["required_keys"],
+            json_value!(["requirement.target"])
+        );
         assert_eq!(session["limits"]["model_calls"], json_value!("4"));
+        assert_eq!(
+            session["time_budget"]["source"],
+            json_value!("test-deadline")
+        );
+        assert_eq!(
+            session["time_budget"]["clock"],
+            json_value!("host-wall-clock")
+        );
+        assert_eq!(session["time_budget"]["total_ms"], json_value!(4000));
+        assert_eq!(session["time_budget"]["elapsed_ms"], json_value!(500));
+        assert_eq!(session["time_budget"]["remaining_ms"], json_value!(3500));
         assert!(session["tools"]["model"]
             .as_array()
             .unwrap()
             .contains(&json_value!("model_call")));
+        assert!(session["tools"]["model"]
+            .as_array()
+            .unwrap()
+            .contains(&json_value!("model_infer")));
+        assert!(session["tools"]["context"]
+            .as_array()
+            .unwrap()
+            .contains(&json_value!("context_project")));
         assert!(session["tools"]["attempts"]
             .as_array()
             .unwrap()
             .contains(&json_value!("attempt_fork")));
+    }
+
+    #[test]
+    fn context_prompt_view_parser_accepts_only_required_keys() {
+        let span = Span::unknown();
+        let value =
+            json::json_to_nu_value(json_value!({"required_keys": ["requirement.target"]}), span);
+        assert_eq!(
+            context_prompt_required_keys_from_value(&value, "test").unwrap(),
+            vec!["requirement.target".to_string()]
+        );
+
+        let invalid = json::json_to_nu_value(json_value!({"focus": "target"}), span);
+        assert!(context_prompt_required_keys_from_value(&invalid, "test").is_err());
     }
 
     #[test]
@@ -9743,6 +12462,644 @@ emit({
             assert!(text.contains(expected), "expected {expected:?} in {text}");
             cleanup_dir(&root);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn model_infer_help_exposes_bounded_validation_and_repair() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("model-infer-help")?;
+        let program = lower_source(
+            r#"topic = help("model_infer")
+emit({
+    "found": topic.found,
+    "has_schema": "schema: record" in topic.signature,
+    "separate_calls": "separately traced model_call" in topic.use_when,
+    "bounded": "capped at four" in topic.avoid[2],
+    "not_truth": "not factual correctness" in topic.avoid[3],
+    "compact_prompt": "schema_prompt" in topic.signature,
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, Span::unknown())?,
+            json_value!({
+                "found": true,
+                "has_schema": true,
+                "separate_calls": true,
+                "bounded": true,
+                "not_truth": true,
+                "compact_prompt": true,
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn model_infer_rejects_invalid_schema_and_options_before_rpc() -> Result<(), ShellError> {
+        let cases = [
+            (
+                r#"model_infer([{"role": "user", "content": "ready?"}], [])"#,
+                "schema must be a record",
+            ),
+            (
+                r#"model_infer([{"role": "user", "content": "ready?"}], {"type": "string", "pattern": "yes"})"#,
+                "unsupported JSON Schema keyword",
+            ),
+            (
+                r#"model_infer([{"role": "user", "content": "ready?"}], {"type": "object"}, retries=5)"#,
+                "retries must be between 0 and 4",
+            ),
+            (
+                r#"model_infer([{"role": "user", "content": "ready?"}], {"type": "object"}, response_format={"type": "json_object"})"#,
+                "owns response_format",
+            ),
+            (
+                r#"model_infer([{"role": "user", "content": "ready?"}], {"type": "object"}, schema_prompt=42)"#,
+                "schema_prompt",
+            ),
+        ];
+
+        for (index, (source, expected)) in cases.into_iter().enumerate() {
+            let (engine_state, mut stack, root) =
+                test_engine(&format!("model-infer-invalid-{index}"))?;
+            let program = lower_source(source)?;
+            let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+                .expect_err("invalid model_infer should fail before Gateway access");
+            let text = format!("{error:?}");
+            assert!(text.contains("model_infer_invalid_request"), "{text}");
+            assert!(text.contains(expected), "expected {expected:?} in {text}");
+            cleanup_dir(&root);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn model_infer_schema_prompt_preserves_default_and_allows_compact_guidance() {
+        let schema = br#"{"type":"object","properties":{"ready":{"type":"boolean"}}}"#;
+        let default = super::model_infer_schema_instruction(schema, "");
+        assert!(default.contains("JSON Schema:"));
+        assert!(default.contains(String::from_utf8_lossy(schema).as_ref()));
+
+        let compact =
+            super::model_infer_schema_instruction(schema, "  {ready:boolean}; no extras  ");
+        assert_eq!(
+            compact,
+            "Return exactly one JSON object. Do not add prose or Markdown.\nOutput contract:\n{ready:boolean}; no extras"
+        );
+        assert!(!compact.contains("\"properties\""));
+    }
+
+    #[test]
+    fn run_transition_hooks_rewrite_one_action_and_record_its_outcome() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("run-transition-hooks")?;
+        let program = lower_source(
+            r#"def prepare_action(step):
+    return {"argv": ["printf", "patched"]}
+
+def record_outcome(step):
+    return context_write(
+        "outcome.last_run",
+        "outcome",
+        {
+            "transition_id": step.transition_id,
+            "ok": step.outcome.ok,
+            "stdout": step.outcome.value.stdout,
+        },
+    )
+
+result = run(
+    ["printf", "original"],
+    hooks={"pre": prepare_action, "post": record_outcome},
+)
+memory = context_read(keys=["outcome.last_run"])
+emit({
+    "stdout": result.stdout,
+    "transition_id": result.transition_id,
+    "memory": memory[0].content,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, Span::unknown())?,
+            json_value!({
+                "stdout": "patched",
+                "transition_id": "transition-1",
+                "memory": {
+                    "transition_id": "transition-1",
+                    "ok": true,
+                    "stdout": "patched",
+                },
+            })
+        );
+        let events = output.diagnostics["transitions"]
+            .as_array()
+            .expect("transition diagnostics");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["phase"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["start", "pre", "effect", "post"]
+        );
+        assert_eq!(events[1]["changed"], json_value!(true));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn run_transition_pre_hook_rejection_is_a_recoverable_outcome() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("run-transition-rejection")?;
+        let program = lower_source(
+            r#"def record_rejection(step):
+    return context_write(
+        "outcome.rejected_run",
+        "outcome",
+        {
+            "ok": step.outcome.ok,
+            "kind": step.outcome.value.kind,
+            "reason": step.outcome.value.policy_reason,
+        },
+    )
+
+result = run(
+    ["printf", "must-not-execute"],
+    hooks={
+        "pre": lambda step: {"allow": False, "reason": "argv is outside policy"},
+        "post": record_rejection,
+    },
+)
+memory = context_read(keys=["outcome.rejected_run"])
+emit({
+    "ok": result.ok,
+    "kind": result.kind,
+    "reason": result.policy_reason,
+    "stdout": result.stdout,
+    "transition_id": result.transition_id,
+    "memory": memory[0].content,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, Span::unknown())?,
+            json_value!({
+                "ok": false,
+                "kind": "policy_rejected",
+                "reason": "argv is outside policy",
+                "stdout": "",
+                "transition_id": "transition-1",
+                "memory": {
+                    "ok": false,
+                    "kind": "policy_rejected",
+                    "reason": "argv is outside policy",
+                },
+            })
+        );
+        let events = output.diagnostics["transitions"]
+            .as_array()
+            .expect("transition diagnostics");
+        assert_eq!(events[1]["ok"], json_value!(false));
+        assert_eq!(events[1]["rejected"], json_value!(true));
+        assert_eq!(events[2]["skipped"], json_value!(true));
+        assert_eq!(events[3]["ok"], json_value!(true));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn run_post_hook_observes_nonzero_command_as_failed_outcome() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("run-transition-failure")?;
+        let program = lower_source(
+            r#"def record_failure(step):
+    return context_write(
+        "outcome.failed_run",
+        "outcome",
+        {
+            "transition_ok": step.outcome.ok,
+            "run_ok": step.outcome.value.ok,
+            "exit_code": step.outcome.value.exit_code,
+        },
+    )
+
+result = run(["sh", "-c", "exit 7"], hooks={"post": record_failure})
+memory = context_read(keys=["outcome.failed_run"])
+emit({"result_ok": result.ok, "memory": memory[0].content})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, Span::unknown())?,
+            json_value!({
+                "result_ok": false,
+                "memory": {
+                    "transition_ok": false,
+                    "run_ok": false,
+                    "exit_code": 7,
+                },
+            })
+        );
+        assert_eq!(
+            output.diagnostics["transitions"][1]["ok"],
+            json_value!(false)
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn first_class_transition_hooks_cross_user_function_boundaries() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("first-class-transition-hooks")?;
+        let program = lower_source(
+            r#"def record_outcome(step):
+    return context_write(
+        "outcome.reusable_hook",
+        "outcome",
+        {"ok": step.outcome.ok, "text": step.outcome.value.stdout},
+    )
+
+def invoke_with_hooks(active_hooks):
+    return run(["printf", "ready"], hooks=active_hooks)
+
+active_hooks = transition_hooks(post=record_outcome)
+result = invoke_with_hooks(active_hooks)
+memory = context_read(keys=["outcome.reusable_hook"])
+emit({"ok": result.ok, "memory": memory[0].content})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, Span::unknown())?,
+            json_value!({
+                "ok": true,
+                "memory": {"ok": true, "text": "ready"},
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_workflow_repairs_before_evidence_gated_advancement() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("typed-workflow-repair")?;
+        let program = lower_source(
+            r#"def output_ready(step):
+    probe = run(["test", "-s", "artifact.txt"])
+    refs = ["stat:artifact.txt"] if probe.ok else []
+    return workflow_evidence(probe.ok, "artifact exists and is non-empty", refs)
+
+def generate_output(step):
+    return run(["sh", "-c", "exit 7"])
+
+def repair_output(step):
+    return run(["sh", "-c", "printf ready > artifact.txt"])
+
+def execute(plan):
+    return workflow_run(plan)
+
+artifact = workflow_stage(
+    "artifact",
+    evidence=output_ready,
+    action=generate_output,
+    repair=repair_output,
+    max_attempts=1,
+)
+plan = workflow("build-artifact", artifact)
+report = execute(plan)
+stage_report = report.stages[0]
+emit({
+    "stage_type": type(artifact),
+    "workflow_type": type(plan),
+    "kind": report.kind,
+    "ok": report.ok,
+    "failed_stage": report.failed_stage,
+    "status": stage_report.status,
+    "attempts": stage_report.attempts,
+    "repairs": stage_report.repairs,
+    "checks": stage_report.checks,
+    "action_ok": stage_report.last_action.ok,
+    "action_exit": stage_report.last_action.exit_code,
+    "repair_ok": stage_report.last_repair.ok,
+    "evidence": stage_report.evidence.evidence,
+    "artifact": read_text("artifact.txt"),
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, Span::unknown())?,
+            json_value!({
+                "stage_type": "workflow_stage",
+                "workflow_type": "workflow",
+                "kind": "workflow_report",
+                "ok": true,
+                "failed_stage": null,
+                "status": "completed",
+                "attempts": 1,
+                "repairs": 1,
+                "checks": 3,
+                "action_ok": false,
+                "action_exit": 7,
+                "repair_ok": true,
+                "evidence": ["stat:artifact.txt"],
+                "artifact": "ready",
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn stage_syntax_lowers_file_evidence_and_repairs_before_advancing() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("stage-syntax-repair")?;
+        let program = lower_source(
+            r#"def repair_artifact(step):
+    return run(["sh", "-c", "printf ready > artifact.txt"])
+
+@stage(
+    evidence=file_nonempty("artifact.txt"),
+    repair=repair_artifact,
+    max_attempts=1,
+)
+def artifact(step):
+    return run(["sh", "-c", "exit 7"])
+
+report = workflow_run(workflow("build-artifact", artifact))
+stage_report = report.stages[0]
+emit({
+    "stage_type": type(artifact),
+    "evidence_type": type(file_nonempty("other.txt")),
+    "ok": report.ok,
+    "status": stage_report.status,
+    "attempts": stage_report.attempts,
+    "repairs": stage_report.repairs,
+    "checks": stage_report.checks,
+    "action_ok": stage_report.last_action.ok,
+    "repair_ok": stage_report.last_repair.ok,
+    "evidence": stage_report.evidence.evidence,
+    "artifact": read_text("artifact.txt"),
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, Span::unknown())?,
+            json_value!({
+                "stage_type": "workflow_stage",
+                "evidence_type": "workflow_evidence_spec",
+                "ok": true,
+                "status": "completed",
+                "attempts": 1,
+                "repairs": 1,
+                "checks": 3,
+                "action_ok": false,
+                "repair_ok": true,
+                "evidence": ["file:artifact.txt:size=5"],
+                "artifact": "ready",
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_workflow_does_not_treat_action_ok_as_completion() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("typed-workflow-unmet")?;
+        let program = lower_source(
+            r#"def never_ready(step):
+    return workflow_evidence(False, "required proof is absent")
+
+def action_says_ok(step):
+    return {"ok": True, "message": "action completed"}
+
+stage = workflow_stage(
+    "proof",
+    evidence=never_ready,
+    action=action_says_ok,
+    max_attempts=2,
+)
+report = workflow_run(workflow("evidence-wins", stage))
+stage_report = report.stages[0]
+emit({
+    "ok": report.ok,
+    "complete": report.complete,
+    "failed_stage": report.failed_stage,
+    "completed_stages": report.completed_stages,
+    "status": stage_report.status,
+    "attempts": stage_report.attempts,
+    "checks": stage_report.checks,
+    "action_ok": stage_report.last_action.ok,
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, Span::unknown())?,
+            json_value!({
+                "ok": false,
+                "complete": false,
+                "failed_stage": "proof",
+                "completed_stages": [],
+                "status": "failed",
+                "attempts": 2,
+                "checks": 3,
+                "action_ok": true,
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_workflow_accepts_lambda_handlers_and_skips_satisfied_stage() -> Result<(), ShellError>
+    {
+        let (engine_state, mut stack, root) = test_engine("typed-workflow-lambda")?;
+        let program = lower_source(
+            r#"stage = workflow_stage(
+    "already-done",
+    evidence=lambda step: workflow_evidence(True, "fixture is already proved", ["fixture:ready"]),
+    action=lambda step: {"ok": False, "message": "must not run"},
+)
+report = workflow_run(workflow("lambda-handlers", stage))
+emit({
+    "ok": report.ok,
+    "status": report.stages[0].status,
+    "attempts": report.stages[0].attempts,
+    "checks": report.stages[0].checks,
+    "last_action": report.stages[0].last_action,
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, Span::unknown())?,
+            json_value!({
+                "ok": true,
+                "status": "already_satisfied",
+                "attempts": 0,
+                "checks": 1,
+                "last_action": null,
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_workflow_rejects_unreferenced_satisfied_evidence() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("typed-workflow-invalid-evidence")?;
+        let program = lower_source(
+            r#"def invalid_evidence(step):
+    return {"kind": "workflow_evidence", "satisfied": True, "summary": "trust me", "evidence": []}
+
+def action(step):
+    return {"ok": True}
+
+stage = workflow_stage("proof", evidence=invalid_evidence, action=action)
+workflow_run(workflow("invalid-proof", stage))
+"#,
+        )?;
+        let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("satisfied evidence without a reference must fail");
+        let text = format!("{error:?}");
+        assert!(
+            text.contains("workflow `invalid-proof` stage `proof`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("requires at least one evidence reference"),
+            "{text}"
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn model_transition_pre_hook_can_veto_without_rpc() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("model-transition-veto")?;
+        let program = lower_source(
+            r#"model_call(
+    [{"role": "user", "content": "do not send"}],
+    hooks={"pre": lambda step: {"allow": False, "reason": "policy denied request"}},
+)
+"#,
+        )?;
+        let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("pre hook should veto before Gateway access");
+        let text = format!("{error:?}");
+        assert!(text.contains("transition_hook_error"), "{text}");
+        assert!(text.contains("policy denied request"), "{text}");
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn transition_hooks_cannot_nest_model_or_run_effects() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("transition-hook-nesting")?;
+        let program = lower_source(
+            r#"def nested(step):
+    return run(["printf", "nested"])
+
+run(["printf", "outer"], hooks={"post": nested})
+"#,
+        )?;
+        let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("nested run should fail");
+        let text = format!("{error:?}");
+        assert!(text.contains("transition_hook_error"), "{text}");
+        assert!(
+            text.contains("cannot be called from a transition hook"),
+            "{text}"
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn context_builtins_revise_read_and_project_attempt_state() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("context-builtins")?;
+        let program = lower_source(
+            r#"first = context_write("requirement.output", "requirement", {"text": "keep the binary"}, status="pending", evidence=["trace-1"])
+second = context_write("requirement.output", "requirement", {"text": "keep the verified binary"}, status="verified", evidence=["trace-2"])
+episode = context_write("outcome.probe", "outcome", {"command": "probe", "ok": False})
+memory = context_read(query="binary", kinds=["requirement"], limit=5)
+projection = context_project(focus="verified output binary", max_tokens=256, required_keys=["requirement.output"])
+emit({
+    "first": first,
+    "second": second,
+    "episode": episode,
+    "memory": memory,
+    "projection": projection,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+
+        assert_eq!(value["memory"].as_array().unwrap().len(), 1);
+        assert_eq!(value["memory"][0]["id"], value["second"]["id"]);
+        assert_eq!(value["second"]["supersedes"], value["first"]["id"]);
+        assert_eq!(value["projection"]["items"][0]["id"], value["second"]["id"]);
+        assert_eq!(
+            value["projection"]["required_keys"],
+            json_value!(["requirement.output"])
+        );
+        assert!(value["projection"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("verified binary"));
+        assert_eq!(
+            output.diagnostics["context"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| event["op"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["write", "write", "write", "read", "project"]
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn context_state_persists_in_a_warm_stone_session() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("context-session")?;
+        let mut session = StoneSession::default();
+        let write = lower_source(
+            r#"context_write("goal.finish", "goal", "run checks before finish", status="verified")"#,
+        )?;
+        eval_program_with_output_and_session(
+            &engine_state,
+            &mut stack,
+            &write,
+            PipelineData::empty(),
+            Some(&mut session),
+            None,
+            None,
+        )?;
+        let read = lower_source(r#"emit(context_read(keys=["goal.finish"]))"#)?;
+        let output = eval_program_with_output_and_session(
+            &engine_state,
+            &mut stack,
+            &read,
+            PipelineData::empty(),
+            Some(&mut session),
+            None,
+            None,
+        )?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value.as_array().unwrap().len(), 1);
+        assert_eq!(value[0]["content"], json_value!("run checks before finish"));
+        cleanup_dir(&root);
         Ok(())
     }
 
@@ -12714,7 +16071,7 @@ emit({
             include_str!("../../../.stone/helpers/build.stone"),
         );
         let program = lower_source(
-            r#"result = run(["sh", "-c", "printf building; sleep 1"], timeout_ms=20)
+            r#"result = run(["sh", "-c", "printf building; sleep 1"], timeout_ms=100)
 emit({
     "ok": result["ok"],
     "kind": result["kind"],

@@ -6,6 +6,8 @@ use nu_protocol::{
 };
 use serde_json::{json, Map, Number, Value as JsonValue};
 
+use crate::stone_correction;
+
 pub(crate) fn success_response(value: JsonValue, cwd: String) -> JsonValue {
     json!({
         "ok": true,
@@ -32,12 +34,32 @@ pub(crate) fn success_response_with_output(
 }
 
 pub(crate) fn error_response(err: &ShellError, cwd: Option<String>) -> JsonValue {
+    error_response_inner(err, cwd, None)
+}
+
+pub(crate) fn error_response_with_source(
+    err: &ShellError,
+    cwd: Option<String>,
+    source: &str,
+) -> JsonValue {
+    error_response_inner(err, cwd, Some(source))
+}
+
+fn error_response_inner(err: &ShellError, cwd: Option<String>, source: Option<&str>) -> JsonValue {
     let mut root = Map::new();
     root.insert("ok".into(), JsonValue::Bool(false));
     if let Some(cwd) = cwd {
         root.insert("cwd".into(), JsonValue::String(cwd));
     }
-    root.insert("error".into(), shell_error_json(err));
+    let mut error = shell_error_json(err);
+    if let Some(source) = source {
+        if let Some(correction) = stone_correction::correction_for_error(err, source) {
+            if let Some(fields) = error.as_object_mut() {
+                fields.insert("correction".into(), correction);
+            }
+        }
+    }
+    root.insert("error".into(), error);
     JsonValue::Object(root)
 }
 

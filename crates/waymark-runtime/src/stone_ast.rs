@@ -56,6 +56,14 @@ pub struct FunctionDef {
     pub params: Vec<FunctionParam>,
     pub return_type: StoneType,
     pub body: Vec<Stmt>,
+    pub stage: Option<Box<StageDecorator>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StageDecorator {
+    pub evidence: Expr,
+    pub repair: Option<Expr>,
+    pub max_attempts: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -324,12 +332,7 @@ fn lower_function_def(function: py::StmtFunctionDef) -> Result<Stmt, ShellError>
             "async def is not supported",
         ));
     }
-    if !function.decorator_list.is_empty() {
-        return Err(unsupported_message(
-            "function definition",
-            "decorators are not supported",
-        ));
-    }
+    let stage = lower_function_stage_decorator(function.decorator_list)?;
     if function.type_params.is_some() {
         return Err(unsupported_message(
             "function definition",
@@ -369,7 +372,95 @@ fn lower_function_def(function: py::StmtFunctionDef) -> Result<Stmt, ShellError>
         params,
         return_type,
         body: lower_stmt_block(function.body)?,
+        stage: stage.map(Box::new),
     }))
+}
+
+fn lower_function_stage_decorator(
+    decorators: Vec<py::Decorator>,
+) -> Result<Option<StageDecorator>, ShellError> {
+    let [] = decorators.as_slice() else {
+        if decorators.len() != 1 {
+            return Err(unsupported_message(
+                "function definition",
+                "a Stone function accepts at most one @stage(...) decorator",
+            ));
+        }
+        let decorator = decorators
+            .into_iter()
+            .next()
+            .expect("one decorator checked");
+        let py::Expr::Call(call) = decorator.expression else {
+            return Err(unsupported_message(
+                "function definition",
+                "only @stage(...) decorators are supported; include parentheses and evidence=",
+            ));
+        };
+        let py::Expr::Name(name) = *call.func else {
+            return Err(unsupported_message(
+                "function definition",
+                "only the built-in @stage(...) decorator is supported",
+            ));
+        };
+        if name.id.as_str() != "stage" {
+            return Err(unsupported_message(
+                "function definition",
+                format!(
+                    "unsupported decorator @{}; only @stage(...) is supported",
+                    name.id
+                ),
+            ));
+        }
+        if !call.arguments.args.is_empty() {
+            return Err(unsupported_message(
+                "stage declaration",
+                "@stage(...) accepts only evidence=, repair=, and max_attempts= keyword arguments",
+            ));
+        }
+        let mut evidence = None;
+        let mut repair = None;
+        let mut max_attempts = None;
+        for keyword in call.arguments.keywords {
+            let Some(name) = keyword.arg else {
+                return Err(unsupported_message(
+                    "stage declaration",
+                    "@stage(...) does not support keyword spread",
+                ));
+            };
+            let slot = match name.as_str() {
+                "evidence" => &mut evidence,
+                "repair" => &mut repair,
+                "max_attempts" => &mut max_attempts,
+                other => {
+                    return Err(unsupported_message(
+                        "stage declaration",
+                        format!(
+                            "unsupported @stage field `{other}`; expected evidence, repair, or max_attempts"
+                        ),
+                    ));
+                }
+            };
+            if slot.is_some() {
+                return Err(unsupported_message(
+                    "stage declaration",
+                    format!("duplicate @stage field `{name}`"),
+                ));
+            }
+            *slot = Some(lower_expr(keyword.value)?);
+        }
+        let evidence = evidence.ok_or_else(|| {
+            unsupported_message(
+                "stage declaration",
+                "@stage(...) requires evidence= so advancement is explicitly gated",
+            )
+        })?;
+        return Ok(Some(StageDecorator {
+            evidence,
+            repair,
+            max_attempts,
+        }));
+    };
+    Ok(None)
 }
 
 fn lower_function_default(default: py::Expr) -> Result<Expr, ShellError> {
@@ -1725,6 +1816,48 @@ values = sorted([3, 1, 2])
             }
         ));
         assert!(matches!(program.statements[3], Stmt::While { .. }));
+    }
+
+    #[test]
+    fn lowers_stage_decorator_to_typed_function_metadata() {
+        let program = lower_source(
+            r#"@stage(evidence=file_nonempty("artifact.txt"), repair=repair_artifact, max_attempts=2)
+def artifact(step):
+    return run(["make", "artifact"])
+"#,
+        )
+        .expect("lower stage declaration");
+        let Stmt::FunctionDef(function) = &program.statements[0] else {
+            panic!("expected function definition");
+        };
+        let stage = function.stage.as_ref().expect("stage metadata");
+        assert!(matches!(
+            stage.evidence,
+            Expr::Call(ref call) if call.name == "file_nonempty"
+        ));
+        assert!(matches!(stage.repair, Some(Expr::Name(ref name)) if name == "repair_artifact"));
+        assert!(matches!(stage.max_attempts, Some(Expr::Int(ref value)) if value == "2"));
+    }
+
+    #[test]
+    fn rejects_unknown_or_underspecified_decorators() {
+        let unknown = lower_source(
+            r#"@cache()
+def artifact(step):
+    return step
+"#,
+        )
+        .expect_err("unknown decorator");
+        assert!(format!("{unknown:?}").contains("only @stage"));
+
+        let missing_evidence = lower_source(
+            r#"@stage(max_attempts=2)
+def artifact(step):
+    return step
+"#,
+        )
+        .expect_err("stage without evidence");
+        assert!(format!("{missing_evidence:?}").contains("requires evidence="));
     }
 
     #[test]

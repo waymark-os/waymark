@@ -1,428 +1,202 @@
 <!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
 
-# Stone Hooks Design
+# Stone Transition Hooks
 
-## Goal
+## Status
 
-Stone hooks let the attempt program customize the Shell runtime around task
-events, tool events, and verifier events.
+Stone supports call-local transition hooks on `model_call(...)` and `run(...)`.
+`transition_hooks(pre=..., post=...)` constructs a first-class, reusable hook
+value. This is the attempt-agent control interface. A previously proposed
+global `register_hook(...)` registry is deferred.
 
-The current implementation already has helper-file hooks for selected
-`run(...)` post-processing. That proved the value of structured feedback:
-instead of returning only stdout/stderr, Shell can attach observations,
-diagnoses, and suggested next checks.
+Stone helper files remain a separate diagnostic facility. They may attach
+observations to selected `run(...)` results, but they do not define the agent
+loop's action-state semantics.
 
-The next version should generalize that into:
+## Model
 
-- more hook points
-- attempt/task-aware event records
-- agent-writable custom callbacks
-- scoped registration for one attempt or one Stone session
-- predictable ordering, limits, and tracing
+An agent trajectory is a sequence of individual transitions:
 
-Hooks should make the computer easier for agents to use without giving hooks
-new authority. A hook runs with the same Shell/Gateway capabilities as the
-attempt program that registered it.
+```text
+s_t
+  -> pre(s_t, action_t)
+  -> execute(action_t)
+  -> post(s_t, action_t, outcome_t)
+  -> s_t+1
+```
 
-## Existing V0
-
-See [Stone Helpers](STONE_HELPERS.md).
-
-V0 helper files can register hooks such as:
+Hooks belong to one dynamic effect invocation, not to a global event name:
 
 ```stone
-def python_after_failure(event):
-    return {
-        "kind": "python_failure",
-        "summary": event["stderr"],
-        "next_checks": [["python3", "-m", "pip", "check"]],
-    }
+decision_hooks = transition_hooks(
+    pre=prepare_decision,
+    post=record_decision,
+)
+response = model_call(
+    messages,
+    hooks=decision_hooks,
+)
 
-hook(
-  "run.after_failure",
-  family="python",
-  argv0_prefix=["python"],
-  handler="python.after_failure",
-  priority=100,
+action_hooks = transition_hooks(
+    pre=check_action,
+    post=record_outcome,
+)
+result = run(
+    ["pytest", "-q"],
+    hooks=action_hooks,
 )
 ```
 
-V0 is intentionally narrow:
+Handlers may be named Stone functions, assigned callable values, or lambdas.
+Each receives one transition record. Hook values may be bound, retained in a
+warm session when their captures are persistable, and passed through ordinary
+Stone functions. Literal `hooks={"pre": ..., "post": ...}` remains supported
+for one-off call sites. Hook values are task-owned control objects, not JSON:
+they cannot be nested in ordinary data records or cross the task authority
+boundary.
 
-- hooks are centered on `run.after_success`, `run.after_failure`, and
-  `run.after_timeout`
-- matchers are mostly process-command family filters
-- helper discovery is file based
-- callbacks are used mainly for diagnostics
+## Transition Record
 
-The design below keeps that compatibility but turns hooks into a first-class
-Stone runtime concept.
-
-## Hook Model
-
-A hook registration binds:
-
-```text
-event name
-matcher
-handler callback
-priority
-scope
-limits
-```
-
-Conceptual record:
-
-```text
-Hook {
-  id
-  event
-  matcher
-  handler
-  priority
-  scope
-  limits
-}
-```
-
-Handlers receive one event record and may return:
-
-```text
-None
-observation record
-list[observation record]
-replacement/decision record for before hooks
-```
-
-Post hooks should usually return observations. Pre hooks may return decisions
-such as `allow`, `deny`, `rewrite`, or `warn`, but Gateway remains the final
-authority for access control.
-
-## Registration APIs
-
-Keep helper-file registration:
-
-```stone
-hook("run.after_failure", handler="python.after_failure", argv0_prefix=["python"])
-```
-
-Add runtime registration for agents:
-
-```stone
-def explain_test_failure(event):
-    if contains(event.stderr, "AssertionError"):
-        return {
-            "kind": "test_failure_hint",
-            "summary": "pytest assertion failed",
-            "evidence": {"stderr_tail": event.stderr_tail},
-            "next_checks": [["pytest", "-q", "-vv"]],
-        }
-    return None
-
-register_hook(
-  "run.after_failure",
-  handler=explain_test_failure,
-  matcher={"argv0": ["pytest"]},
-  priority=100,
-  scope="attempt",
-)
-```
-
-Potential builtin forms:
-
-```text
-register_hook(event, handler, matcher={}, priority=0, scope="session", limits={}) -> hook_id
-unregister_hook(hook_id) -> bool
-hooks(event="") -> list[record]
-hook_trace(limit=100) -> list[record]
-```
-
-`hook(...)` can remain the declarative helper-file form. `register_hook(...)`
-is the programmatic form for attempt code.
-
-## Scopes
-
-Hooks need explicit lifetime:
-
-```text
-call       only for one operation
-session    current warm Stone session
-attempt    current Gateway attempt
-task       current task runtime view
-workspace  project helper file, loaded from .stone/helpers
-user       user helper directory
-system     checked-in or installed helper directory
-```
-
-Agent-written hooks should default to `attempt` or `session`, not user/system.
-An attempt should not silently install persistent user hooks.
-
-## Event Record
-
-Every hook event should include common fields:
+Pre-hook input:
 
 ```json
 {
-  "event": "run.after_failure",
-  "hook_phase": "after",
-  "attempt": "attempt-...",
-  "task": {"objective": "..."},
-  "operation": "run",
-  "timestamp_ms": 123,
-  "cwd": "/app",
-  "capabilities": {"network": false},
-  "trace_id": "..."
+  "transition_id": "transition-7",
+  "kind": "model_call",
+  "phase": "pre",
+  "input": {}
 }
 ```
 
-Tool-specific fields extend that common envelope. For `run.after_failure`:
+Post-hook input adds a structured outcome:
+
+```json
+{
+  "transition_id": "transition-7",
+  "kind": "model_call",
+  "phase": "post",
+  "input": {},
+  "outcome": {
+    "ok": true,
+    "value": {}
+  }
+}
+```
+
+Failures use `outcome.ok=false`. A model transport failure supplies
+`outcome.error`; a completed `run` supplies its structured record as
+`outcome.value`, with `outcome.ok` matching `value.ok`. A transition ID is
+attached to the returned model/run record. Standalone IDs are unique within a
+Stone session. Gateway-attached IDs include the controller-run ordinal and are
+scoped by the attempt, so a restarted process cannot reuse an earlier
+controller's ID. Use `(attempt_id, transition_id)` for global identity.
+
+For `model_call`, `input` is the effective request record. For `run`, it is:
 
 ```json
 {
   "argv": ["pytest", "-q"],
-  "argv0": "pytest",
-  "status": 1,
-  "stdout": "...",
-  "stderr": "...",
-  "stdout_tail": "...",
-  "stderr_tail": "...",
-  "duration_ms": 2310,
-  "timed_out": false,
-  "suggested_actions": []
+  "arguments": [],
+  "options": {"timeout_ms": 30000}
 }
 ```
 
-The event should include enough structured data for handlers to reason without
-parsing human-formatted Shell output.
+## Pre-Hook Results
 
-## Hook Points
-
-Start with a small stable set and expand deliberately.
-
-### Process Hooks
+A pre hook may return:
 
 ```text
-run.before
-run.after_success
-run.after_failure
-run.after_timeout
-run.after_spawn_error
-run.after_background_start
-run.after_background_exit
+None or True       continue unchanged
+False              reject the transition
+{"allow": false}  reject, optionally with reason
+patch record       continue with the supported input patch
 ```
 
-Use cases:
+The initial patch surface is deliberately narrow:
 
-- add diagnostics after a failed compiler/test command
-- detect missing libraries, missing Python modules, bad permissions
-- suggest longer timeout or background daemon APIs
-- attach concise feedback to long outputs
+```stone
+# model_call: replace the visible messages
+return {"messages": step.input.messages + memory_messages}
 
-### Filesystem Hooks
+# run: replace argv
+return {"argv": ["pytest", "-q", "tests/test_api.py"]}
+```
+
+Gateway capability and credential policy remains authoritative after a pre
+hook permits or rewrites a request.
+
+For `run`, rejection is a recoverable action outcome: the command is not
+executed, `run` returns `ok=false`, `kind="policy_rejected"`, and a bounded
+`policy_reason`, and the post hook observes that record. This lets an agent
+revise an invalid argv on its next decision without losing the trajectory.
+Malformed hooks and hook execution failures still fail the Stone call.
+`model_call` rejection remains call-fatal because there is no model response
+for the surrounding decision step to consume.
+
+## Post-Hook Results
+
+Post-hook return values do not replace the effect outcome. Post hooks normally
+update attempt-local context:
+
+```stone
+def record_outcome(step):
+    return context_write(
+        "outcome.last_test",
+        "outcome",
+        {
+            "transition_id": step.transition_id,
+            "ok": step.outcome.ok,
+            "result": step.outcome.value,
+        },
+    )
+```
+
+Post hooks run for successful and failed effects. A required post-hook failure
+fails the Stone call even though the underlying effect may already have
+occurred.
+
+## Execution Rules
+
+- Hook ordering is always `pre`, effect, `post`; a rejected `run` records the
+  effect as skipped and still invokes `post`.
+- Each phase runs at most once for a dynamic transition.
+- Hooks may use ordinary deterministic Stone control and context operations.
+- Hooks cannot recursively invoke `model_call`, `run`, or `must_run`.
+- Hooks receive only the attempt's existing capabilities; they add no
+  authority.
+- Raw inputs and outputs remain owned by normal effect tracing. Stone emits a
+  bounded transition diagnostic containing IDs, phases, hook presence, patch
+  status, and success/failure.
+
+## Attempt Memory Use
+
+The first intended policy is short-term and attempt-local:
 
 ```text
-fs.before_read
-fs.after_read
-fs.before_write
-fs.after_write
-fs.before_remove
-fs.after_remove
-fs.after_diff
+run.post        -> context_write important outcome
+model_call.pre  -> context_project relevant state
+model effect    -> decides with the bounded projection visible
+model_call.post -> context_write decision/outcome
 ```
 
-Use cases:
+The memory data and the hook program are separate. Hooks are reconstructed
+from Stone program source; retained data lives in the context state. Attached
+attempts now keep that data in Gateway-owned memory and restore it when a local
+Stone controller restarts. Standalone evaluation retains only bounded local
+state. Context fork semantics remain deferred and are not implied by this
+interface.
 
-- warn when reading huge or binary files
-- normalize generated output
-- check writes against declared task outputs
-- flag accidental edits to declared inputs
+An in-flight action needs a narrower restart policy than ordinary retained
+facts. The reference [in-flight restart semantics](STONE_INFLIGHT_RESTART_SEMANTICS.md)
+uses a pre-hook `started_or_unknown` marker and a compact post-hook receipt.
+Only `prepared/not_started` may resume; an unknown start without a receipt must
+replan, while a matching completed receipt can be consolidated without replay.
 
-Filesystem hooks must not become a bypass around Gateway transaction policy.
-Gateway still owns canonical commit/rollback semantics.
+## Deferred
 
-### Task Hooks
-
-These depend on Gateway providing `task_spec` and `TaskRuntimeView`.
-
-```text
-task.before_start
-task.after_start
-task.before_check
-task.after_check
-task.before_result
-task.after_result
-```
-
-Use cases:
-
-- render task-specific prompt/context
-- generate task-specific Shell affordances
-- run cheap local checkers before an expensive verifier
-- transform a result into the declared schema
-
-### Attempt Hooks
-
-These are useful when Shell runs inside a Gateway attempt.
-
-```text
-attempt.after_spawn
-attempt.before_finish
-attempt.after_finish
-attempt.after_child_result
-attempt.after_state
-```
-
-Use cases:
-
-- summarize child attempts for a parent
-- inspect dirty state before finish
-- attach artifact summaries
-- apply task-specific commit warnings
-
-### Model/Agent Hooks
-
-These should be added only when model calls are mediated by Shell or Gateway:
-
-```text
-model.before_request
-model.after_response
-agent.before_turn
-agent.after_turn
-agent.after_tool_observation
-```
-
-Use cases:
-
-- render task spec into prompt fragments
-- compress observations
-- add structured warnings when the context is stale or near budget
-
-## Handler Results
-
-Post-hook observations should be regular records:
-
-```json
-{
-  "kind": "pytest_failure",
-  "summary": "3 tests failed; first failure is test_parse_dates",
-  "severity": "info",
-  "evidence": {
-    "stderr_tail": "..."
-  },
-  "next_checks": [
-    ["pytest", "-q", "-vv", "tests/test_dates.py"]
-  ],
-  "suggested_actions": [
-    "Inspect the first failing assertion before editing unrelated files."
-  ]
-}
-```
-
-Pre-hook decisions should be explicit:
-
-```json
-{
-  "decision": "warn",
-  "message": "input.txt is declared read-only by task_spec"
-}
-```
-
-Allowed decisions:
-
-```text
-allow
-warn
-deny
-rewrite
-```
-
-`deny` and `rewrite` are Shell-level decisions. Gateway may still deny an
-operation after a hook allows it.
-
-## Ordering And Limits
-
-Hooks run in deterministic order:
-
-```text
-higher priority first
-then narrower matcher
-then registration time
-then hook id
-```
-
-Runtime must enforce:
-
-- max hooks per event
-- max handler runtime
-- max observation size
-- recursion guard
-- no hook invocation for hook-internal diagnostic operations unless explicitly
-  requested
-- trace every hook invocation and error
-
-Hook failure should not crash the original operation by default. The result
-should include a `hook_errors` list unless the hook was registered as
-`required=true`.
-
-## Safety
-
-Hooks are not a security boundary.
-
-Security comes from:
-
-- microVM/container isolation
-- Gateway capability APIs
-- transactional workspace mutation
-- commit-time review and approval
-- trace/audit
-
-Hooks improve control flow and feedback. They must not receive ambient host
-authority, unscoped secrets, or direct canonical workspace write access.
-
-Agent-written hooks should be serialized into attempt/session state so their
-effects are auditable and rollback/commit semantics are clear.
-
-## Relationship To TaskSpec
-
-`task_spec` should customize the runtime by installing task-scoped hooks or
-hook data.
-
-Examples:
-
-- declared inputs register `fs.before_write` warnings
-- declared outputs register `fs.after_write` observations
-- success criteria register `task.before_check` and `task.after_check`
-- constraints register `attempt.before_finish` warnings
-
-This makes `task_spec` more than LLM prompt text. It becomes a structured
-contract that Shell can use to shape the attempt's tools and feedback.
-
-## First Milestone
-
-`Stone Hooks V1`
-
-Scope:
-
-1. Keep existing helper-file `hook(...)` compatibility.
-2. Add programmatic `register_hook`, `unregister_hook`, and `hooks`.
-3. Support attempt/session scoped hooks.
-4. Add event envelopes for `run.before`, `run.after_*`, and `task.after_check`.
-5. Add recursion and size limits.
-6. Trace hook invocations in MCP and Gateway-backed attempts.
-7. Add one agent-written hook smoke:
-
-```text
-Stone program registers run.after_failure for pytest
-  -> runs failing pytest command
-  -> hook attaches structured observation
-  -> result contains helpers/observations
-```
-
-Then extend to task-spec driven hooks:
-
-```text
-task_spec declares input.txt read-only
-  -> Shell registers fs.before_write warning
-  -> attempt tries to write input.txt
-  -> task_diff/task_check reports constraint violation
-```
+- global/session hook registration
+- arbitrary filesystem/task/attempt event subscriptions
+- priority and matcher systems
+- nested model/tool effects
+- cross-attempt memory promotion
+- context checkpoint/fork policy

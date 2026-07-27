@@ -1,0 +1,271 @@
+# Compare append-only observations with a keyed, bounded observation window.
+#
+# Both arms perform the same writes. A uses one key per observation and reaches
+# the 256-key hot-store limit. K revises 16 stable observation slots.
+
+
+def retain_model_decision(step):
+    content = ""
+    if step.outcome.ok:
+        content = step.outcome.value.content
+    return context_write(
+        "decision.latest",
+        "decision",
+        {
+            "phase": "fork-worker",
+            "ok": step.outcome.ok,
+            "content": content,
+            "transition_id": step.transition_id,
+        },
+        evidence=["transition:" + step.transition_id],
+    )
+
+
+def inject_projection(step, projection):
+    return {
+        "messages": step.input.messages + [
+            {
+                "role": "user",
+                "content": "Active attempt memory:\n" + projection.text,
+            },
+        ]
+    }
+
+
+def seed_pressure(mode):
+    targets = read_json("/app/targets.json")
+    context_write(
+        "requirement.target",
+        "requirement",
+        {"target": targets.old, "state": "obsolete"},
+        status="contradicted",
+        evidence=["fixture:old-target"],
+    )
+    current = context_write(
+        "requirement.target",
+        "requirement",
+        {"target": targets.current, "state": "current"},
+        status="verified",
+        evidence=["fixture:current-target"],
+    )
+    context_write(
+        "goal.active",
+        "goal",
+        {"goal": "select the current verified target"},
+        status="active",
+        evidence=["experiment:goal"],
+    )
+    context_write(
+        "outcome.unresolved",
+        "outcome",
+        {"failure": "verification remains unresolved", "retry": False},
+        status="pending",
+        evidence=["experiment:failed-check"],
+    )
+    context_write(
+        "decision.latest",
+        "decision",
+        {"phase": "initial", "sequence": -1},
+        evidence=["experiment:initial-decision"],
+    )
+
+    # Explicitly resolved state leaves the hot frontier.
+    context_write(
+        "risk.resolved",
+        "risk",
+        {"risk": "temporary pressure probe"},
+        status="active",
+        evidence=["experiment:risk-opened"],
+    )
+    context_write(
+        "risk.resolved",
+        "risk",
+        {"risk": "temporary pressure probe"},
+        status="archived",
+        evidence=["experiment:risk-resolved"],
+    )
+
+    # A long decision trajectory revises one semantic key.
+    for sequence in range(64):
+        context_write(
+            "decision.latest",
+            "decision",
+            {"phase": "pressure", "sequence": sequence},
+            evidence=["experiment:decision-" + str(sequence)],
+        )
+
+    filler = "routine historical observation payload; intentionally irrelevant to target selection; bounded pressure data 0123456789 abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789 abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789 abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789 abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789 abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789 abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for index in range(252):
+        if mode == "A":
+            key = "observation." + str(index)
+        else:
+            key = "observation.slot." + str(index % 16)
+        context_write(
+            key,
+            "pressure",
+            {
+                "sequence": index,
+                "summary": "routine historical observation",
+                "payload": filler,
+            },
+            evidence=["experiment:observation-" + str(index)],
+        )
+
+    items = context_read(limit=256)
+    requirement = context_read(keys=["requirement.target"], limit=1)[0]
+    latest_decision = context_read(keys=["decision.latest"], limit=1)[0]
+    latest_pressure = context_read(kinds=["pressure"], limit=1)[0]
+    return {
+        "phase": "seed",
+        "mode": mode,
+        "memory_revision": attempt_info().memory_revision,
+        "item_count": len(items),
+        "pressure_item_count": len(context_read(kinds=["pressure"], limit=256)),
+        "latest_decision_sequence": latest_decision.content.sequence,
+        "latest_pressure_sequence": latest_pressure.content.sequence,
+        "requirement_target": requirement.content.target,
+        "requirement_supersedes": requirement.supersedes,
+        "resolved_risk_count": len(context_read(keys=["risk.resolved"], limit=1)),
+        "current_item_id": current.id,
+    }
+
+
+def worker(input):
+    targets = read_json("/app/targets.json")
+    item_count_before = len(context_read(limit=256))
+    projection = context_project(
+        focus="current verified requirement target active goal unresolved failure latest decision",
+        max_tokens=160,
+    )
+    response = model_call(
+        [
+            {
+                "role": "system",
+                "content": "Use only Active attempt memory. Return exactly one JSON object with one string field selected_target. Read selected_target from the current verified item keyed requirement.target. Ignore unrelated observations. If that item is absent, return insufficient_evidence. Never invent a target.",
+            },
+            {
+                "role": "user",
+                "content": "Select the current verified target.",
+            },
+        ],
+        response_format={"type": "json_object"},
+        max_output_tokens=96,
+        hooks={
+            "pre": lambda step: inject_projection(step, projection),
+            "post": retain_model_decision,
+        },
+    )
+    decoded = json_loads(response.content)
+    return {
+        "selected_target": decoded.selected_target,
+        "projection_keys": map(lambda item: item.key, projection.items),
+        "projection_revision": projection.revision,
+        "projection_estimated_tokens": projection.estimated_tokens,
+        "projection_truncated": projection.truncated,
+        "projection_contains_current": targets.current in projection.text,
+        "projection_contains_old": targets.old in projection.text,
+        "item_count_before": item_count_before,
+        "item_count_after": len(context_read(limit=256)),
+        "memory_revision": attempt_info().memory_revision,
+        "provider": response.provider,
+        "model": response.model,
+        "usage": response.usage,
+        "transition_id": response.transition_id,
+    }
+
+
+def restore_and_fork(mode):
+    root = attempt_info()
+    requirement = context_read(keys=["requirement.target"], limit=1)[0]
+    parent_count_before = len(context_read(limit=256))
+    scope = attempt_scope(join_timeout_ms=60000)
+    child = attempt_fork(
+        program=current_program(),
+        entrypoint="worker",
+        input={},
+        start=True,
+        scope=scope,
+    )
+    outcome = attempt_join(child, timeout_ms=60000)
+    if not outcome.joined or outcome.result.status != "succeeded":
+        fail(
+            "pressure worker did not report success",
+            code="memory_pressure_child_failed",
+            detail=outcome,
+        )
+    child_result = outcome.result.value
+    attempt_discard(child, reason="pressure experiment worker complete")
+    context_write(
+        "decision.latest",
+        "decision",
+        {
+            "phase": "parent-promotion",
+            "selected_target": child_result.selected_target,
+            "child_attempt": child.attempt,
+        },
+        status="verified",
+        evidence=["child-result:" + child.attempt],
+    )
+    cleanup = attempt_scope_close(scope)
+    if not cleanup.clean:
+        fail(
+            "pressure experiment scope cleanup failed",
+            code="memory_pressure_cleanup_failed",
+            detail=cleanup,
+        )
+    parent_projection = context_project(
+        focus="current verified requirement target active goal unresolved failure latest decision",
+        max_tokens=160,
+    )
+    return {
+        "phase": "restore",
+        "mode": mode,
+        "controller_run_count": root.controller_run_count,
+        "parent_memory_ref": root.memory_ref,
+        "parent_revision_before": root.memory_revision,
+        "parent_revision_after": attempt_info().memory_revision,
+        "parent_item_count_before": parent_count_before,
+        "parent_item_count_after": len(context_read(limit=256)),
+        "requirement_target": requirement.content.target,
+        "requirement_supersedes": requirement.supersedes,
+        "resolved_risk_count": len(context_read(keys=["risk.resolved"], limit=1)),
+        "fork_origin_revision": child.fork_origin.memory_revision,
+        "child": child.attempt,
+        "child_result": child_result,
+        "parent_projection": {
+            "keys": map(lambda item: item.key, parent_projection.items),
+            "estimated_tokens": parent_projection.estimated_tokens,
+            "truncated": parent_projection.truncated,
+        },
+        "clean": cleanup.clean,
+    }
+
+
+def main(input):
+    mode = read_file("/app/mode.txt", max_bytes=8).strip()
+    if mode != "A" and mode != "K":
+        fail("mode must be A or K", code="memory_pressure_bad_mode")
+    if attempt_info().controller_restarted:
+        return restore_and_fork(mode)
+    return seed_pressure(mode)
+
+
+# The local development controller launches admitted Stone source as a script.
+control = attempt_info()
+entrypoint = get(control.metadata, "program_entrypoint", "main")
+if entrypoint == "worker":
+    result = worker(task_input())
+    attempt_report(
+        status="succeeded",
+        result=result,
+        metadata={"control": "attempt_memory_pressure_worker"},
+    )
+else:
+    result = main(task_input())
+    if result.phase == "restore":
+        attempt_report(
+            status="succeeded",
+            result=result,
+            metadata={"control": "attempt_memory_pressure_parent"},
+        )
+emit(result)

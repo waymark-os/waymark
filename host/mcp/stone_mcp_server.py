@@ -476,6 +476,12 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "effects": ["read_env"],
         "example": "previous = last_result()",
     },
+    "correction_apply": {
+        "name": "correction_apply",
+        "signature": "correction_apply(source: str, correction: record, candidate: int = 0) -> record",
+        "effects": [],
+        "example": "preview = correction_apply(source, failure.error.correction)",
+    },
     "last": {
         "name": "last",
         "signature": "last(values: list, count: int? = None) -> Any | list",
@@ -718,6 +724,7 @@ Stone_CALL_ARG_ORDER: dict[str, tuple[str, ...]] = {
     "env_commit": ("message", "allow_risky"),
     "env_rollback": (),
     "last_result": (),
+    "correction_apply": ("source", "correction", "candidate"),
     "rm": ("path",),
     "start_daemon": ("argv", "cwd", "env", "stdout", "stderr"),
     "daemon_status": ("daemon", "port", "host", "log", "max_log_bytes"),
@@ -824,6 +831,7 @@ def compact_error(error: Any) -> dict[str, Any] | None:
             "code": error.get("code"),
             "message": bound_text(error.get("message"), 512),
             "detail": bound_text(error.get("detail"), 512),
+            "correction": normalize_stone_correction(error.get("correction")),
         }
     )
 
@@ -1452,6 +1460,9 @@ def normalize_stone_error(error: Any) -> dict[str, Any]:
         value = error.get(key)
         if value not in (None, "", [], {}):
             normalized[key] = value
+    correction = normalize_stone_correction(error.get("correction"))
+    if correction:
+        normalized["correction"] = correction
     if "message" not in normalized and "detail" in normalized:
         normalized["message"] = normalized["detail"]
     if "kind" not in normalized:
@@ -1459,6 +1470,71 @@ def normalize_stone_error(error: Any) -> dict[str, Any]:
     if "code" not in normalized:
         normalized["code"] = "stone_error"
     return normalized
+
+
+def normalize_stone_correction(correction: Any) -> dict[str, Any] | None:
+    if not isinstance(correction, dict):
+        return None
+    normalized: dict[str, Any] = {}
+    for key in ("version", "auto_apply"):
+        value = correction.get(key)
+        if isinstance(value, (int, bool)):
+            normalized[key] = value
+    for key in (
+        "mode",
+        "phase",
+        "execution_state",
+        "class",
+        "safety",
+        "retry",
+        "source_sha256",
+        "received",
+    ):
+        value = correction.get(key)
+        if isinstance(value, str):
+            normalized[key] = bound_text(value, 256)
+    guidance = correction.get("guidance")
+    if isinstance(guidance, str):
+        normalized["guidance"] = bound_text(guidance, 1024)
+    for key, limit in (("expected", 16), ("choices", 4)):
+        values = correction.get(key)
+        if isinstance(values, list):
+            normalized[key] = [
+                bound_text(value, 256)
+                for value in values[:limit]
+                if isinstance(value, str)
+            ]
+
+    candidates = correction.get("candidates")
+    if isinstance(candidates, list):
+        normalized_candidates: list[dict[str, Any]] = []
+        for candidate in candidates[:3]:
+            if not isinstance(candidate, dict):
+                continue
+            item: dict[str, Any] = {}
+            for key in ("replacement", "confidence"):
+                value = candidate.get(key)
+                if isinstance(value, str):
+                    item[key] = bound_text(value, 128)
+            distance = candidate.get("distance")
+            if isinstance(distance, int) and not isinstance(distance, bool):
+                item["distance"] = distance
+            edit = candidate.get("edit")
+            if isinstance(edit, dict):
+                normalized_edit: dict[str, Any] = {}
+                for key in ("start", "end"):
+                    value = edit.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        normalized_edit[key] = value
+                replacement = edit.get("replacement")
+                if isinstance(replacement, str):
+                    normalized_edit["replacement"] = bound_text(replacement, 128)
+                if normalized_edit:
+                    item["edit"] = normalized_edit
+            if item:
+                normalized_candidates.append(item)
+        normalized["candidates"] = normalized_candidates
+    return sparse(normalized)
 
 
 def parse_json_response(text: str) -> dict[str, Any] | None:
@@ -2352,7 +2428,12 @@ TOOLS = [
             "multi-line script like python -c or bash -c, not only a single expression. "
             "Large emitted values are replaced with a head/tail peek by default; bind "
             "large values and emit len/head/tail summaries, or set allow_large_output=true "
-            "only when the full value is required. Open file handles do not persist."
+            "only when the full value is required. Open file handles do not persist. "
+            "A recoverable failure may include error.correction; pass it with the exact "
+            "failed source to stone_call(name='correction_apply', ...) for a validated, "
+            "unexecuted source preview, then evaluate that source explicitly. "
+            "correction.execution_state='not_started' means admission rejected the "
+            "program before any Stone statement ran."
         ),
         "inputSchema": {
             "type": "object",

@@ -6,11 +6,11 @@ use crate::gateway_runtime::{config, linux_exec_record, with_client, GatewayRunt
 use crate::json::json_to_nu_value;
 use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, Value};
 use waymark_gateway_client::proto::{
-    AttemptAcceptResponse, AttemptFinishRequest, AttemptFinishResponse, AttemptForkRequest,
-    AttemptProgram, AttemptPublishRequest, AttemptRecord, AttemptReportResultRequest,
-    AttemptReportResultResponse, AttemptRunProcessRequest, AttemptRunProcessResponse,
-    AttemptSpawnRequest, AttemptStateResponse, CapabilityRequest, ContextSource,
-    EnvRunCheckpointRequest, TaskSpec, WorkspaceSource,
+    AttemptAcceptResponse, AttemptContextPromptView, AttemptFinishRequest, AttemptFinishResponse,
+    AttemptForkRequest, AttemptInspectRequest, AttemptInspectResponse, AttemptProgram,
+    AttemptPublishRequest, AttemptRecord, AttemptReportResultRequest, AttemptReportResultResponse,
+    AttemptRunProcessRequest, AttemptRunProcessResponse, AttemptSpawnRequest, AttemptStateResponse,
+    CapabilityRequest, ContextSource, EnvRunCheckpointRequest, TaskSpec, WorkspaceSource,
 };
 
 pub(crate) fn enabled() -> bool {
@@ -21,14 +21,14 @@ pub(crate) fn attempt_info(attempt: String) -> Result<Value, ShellError> {
     let config = required_config()?;
     let attempt = effective_attempt(&config, attempt)?;
     let record = with_client(&config, |client| client.attempt_info(attempt))?;
-    Ok(attempt_record_value(record, Span::unknown()))
+    attempt_record_value(record, Span::unknown())
 }
 
 pub(crate) fn attempt_start(attempt: String) -> Result<Value, ShellError> {
     let config = required_config()?;
     let attempt = effective_attempt(&config, attempt)?;
     let record = with_client(&config, |client| client.attempt_start(attempt))?;
-    Ok(attempt_record_value(record, Span::unknown()))
+    attempt_record_value(record, Span::unknown())
 }
 
 pub(crate) fn attempts(
@@ -41,13 +41,12 @@ pub(crate) fn attempts(
         client.attempt_list(task, workspace, state)
     })?;
     let span = Span::unknown();
-    Ok(Value::list(
-        list.attempts
-            .into_iter()
-            .map(|attempt| attempt_record_value(attempt, span))
-            .collect(),
-        span,
-    ))
+    let attempts = list
+        .attempts
+        .into_iter()
+        .map(|attempt| attempt_record_value(attempt, span))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Value::list(attempts, span))
 }
 
 pub(crate) fn attempt_state(attempt: String, sample_limit: u32) -> Result<Value, ShellError> {
@@ -59,13 +58,32 @@ pub(crate) fn attempt_state(attempt: String, sample_limit: u32) -> Result<Value,
     attempt_state_value(state, Span::unknown())
 }
 
+pub(crate) fn attempt_inspect(
+    attempt: String,
+    include_details: bool,
+    trace_limit: u32,
+    max_bytes: u32,
+) -> Result<Value, ShellError> {
+    let config = required_config()?;
+    let attempt = effective_attempt(&config, attempt)?;
+    let inspection = with_client(&config, |client| {
+        client.attempt_inspect(AttemptInspectRequest {
+            attempt,
+            include_details,
+            trace_limit,
+            max_bytes,
+        })
+    })?;
+    attempt_inspect_value(inspection, Span::unknown())
+}
+
 pub(crate) fn attempt_wait(attempt: String, timeout_ms: Option<u32>) -> Result<Value, ShellError> {
     let config = required_config()?;
     let attempt = effective_attempt(&config, attempt)?;
     let record = with_client(&config, |client| {
         client.attempt_wait(attempt.clone(), timeout_ms)
     })?;
-    Ok(attempt_record_value(record, Span::unknown()))
+    attempt_record_value(record, Span::unknown())
 }
 
 pub(crate) struct AttemptWaitSetValue {
@@ -84,12 +102,13 @@ pub(crate) fn attempt_wait_set(
         client.attempt_wait_set(attempts, wait_all, timeout_ms)
     })?;
     let span = Span::unknown();
+    let ready = response
+        .ready
+        .into_iter()
+        .map(|attempt| attempt_record_value(attempt, span))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(AttemptWaitSetValue {
-        ready: response
-            .ready
-            .into_iter()
-            .map(|attempt| attempt_record_value(attempt, span))
-            .collect(),
+        ready,
         completed: response.completed,
         timed_out: response.timed_out,
     })
@@ -99,7 +118,7 @@ pub(crate) fn attempt_terminate(attempt: String) -> Result<Value, ShellError> {
     let config = required_config()?;
     let attempt = effective_attempt(&config, attempt)?;
     let record = with_client(&config, |client| client.attempt_terminate(attempt))?;
-    Ok(attempt_record_value(record, Span::unknown()))
+    attempt_record_value(record, Span::unknown())
 }
 
 #[derive(Clone, Debug, Default)]
@@ -162,7 +181,7 @@ pub(crate) fn attempt_spawn(
             task_input_json: spawn_v1.task_input_json.clone(),
         })
     })?;
-    Ok(attempt_record_value(attempt, Span::unknown()))
+    attempt_record_value(attempt, Span::unknown())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -175,6 +194,7 @@ pub(crate) fn attempt_fork(
     workspace_mount: String,
     resource_limits: Vec<(String, String)>,
     metadata: Vec<(String, String)>,
+    context_prompt_required_keys: Option<Vec<String>>,
     task_input_json: String,
     program: Option<AttemptProgram>,
     start: bool,
@@ -194,9 +214,12 @@ pub(crate) fn attempt_fork(
             program: program.clone(),
             start,
             task_input_json: task_input_json.clone(),
+            context_prompt_view: context_prompt_required_keys
+                .clone()
+                .map(|required_keys| AttemptContextPromptView { required_keys }),
         })
     })?;
-    Ok(attempt_record_value(attempt, Span::unknown()))
+    attempt_record_value(attempt, Span::unknown())
 }
 
 pub(crate) fn attempt_finish(
@@ -236,6 +259,7 @@ pub(crate) fn attempt_report(
             status: status.clone(),
             result_json: result_json.clone(),
             error_json: error_json.clone(),
+            details_json: String::new(),
             reason: reason.clone(),
             metadata: metadata.clone().into_iter().collect(),
         })
@@ -311,7 +335,7 @@ pub(crate) fn attempt_run_process(
             wait_timeout_ms: 1_000,
         })
     })?;
-    Ok(attempt_process_value(run, Span::unknown()))
+    attempt_process_value(run, Span::unknown())
 }
 
 pub(crate) fn env_state(sample_limit: u32) -> Result<Value, ShellError> {
@@ -745,7 +769,24 @@ pub(crate) fn env_run_checkpoint(
     Ok(Value::record(record, span))
 }
 
-fn attempt_record_value(attempt: AttemptRecord, span: Span) -> Value {
+fn attempt_record_value(attempt: AttemptRecord, span: Span) -> Result<Value, ShellError> {
+    let reported_result = optional_json_text_value(
+        &attempt.reported_result_json,
+        span,
+        "attempt reported result",
+    )?;
+    let reported_error =
+        optional_json_text_value(&attempt.reported_error_json, span, "attempt reported error")?;
+    let controller_run_count = attempt
+        .metadata
+        .get("controller_run_count")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_default();
+    let controller_phase = match controller_run_count {
+        0 => "pending",
+        1 => "initial",
+        _ => "restart",
+    };
     let mut record = Record::new();
     record.push("attempt", Value::string(attempt.attempt, span));
     record.push("task", Value::string(attempt.task, span));
@@ -768,6 +809,74 @@ fn attempt_record_value(attempt: AttemptRecord, span: Span) -> Value {
     record.push(
         "capability_profile",
         Value::string(attempt.capability_profile, span),
+    );
+    record.push(
+        "controller_run_count",
+        Value::int(u64_to_i64(controller_run_count), span),
+    );
+    record.push(
+        "controller_restarted",
+        Value::bool(controller_run_count > 1, span),
+    );
+    record.push("controller_phase", Value::string(controller_phase, span));
+    record.push("memory_ref", Value::string(attempt.memory_ref, span));
+    record.push(
+        "memory_revision",
+        Value::int(u64_to_i64(attempt.memory_revision), span),
+    );
+    record.push("reported_result", reported_result);
+    record.push("reported_error", reported_error);
+    record.push(
+        "fork_origin",
+        attempt
+            .fork_origin
+            .map(|origin| {
+                let mut fork = Record::new();
+                fork.push("parent_attempt", Value::string(origin.parent_attempt, span));
+                fork.push(
+                    "workspace_checkpoint",
+                    Value::string(origin.workspace_checkpoint, span),
+                );
+                fork.push(
+                    "workspace_revision",
+                    Value::int(u64_to_i64(origin.workspace_revision), span),
+                );
+                fork.push("memory_ref", Value::string(origin.memory_ref, span));
+                fork.push(
+                    "memory_revision",
+                    Value::int(u64_to_i64(origin.memory_revision), span),
+                );
+                fork.push(
+                    "operation_policy",
+                    Value::string(origin.operation_policy, span),
+                );
+                fork.push(
+                    "created_at_ms",
+                    Value::int(u64_to_i64(origin.created_at_ms), span),
+                );
+                Value::record(fork, span)
+            })
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    record.push(
+        "context_prompt_view",
+        attempt
+            .context_prompt_view
+            .map(|view| {
+                let mut prompt = Record::new();
+                prompt.push(
+                    "required_keys",
+                    Value::list(
+                        view.required_keys
+                            .into_iter()
+                            .map(|key| Value::string(key, span))
+                            .collect(),
+                        span,
+                    ),
+                );
+                Value::record(prompt, span)
+            })
+            .unwrap_or_else(|| Value::nothing(span)),
     );
     record.push(
         "resource_limits",
@@ -795,18 +904,16 @@ fn attempt_record_value(attempt: AttemptRecord, span: Span) -> Value {
     );
     record.push("generation", Value::string(attempt.generation, span));
     record.push("close_reason", Value::string(attempt.close_reason, span));
-    Value::record(record, span)
+    Ok(Value::record(record, span))
 }
 
 fn attempt_state_value(state: AttemptStateResponse, span: Span) -> Result<Value, ShellError> {
     let mut record = Record::new();
-    record.push(
-        "attempt",
-        state
-            .attempt
-            .map(|attempt| attempt_record_value(attempt, span))
-            .unwrap_or_else(|| Value::nothing(span)),
-    );
+    let attempt = match state.attempt {
+        Some(attempt) => attempt_record_value(attempt, span)?,
+        None => Value::nothing(span),
+    };
+    record.push("attempt", attempt);
     record.push("tx_closed", Value::bool(state.tx_closed, span));
     record.push("env_state", Value::string(state.env_state, span));
     if let Some(diff) = state.diff {
@@ -817,15 +924,105 @@ fn attempt_state_value(state: AttemptStateResponse, span: Span) -> Result<Value,
     Ok(Value::record(record, span))
 }
 
+fn attempt_inspect_value(
+    inspection: AttemptInspectResponse,
+    span: Span,
+) -> Result<Value, ShellError> {
+    let mut record = Record::new();
+    let attempt = match inspection.attempt {
+        Some(attempt) => attempt_record_value(attempt, span)?,
+        None => Value::nothing(span),
+    };
+    record.push("attempt", attempt);
+    record.push(
+        "summary",
+        optional_json_text_value(&inspection.summary_json, span, "attempt summary")?,
+    );
+    record.push(
+        "error",
+        optional_json_text_value(&inspection.error_json, span, "attempt error")?,
+    );
+    record.push(
+        "details",
+        optional_json_text_value(&inspection.details_json, span, "attempt details")?,
+    );
+    record.push(
+        "details_truncated",
+        Value::bool(inspection.details_truncated, span),
+    );
+    record.push(
+        "details_bytes",
+        Value::int(u64_to_i64(inspection.details_bytes), span),
+    );
+    let trace = inspection
+        .trace_json
+        .iter()
+        .map(|event| optional_json_text_value(event, span, "attempt trace event"))
+        .collect::<Result<Vec<_>, _>>()?;
+    record.push("trace", Value::list(trace, span));
+    record.push(
+        "trace_truncated",
+        Value::bool(inspection.trace_truncated, span),
+    );
+    record.push(
+        "active_operations",
+        Value::list(
+            inspection
+                .active_operations
+                .into_iter()
+                .map(|operation| Value::string(operation, span))
+                .collect(),
+            span,
+        ),
+    );
+    record.push(
+        "active_runs",
+        Value::list(
+            inspection
+                .active_runs
+                .into_iter()
+                .map(|run| Value::string(run, span))
+                .collect(),
+            span,
+        ),
+    );
+    record.push(
+        "active_descendants",
+        Value::list(
+            inspection
+                .active_descendants
+                .into_iter()
+                .map(|attempt| Value::string(attempt, span))
+                .collect(),
+            span,
+        ),
+    );
+    record.push(
+        "resource_state",
+        Value::string(inspection.resource_state, span),
+    );
+    record.push(
+        "resources_reclaimed",
+        Value::bool(inspection.resources_reclaimed, span),
+    );
+    record.push(
+        "controller_run",
+        Value::string(inspection.controller_run, span),
+    );
+    record.push(
+        "controller_active",
+        Value::bool(inspection.controller_active, span),
+    );
+    Ok(Value::record(record, span))
+}
+
 fn attempt_finish_value(finish: AttemptFinishResponse, span: Span) -> Result<Value, ShellError> {
     let mut record = Record::new();
-    record.push(
-        "attempt",
-        finish
-            .attempt
-            .map(|attempt| attempt_record_value(attempt, span))
-            .unwrap_or_else(|| Value::nothing(span)),
-    );
+    let attempt = match finish.attempt {
+        Some(attempt) => attempt_record_value(attempt, span)?,
+        None => Value::nothing(span),
+    };
+    record.push("attempt", attempt);
     record.push("generation", Value::string(finish.generation, span));
     record.push(
         "file_changes",
@@ -848,13 +1045,11 @@ fn attempt_report_value(
     span: Span,
 ) -> Result<Value, ShellError> {
     let mut record = Record::new();
-    record.push(
-        "attempt",
-        report
-            .attempt
-            .map(|attempt| attempt_record_value(attempt, span))
-            .unwrap_or_else(|| Value::nothing(span)),
-    );
+    let attempt = match report.attempt {
+        Some(attempt) => attempt_record_value(attempt, span)?,
+        None => Value::nothing(span),
+    };
+    record.push("attempt", attempt);
     record.push("tx_closed", Value::bool(report.tx_closed, span));
     record.push(
         "file_changes",
@@ -874,20 +1069,16 @@ fn attempt_report_value(
 
 fn attempt_accept_value(accepted: AttemptAcceptResponse, span: Span) -> Result<Value, ShellError> {
     let mut record = Record::new();
-    record.push(
-        "parent",
-        accepted
-            .parent
-            .map(|attempt| attempt_record_value(attempt, span))
-            .unwrap_or_else(|| Value::nothing(span)),
-    );
-    record.push(
-        "child",
-        accepted
-            .child
-            .map(|attempt| attempt_record_value(attempt, span))
-            .unwrap_or_else(|| Value::nothing(span)),
-    );
+    let parent = match accepted.parent {
+        Some(attempt) => attempt_record_value(attempt, span)?,
+        None => Value::nothing(span),
+    };
+    let child = match accepted.child {
+        Some(attempt) => attempt_record_value(attempt, span)?,
+        None => Value::nothing(span),
+    };
+    record.push("parent", parent);
+    record.push("child", child);
     record.push(
         "file_changes",
         Value::int(u64_to_i64(accepted.file_changes), span),
@@ -904,15 +1095,14 @@ fn attempt_accept_value(accepted: AttemptAcceptResponse, span: Span) -> Result<V
     Ok(Value::record(record, span))
 }
 
-fn attempt_process_value(run: AttemptRunProcessResponse, span: Span) -> Value {
+fn attempt_process_value(run: AttemptRunProcessResponse, span: Span) -> Result<Value, ShellError> {
     let mut record = Record::new();
     record.push("run", Value::string(run.run, span));
-    record.push(
-        "attempt",
-        run.attempt
-            .map(|attempt| attempt_record_value(attempt, span))
-            .unwrap_or_else(|| Value::nothing(span)),
-    );
+    let attempt = match run.attempt {
+        Some(attempt) => attempt_record_value(attempt, span)?,
+        None => Value::nothing(span),
+    };
+    record.push("attempt", attempt);
     record.push("task", Value::string(run.task, span));
     record.push("workspace", Value::string(run.workspace, span));
     record.push("tx", Value::string(run.tx, span));
@@ -941,7 +1131,7 @@ fn attempt_process_value(run: AttemptRunProcessResponse, span: Span) -> Value {
             span,
         ),
     );
-    Value::record(record, span)
+    Ok(Value::record(record, span))
 }
 
 fn string_map_value(map: HashMap<String, String>, span: Span) -> Value {
@@ -977,6 +1167,19 @@ fn json_text_value(text: &str, span: Span) -> Result<Value, ShellError> {
     Ok(json_to_nu_value(json, span))
 }
 
+fn optional_json_text_value(text: &str, span: Span, label: &str) -> Result<Value, ShellError> {
+    if text.is_empty() {
+        return Ok(Value::nothing(span));
+    }
+    let json = serde_json::from_str(text).map_err(|err| {
+        stone_error(
+            "attempt",
+            format!("Gateway returned invalid {label} JSON: {err}"),
+        )
+    })?;
+    Ok(json_to_nu_value(json, span))
+}
+
 fn required_config() -> Result<GatewayRuntimeConfig, ShellError> {
     config().ok_or_else(|| stone_error("env", "Gateway runtime config is not active"))
 }
@@ -986,4 +1189,159 @@ fn stone_error(kind: &str, message: impl Into<String>) -> ShellError {
         GenericError::new_internal(format!("Stone {kind} error"), message.into())
             .with_code("stone_script_error"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attempt_inspection_exposes_typed_archive_and_resource_state() {
+        let inspection = AttemptInspectResponse {
+            attempt: Some(AttemptRecord {
+                attempt: "attempt-child".to_string(),
+                ..Default::default()
+            }),
+            summary_json: r#"{"answer":"hello"}"#.to_string(),
+            details_json: r#"{"ok":true,"kind":"task_result"}"#.to_string(),
+            trace_json: vec![r#"{"op":"attempt.report_result"}"#.to_string()],
+            details_bytes: 32,
+            resource_state: "reclaimed".to_string(),
+            resources_reclaimed: true,
+            controller_run: "process-1".to_string(),
+            ..Default::default()
+        };
+
+        let value = attempt_inspect_value(inspection, Span::unknown()).unwrap();
+        let record = value.as_record().expect("inspection record");
+        assert_eq!(
+            record
+                .get("summary")
+                .unwrap()
+                .as_record()
+                .unwrap()
+                .get("answer")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            record.get("resource_state").unwrap().as_str().unwrap(),
+            "reclaimed"
+        );
+        assert!(record
+            .get("resources_reclaimed")
+            .unwrap()
+            .as_bool()
+            .unwrap());
+        assert_eq!(record.get("trace").unwrap().as_list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn attempt_record_exposes_typed_controller_lifecycle_and_memory() {
+        let mut attempt = AttemptRecord {
+            attempt: "attempt-1".to_string(),
+            memory_ref: "attempt-memory:attempt-1".to_string(),
+            memory_revision: 5,
+            reported_result_json: r#"{"candidate":"cobalt","decision":"select"}"#.to_string(),
+            fork_origin: Some(waymark_gateway_client::proto::AttemptForkOrigin {
+                parent_attempt: "attempt-parent".to_string(),
+                workspace_checkpoint: "cp-1".to_string(),
+                workspace_revision: 3,
+                operation_policy: "require_idle".to_string(),
+                created_at_ms: 10,
+                memory_ref: "attempt-memory:attempt-parent".to_string(),
+                memory_revision: 4,
+            }),
+            context_prompt_view: Some(AttemptContextPromptView {
+                required_keys: vec!["requirement.target".to_string()],
+            }),
+            ..Default::default()
+        };
+        attempt
+            .metadata
+            .insert("controller_run_count".to_string(), "2".to_string());
+
+        let value = attempt_record_value(attempt, Span::unknown()).unwrap();
+        let record = value.as_record().expect("attempt record");
+        assert_eq!(
+            record
+                .get("controller_run_count")
+                .expect("run count")
+                .as_int()
+                .unwrap(),
+            2
+        );
+        assert!(record
+            .get("controller_restarted")
+            .expect("restart flag")
+            .as_bool()
+            .unwrap());
+        assert_eq!(
+            record
+                .get("controller_phase")
+                .expect("controller phase")
+                .as_str()
+                .unwrap(),
+            "restart"
+        );
+        assert_eq!(
+            record
+                .get("memory_revision")
+                .expect("memory revision")
+                .as_int()
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            record
+                .get("reported_result")
+                .expect("reported result")
+                .as_record()
+                .unwrap()
+                .get("decision")
+                .expect("decision")
+                .as_str()
+                .unwrap(),
+            "select"
+        );
+        assert!(record
+            .get("reported_error")
+            .expect("reported error")
+            .is_nothing());
+        let fork = record
+            .get("fork_origin")
+            .expect("fork origin")
+            .as_record()
+            .unwrap();
+        assert_eq!(
+            fork.get("memory_ref")
+                .expect("fork memory ref")
+                .as_str()
+                .unwrap(),
+            "attempt-memory:attempt-parent"
+        );
+        assert_eq!(
+            fork.get("memory_revision")
+                .expect("fork memory revision")
+                .as_int()
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            record
+                .get("context_prompt_view")
+                .expect("context prompt view")
+                .as_record()
+                .unwrap()
+                .get("required_keys")
+                .expect("required keys")
+                .as_list()
+                .unwrap()[0]
+                .as_str()
+                .unwrap(),
+            "requirement.target"
+        );
+    }
 }

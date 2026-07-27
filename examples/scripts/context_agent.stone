@@ -1,0 +1,74 @@
+def context_agent():
+    messages = [
+        {
+            "role": "system",
+            "content": "Return JSON only as {\"actions\":[...]}. Use context_write or context_read actions to manage task state. Return {\"final\":{\"answer\":\"...\"}} only after checking requirements.",
+        }
+    ]
+    turns = 0
+    projection = context_project(focus="task start", max_tokens=256)
+
+    for turn in range(6):
+        projection = context_project(
+            focus="complete the task and check requirements at turn " + str(turn + 1),
+            max_tokens=256,
+        )
+        messages.append({
+            "role": "user",
+            "content": json_dumps({"active_context": projection.text}),
+        })
+        response = model_call(
+            messages,
+            model_class="agent",
+            response_format={"type": "json_object"},
+            max_output_tokens=256,
+        )
+        turns += 1
+        decoded = json_loads(response.content)
+        actions = decoded.actions
+        if len(actions) == 0:
+            fail("model returned no actions", code="invalid_model_response")
+        messages.append({"role": "assistant", "content": response.content})
+
+        for action in actions:
+            final = get(action, "final", None)
+            if final is not None:
+                ledger = context_read(keys=["requirement.output"])
+                if len(ledger) == 0:
+                    fail("finish requires requirement.output", code="finish_without_ledger")
+                return {
+                    "answer": final.answer,
+                    "turns": turns,
+                    "ledger": ledger,
+                    "projection": projection,
+                }
+
+            tool = get(action, "tool", "")
+            input = get(action, "input", {})
+            if tool == "context_write":
+                result = context_write(
+                    input.key,
+                    input.kind,
+                    input.content,
+                    status=get(input, "status", "active"),
+                    evidence=get(input, "evidence", []),
+                )
+            elif tool == "context_read":
+                result = context_read(
+                    query=get(input, "query", ""),
+                    keys=get(input, "keys", []),
+                    kinds=get(input, "kinds", []),
+                    limit=get(input, "limit", 8),
+                )
+            else:
+                fail("unknown context tool: " + tool, code="unknown_context_tool")
+
+            messages.append({
+                "role": "user",
+                "content": json_dumps({"context_action": action, "result": result}),
+            })
+
+    fail("context agent exceeded its turn bound", code="context_turn_limit")
+
+
+emit(context_agent())

@@ -9,6 +9,53 @@ operations rather than Python standard-library APIs. Its primary author is an
 agent generating or repairing task-specific code; human readability remains
 valuable for review and debugging.
 
+## Structured Correction Suggestions
+
+Stone error responses may include an `error.correction` record when the
+runtime can produce a bounded, context-aware recovery suggestion. Version 1
+contains the correction phase and class, received and expected names, at most
+three ranked candidates, an optional byte-range source edit, and explicit
+recovery choices. `source_sha256` binds the suggestion to the exact failed
+source. `execution_state` is `not_started` when conservative admission checks
+rejected the program before any statement ran, and `started_or_unknown` for
+evaluation-time failures.
+
+Corrections are advisory: `auto_apply` is always `false` and `retry` is
+`explicit_only`. Even a local spelling fix may be discovered after an earlier
+effect, so the runtime never edits source or reruns a program silently. A
+controller may inspect the edit, apply it deliberately, and evaluate it in the
+appropriate transaction.
+
+Name, keyword, and structured-field mistakes can receive local edit
+suggestions. Semantic mismatches such as Python `global` or an unsupported
+model message role are marked `requires_repair` and provide guidance without a
+mechanical replacement.
+
+In a persistent session, a controller can retrieve the prior error and request
+a validated source transformation:
+
+```python
+failed = last_result()
+preview = correction_apply(original_source, failed.error.correction)
+emit(preview)
+```
+
+`correction_apply` accepts only a matching `suggest_only` correction and an
+unambiguous advertised edit. It returns the corrected source with
+`executed=False`; evaluating that source is a separate, explicit controller
+decision.
+
+Controllers that expose `stone_eval` as an action can use the bounded
+[`attempt_correction_policy.stone`](../examples/references/attempt_correction_policy.stone)
+reference. It remembers source/candidate hashes in attempt context, permits one
+pre-effect high-confidence retry, and sends ambiguous or possibly executed
+actions back for replanning.
+
+Before evaluation, Stone checks direct callable names and the structured
+keywords of `model_call`, the context APIs, and `correction_apply`. Source and
+session definitions plus lexically bound dynamic callables remain valid. This
+preflight is intentionally conservative rather than a general type checker.
+
 ## Running Code
 
 ```sh
@@ -127,6 +174,39 @@ state surprises. Calls to user-defined functions currently accept positional
 arguments only; keyword arguments are reserved for builtins such as `run(...)`
 and `model_call(...)`.
 
+Named functions are also first-class callable values. This supports visible
+control adapters without lambda wrappers:
+
+```python
+def apply(adapter, value):
+    return adapter(value)
+
+def verify(candidate):
+    return candidate["ok"]
+
+emit(apply(verify, {"ok": True}))
+```
+
+`transition_hooks(pre=..., post=...)` creates a first-class call-local policy
+value. It may be assigned and passed through Stone functions before being used
+as `hooks=` on `model_call`, `model_infer`, `run`, or `must_run`. Literal hook
+records remain valid for one-off calls. Hook values are task-owned control
+objects rather than JSON/data records, and a warm session retains them only
+when captured values are persistable.
+
+`@stage(...)` declares an action function as a first-class deterministic stage
+for procedures that should not be rediscovered by a model on every turn.
+`file_nonempty(path)` supplies a lazy authoritative evidence specification and
+generates its observed path/size reference automatically. The frontend lowers
+this syntax to the same typed representation exposed explicitly by
+`workflow_stage(...)`. `workflow_run(...)` checks evidence before and after
+each action and optional repair, and advances only when it is satisfied. An
+action's `ok` field is required input but is never completion proof by itself.
+See
+[Stone Typed Workflows](STONE_TYPED_WORKFLOWS.md) and the
+[`typed_evidence_workflow.stone`](../examples/scripts/typed_evidence_workflow.stone)
+canary.
+
 `try` / `except` catches runtime evaluation errors, not parse or lowering
 errors:
 
@@ -147,6 +227,16 @@ Supported handlers are `except:`, `except Exception:`, and
 
 - `emit(value)`: return a structured success value.
 - `fail(message)`: return a structured failure.
+- `workflow_evidence(satisfied, summary, references=[])`: construct bounded stage
+  evidence; satisfied evidence requires at least one reference.
+- `@stage(evidence=..., repair=None, max_attempts=1)`: declare the following
+  one-argument action function as a named typed stage.
+- `file_nonempty(path)`: declare a lazy non-empty regular-file proof whose
+  evidence reference is generated from the authoritative workspace probe.
+- `workflow_stage(name, evidence=..., action=..., repair=None,
+  max_attempts=1)`: define one bounded evidence/action/repair stage.
+- `workflow(name, stage, ...)`, `workflow_run(plan)`: compose and execute
+  sequential evidence-gated stages, returning a compact structured report.
 - `read_text(path)`, `write_text(path, text)`: text file I/O.
 - `read_json(path)`, `write_json(path, value)`: JSON file I/O.
 - `read_jsonl(path)`, `write_jsonl(path, rows)`: JSONL file I/O.
@@ -194,28 +284,84 @@ Supported handlers are `except:`, `except Exception:`, and
   `tuple()` is an agent-compatibility alias for `list()`.
 - `run(argv, cwd=None, stdin=None, timeout_ms=None, env=None, background=False,
   stdout="capture", stderr="capture", max_stdout_bytes=1048576,
-  max_stderr_bytes=1048576)`: Linux command execution with structured stdout,
+  max_stderr_bytes=1048576, hooks={})`: Linux command execution with structured stdout,
   stderr, status, truncation flags, and helper observations. Agent loops should
   normally set much smaller output bounds (for example 16 KiB/8 KiB) so one
   noisy command cannot dominate every later model call. Set `stdout` or
   `stderr` to `"suppress"`/`"discard"` when content is not evidence, or set
   `stderr="stdout"` to merge it. A timeout can return a `still_running` handle;
   terminate or wait for that handle explicitly before finishing the attempt.
+  A call-local pre hook may veto or replace `argv`; a post hook observes the
+  structured success/failure outcome.
 - `must_run(argv, cwd=None, stdin=None, timeout_ms=None, env=None,
   stdout="capture", stderr="capture", max_stdout_bytes=1048576,
   max_stderr_bytes=1048576)`: checked Linux command execution for
   `set -e`-style scripts. It returns the same structured record as `run()` on
   success, and raises a Stone error with the run record attached when the
   external process exits nonzero or times out.
-- `model_call(messages, model_class="agent", ...)`: one explicit Gateway-backed
+- `model_call(messages, model_class="agent", hooks={}, ...)`: one explicit Gateway-backed
   model effect. The Stone program supplies the ordered structured messages and
   owns conversation state, retry, tool dispatch, and stopping policy. The
+  `role` and `content` fields of every message are strings; use `json_dumps`
+  before placing a structured observation in `content`. The
   result contains normalized `content`, assistant `messages`, provider/model,
   finish reason, latency, usage, and metadata. Provider credentials and
   endpoints remain in Gateway. See `help("model_call")` and
   [`model_two_turn.stone`](../examples/scripts/model_two_turn.stone). With the
   current Gateway protobuf, explicit `top_p` and `seed` values must be greater
-  than zero; omit them to use provider defaults.
+  than zero; omit them to use provider defaults. Call-local pre/post hooks may
+  project attempt memory into this one request and record its outcome. See
+  [Stone Transition Hooks](STONE_HOOKS_DESIGN.md).
+- `model_infer(messages, schema, retries=0, repair_prompt="",
+  schema_prompt="", hooks={}, ...)`:
+  a schema-validated JSON decision built from ordinary model-call
+  transitions. By default Stone injects the declared schema into the visible
+  request. A bounded `schema_prompt` may instead provide a compact equivalent
+  model-facing contract while the runtime continues to validate against the
+  complete schema. Stone uses portable JSON-object response mode and
+  independently validates the returned value. A failed validation never enters control as
+  `inference.value`; an allowed repair is another traced and charged model
+  call. The result includes the final typed `value`, final raw `response`,
+  `validation_attempts`, bounded failure summaries, and aggregate `usage`.
+  Schemas and repair state are size-bounded, retries are capped at four, and
+  unsupported schema keywords fail before a model effect. See
+  `help("model_infer")`,
+  [`model_infer_repair.stone`](../examples/scripts/model_infer_repair.stone),
+  and the reusable
+  [`typed_react_agent.stone`](../examples/scripts/typed_react_agent.stone).
+- The checked-in
+  [`standard_attempt_agent.stone`](../examples/scripts/standard_attempt_agent.stone)
+  composes typed inference with replaceable named-function adapters for
+  dispatch, finish verification, and progress retention. It bounds messages,
+  reads, process output, time, rounds, and actions, and permits exactly one
+  action per model transition. See
+  [Standard Visible Agent Control](STONE_STANDARD_AGENT_CONTROL.md).
+- A `run(...)` pre hook may reject one command without aborting the surrounding
+  agent loop. The command is skipped, the result has `ok=false`,
+  `kind="policy_rejected"`, and `policy_reason`, and the post hook still
+  observes the bounded failed outcome so the next model decision can recover.
+- `context_write(...)`, `context_read(...)`, and `context_project(...)`:
+  experimental attempt-context operations for model-authored write/manage/read
+  loops. In an attached attempt they use bounded, revisioned Gateway state and
+  survive controller restart; standalone evaluation uses the bounded warm
+  session fallback. Raw effects remain in transition trace; retain an
+  important outcome by writing it under a meaningful key.
+  `context_project(..., required_keys=[...])` reserves exact critical keys
+  before relevance-ranked fill and fails if they are missing or cannot fit the
+  token budget. Fork snapshots attempt memory, accept does not merge it, and
+  parent promotion is an explicit write. Inspect each operation with
+  `help("context_write")` and the related help entries before use. The
+  commented [`default_attempt_agent.stone`](../examples/scripts/default_attempt_agent.stone)
+  composes these operations with transition hooks into a bounded reference
+  loop.
+- `attempt_join(child)` returns a typed outcome whose `result.value` is the
+  child's compact named-entrypoint return value. Use
+  `attempt_inspect(child, include_details=False, trace_limit=20,
+  max_bytes=32768)` only when the parent needs a bounded trace tail, the
+  optional full controller envelope, or execution-resource status. Inspection
+  remains available after `attempt_accept` or `attempt_discard`: archives
+  persist while the child controller, operations, runs, and transaction are
+  reclaimed.
 - `task_spec()`: read the attached attempt's admitted objective, named inputs
   and outputs, success criteria, constraints, and metadata as a structured
   record. This is a read-only view, not a rendered prompt.
@@ -247,6 +393,9 @@ Supported handlers are `except:`, `except Exception:`, and
   git summary, and common tool availability/version probes.
 - `last_result()`: previous Waymark command response as typed data, or `None`
   before any previous response in the current runtime process.
+- `correction_apply(source, correction, candidate=0)`: validate one
+  source-bound `suggest_only` correction and return corrected, unexecuted
+  source for an explicit later evaluation.
 - `help()`, `help("topic")`: builtin help.
 
 ## Result Shape

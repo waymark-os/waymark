@@ -1,0 +1,89 @@
+def retain_requirement(step):
+    if not step.outcome.ok:
+        fail("early requirement probe failed", code="memory_canary_probe_failed")
+    payload = json_loads(step.outcome.value.stdout)
+    return context_write(
+        "requirement.pivot_action",
+        "requirement",
+        {
+            "action_token": payload.action_token,
+            "source_transition_id": step.transition_id,
+        },
+        status="verified",
+        evidence=["transition:" + step.transition_id],
+    )
+
+
+def prepare_decision(step):
+    projection = context_project(
+        focus="verified opaque token for the required pivot action",
+        max_tokens=128,
+    )
+    return {
+        "messages": step.input.messages + [
+            {
+                "role": "user",
+                "content": "Active attempt memory:\n" + projection.text,
+            }
+        ]
+    }
+
+
+early = run(
+    ["cat", "/app/early_requirement.json"],
+    hooks={"post": retain_requirement},
+)
+
+messages = [
+    {
+        "role": "system",
+        "content": "You select one action from explicit visible evidence. Never guess an opaque action token. Return exactly one JSON object with one string field named selected_action. If the required token is not visible, use insufficient_evidence.",
+    },
+]
+for index in range(16):
+    messages.append({
+        "role": "user",
+        "content": "Distractor observation " + str(index) + ": routine checks passed; this observation contains no pivot-action token.",
+    })
+messages.append({
+    "role": "user",
+    "content": "Select the required opaque token for the pivot action now.",
+})
+
+results = []
+modes = ["N", "M", "M", "N"]
+for mode in modes:
+    if mode == "M":
+        response = model_call(
+            messages,
+            response_format={"type": "json_object"},
+            max_output_tokens=128,
+            hooks={"pre": prepare_decision},
+        )
+    else:
+        response = model_call(
+            messages,
+            response_format={"type": "json_object"},
+            max_output_tokens=128,
+        )
+    decoded = json_loads(response.content)
+    selected_action = decoded.selected_action
+    action = run(["printf", selected_action])
+    results.append({
+        "mode": mode,
+        "selected_action": selected_action,
+        "materialized_action": action.stdout,
+        "model_transition_id": response.transition_id,
+        "action_transition_id": action.transition_id,
+        "provider": response.provider,
+        "model": response.model,
+        "usage": response.usage,
+        "response": response.content,
+    })
+
+emit({
+    "early_transition_id": early.transition_id,
+    "recent_message_count": len(messages),
+    "retained": context_read(keys=["requirement.pivot_action"]),
+    "results": results,
+})

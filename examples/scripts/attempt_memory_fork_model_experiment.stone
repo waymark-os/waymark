@@ -1,0 +1,223 @@
+# Real-model fork experiment for attempt-oriented short-term memory.
+#
+# Arm F forks from the parent's current workspace+memory frontier. Arm S uses
+# ordinary lifecycle-parented spawn and therefore starts with empty memory.
+# Each child sees only its candidate in task_input; the opaque target can reach
+# the model only through context_project().
+
+
+def prepare_candidate_decision(step, projection):
+    return {
+        "messages": step.input.messages + [
+            {
+                "role": "user",
+                "content": "Active attempt memory:\n" + projection.text,
+            },
+        ]
+    }
+
+
+def record_candidate_decision(step, candidate):
+    content = ""
+    if step.outcome.ok:
+        content = step.outcome.value.content
+    return context_write(
+        "decision.child",
+        "decision",
+        {
+            "candidate": candidate,
+            "ok": step.outcome.ok,
+            "content": content,
+            "transition_id": step.transition_id,
+        },
+        evidence=["transition:" + step.transition_id],
+    )
+
+
+def worker(input):
+    projection = context_project(
+        focus="verified requirement target for candidate selection",
+        max_tokens=160,
+    )
+    response = model_call(
+        [
+            {
+                "role": "system",
+                "content": "Evaluate exactly one candidate using only the supplied Active attempt memory. Find the item with key requirement.target and read target from its content. Return one JSON object with string fields candidate and decision. Echo the candidate exactly. decision must be select when it equals target, reject when a different target is visible, or insufficient when requirement.target is absent. Never infer or invent a target.",
+            },
+            {
+                "role": "user",
+                "content": "Candidate: " + input.candidate,
+            },
+        ],
+        response_format={"type": "json_object"},
+        max_output_tokens=128,
+        hooks={
+            "pre": lambda step: prepare_candidate_decision(step, projection),
+            "post": lambda step: record_candidate_decision(step, input.candidate),
+        },
+    )
+    decoded = json_loads(response.content)
+    if decoded.candidate != input.candidate:
+        fail(
+            "model did not echo its assigned candidate",
+            code="fork_model_candidate_mismatch",
+            detail={"expected": input.candidate, "actual": decoded},
+        )
+    if decoded.decision != "select" and decoded.decision != "reject" and decoded.decision != "insufficient":
+        fail(
+            "model returned an invalid decision",
+            code="fork_model_invalid_decision",
+            detail=decoded,
+        )
+    return {
+        "candidate": input.candidate,
+        "decision": decoded.decision,
+        "projected_keys": map(lambda item: item.key, projection.items),
+        "memory_revision": attempt_info().memory_revision,
+        "transition_id": response.transition_id,
+        "provider": response.provider,
+        "model": response.model,
+        "usage": response.usage,
+    }
+
+
+def start_worker(arm, root, scope, candidate):
+    if arm == "F":
+        return attempt_fork(
+            program=current_program(),
+            entrypoint="worker",
+            input={"candidate": candidate},
+            start=True,
+            scope=scope,
+        )
+    return attempt_spawn(
+        task=root.task + "-spawn-" + candidate,
+        workspace=root.workspace,
+        parent_attempt=root.attempt,
+        program=current_program(),
+        entrypoint="worker",
+        task_input={"candidate": candidate},
+        start=True,
+        scope=scope,
+    )
+
+
+def main(input):
+    if input.arm != "F" and input.arm != "S":
+        fail("arm must be F or S", code="fork_model_bad_arm")
+    if len(input.candidates) != 2:
+        fail("experiment requires exactly two candidates", code="fork_model_bad_candidates")
+
+    root = attempt_info()
+    context_write(
+        "requirement.target",
+        "requirement",
+        {"target": input.target},
+        status="verified",
+        evidence=["experiment:parent-input"],
+    )
+    scope = attempt_scope(join_timeout_ms=60000)
+
+    first = start_worker(input.arm, root, scope, input.candidates[0])
+    first_outcome = attempt_join(first, timeout_ms=60000)
+    second = start_worker(input.arm, root, scope, input.candidates[1])
+    second_outcome = attempt_join(second, timeout_ms=60000)
+
+    if not first_outcome.joined or not second_outcome.joined:
+        fail(
+            "candidate workers did not join",
+            code="fork_model_join_failed",
+            detail={"first": first_outcome, "second": second_outcome},
+        )
+    if first_outcome.result.status != "succeeded" or second_outcome.result.status != "succeeded":
+        fail(
+            "candidate worker did not report success",
+            code="fork_model_child_failed",
+            detail={"first": first_outcome, "second": second_outcome},
+        )
+
+    first_result = first_outcome.result.value
+    second_result = second_outcome.result.value
+    selected = None
+    selected_result = None
+    rejected = None
+    if first_result.decision == "select" and second_result.decision != "select":
+        selected = first
+        selected_result = first_result
+        rejected = second
+    if second_result.decision == "select" and first_result.decision != "select":
+        selected = second
+        selected_result = second_result
+        rejected = first
+
+    accepted = ""
+    promoted = False
+    if input.arm == "F" and selected != None and selected_result.candidate == input.target:
+        attempt_accept(root.attempt, selected)
+        accepted = selected.attempt
+        attempt_discard(rejected, reason="non-selected fork candidate")
+        context_write(
+            "candidate.accepted",
+            "candidate",
+            {
+                "candidate": selected_result.candidate,
+                "child_attempt": selected.attempt,
+                "decision": selected_result.decision,
+            },
+            status="verified",
+            evidence=["accepted-child:" + selected.attempt],
+        )
+        promoted = True
+    else:
+        attempt_discard(first, reason="experiment arm did not select this candidate")
+        attempt_discard(second, reason="experiment arm did not select this candidate")
+
+    cleanup = attempt_scope_close(scope)
+    if not cleanup.clean:
+        fail(
+            "candidate scope cleanup failed",
+            code="fork_model_cleanup_failed",
+            detail=cleanup,
+        )
+
+    parent = attempt_info()
+    parent_memory = context_read(limit=20)
+    return {
+        "arm": input.arm,
+        "target": input.target,
+        "children": [
+            {
+                "attempt": first.attempt,
+                "memory_ref": first_outcome.record.memory_ref,
+                "result": first_result,
+            },
+            {
+                "attempt": second.attempt,
+                "memory_ref": second_outcome.record.memory_ref,
+                "result": second_result,
+            },
+        ],
+        "accepted": accepted,
+        "promoted": promoted,
+        "parent_memory_ref": parent.memory_ref,
+        "parent_memory_revision": parent.memory_revision,
+        "parent_keys": map(lambda item: item.key, parent_memory),
+        "clean": cleanup.clean,
+    }
+
+
+# The local development controller launches admitted Stone source as a script.
+# Dispatch from the recorded entrypoint so parent and child share one module.
+control = attempt_info()
+entrypoint = get(control.metadata, "program_entrypoint", "main")
+if entrypoint == "worker":
+    result = worker(task_input())
+else:
+    result = main(task_input())
+attempt_report(
+    status="succeeded",
+    result=result,
+    metadata={"control": "attempt_memory_fork_model_experiment"},
+)
+emit(result)

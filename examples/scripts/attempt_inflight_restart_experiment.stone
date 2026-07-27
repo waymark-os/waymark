@@ -1,0 +1,237 @@
+# Crash/restart policy for one attempt-local action.
+#
+# The workspace fixture supplies mode.txt with one boundary:
+#   prepared  - controller ended before the effect transition started
+#   started   - effect may have run, but no durable outcome receipt exists
+#   completed - post hook retained a receipt before terminal consolidation
+#
+# This source is restarted unchanged. Gateway context is the short-term ledger;
+# detailed transition events remain in trace.
+
+ACTION_KEY = "action.inflight"
+RECEIPT_KEY = "action.receipt"
+ACTION_ID = "append-effect"
+ACTION_ARGV = ["sh", "-c", "printf 'effect\\n' >> /app/effect.log"]
+ACTION_INPUT_SHA256 = sha256(json_dumps(ACTION_ARGV))
+
+
+def read_one(key):
+    items = context_read(keys=[key], limit=1)
+    if len(items) == 0:
+        return None
+    return items[0]
+
+
+def action_state():
+    item = read_one(ACTION_KEY)
+    if item == None:
+        return None
+    return item.content
+
+
+def action_receipt():
+    item = read_one(RECEIPT_KEY)
+    if item == None:
+        return None
+    return item.content
+
+
+def write_action_state(content, status):
+    return context_write(
+        ACTION_KEY,
+        "action",
+        content,
+        status=status,
+        evidence=["action:" + ACTION_ID],
+    )
+
+
+def prepare_action():
+    return write_action_state(
+        {
+            "version": 1,
+            "action_id": ACTION_ID,
+            "input_sha256": ACTION_INPUT_SHA256,
+            "phase": "prepared",
+            "execution_state": "not_started",
+            "transition_id": None,
+            "decision": "pending",
+            "outcome": None,
+        },
+        "pending",
+    )
+
+
+# A pre hook narrows the restart policy before the external effect. If the
+# controller disappears after this write, a later controller must not replay.
+def mark_action_started(step):
+    write_action_state(
+        {
+            "version": 1,
+            "action_id": ACTION_ID,
+            "input_sha256": ACTION_INPUT_SHA256,
+            "phase": "started_or_unknown",
+            "execution_state": "started_or_unknown",
+            "transition_id": step.transition_id,
+            "decision": "replan_if_no_receipt",
+            "outcome": None,
+        },
+        "pending",
+    )
+    return None
+
+
+# The post hook writes a compact durable receipt, not a second transcript.
+# Terminal consolidation is deliberately a separate controller step.
+def retain_action_receipt(step):
+    result = get(step.outcome, "value", None)
+    if result == None:
+        outcome = {
+            "ok": False,
+            "exit_code": None,
+            "stdout_sha256": None,
+            "stderr_sha256": sha256(json_dumps(step.outcome.error)),
+        }
+    else:
+        outcome = {
+            "ok": step.outcome.ok,
+            "exit_code": result.exit_code,
+            "stdout_sha256": sha256(result.stdout),
+            "stderr_sha256": sha256(result.stderr),
+        }
+    return context_write(
+        RECEIPT_KEY,
+        "transition_receipt",
+        {
+            "version": 1,
+            "action_id": ACTION_ID,
+            "input_sha256": ACTION_INPUT_SHA256,
+            "phase": "completed",
+            "transition_id": step.transition_id,
+            "outcome": outcome,
+        },
+        status="verified",
+        evidence=["transition:" + step.transition_id],
+    )
+
+
+def validate_receipt(state, receipt):
+    return (
+        receipt != None
+        and receipt.action_id == state.action_id
+        and receipt.input_sha256 == state.input_sha256
+        and receipt.transition_id == state.transition_id
+        and receipt.phase == "completed"
+    )
+
+
+def finalize_from_receipt(state, receipt):
+    if not validate_receipt(state, receipt):
+        fail(
+            "action receipt does not match the in-flight transition",
+            code="action_receipt_mismatch",
+        )
+    terminal = {
+        "version": 1,
+        "action_id": state.action_id,
+        "input_sha256": state.input_sha256,
+        "phase": "terminal",
+        "execution_state": "completed",
+        "transition_id": receipt.transition_id,
+        "decision": "record_outcome",
+        "outcome": receipt.outcome,
+    }
+    write_action_state(terminal, "verified")
+    context_write(
+        RECEIPT_KEY,
+        "transition_receipt",
+        {"transition_id": receipt.transition_id, "consolidated": True},
+        status="archived",
+        evidence=["transition:" + receipt.transition_id],
+    )
+    return terminal
+
+
+def terminal_replan(state):
+    terminal = {
+        "version": 1,
+        "action_id": state.action_id,
+        "input_sha256": state.input_sha256,
+        "phase": "terminal",
+        "execution_state": "started_or_unknown",
+        "transition_id": state.transition_id,
+        "decision": "replan",
+        "outcome": None,
+    }
+    write_action_state(terminal, "active")
+    return terminal
+
+
+def effect_lines():
+    try:
+        return read_text("effect.log").splitlines()
+    except Exception:
+        return []
+
+
+def controller():
+    boundary = read_text("mode.txt").strip()
+    lifecycle = attempt_info()
+    state = action_state()
+    decision = ""
+    transition_id = None
+
+    if state == None:
+        prepare_action()
+        state = action_state()
+        if boundary == "prepared":
+            decision = "stop_before_execution"
+        elif boundary == "started":
+            result = run(ACTION_ARGV, hooks={"pre": mark_action_started})
+            transition_id = result.transition_id
+            state = action_state()
+            decision = "lose_outcome"
+        elif boundary == "completed":
+            result = run(
+                ACTION_ARGV,
+                hooks={"pre": mark_action_started, "post": retain_action_receipt},
+            )
+            transition_id = result.transition_id
+            state = action_state()
+            decision = "stop_before_consolidation"
+        else:
+            fail("unknown restart boundary: " + boundary, code="bad_restart_boundary")
+    elif state.phase == "prepared":
+        decision = "resume_once"
+        result = run(
+            ACTION_ARGV,
+            hooks={"pre": mark_action_started, "post": retain_action_receipt},
+        )
+        transition_id = result.transition_id
+        state = action_state()
+        state = finalize_from_receipt(state, action_receipt())
+    elif state.phase == "started_or_unknown":
+        receipt = action_receipt()
+        if receipt == None:
+            decision = "replan"
+            state = terminal_replan(state)
+        else:
+            decision = "record_outcome"
+            state = finalize_from_receipt(state, receipt)
+    elif state.phase == "terminal":
+        decision = "terminal_noop"
+    else:
+        fail("unknown in-flight phase: " + state.phase, code="bad_inflight_phase")
+
+    return {
+        "boundary": boundary,
+        "controller_run_count": lifecycle.controller_run_count,
+        "decision": decision,
+        "transition_id": transition_id,
+        "state": state,
+        "effect_lines": effect_lines(),
+        "memory": context_read(limit=8),
+    }
+
+
+emit(controller())

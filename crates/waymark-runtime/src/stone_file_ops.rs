@@ -116,6 +116,13 @@ pub(crate) fn stat_record(path: &Path, follow_symlinks: bool) -> Result<Value, S
     Ok(file_stat_record(stat, Span::unknown()))
 }
 
+pub(crate) fn file_nonempty_probe(path: &Path) -> Result<Option<u64>, ShellError> {
+    let Some(stat) = stone_file_adapter().stat_optional(path, false)? else {
+        return Ok(None);
+    };
+    Ok((stat.is_file && stat.size > 0).then_some(stat.size))
+}
+
 pub(crate) fn list_dir_records(path: &Path) -> Result<Vec<Value>, ShellError> {
     let mut entries = stone_file_adapter()
         .list_dir(path)?
@@ -763,6 +770,11 @@ trait StoneFileAdapter {
         append: bool,
     ) -> Result<StoneFileWrite, ShellError>;
     fn stat(&self, path: &Path, follow_symlinks: bool) -> Result<StoneFileStat, ShellError>;
+    fn stat_optional(
+        &self,
+        path: &Path,
+        follow_symlinks: bool,
+    ) -> Result<Option<StoneFileStat>, ShellError>;
     fn list_dir(&self, path: &Path) -> Result<Vec<StoneFileEntry>, ShellError>;
 }
 
@@ -870,6 +882,28 @@ impl StoneFileAdapter for StdStoneFileAdapter {
         }
         .map_err(|err| io_read_stone_error("stat", err, path))?;
         Ok(file_stat_from_metadata(path.to_path_buf(), &metadata))
+    }
+
+    fn stat_optional(
+        &self,
+        path: &Path,
+        follow_symlinks: bool,
+    ) -> Result<Option<StoneFileStat>, ShellError> {
+        if gateway_runtime::enabled() {
+            return gateway_runtime::stat_optional_record(path, Span::unknown())?
+                .map(stone_file_stat_from_value)
+                .transpose();
+        }
+        let metadata = if follow_symlinks {
+            fs::metadata(path)
+        } else {
+            fs::symlink_metadata(path)
+        };
+        match metadata {
+            Ok(metadata) => Ok(Some(file_stat_from_metadata(path.to_path_buf(), &metadata))),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(io_stone_error("stat", error, path)),
+        }
     }
 
     fn list_dir(&self, path: &Path) -> Result<Vec<StoneFileEntry>, ShellError> {

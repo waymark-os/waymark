@@ -1,0 +1,160 @@
+# Compare relevance-only projection with one call-local required memory key.
+
+
+def inject_projection(step, projection):
+    return {
+        "messages": step.input.messages + [
+            {
+                "role": "user",
+                "content": "Active attempt memory:\n" + projection.text,
+            },
+        ]
+    }
+
+
+def retain_decision(step):
+    content = ""
+    if step.outcome.ok:
+        content = step.outcome.value.content
+    return context_write(
+        "decision.latest",
+        "decision",
+        {
+            "phase": "worker",
+            "ok": step.outcome.ok,
+            "content": content,
+            "transition_id": step.transition_id,
+        },
+        evidence=["transition:" + step.transition_id],
+    )
+
+
+def worker(input):
+    mode = read_file("/app/mode.txt", max_bytes=8).strip()
+    targets = read_json("/app/targets.json")
+    required = []
+    if mode == "R":
+        required = ["requirement.target"]
+    projection = context_project(
+        focus="active goal latest decision current verified target requirement",
+        max_tokens=96,
+        required_keys=required,
+    )
+    response = model_call(
+        [
+            {
+                "role": "system",
+                "content": "Use only Active attempt memory. Return exactly one JSON object with one string field selected_target. Read the value only from the item keyed requirement.target. If that exact item is absent, return insufficient_evidence. Ignore goals, decisions, and candidate values.",
+            },
+            {
+                "role": "user",
+                "content": "Select the current verified target.",
+            },
+        ],
+        response_format={"type": "json_object"},
+        max_output_tokens=96,
+        hooks={
+            "pre": lambda step: inject_projection(step, projection),
+            "post": retain_decision,
+        },
+    )
+    decoded = json_loads(response.content)
+    return {
+        "mode": mode,
+        "selected_target": decoded.selected_target,
+        "projection_keys": map(lambda item: item.key, projection.items),
+        "required_keys": projection.required_keys,
+        "projection_tokens": projection.estimated_tokens,
+        "projection_truncated": projection.truncated,
+        "contains_current": targets.current in projection.text,
+        "contains_decoy": targets.decoy in projection.text,
+        "memory_revision": attempt_info().memory_revision,
+        "provider": response.provider,
+        "model": response.model,
+        "usage": response.usage,
+        "transition_id": response.transition_id,
+    }
+
+
+def main(input):
+    mode = read_file("/app/mode.txt", max_bytes=8).strip()
+    if mode != "U" and mode != "R":
+        fail("mode must be U or R", code="required_projection_bad_mode")
+    targets = read_json("/app/targets.json")
+    context_write(
+        "requirement.target",
+        "requirement",
+        {"state": "current", "target": targets.current},
+        status="verified",
+        evidence=["fixture:current-target"],
+    )
+    context_write(
+        "decision.latest",
+        "decision",
+        {
+            "state": "pending",
+            "candidate": targets.decoy,
+            "note": "latest decision considers an active goal and current verified target",
+        },
+        status="pending",
+        evidence=["fixture:pending-decision"],
+    )
+    context_write(
+        "goal.active",
+        "goal",
+        {
+            "goal": "active goal for current verified target selection",
+            "note": "latest decision follows this active goal",
+        },
+        status="active",
+        evidence=["fixture:active-goal"],
+    )
+
+    root = attempt_info()
+    scope = attempt_scope(join_timeout_ms=60000)
+    child = attempt_fork(
+        program=current_program(),
+        entrypoint="worker",
+        input={},
+        start=True,
+        scope=scope,
+    )
+    outcome = attempt_join(child, timeout_ms=60000)
+    if not outcome.joined or outcome.result.status != "succeeded":
+        fail(
+            "required projection worker did not report success",
+            code="required_projection_child_failed",
+            detail=outcome,
+        )
+    child_result = outcome.result.value
+    attempt_discard(child, reason="required projection experiment complete")
+    cleanup = attempt_scope_close(scope)
+    if not cleanup.clean:
+        fail(
+            "required projection scope cleanup failed",
+            code="required_projection_cleanup_failed",
+            detail=cleanup,
+        )
+    return {
+        "mode": mode,
+        "parent_memory_ref": root.memory_ref,
+        "parent_memory_revision": attempt_info().memory_revision,
+        "fork_origin_revision": child.fork_origin.memory_revision,
+        "child": child.attempt,
+        "child_result": child_result,
+        "clean": cleanup.clean,
+    }
+
+
+control = attempt_info()
+entrypoint = get(control.metadata, "program_entrypoint", "main")
+if entrypoint == "worker":
+    result = worker(task_input())
+else:
+    result = main(task_input())
+attempt_report(
+    status="succeeded",
+    result=result,
+    metadata={"control": "attempt_memory_required_projection"},
+)
+emit(result)

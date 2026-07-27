@@ -23,16 +23,19 @@ mod global_state;
 mod json;
 mod linux_tools;
 mod server;
+mod stone_admission;
 mod stone_agent_control;
 mod stone_ast;
 mod stone_attempt_scope;
 mod stone_attempt_value;
 mod stone_builtins;
+mod stone_correction;
 mod stone_eval;
 mod stone_file_ops;
 mod stone_frontend;
 mod stone_hash;
 mod stone_helpers;
+mod stone_json_schema;
 mod stone_vm;
 #[cfg(test)]
 mod stone_vm_tests;
@@ -208,10 +211,14 @@ impl StoneGuest {
                             }
                             response
                         }
-                        Err(err) => json::error_response(&err, Some(self.current_cwd())),
+                        Err(err) => {
+                            json::error_response_with_source(&err, Some(self.current_cwd()), source)
+                        }
                     }
                 }
-                Err(err) => json::error_response(&err, Some(self.current_cwd())),
+                Err(err) => {
+                    json::error_response_with_source(&err, Some(self.current_cwd()), source)
+                }
             }
         } else {
             match self.execute_json(frontend, source, input) {
@@ -1434,6 +1441,110 @@ last(values, 2)"#,
         assert_eq!(response["error"]["kind"], json!("generic"));
         assert_eq!(response["error"]["code"], json!("stone_script_error"));
         assert!(response["error"]["location"].is_string());
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn stone_errors_include_bounded_correction_envelopes() -> Result<(), ShellError> {
+        let start_dir = test_root("error-correction");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+
+        let unknown = guest.command_response(r#"context_projet(focus="x")"#);
+        assert_eq!(unknown["ok"], json!(false));
+        assert_eq!(unknown["error"]["correction"]["class"], json!("name"));
+        assert_eq!(unknown["error"]["correction"]["phase"], json!("admission"));
+        assert_eq!(
+            unknown["error"]["correction"]["execution_state"],
+            json!("not_started")
+        );
+        assert_eq!(
+            unknown["error"]["correction"]["candidates"][0]["replacement"],
+            json!("context_project")
+        );
+        assert_eq!(unknown["error"]["correction"]["auto_apply"], json!(false));
+
+        let preview = guest.command_response(
+            r#"failed = last_result()
+preview = correction_apply(
+    "context_projet(focus=\"x\")",
+    failed.error.correction,
+)
+emit(preview)"#,
+        );
+        assert_eq!(preview["ok"], json!(true));
+        assert_eq!(preview["value"]["executed"], json!(false));
+        assert_eq!(
+            preview["value"]["source"],
+            json!(r#"context_project(focus="x")"#)
+        );
+        let corrected_source = preview["value"]["source"]
+            .as_str()
+            .expect("corrected source")
+            .to_string();
+        let corrected = guest.command_response(&corrected_source);
+        assert_eq!(corrected["ok"], json!(true));
+
+        let keyword = guest.command_response(r#"context_project(max_token=32)"#);
+        assert_eq!(keyword["ok"], json!(false));
+        assert_eq!(
+            keyword["error"]["correction"]["candidates"][0]["replacement"],
+            json!("max_tokens")
+        );
+        assert_eq!(
+            keyword["error"]["correction"]["execution_state"],
+            json!("not_started")
+        );
+
+        let field = guest.command_response(
+            r#"def transition_id(step):
+    return step.id
+emit(transition_id({"transition_id": "transition-1", "phase": "post"}))"#,
+        );
+        assert_eq!(field["ok"], json!(false));
+        assert_eq!(field["error"]["correction"]["class"], json!("field"));
+        assert_eq!(
+            field["error"]["correction"]["execution_state"],
+            json!("started_or_unknown")
+        );
+        assert_eq!(
+            field["error"]["correction"]["candidates"][0]["replacement"],
+            json!("transition_id")
+        );
+
+        let semantic = guest.command_response(
+            r#"mode = "M"
+def update():
+    global mode
+    mode = "N""#,
+        );
+        assert_eq!(semantic["ok"], json!(false));
+        assert_eq!(
+            semantic["error"]["correction"]["safety"],
+            json!("requires_repair")
+        );
+        assert_eq!(
+            semantic["error"]["correction"]["execution_state"],
+            json!("not_started")
+        );
+        assert_eq!(semantic["error"]["correction"]["candidates"], json!([]));
+
+        let marker = start_dir.join("admission-marker.txt");
+        let before_effect = guest.command_response(
+            r#"write_text("admission-marker.txt", "should not exist")
+context_projet()"#,
+        );
+        assert_eq!(before_effect["ok"], json!(false));
+        assert_eq!(
+            before_effect["error"]["correction"]["execution_state"],
+            json!("not_started")
+        );
+        assert!(
+            !marker.exists(),
+            "admission must precede filesystem effects"
+        );
 
         cleanup_dir(&start_dir);
         Ok(())

@@ -1,0 +1,13 @@
+retained = context_read(keys=["restart.probe"], limit=1)
+
+if len(retained) == 0:
+    item = context_write(
+        "restart.probe",
+        "fact",
+        {"value": "retained-across-controller-restart"},
+        status="verified",
+        evidence=["canary:first-run"],
+    )
+    emit({"phase": "write", "item": item})
+else:
+    emit({"phase": "restore", "item": retained[0]})

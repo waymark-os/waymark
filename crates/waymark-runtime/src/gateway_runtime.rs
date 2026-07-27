@@ -7,12 +7,15 @@ use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, 
 use serde_json::{json, Value as JsonValue};
 use waymark_gateway_client::proto::{
     attempt_program, AttemptChannelAttachBootRequest, AttemptChannelAttachRequest,
-    AttemptChannelAttachResponse, AttemptControlBlock, AttemptProviderLeaseReleaseRequest,
-    AttemptProviderLeaseReleaseResponse, AttemptReportResultRequest, ModelCallRequest,
-    ModelCallResponse, ModelMessage, ModelSampling, TaskSpec as GatewayTaskSpec, WorkspaceEntry,
-    WorkspaceEntryKind,
+    AttemptChannelAttachResponse, AttemptControlBlock, AttemptMemoryItem,
+    AttemptMemoryProjectRequest, AttemptMemoryReadRequest, AttemptMemoryWriteRequest,
+    AttemptProviderLeaseReleaseRequest, AttemptProviderLeaseReleaseResponse,
+    AttemptReportResultRequest, ModelCallRequest, ModelCallResponse, ModelMessage, ModelSampling,
+    TaskSpec as GatewayTaskSpec, WorkspaceEntry, WorkspaceEntryKind,
 };
-use waymark_gateway_client::{GatewayRpcClient, LinuxExecOptions, LinuxProbeOptions};
+use waymark_gateway_client::{
+    Error as GatewayClientError, GatewayRpcClient, LinuxExecOptions, LinuxProbeOptions,
+};
 
 use crate::agent::{AgentError, AgentModelGateway};
 use crate::global_state::{ProcessLocalState, ProcessTls};
@@ -81,6 +84,12 @@ pub(crate) fn config() -> Option<GatewayRuntimeConfig> {
 
 pub(crate) fn enabled() -> bool {
     config().is_some()
+}
+
+pub(crate) fn attempt_memory_enabled() -> bool {
+    config().is_some_and(|config| {
+        !config.attempt.is_empty() || !config.boot_token.is_empty() || !config.channel_id.is_empty()
+    })
 }
 
 /// Clear attempt-specific Gateway state owned by the current Stone process
@@ -350,6 +359,8 @@ pub(crate) fn task_spec_value(span: Span) -> Result<Value, ShellError> {
             "Gateway task context is not active in this Stone runtime",
         )
     })?;
+    let config = attached_config(config)
+        .map_err(|err| stone_error("task_spec", shell_error_detail(&err)))?;
     let task_spec = config
         .control
         .as_ref()
@@ -365,6 +376,8 @@ pub(crate) fn task_input_value(span: Span) -> Result<Value, ShellError> {
             "Gateway task context is not active in this Stone runtime",
         )
     })?;
+    let config = attached_config(config)
+        .map_err(|err| stone_error("task_input", shell_error_detail(&err)))?;
     let input_json = config
         .control
         .as_ref()
@@ -373,6 +386,156 @@ pub(crate) fn task_input_value(span: Span) -> Result<Value, ShellError> {
         .as_str();
     let input = parse_task_input_json(input_json)?;
     Ok(json_to_nu_value(input, span))
+}
+
+pub(crate) fn context_write(
+    key: String,
+    kind: String,
+    content: JsonValue,
+    status: String,
+    evidence: Vec<JsonValue>,
+) -> Result<(JsonValue, u64, usize), ShellError> {
+    let config = required_config()?;
+    let content_json = serde_json::to_string(&content)
+        .map_err(|error| stone_error("gateway context", error.to_string()))?;
+    let evidence_json = evidence
+        .iter()
+        .map(|value| {
+            serde_json::to_string(value)
+                .map_err(|error| stone_error("gateway context", error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let response = with_client(&config, |client| {
+        client.attempt_memory_write(AttemptMemoryWriteRequest {
+            attempt: config.attempt.clone(),
+            key,
+            kind,
+            content_json,
+            status,
+            evidence_json,
+            expected_revision: 0,
+            has_expected_revision: false,
+        })
+    })?;
+    let memory = response.memory.ok_or_else(|| {
+        stone_error(
+            "gateway context",
+            "attempt.memory.write response has no memory descriptor",
+        )
+    })?;
+    let item = response.item.ok_or_else(|| {
+        stone_error(
+            "gateway context",
+            "attempt.memory.write response has no item",
+        )
+    })?;
+    Ok((
+        context_item_json(item)?,
+        memory.revision,
+        memory.item_count as usize,
+    ))
+}
+
+pub(crate) fn context_read(
+    query: String,
+    keys: Vec<String>,
+    kinds: Vec<String>,
+    limit: usize,
+) -> Result<(Vec<JsonValue>, u64, usize), ShellError> {
+    let config = required_config()?;
+    let response = with_client(&config, |client| {
+        client.attempt_memory_read(AttemptMemoryReadRequest {
+            attempt: config.attempt.clone(),
+            query,
+            keys,
+            kinds,
+            limit: u32::try_from(limit).unwrap_or(u32::MAX),
+        })
+    })?;
+    let memory = response.memory.ok_or_else(|| {
+        stone_error(
+            "gateway context",
+            "attempt.memory.read response has no memory descriptor",
+        )
+    })?;
+    let items = response
+        .items
+        .into_iter()
+        .map(context_item_json)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((items, memory.revision, memory.item_count as usize))
+}
+
+pub(crate) fn context_project(
+    focus: String,
+    max_tokens: usize,
+    required_keys: Vec<String>,
+) -> Result<(JsonValue, u64, usize), ShellError> {
+    let config = required_config()?;
+    let response = with_client(&config, |client| {
+        client.attempt_memory_project(AttemptMemoryProjectRequest {
+            attempt: config.attempt.clone(),
+            focus,
+            max_tokens: u32::try_from(max_tokens).unwrap_or(u32::MAX),
+            required_keys,
+        })
+    })?;
+    let memory = response.memory.ok_or_else(|| {
+        stone_error(
+            "gateway context",
+            "attempt.memory.project response has no memory descriptor",
+        )
+    })?;
+    let items = response
+        .items
+        .into_iter()
+        .map(context_item_json)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((
+        json!({
+            "revision": memory.revision,
+            "focus": response.focus,
+            "required_keys": response.required_keys,
+            "items": items,
+            "text": response.text,
+            "estimated_tokens": response.estimated_tokens,
+            "truncated": response.truncated,
+        }),
+        memory.revision,
+        memory.item_count as usize,
+    ))
+}
+
+fn context_item_json(item: AttemptMemoryItem) -> Result<JsonValue, ShellError> {
+    let content: JsonValue = serde_json::from_str(&item.content_json).map_err(|error| {
+        stone_error(
+            "gateway context",
+            format!("invalid content_json in memory response: {error}"),
+        )
+    })?;
+    let evidence = item
+        .evidence_json
+        .iter()
+        .map(|value| {
+            serde_json::from_str::<JsonValue>(value).map_err(|error| {
+                stone_error(
+                    "gateway context",
+                    format!("invalid evidence_json in memory response: {error}"),
+                )
+            })
+        })
+        .collect::<Result<Vec<JsonValue>, _>>()?;
+    Ok(json!({
+        "id": item.id,
+        "key": item.key,
+        "kind": item.kind,
+        "content": content,
+        "status": item.status,
+        "evidence": evidence,
+        "revision": item.revision,
+        "supersedes": if item.supersedes.is_empty() { JsonValue::Null } else { json!(item.supersedes) },
+        "superseded_by": null,
+    }))
 }
 
 fn parse_task_input_json(input_json: &str) -> Result<JsonValue, ShellError> {
@@ -460,7 +623,7 @@ fn attempt_report_result_request(
     config: &GatewayRuntimeConfig,
     response: &JsonValue,
 ) -> Result<AttemptReportResultRequest, ShellError> {
-    let result_json = serde_json::to_string(response).map_err(|err| {
+    let details_json = serde_json::to_string(response).map_err(|err| {
         stone_error(
             "gateway report",
             format!("failed to encode task response JSON: {err}"),
@@ -470,6 +633,21 @@ fn attempt_report_result_request(
         .get("ok")
         .and_then(JsonValue::as_bool)
         .unwrap_or(false);
+    let summary = response.get("value").cloned().unwrap_or_else(|| {
+        serde_json::json!({
+            "ok": ok,
+            "kind": response
+                .get("kind")
+                .and_then(JsonValue::as_str)
+                .unwrap_or(if ok { "success" } else { "failed" }),
+        })
+    });
+    let result_json = serde_json::to_string(&summary).map_err(|err| {
+        stone_error(
+            "gateway report",
+            format!("failed to encode task summary JSON: {err}"),
+        )
+    })?;
     let error_json = if ok {
         String::new()
     } else {
@@ -490,6 +668,7 @@ fn attempt_report_result_request(
         status: if ok { "succeeded" } else { "failed" }.to_string(),
         result_json,
         error_json,
+        details_json,
         reason: report_reason(response),
         metadata,
     })
@@ -983,6 +1162,19 @@ pub(crate) fn stat_record(path: &Path, span: Span) -> Result<Value, ShellError> 
         entry_record(entry, path.to_path_buf(), span),
         span,
     ))
+}
+
+pub(crate) fn stat_optional_record(path: &Path, span: Span) -> Result<Option<Value>, ShellError> {
+    let config = required_config()?;
+    let rel = workspace_path(&config, path)?;
+    let entry = with_runtime_client(&config, |client| {
+        match client.workspace_tx_stat(&config.tx, rel) {
+            Ok(entry) => Ok(Some(entry)),
+            Err(GatewayClientError::Rpc { kind, .. }) if kind == "not_found" => Ok(None),
+            Err(error) => Err(stone_error("gateway rpc", error.to_string())),
+        }
+    })?;
+    Ok(entry.map(|entry| Value::record(entry_record(entry, path.to_path_buf(), span), span)))
 }
 
 pub(crate) fn list_dir_records(path: &Path, span: Span) -> Result<Vec<Value>, ShellError> {
@@ -2079,7 +2271,29 @@ fn with_runtime_client<T>(
     }
     let mut config = config.clone();
     let mut client = connect_attached_gateway_client(&mut config)?;
+    // Attachment resolves the authoritative task/control block as well as the
+    // attempt, transaction, and policy fields. Publish that resolved view so
+    // task_spec()/task_input() can follow any other lazy Gateway operation in
+    // the same Stone controller.
+    set_config(Some(config));
     call(&mut client)
+}
+
+#[cfg(any(unix, target_os = "hermit"))]
+fn attached_config(config: GatewayRuntimeConfig) -> Result<GatewayRuntimeConfig, ShellError> {
+    if config.control.is_some() || (config.attempt.is_empty() && config.boot_token.is_empty()) {
+        return Ok(config);
+    }
+
+    // Connecting performs attachment and with_runtime_client publishes the
+    // returned control block; no additional Gateway request is necessary.
+    with_runtime_client(&config, |_client| Ok(()))?;
+    required_config()
+}
+
+#[cfg(not(any(unix, target_os = "hermit")))]
+fn attached_config(config: GatewayRuntimeConfig) -> Result<GatewayRuntimeConfig, ShellError> {
+    Ok(config)
 }
 
 #[cfg(not(any(unix, target_os = "hermit")))]
@@ -2262,7 +2476,7 @@ fn model_call_error(code: &'static str, message: impl Into<String>) -> ShellErro
     )
 }
 
-fn shell_error_detail(err: &ShellError) -> String {
+pub(crate) fn shell_error_detail(err: &ShellError) -> String {
     match err {
         ShellError::Generic(generic) if !generic.msg.is_empty() => {
             format!("{}: {}", generic.error, generic.msg)
@@ -2564,6 +2778,7 @@ mod tests {
         )
         .unwrap();
         let result: JsonValue = serde_json::from_str(&request.result_json).unwrap();
+        let details: JsonValue = serde_json::from_str(&request.details_json).unwrap();
 
         assert_eq!(request.attempt, "attempt-1");
         assert_eq!(request.status, "succeeded");
@@ -2577,7 +2792,9 @@ mod tests {
             request.metadata.get("kind"),
             Some(&"task_result".to_string())
         );
-        assert_eq!(result["value"]["answer"], json!("hello"));
+        assert_eq!(result["answer"], json!("hello"));
+        assert_eq!(details["value"]["answer"], json!("hello"));
+        assert_eq!(details["kind"], json!("task_result"));
 
         let request = attempt_report_result_request(
             &config,
@@ -2593,10 +2810,12 @@ mod tests {
         )
         .unwrap();
         let error: JsonValue = serde_json::from_str(&request.error_json).unwrap();
+        let details: JsonValue = serde_json::from_str(&request.details_json).unwrap();
 
         assert_eq!(request.status, "failed");
         assert_eq!(request.reason, "bad task");
         assert_eq!(error["code"], json!("bad_task"));
+        assert_eq!(details["kind"], json!("runner_error"));
     }
 
     #[test]

@@ -1,0 +1,211 @@
+def mode_name():
+    return read_file("mode.txt", max_bytes=16).strip()
+
+
+def raw_transcript(payload, transition_id):
+    messages = [
+        {
+            "role": "user",
+            "content": "Early verified requirement from " + transition_id + ": " + json_dumps(payload),
+        },
+    ]
+    for index in range(48):
+        messages.append({
+            "role": "user",
+            "content": "Historical distractor " + str(index) + ": routine observation; no pivot-action token is present.",
+        })
+    return messages
+
+
+def retain_early_requirement(step):
+    if not step.outcome.ok:
+        fail("early requirement probe failed", code="restart_memory_probe_failed")
+    payload = json_loads(step.outcome.value.stdout)
+    mode = mode_name()
+    if mode == "M":
+        return context_write(
+            "requirement.pivot_action",
+            "requirement",
+            {
+                "action_token": payload.action_token,
+                "source_transition_id": step.transition_id,
+            },
+            status="verified",
+            evidence=["transition:" + step.transition_id],
+        )
+    if mode == "T":
+        write_file(
+            "raw-transcript.json",
+            json_dumps(raw_transcript(payload, step.transition_id)),
+        )
+    return None
+
+
+def prepare_decision(step):
+    mode = mode_name()
+    if mode == "M":
+        projection = context_project(
+            focus="verified pivot action and relevant tool outcome",
+            max_tokens=192,
+        )
+        return {
+            "messages": step.input.messages + [
+                {
+                    "role": "user",
+                    "content": "Active attempt memory:\n" + projection.text,
+                },
+            ]
+        }
+    if mode == "T":
+        history = json_loads(read_file("raw-transcript.json", max_bytes=32768))
+        return {
+            "messages": [step.input.messages[0]] + history + step.input.messages[1:]
+        }
+    return None
+
+
+def record_decision(step):
+    if mode_name() != "M":
+        return None
+    content = ""
+    if step.outcome.ok:
+        content = step.outcome.value.content
+    return context_write(
+        "decision.last",
+        "decision",
+        {
+            "transition_id": step.transition_id,
+            "ok": step.outcome.ok,
+            "content": content,
+        },
+        evidence=["transition:" + step.transition_id],
+    )
+
+
+def check_action(step):
+    if len(step.input.argv) == 0:
+        return {"allow": False, "reason": "empty action argv"}
+    return None
+
+
+def record_outcome(step):
+    if mode_name() != "M":
+        return None
+    return context_write(
+        "outcome.last_tool",
+        "outcome",
+        {
+            "transition_id": step.transition_id,
+            "ok": step.outcome.ok,
+            "exit_code": step.outcome.value.exit_code,
+            "stdout": step.outcome.value.stdout,
+            "stderr": step.outcome.value.stderr,
+        },
+        evidence=["transition:" + step.transition_id],
+    )
+
+
+mode = mode_name()
+if mode != "N" and mode != "T" and mode != "M":
+    fail("unknown experiment mode: " + mode, code="restart_memory_bad_mode")
+
+lifecycle = attempt_info()
+restoring = lifecycle.controller_restarted
+
+if not restoring:
+    early = run(
+        ["cat", "/app/early_requirement.json"],
+        hooks={"post": retain_early_requirement},
+    )
+    retained = []
+    if mode == "M":
+        retained = context_read(keys=["requirement.pivot_action"], limit=1)
+    emit({
+        "phase": "seed",
+        "mode": mode,
+        "early_transition_id": early.transition_id,
+        "retained": retained,
+    })
+else:
+    messages = [
+        {
+            "role": "system",
+            "content": "Follow visible evidence only. Return exactly one JSON object with one string field named selected_action. On turn 0 return diagnostic_probe. On turn 1 return the verified opaque pivot-action token; if it is not visible, return insufficient_evidence. Never invent an opaque token.",
+        },
+    ]
+    for index in range(18):
+        messages.append({
+            "role": "user",
+            "content": "Recent distractor " + str(index) + ": routine check passed; no pivot-action token is present.",
+        })
+
+    decisions = []
+    model_transition_ids = []
+    action_transition_ids = []
+    usage = []
+    failed_probe = None
+    materialized_action = ""
+
+    for turn in range(2):
+        if turn == 0:
+            request = "Choose the required diagnostic action for turn 0."
+        else:
+            request = "The diagnostic probe has completed. Choose the final opaque pivot action for turn 1."
+        messages.append({"role": "user", "content": request})
+        response = model_call(
+            messages,
+            response_format={"type": "json_object"},
+            max_output_tokens=128,
+            hooks={"pre": prepare_decision, "post": record_decision},
+        )
+        decoded = json_loads(response.content)
+        selected_action = decoded.selected_action
+        decisions.append(selected_action)
+        model_transition_ids.append(response.transition_id)
+        usage.append(response.usage)
+        messages.append({"role": "assistant", "content": response.content})
+
+        if turn == 0:
+            failed_probe = run(
+                ["sh", "-c", "printf 'diagnostic failed; do not retry\\n' >&2; exit 7"],
+                hooks={"pre": check_action, "post": record_outcome},
+            )
+            action_transition_ids.append(failed_probe.transition_id)
+            messages.append({
+                "role": "user",
+                "content": json_dumps({
+                    "kind": "tool_outcome",
+                    "ok": failed_probe.ok,
+                    "exit_code": failed_probe.exit_code,
+                    "stderr": failed_probe.stderr,
+                }),
+            })
+        else:
+            final_action = run(
+                ["printf", selected_action],
+                hooks={"pre": check_action, "post": record_outcome},
+            )
+            action_transition_ids.append(final_action.transition_id)
+            materialized_action = final_action.stdout
+
+    retained = []
+    if mode == "M":
+        retained = context_read(limit=8)
+    emit({
+        "phase": "restore",
+        "mode": mode,
+        "decisions": decisions,
+        "selected_action": decisions[-1],
+        "materialized_action": materialized_action,
+        "failed_probe": {
+            "ok": failed_probe.ok,
+            "exit_code": failed_probe.exit_code,
+            "stderr": failed_probe.stderr,
+        },
+        "model_transition_ids": model_transition_ids,
+        "action_transition_ids": action_transition_ids,
+        "provider": response.provider,
+        "model": response.model,
+        "usage": usage,
+        "retained": retained,
+    })

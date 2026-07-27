@@ -1,0 +1,421 @@
+# Forked-portfolio extension for standard_attempt_agent.stone.
+#
+# This file is intentionally a small visible control-flow layer. The benchmark
+# driver admits the definitions from standard_attempt_agent.stone, then this
+# extension, as one Stone module because Stone does not yet have imports.
+#
+# Extension points:
+#   - portfolio_materialize_strategy: prepare one isolated candidate;
+#   - portfolio_read_only_dispatch: constrain child model actions;
+#   - portfolio_verify_finish: attach authoritative candidate evidence;
+#   - portfolio_parent: change comparison and selection policy.
+#
+# The example uses fork only after creating a useful shared prefix. A separate
+# lifecycle-parented spawn probe proves that parentage alone inherits neither
+# the dirty workspace nor the parent's hot memory.
+
+PORTFOLIO_REQUIREMENT_KEY = "requirement.portfolio_target"
+PORTFOLIO_LATE_PARENT_KEY = "parent.after_portfolio_fork"
+
+
+def portfolio_spawn_probe(input):
+    problem_seen = True
+    verifier_seen = True
+    marker_seen = True
+    try:
+        read_text("problem.txt")
+    except Exception:
+        problem_seen = False
+    try:
+        read_text("verify_candidate.py")
+    except Exception:
+        verifier_seen = False
+    try:
+        read_text("shared-prefix.txt")
+    except Exception:
+        marker_seen = False
+    inherited = context_read(keys=[PORTFOLIO_REQUIREMENT_KEY], limit=1)
+    return {
+        "problem_seen": problem_seen,
+        "verifier_seen": verifier_seen,
+        "marker_seen": marker_seen,
+        "memory_seen": len(inherited) > 0,
+        "parent_attempt": attempt_info().parent_attempt,
+        "canonical_readme": read_text("README.md").strip(),
+    }
+
+
+def portfolio_materialize_strategy(strategy):
+    script = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "strategy = sys.argv[1]\n"
+        "problem = Path('/app/problem.txt').read_text().strip()\n"
+        "if strategy == 'reverse':\n"
+        "    answer = problem[::-1]\n"
+        "elif strategy == 'uppercase':\n"
+        "    answer = problem.upper()\n"
+        "else:\n"
+        "    raise SystemExit('unknown strategy')\n"
+        "Path('/app/answer.txt').write_text(answer + '\\n')\n"
+        "Path('/app/strategy.txt').write_text(strategy + '\\n')\n"
+    )
+    prepared = run(
+        ["python3", "-c", script, strategy],
+        cwd="/app",
+        timeout_ms=10000,
+        max_stdout_bytes=1024,
+        max_stderr_bytes=2048,
+    )
+    if not prepared.ok:
+        fail(
+            "portfolio strategy preparation failed",
+            code="portfolio_strategy_failed",
+            detail=prepared,
+        )
+    output = read_text("answer.txt").strip()
+    context_write(
+        "candidate.strategy",
+        "candidate",
+        {"strategy": strategy, "output": output},
+        status="active",
+        evidence=["portfolio:strategy-prepared"],
+    )
+    return output
+
+
+def portfolio_read_only_dispatch(action, options):
+    if action.tool == "read":
+        return standard_shell_dispatch(action, options)
+    return {
+        "ok": False,
+        "kind": "portfolio_read_only",
+        "message": (
+            "This candidate is already materialized. Inspect it with read, "
+            "then finish; parent policy owns verification and selection."
+        ),
+    }
+
+
+def portfolio_verify_finish(candidate, session, state):
+    requirements = context_read(
+        keys=[PORTFOLIO_REQUIREMENT_KEY],
+        limit=1,
+    )
+    if len(requirements) != 1:
+        fail(
+            "portfolio child lost its admitted requirement",
+            code="portfolio_requirement_missing",
+        )
+    expected = requirements[0].content.expected
+    output = read_text("answer.txt").strip()
+    verification = run(
+        ["python3", "verify_candidate.py"],
+        cwd="/app",
+        timeout_ms=10000,
+        max_stdout_bytes=1024,
+        max_stderr_bytes=2048,
+    )
+    passed = verification.ok and output == expected
+    context_write(
+        "candidate.verification",
+        "evidence",
+        {
+            "strategy": session.input.strategy,
+            "output": output,
+            "expected": expected,
+            "passed": passed,
+            "exit_code": verification.exit_code,
+        },
+        status="verified" if passed else "contradicted",
+        evidence=["portfolio:shared-verifier"],
+    )
+    candidate["strategy"] = session.input.strategy
+    candidate["candidate_output"] = output
+    candidate["passed"] = passed
+    candidate["verification_exit_code"] = verification.exit_code
+    return candidate
+
+
+def portfolio_worker(input):
+    prepared = portfolio_materialize_strategy(input.strategy)
+    marker = read_text("shared-prefix.txt").strip()
+    session = agent_session()
+    options = standard_agent_options(session.input)
+    result = standard_agent_control(
+        session,
+        options,
+        portfolio_read_only_dispatch,
+        portfolio_verify_finish,
+        standard_record_progress,
+    )
+    memory_keys = map(lambda item: item.key, context_read(limit=16))
+    return {
+        "strategy": input.strategy,
+        "prepared_output": prepared,
+        "shared_prefix": marker,
+        "legacy_policy_in_input": (
+            "initial_action_memory_required_keys" in keys(input)
+        ),
+        "session_context_prompt_view": session.context_prompt_view,
+        "post_fork_parent_key_seen": (
+            PORTFOLIO_LATE_PARENT_KEY in memory_keys
+        ),
+        "memory_keys": memory_keys,
+        "agent_result": result,
+    }
+
+
+def portfolio_trace_ops(inspection):
+    return map(lambda event: get(event, "op", ""), inspection.trace)
+
+
+def portfolio_parent(input):
+    if len(input.strategies) != 2:
+        fail(
+            "portfolio example requires exactly two strategies",
+            code="portfolio_bad_strategy_count",
+        )
+    root = attempt_info()
+
+    # This is the expensive/common prefix. None of these files exist in the
+    # canonical generation used by an ordinary spawn.
+    write_text("problem.txt", input.problem + "\n")
+    write_text("shared-prefix.txt", input.frontier_marker + "\n")
+    write_text(
+        "verify_candidate.py",
+        (
+            "from pathlib import Path\n"
+            "problem = Path('/app/problem.txt').read_text().strip()\n"
+            "answer = Path('/app/answer.txt').read_text().strip()\n"
+            "raise SystemExit(0 if answer == problem[::-1] else 1)\n"
+        ),
+    )
+    context_write(
+        PORTFOLIO_REQUIREMENT_KEY,
+        "requirement",
+        {
+            "expected": input.expected,
+            "contract": "answer must equal the reverse of problem.txt",
+        },
+        status="verified",
+        evidence=["portfolio:parent-frontier"],
+    )
+
+    # Negative baseline: lifecycle parentage is supervision, not inheritance.
+    baseline_scope = attempt_scope(join_timeout_ms=60000)
+    baseline = attempt_spawn(
+        task=root.task + "-spawn-baseline",
+        workspace=root.workspace,
+        parent_attempt=root.attempt,
+        program=current_program(),
+        entrypoint="portfolio_spawn_probe",
+        task_input={"probe": "lifecycle-parent-only"},
+        start=True,
+        scope=baseline_scope,
+    )
+    baseline_outcome = attempt_join(baseline, timeout_ms=60000)
+    if (
+        not baseline_outcome.joined
+        or baseline_outcome.result.status != "succeeded"
+    ):
+        fail(
+            "spawn baseline did not complete",
+            code="portfolio_spawn_baseline_failed",
+            detail=baseline_outcome,
+        )
+    baseline_result = baseline_outcome.result.value
+    if (
+        baseline_result.problem_seen
+        or baseline_result.verifier_seen
+        or baseline_result.marker_seen
+        or baseline_result.memory_seen
+    ):
+        fail(
+            "lifecycle-parented spawn unexpectedly inherited fork state",
+            code="portfolio_spawn_inherited_state",
+            detail=baseline_result,
+        )
+    attempt_discard(
+        baseline,
+        reason="portfolio spawn baseline complete",
+    )
+    baseline_cleanup = attempt_scope_close(baseline_scope)
+    if not baseline_cleanup.clean:
+        fail(
+            "spawn baseline scope did not close cleanly",
+            code="portfolio_spawn_cleanup_failed",
+            detail=baseline_cleanup,
+        )
+
+    scope = attempt_scope(join_timeout_ms=60000)
+    children = []
+    for strategy in input.strategies:
+        children.append(attempt_fork(
+            program=current_program(),
+            entrypoint="portfolio_worker",
+            input={
+                "strategy": strategy,
+                "action_memory_projection_tokens": 192,
+                "max_turns": input.max_turns,
+                "completion_critique": False,
+                "proactive_completion_checkpoint": False,
+            },
+            context_prompt_view={
+                "required_keys": [PORTFOLIO_REQUIREMENT_KEY],
+            },
+            start=True,
+            scope=scope,
+        ))
+
+    # Both forks are sealed before this write, so neither child may observe it.
+    context_write(
+        PORTFOLIO_LATE_PARENT_KEY,
+        "fact",
+        {"value": "parent-only"},
+        status="verified",
+        evidence=["portfolio:post-fork"],
+    )
+
+    joined = attempt_wait_all(scope, timeout_ms=60000)
+    if not joined.completed or len(joined.outcomes) != 2:
+        fail(
+            "portfolio children did not complete",
+            code="portfolio_join_failed",
+            detail=joined,
+        )
+
+    winner = None
+    loser = None
+    child_results = []
+    pre_inspections = []
+    for outcome in joined.outcomes:
+        if outcome.result.status != "succeeded":
+            fail(
+                "portfolio child controller failed",
+                code="portfolio_child_failed",
+                detail=outcome,
+            )
+        child = outcome.result.value
+        inspection = attempt_inspect(
+            outcome.attempt,
+            include_details=True,
+            trace_limit=64,
+            max_bytes=65536,
+        )
+        trace_ops = portfolio_trace_ops(inspection)
+        child_results.append({
+            "attempt": outcome.attempt,
+            "strategy": child.strategy,
+            "result": child,
+            "fork_memory_ref": outcome.record.fork_origin.memory_ref,
+            "fork_memory_revision": outcome.record.fork_origin.memory_revision,
+        })
+        pre_inspections.append({
+            "attempt": outcome.attempt,
+            "strategy": child.strategy,
+            "resource_state": inspection.resource_state,
+            "resources_reclaimed": inspection.resources_reclaimed,
+            "trace_ops": trace_ops,
+            "summary_passed": inspection.summary.agent_result.passed,
+        })
+        if child.agent_result.passed:
+            if winner != None:
+                fail(
+                    "portfolio produced multiple verified winners",
+                    code="portfolio_ambiguous_winner",
+                )
+            winner = outcome
+        else:
+            loser = outcome
+    if winner == None or loser == None:
+        fail(
+            "portfolio did not produce one winner and one loser",
+            code="portfolio_no_unique_winner",
+            detail=child_results,
+        )
+
+    accepted = attempt_accept(root.attempt, winner)
+    attempt_discard(loser, reason="portfolio losing candidate")
+
+    winner_post = attempt_inspect(
+        winner.attempt,
+        include_details=False,
+        trace_limit=8,
+    )
+    loser_post = attempt_inspect(
+        loser.attempt,
+        include_details=False,
+        trace_limit=8,
+    )
+    cleanup = attempt_scope_close(scope)
+    if not cleanup.clean:
+        fail(
+            "portfolio scope did not close cleanly",
+            code="portfolio_cleanup_failed",
+            detail=cleanup,
+        )
+
+    answer = read_text("answer.txt").strip()
+    if answer != input.expected:
+        fail(
+            "accepted portfolio candidate has the wrong answer",
+            code="portfolio_accept_failed",
+            detail={"expected": input.expected, "actual": answer},
+        )
+    parent_keys = map(lambda item: item.key, context_read(limit=16))
+    if parent_keys != [
+        PORTFOLIO_LATE_PARENT_KEY,
+        PORTFOLIO_REQUIREMENT_KEY,
+    ]:
+        fail(
+            "child memory leaked into portfolio parent",
+            code="portfolio_memory_leak",
+            detail=parent_keys,
+        )
+
+    return {
+        "answer": answer,
+        "winner": winner.attempt,
+        "loser": loser.attempt,
+        "winner_strategy": winner.result.value.strategy,
+        "loser_strategy": loser.result.value.strategy,
+        "accepted": accepted.child.attempt,
+        "baseline_attempt": baseline.attempt,
+        "baseline_result": baseline_result,
+        "baseline_clean": baseline_cleanup.clean,
+        "child_results": child_results,
+        "pre_inspections": pre_inspections,
+        "post_cleanup": {
+            "winner_resource_state": winner_post.resource_state,
+            "winner_resources_reclaimed": winner_post.resources_reclaimed,
+            "loser_resource_state": loser_post.resource_state,
+            "loser_resources_reclaimed": loser_post.resources_reclaimed,
+        },
+        "parent_keys": parent_keys,
+        "parent_memory_revision": attempt_info().memory_revision,
+        "clean": cleanup.clean,
+    }
+
+
+# Compatibility controller dispatch until the local Stone provider invokes the
+# recorded entrypoint directly. Keeping the dispatch visible also makes the
+# admitted source runnable through the current Gateway controller.
+portfolio_control = attempt_info()
+portfolio_entrypoint = get(
+    portfolio_control.metadata,
+    "program_entrypoint",
+    "portfolio_parent",
+)
+if portfolio_entrypoint == "portfolio_worker":
+    portfolio_result = portfolio_worker(task_input())
+elif portfolio_entrypoint == "portfolio_spawn_probe":
+    portfolio_result = portfolio_spawn_probe(task_input())
+else:
+    portfolio_result = portfolio_parent(task_input())
+attempt_report(
+    status="succeeded",
+    result=portfolio_result,
+    metadata={"control": "standard_fork_portfolio_v1"},
+)
+emit(portfolio_result)

@@ -764,9 +764,11 @@ acceptance decision.
 At the Stone surface, `attempt_fork` means “continue from exactly here in an
 isolated child.” Waymark asks Gateway to create one coherent current-parent
 frontier, then starts a named child entrypoint against that state. The parent
-continues after the call. The child shares the immutable past, receives private
-writable workspace/context tails, and cannot affect the parent until explicit
-acceptance.
+continues after the call. The child receives the bounded parent memory snapshot
+at the typed `child.fork_origin.memory_revision`, then parent and child ledgers
+diverge under separate `memory_ref` values. Accept imports workspace state but
+does not merge child memory; parent Stone policy promotes selected facts with
+an explicit `context_write`.
 
 `attempt_spawn` instead constructs a child from explicit resource sources. A
 spawned child can have a lifecycle parent without being a state continuation of
@@ -780,6 +782,7 @@ The target LLM-friendly form is:
 child = attempt_fork(
     entrypoint="worker",
     input={"strategy": "alternate"},
+    context_prompt_view={"required_keys": ["requirement.target"]},
     budget={"model_calls": 4, "wall_time_ms": 120000},
     scope=scope,
 )
@@ -790,6 +793,10 @@ child by default and registers it with the current structured-concurrency
 scope. The raw syscall retains create-without-start for supervisors. Arbitrary
 workspace/context source selection, host provider identities, and credentials
 are not fork arguments.
+
+The required-key subset of `context_prompt_view` is implemented now. It is
+persisted as child admission state and exposed through
+`agent_session().context_prompt_view`; it does not carry rendered prompt bytes.
 
 Fork does not clone the live Stone stack, a model invocation, or an in-flight
 Linux RPC. V1 requires the parent's provider operations to be idle and starts
@@ -1027,7 +1034,8 @@ The M2.5 implementation now establishes the control and supervision seams:
   deterministic trace conformance test;
 - Stone exposes `agent_session()` plus `help("agent_control")`, so an ordinary
   `def control(session)` receives structured task, input, current attempt,
-  limits, and discoverable resource-tool families.
+  typed context-prompt admission view, limits, and discoverable resource-tool
+  families.
 - `react_control(...)` and `scripted_control(...)` construct opaque,
   task-owned `agent_control` values inside Stone. They are ordinary callables,
   survive warm evaluations, and can be captured and delegated to by Stone
@@ -1071,6 +1079,16 @@ The M2.5 implementation now establishes the control and supervision seams:
   snapshots. The outcome keeps compatibility fields and separates execution,
   reported result, evaluation, selection, and cleanup views; unavailable phases
   are explicit (`not_evaluated`, `pending`) rather than inferred as success.
+  Terminal wait/join snapshots parse the child's compact returned value into
+  `outcome.result.value` or `outcome.result.error`. Ordinary info/list records
+  omit report bodies, so comparison is explicit without making every lifecycle
+  observation carry child payloads.
+- `attempt_inspect(child, include_details=False, trace_limit=20,
+  max_bytes=32768)` is the bounded drill-down path. It returns the compact
+  summary, optional archived controller envelope, a relevant trace tail, and
+  live controller/operation/run state. Accept/discard close the child
+  transaction and reclaim execution resources; report sidecars and trace
+  remain inspectable afterward.
 - `attempt_wait_any` and `attempt_wait_all` use the Gateway
   `AttemptWaitSet` syscall. The Gateway observes all controller processes as
   one wait set, so Stone does not implement biased sequential polling.
@@ -1078,21 +1096,44 @@ The M2.5 implementation now establishes the control and supervision seams:
   admitted module forks two named workers, passes the winning typed outcome
   through an ordinary Stone function, accepts it, waits for and discards the
   remaining child, and closes the supervision scope.
+- named Stone functions are now first-class callable values, so adapter
+  arguments can use `dispatch_action` directly rather than requiring a lambda
+  wrapper;
+- `examples/scripts/standard_attempt_agent.stone` is the first ordinary-source
+  control library. Its `standard_agent_control(...)` loop composes typed
+  inference with replaceable dispatch, verification, and progress adapters,
+  bounded observations/history/resources, recoverable tool errors, same-key
+  memory, and compact result provenance.
+- `examples/references/standard_attempt_fork_portfolio.stone` composes that
+  library into a complete parent/child portfolio: negative spawn baseline,
+  two typed-view forks, retained child inspection, deterministic selection,
+  accept/discard, and post-cleanup reclamation checks.
 
 This closes the native-to-Stone invocation seam. Forked named entrypoints now
-also receive structured per-fork input through ordinary `input=...` syntax. It
-does not yet provide the standard Stone adapter library (`with_tools`,
-`with_context`, budgets, retry, verification, and event hooks),
-verifier-populated evaluation outcomes, or aggregate budget/event views.
-Those are the remaining M2.5 composition and attempt-tree ergonomics, rather
-than another agent execution representation.
+also receive structured per-fork input through ordinary `input=...` syntax.
+The first visible agent-control library covers the common single-attempt
+decision loop, but Stone does not yet provide compositional wrappers such as
+`with_tools`, `with_context`, aggregate budgets, critic/fallback policy, or
+event hooks. Verifier-populated evaluation outcomes and aggregate
+budget/event views also remain. Those are the remaining M2.5 composition and
+attempt-tree ergonomics, rather than another agent execution representation.
 
 ### M3: Typed Inference
 
-1. Add JSON Schema validation to the Waymark runtime.
-2. Add `model_infer` with explicit bounded repair.
-3. Extend Gateway structured-output mapping where providers support it.
-4. Record aggregate usage and validation failures.
+Implemented:
+
+1. Waymark validates a strict, documented JSON Schema subset before and after
+   the model effect.
+2. `model_infer` provides explicit repair with at most four retries; each
+   attempt is an ordinary traced `model_call` transition.
+3. Successful inference returns aggregate usage and bounded validation
+   failures; exhausted inference includes the same bounded summary in its
+   structured error while per-call accounting remains in Gateway trace.
+
+Remaining: map the canonical schema to provider-native structured output where
+supported. The portable path currently injects the schema into visible
+messages, requests JSON-object output, and relies on independent runtime
+validation for authority.
 
 Exit criterion: malformed outputs never enter Stone control as typed values;
 repair behavior and cost are fully visible.
@@ -1219,15 +1260,70 @@ helps agent computer use. A successful Stone ReAct demo alone does not.
 M1 and the M2 mechanism gate are complete. The evidence and remaining claim
 boundary are recorded in `STONE_AGENT_AUTHORSHIP_M2_PILOT.md`.
 
-Continue M2.5 before another broad Terminal-Bench comparison. The shared
-`AgentControl` contract and first-class optimized Stone controls now establish
-the invocation seam, and task-owned scopes now provide bounded automatic child
-cleanup, and current-module named entrypoints remove escaped child source.
-Typed attempt handles, structured outcome snapshots, and Gateway wait sets now
-cover the basic process-tree control path. Next expose ordinary control
-adapters, verifier-populated evaluation outcomes, and
-aggregate budget/event views. Compatibility ids remain accepted at syscall
-boundaries, but new Stone control should retain handles. After deterministic fixtures, run validation plan C
-followed by untouched, historically unresolved Terminal-Bench tasks. Do not treat the
-deterministic mechanism cohort as validation of the broader attempt-first OS
-hypothesis.
+The compact standard visible control now passes the three deterministic and
+real-model action baselines with the exact ten-call trajectory, including
+failed-tool recovery. Its result/progress/trace split is sound, and separating
+the compact model-facing contract from the complete runtime validation schema
+reduced real-model input below the smaller typed loop. Terra and Luna also
+authored and executed named verifier specializations from the compact adapter
+contract. The first Terra probe exposed one learnability gap—record mutation
+requires item rather than attribute assignment—which the bounded language
+guide now states explicitly.
+
+A subsequent simple repository task provides the first causal task-policy
+evidence: a Terra-authored verifier plus a real Terra inner loop produced exact
+externally checked workspace bytes, while the same admitted verifier rejected
+a plausible wrong-output fixture with its declared verification error. Both
+paths preserved the expected trace, bounded same-key progress, and rollback.
+
+The executable-verifier gate now passes too. Terra authored a bounded visible
+test adapter without access to the repository, answer, or hidden tests. A real
+Terra inner attempt passed that test and an independent host-owned verifier in
+a rolled-back checkpoint branch. A wrong implementation was rejected by both
+layers. This establishes the intended feedback/authority boundary on one
+constructed task, not broad task competence.
+
+The first generic-control TBv2.1 engineering cell now passes as well. The
+unchanged standard Stone source solved untouched `portfolio-optimization` in
+eight decisions and earned official Harbor reward `1.0`. The source was not
+task-specialized and used no forks. Exact source/admission hashes, guarded
+binary publication, official-verifier handoff, bounded progress memory, and
+clean lifecycle closure all passed. Earlier same-task cells informed generic
+harness fixes, so this is mechanism evidence rather than an unbiased causal
+comparison.
+
+An exact-source cross-task replication on untouched `mcmc-sampling-stan` was
+conformant but earned reward `0.0`. It passed the two numerical-result checks
+but failed RStan installation and end-to-end sampling. The controller retained
+only one same-key progress/counter item and accepted a non-empty finish claim;
+it had no structured public-requirement ledger, per-requirement evidence, or
+independent completion critique. This separates clean mechanism delivery from
+task-policy adequacy.
+
+Standard control V1 now implements that next slice. It retains one bounded
+public-task requirement, a fixed evidence ring, a same-key semantic audit, and
+a fresh completion critique that may veto finish and return a repair
+objective. It receives only public requirements and recorded visible evidence,
+never hidden verifier content, and the total model-call budget reserves room
+for it.
+
+Three deterministic Gateway/LibOS cells provide causal mechanism evidence. A
+premature finish caused one missing read in the no-critic ablation; treatment
+rejected it, induced the read, and then approved. A claimed approval containing
+an unsupported requirement was also normalized to rejection. Every cell
+rolled back and treatment retained five latest-state memory items. See
+`STONE_STANDARD_AGENT_COMPLETION_CRITIQUE_EXPERIMENT.md`.
+
+The small real-model comparison now passes as well. Terra rejected missing
+read-back evidence, approved complete write/read evidence, and rejected a
+failed RStan execution with a concrete dependency/run repair objective. Each
+case used one model call and at most four retained memory items. The first
+failed-execution probe also found a protocol integration bug—failed evidence
+must use status `contradicted`, not `rejected`—which is fixed and source-tested.
+See `STONE_STANDARD_COMPLETION_CRITIC_QUALITY_EXPERIMENT.md`.
+
+Continue M2.5 by freezing this corrected V1 treatment for a new untouched task,
+then add verifier-populated outcomes and aggregate budget/event views.
+Compatibility ids remain accepted at syscall boundaries, but new Stone
+control should retain handles. Do not treat the mechanism, specialization, or
+single-task cells as validation of the broader attempt-first OS hypothesis.

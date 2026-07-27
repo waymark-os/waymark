@@ -1,0 +1,16 @@
+# Minimal @stage lowering and evidence-gated repair canary.
+def repair_output(step):
+    return run(["sh", "-c", "printf ready > artifact.txt"])
+
+
+@stage(
+    evidence=file_nonempty("artifact.txt"),
+    repair=repair_output,
+    max_attempts=1,
+)
+def artifact(step):
+    return run(["sh", "-c", "exit 7"])
+
+
+report = workflow_run(workflow("build-artifact", artifact))
+emit(report)

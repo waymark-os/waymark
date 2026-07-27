@@ -70,6 +70,16 @@ impl AttemptOutcomeValue {
                 span,
             ),
         );
+        result.push(
+            "value",
+            attempt_record_field(&self.record, "reported_result")
+                .unwrap_or_else(|| Value::nothing(span)),
+        );
+        result.push(
+            "error",
+            attempt_record_field(&self.record, "reported_error")
+                .unwrap_or_else(|| Value::nothing(span)),
+        );
         outcome.push("result", Value::record(result, span));
 
         let mut evaluation = Record::new();
@@ -108,6 +118,13 @@ impl AttemptOutcomeValue {
         }
         record_attribute(&self.materialize(), attr, "attempt_outcome")
     }
+}
+
+fn attempt_record_field(value: &Value, key: &str) -> Option<Value> {
+    let Value::Record { val, .. } = value else {
+        return None;
+    };
+    val.get(key).cloned()
 }
 
 fn attempt_metadata_string(value: &Value, key: &str) -> Option<String> {

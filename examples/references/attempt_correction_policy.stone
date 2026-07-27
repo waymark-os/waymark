@@ -1,0 +1,219 @@
+# Bounded controller policy for recovering one model-authored Stone action.
+#
+# Load these functions in the controller's warm Stone session. After a failed
+# stone_eval, call:
+#
+#   recovery = prepare_stone_recovery(failed_source, last_result())
+#
+# Evaluate recovery.preview.source only when decision == "retry_once". After
+# that explicit evaluation, close the action-state pair with:
+#
+#   record_stone_recovery_outcome(
+#       recovery.preview.source_sha256,
+#       last_result(),
+#   )
+#
+# The ledger stores only hashes, decisions, and compact outcomes. Raw source,
+# errors, and transcripts stay in trace/cold storage.
+
+STONE_RECOVERY_KEY = "recovery.stone"
+STONE_RECOVERY_MAX_ATTEMPTS = 4
+
+
+def stone_recovery_ledger():
+    items = context_read(keys=[STONE_RECOVERY_KEY], limit=1)
+    if len(items) == 0:
+        return {
+            "version": 1,
+            "attempts_used": 0,
+            "entries": [],
+            "last_decision": None,
+        }
+    content = get(items[0], "content", {})
+    entries = get(content, "entries", [])
+    # Defend against an older or hand-written oversized value. The context
+    # store has its own byte bound; this policy also keeps the hot view small.
+    entries = entries[-STONE_RECOVERY_MAX_ATTEMPTS:]
+    return {
+        "version": 1,
+        "attempts_used": len(entries),
+        "entries": entries,
+        "last_decision": get(content, "last_decision", None),
+    }
+
+
+def write_stone_recovery_ledger(entries, decision):
+    bounded_entries = entries[-STONE_RECOVERY_MAX_ATTEMPTS:]
+    content = {
+        "version": 1,
+        "attempts_used": len(bounded_entries),
+        "max_attempts": STONE_RECOVERY_MAX_ATTEMPTS,
+        "entries": bounded_entries,
+        "last_decision": decision,
+    }
+    context_write(
+        STONE_RECOVERY_KEY,
+        "recovery",
+        content,
+        evidence=["controller:stone-correction"],
+    )
+    return content
+
+
+def reject_stone_recovery(entries, source_sha256, pair_key, reason):
+    decision = {
+        "decision": "replan",
+        "reason": reason,
+        "source_sha256": source_sha256,
+        "pair_key": pair_key,
+    }
+    ledger = write_stone_recovery_ledger(entries, decision)
+    return {
+        "decision": "replan",
+        "reason": reason,
+        "pair_key": pair_key,
+        "attempts_used": ledger["attempts_used"],
+        "attempts_remaining": STONE_RECOVERY_MAX_ATTEMPTS - ledger["attempts_used"],
+    }
+
+
+def prepare_stone_recovery(source, failure):
+    ledger = stone_recovery_ledger()
+    entries = ledger["entries"]
+    error = get(failure, "error", {})
+    correction = get(error, "correction", {})
+    source_sha256 = get(correction, "source_sha256", sha256(source))
+    candidates = get(correction, "candidates", [])
+    pair_key = source_sha256 + ":none"
+
+    # Mechanical replay is deliberately narrower than correction_apply().
+    # A controller may still edit or reject every other suggestion.
+    if get(correction, "execution_state", "") != "not_started":
+        return reject_stone_recovery(
+            entries, source_sha256, pair_key, "execution_may_have_started"
+        )
+    if get(correction, "safety", "") != "suggest_only":
+        return reject_stone_recovery(
+            entries, source_sha256, pair_key, "semantic_repair_required"
+        )
+    if get(correction, "retry", "") != "explicit_only":
+        return reject_stone_recovery(
+            entries, source_sha256, pair_key, "unsupported_retry_contract"
+        )
+    if get(correction, "auto_apply", True):
+        return reject_stone_recovery(
+            entries, source_sha256, pair_key, "unexpected_auto_apply"
+        )
+    if get(correction, "class", "") not in ["name", "keyword"]:
+        return reject_stone_recovery(
+            entries, source_sha256, pair_key, "local_edit_not_replayable"
+        )
+    if len(candidates) != 1:
+        return reject_stone_recovery(
+            entries, source_sha256, pair_key, "candidate_not_unique"
+        )
+
+    candidate = candidates[0]
+    replacement = get(candidate, "replacement", "")
+    pair_key = source_sha256 + ":" + replacement
+    if get(candidate, "confidence", "") != "high" or "edit" not in candidate:
+        return reject_stone_recovery(
+            entries, source_sha256, pair_key, "candidate_not_high_confidence"
+        )
+    if any(get(entry, "pair_key", "") == pair_key for entry in entries):
+        return reject_stone_recovery(
+            entries, source_sha256, pair_key, "source_candidate_already_tried"
+        )
+    if len(entries) >= STONE_RECOVERY_MAX_ATTEMPTS:
+        return reject_stone_recovery(
+            entries, source_sha256, pair_key, "attempt_budget_exhausted"
+        )
+
+    # This validates the source digest and exact byte edit but does not execute.
+    preview = correction_apply(source, correction)
+    corrected_sha256 = preview["source_sha256"]
+    if any(
+        get(entry, "source_sha256", "") == corrected_sha256
+        or get(entry, "corrected_source_sha256", "") == corrected_sha256
+        for entry in entries
+    ):
+        return reject_stone_recovery(
+            entries, source_sha256, pair_key, "correction_cycle"
+        )
+
+    entry = {
+        "pair_key": pair_key,
+        "source_sha256": source_sha256,
+        "corrected_source_sha256": corrected_sha256,
+        "class": get(correction, "class", ""),
+        "replacement": replacement,
+        "decision": "retry_once",
+        "outcome": "pending",
+    }
+    next_entries = entries + [entry]
+    decision = {
+        "decision": "retry_once",
+        "reason": "safe_pre_effect_edit",
+        "source_sha256": source_sha256,
+        "corrected_source_sha256": corrected_sha256,
+        "pair_key": pair_key,
+    }
+    next_ledger = write_stone_recovery_ledger(next_entries, decision)
+    return {
+        "decision": "retry_once",
+        "reason": "safe_pre_effect_edit",
+        "pair_key": pair_key,
+        "attempts_used": next_ledger["attempts_used"],
+        "attempts_remaining": STONE_RECOVERY_MAX_ATTEMPTS
+        - next_ledger["attempts_used"],
+        "preview": preview,
+    }
+
+
+def record_stone_recovery_outcome(corrected_source_sha256, outcome):
+    ledger = stone_recovery_ledger()
+    next_entries = []
+    recorded = False
+    outcome_ok = get(outcome, "ok", False)
+    outcome_error = get(outcome, "error", {})
+    for entry in ledger["entries"]:
+        if (
+            not recorded
+            and get(entry, "corrected_source_sha256", "")
+            == corrected_source_sha256
+            and get(entry, "outcome", "") == "pending"
+        ):
+            next_entries.append({
+                "pair_key": entry["pair_key"],
+                "source_sha256": entry["source_sha256"],
+                "corrected_source_sha256": entry["corrected_source_sha256"],
+                "class": entry["class"],
+                "replacement": entry["replacement"],
+                "decision": entry["decision"],
+                "outcome": "succeeded" if outcome_ok else "failed",
+                "outcome_code": "" if outcome_ok else get(
+                    outcome_error, "code", "unknown_error"
+                ),
+            })
+            recorded = True
+        else:
+            next_entries.append(entry)
+
+    if not recorded:
+        return {
+            "recorded": False,
+            "reason": "pending_recovery_not_found",
+            "corrected_source_sha256": corrected_source_sha256,
+        }
+
+    decision = {
+        "decision": "outcome",
+        "corrected_source_sha256": corrected_source_sha256,
+        "outcome": "succeeded" if outcome_ok else "failed",
+    }
+    next_ledger = write_stone_recovery_ledger(next_entries, decision)
+    return {
+        "recorded": True,
+        "outcome": decision["outcome"],
+        "attempts_used": next_ledger["attempts_used"],
+    }

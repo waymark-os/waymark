@@ -681,6 +681,7 @@ fn classify_guest_error(response: &JsonValue) -> &'static str {
         Some("task_failure") => "task_failure",
         Some("stone_parse_error") => "stone_parse_error",
         Some("stone_script_unsupported") => "stone_lower_error",
+        Some("stone_admission_error") => "stone_admission_error",
         Some("stone_script_error") => "stone_eval_error",
         Some("parse_error") => "stone_parse_error",
         Some("io_error") => "command_error",
@@ -1327,9 +1328,24 @@ mod tests {
     }
 
     #[test]
+    fn classifies_stone_admission_error() {
+        let root = temp_dir("admission-failure");
+        let task_path = task_with_source(&root, "admission-failure", "missing()");
+
+        let mut guest = StoneGuest::new(root.clone()).expect("guest");
+        let response = guest.task_response_from_path(&task_path);
+
+        assert_eq!(response["ok"], json!(false));
+        assert_eq!(response["kind"], json!("stone_admission_error"));
+        assert_eq!(response["error"]["code"], json!("stone_admission_error"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn classifies_stone_eval_error() {
         let root = temp_dir("eval-failure");
-        let task_path = task_with_source(&root, "eval-failure", "missing()");
+        let task_path = task_with_source(&root, "eval-failure", "emit(1 / 0)");
 
         let mut guest = StoneGuest::new(root.clone()).expect("guest");
         let response = guest.task_response_from_path(&task_path);

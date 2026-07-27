@@ -190,6 +190,52 @@ def run_smoke(args: argparse.Namespace, app_dir: Path, work_dir: Path) -> dict[s
         if reuse_result.get("value") != {"n": 4, "v": 5}:
             raise RuntimeError(f"stone_eval session reuse returned unexpected value: {reuse_result!r}")
 
+        failed_source = "context_projet()"
+        failed_result = client.call_tool("stone_eval", {"source": failed_source})
+        correction = failed_result.get("error", {}).get("correction")
+        if failed_result.get("ok") is not False or not isinstance(correction, dict):
+            raise RuntimeError(
+                f"stone_eval did not return a structured correction: {failed_result!r}"
+            )
+        if correction.get("execution_state") != "not_started":
+            raise RuntimeError(
+                f"Stone did not classify admission as pre-effect: {failed_result!r}"
+            )
+        remembered_result = client.call_tool(
+            "stone_call", {"name": "last_result", "args": []}
+        )
+        require_ok("last_result after correction", remembered_result)
+        remembered_correction = (
+            remembered_result.get("value", {}).get("error", {}).get("correction")
+        )
+        if remembered_correction != correction:
+            raise RuntimeError(
+                f"last_result did not preserve the correction: {remembered_result!r}"
+            )
+        correction_result = client.call_tool(
+            "stone_call",
+            {
+                "name": "correction_apply",
+                "args": {
+                    "source": failed_source,
+                    "correction": remembered_correction,
+                },
+            },
+        )
+        require_ok("correction_apply", correction_result)
+        correction_preview = correction_result.get("value", {})
+        if (
+            correction_preview.get("source") != "context_project()"
+            or correction_preview.get("executed") is not False
+        ):
+            raise RuntimeError(
+                f"correction_apply returned an unexpected preview: {correction_result!r}"
+            )
+        corrected_result = client.call_tool(
+            "stone_eval", {"source": correction_preview["source"]}
+        )
+        require_ok("corrected stone_eval", corrected_result)
+
         call_result = client.call_tool(
             "stone_call",
             {"name": "read_json", "args": {"path": "package.json"}, "cwd": str(app_dir)},
@@ -227,6 +273,10 @@ def run_smoke(args: argparse.Namespace, app_dir: Path, work_dir: Path) -> dict[s
                 "session_reuse": reuse_result.get("value"),
             },
             "stone_call": {"value": call_result.get("value"), "effects": call_result.get("effects")},
+            "correction": {
+                "source": correction_preview.get("source"),
+                "executed": correction_preview.get("executed"),
+            },
             "stone_describe": {"kind": describe_result.get("value", {}).get("kind")},
             "escape_linux": {"gap": escape_result.get("gap")},
         }

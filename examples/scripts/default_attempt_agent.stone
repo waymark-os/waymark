@@ -1,0 +1,212 @@
+# Default attempt-oriented Stone agent loop.
+#
+# This is executable policy, not a hidden runtime loop. Copy it when an attempt
+# needs a conventional model -> action -> outcome cycle, then customize the
+# extension seams marked below. Gateway still owns capabilities, transactions,
+# credentials, attempt lifecycle, and memory bounds.
+
+
+# EXTENSION SEAM 1: memory projection policy.
+# Narrow `focus` or change the user-facing label for a task-specific agent.
+# Keep projection bounded and attached only to this model transition.
+def prepare_decision(step):
+    projection = context_project(
+        focus="current objective, requirements, latest decision, latest tool outcome, blockers",
+        max_tokens=256,
+    )
+    memory_message = {
+        "role": "user",
+        "content": "Active attempt memory:\n" + projection.text,
+    }
+    messages = step.input.messages
+    # Keep the caller's newest observation/instruction last. Appending memory
+    # after it can make retrieved evidence override the action requested for
+    # this particular transition.
+    if len(messages) == 0:
+        return {"messages": [memory_message]}
+    return {
+        "messages": messages[:-1] + [memory_message] + messages[-1:]
+    }
+
+
+# Record every completed decision under one current-state key. Same-key writes
+# replace the hot payload; revision history remains in Gateway trace.
+def record_decision(step):
+    if step.outcome.ok:
+        decision = json_loads(step.outcome.value.content)
+        content = {
+            "ok": True,
+            "transition_id": step.transition_id,
+            "decision": decision,
+        }
+    else:
+        content = {
+            "ok": False,
+            "transition_id": step.transition_id,
+            "error": step.outcome.error,
+        }
+    return context_write(
+        "decision.last",
+        "decision",
+        content,
+        evidence=["transition:" + step.transition_id],
+    )
+
+
+# EXTENSION SEAM 2: action policy.
+# Add task-specific allowlists or argument normalization here. Returning a
+# narrow patch or denial affects this action pair only; Gateway policy remains
+# authoritative afterward.
+def check_action(step):
+    if len(step.input.argv) == 0:
+        return {"allow": False, "reason": "empty action argv"}
+    return None
+
+
+# Retain failed runs as well as successful ones. For a completed nonzero
+# process, step.outcome.ok is False but step.outcome.value is still the run
+# record. This is intentionally not guarded by `if step.outcome.ok`.
+def record_outcome(step):
+    result = get(step.outcome, "value", None)
+    content = {
+        "ok": step.outcome.ok,
+        "transition_id": step.transition_id,
+        "argv": step.input.argv,
+    }
+    if result == None:
+        content["error"] = step.outcome.error
+    else:
+        content["exit_code"] = result.exit_code
+        content["stdout"] = result.stdout
+        content["stderr"] = result.stderr
+    return context_write(
+        "outcome.last_tool",
+        "outcome",
+        content,
+        evidence=["transition:" + step.transition_id],
+    )
+
+
+# EXTENSION SEAM 3: finish verification.
+# Replace this minimal check with workspace/verifier evidence for real tasks.
+def verify_finish(action):
+    answer = get(action, "answer", "")
+    if len(answer) == 0:
+        fail("finish requires a non-empty answer", code="agent_invalid_finish")
+    return answer
+
+
+def default_agent_loop(session, max_turns=6):
+    objective = session.task.objective
+    lifecycle = session.attempt
+
+    # Seed stable task state once. A restarted controller reads the same
+    # Gateway-owned ledger and does not create another objective revision.
+    objective_memory = context_read(keys=["requirement.objective"], limit=1)
+    if len(objective_memory) == 0:
+        context_write(
+            "requirement.objective",
+            "requirement",
+            {"objective": objective},
+            status="verified",
+            evidence=["task:" + session.task.id],
+        )
+
+    messages = [
+        {
+            "role": "system",
+            "content": "Act on the task using visible evidence. Return exactly one JSON object: either {\"kind\":\"run\",\"argv\":[...]} or {\"kind\":\"finish\",\"answer\":\"...\"}. Do not invent tool outcomes.",
+        },
+        {
+            "role": "user",
+            "content": "Objective: " + objective + "\nController phase: " + lifecycle.controller_phase + " (run " + str(lifecycle.controller_run_count) + ")",
+        },
+    ]
+
+# EXTENSION SEAM 4: budgets and stopping policy.
+# Keep this loop bounded. Raise/lower max_turns through the caller rather
+# than adding an implicit retry loop inside model_call or run.
+#
+# This loop does not evaluate model-authored Stone source. A controller that
+# exposes stone_eval as an action should wrap that individual action-state pair
+# with examples/references/attempt_correction_policy.stone. It may replay one
+# pre-effect, high-confidence edit explicitly; it must not restart this whole
+# attempt program or replay a run/model transition after an uncertain effect.
+    for turn in range(max_turns):
+        response = model_call(
+            messages,
+            model_class="agent",
+            max_output_tokens=256,
+            response_format={"type": "json_object"},
+            hooks={"pre": prepare_decision, "post": record_decision},
+        )
+        action = json_loads(response.content)
+        kind = get(action, "kind", "")
+        messages.append({"role": "assistant", "content": response.content})
+
+        if kind == "run":
+            argv = get(action, "argv", [])
+            result = run(
+                argv,
+                timeout_ms=30000,
+                max_stdout_bytes=4096,
+                max_stderr_bytes=4096,
+                hooks={"pre": check_action, "post": record_outcome},
+            )
+            messages.append({
+                "role": "user",
+                "content": json_dumps({
+                    "kind": "tool_outcome",
+                    "ok": result.ok,
+                    "exit_code": result.exit_code,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                }),
+            })
+        elif kind == "finish":
+            answer = verify_finish(action)
+            context_write(
+                "goal.active",
+                "goal",
+                {"answer": answer, "turns": turn + 1},
+                status="verified",
+                evidence=["transition:" + response.transition_id],
+            )
+            ledger = context_read(limit=20)
+            final_context = context_project(
+                focus="final answer, verification, requirements, and latest outcome",
+                max_tokens=256,
+            )
+            return {
+                "answer": answer,
+                "turns": turn + 1,
+                "controller_run_count": lifecycle.controller_run_count,
+                "memory_keys": map(lambda item: item.key, ledger),
+                "final_context": final_context,
+            }
+        else:
+            fail(
+                "unknown model action kind: " + str(kind),
+                code="agent_unknown_action",
+            )
+
+    context_write(
+        "goal.active",
+        "goal",
+        {"status": "blocked", "reason": "turn limit", "max_turns": max_turns},
+        status="blocked",
+    )
+    fail("agent exhausted its turn budget", code="agent_turn_limit")
+
+
+session = agent_session()
+result = default_agent_loop(session, 6)
+
+# Report success so Gateway fences accidental controller restart after a final
+# result. If an outer harness owns result reporting, remove only this call.
+attempt_report(
+    status="succeeded",
+    result=result,
+    metadata={"control": "default_attempt_agent_v0"},
+)
+emit(result)

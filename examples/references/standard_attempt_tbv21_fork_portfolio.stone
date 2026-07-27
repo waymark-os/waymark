@@ -1,0 +1,384 @@
+# Generic forked portfolio for untouched Terminal-Bench tasks.
+#
+# The benchmark driver admits the definitions from standard_attempt_agent.stone
+# followed by this extension as one Stone module. The extension contains no task
+# identity, hidden verifier path, or domain-specific recipe.
+#
+# Control flow:
+#   1. use a small root budget to prepare only reusable setup/diagnosis;
+#   2. fork two standard-agent children from that dirty workspace+memory frontier;
+#   3. let the children pursue distinct generic roles in isolation;
+#   4. compare their bounded reports, accept one workspace, and discard the other.
+
+def portfolio_task_key():
+    return "requirement.portfolio_task"
+
+
+def portfolio_frontier_key():
+    return "progress.portfolio_frontier"
+
+
+def portfolio_selection_key():
+    return "decision.portfolio_selection"
+
+
+def portfolio_selection_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "winner_index": {"type": "integer", "enum": [0, 1]},
+            "publish_ready": {"type": "boolean"},
+            "reason": {"type": "string", "minLength": 1, "maxLength": 1024},
+        },
+        "required": ["winner_index", "publish_ready", "reason"],
+        "additionalProperties": False,
+    }
+
+
+def portfolio_phase_session(session):
+    return {
+        "task": session.task,
+        "input": {
+            "max_turns": 3,
+            "max_rounds": 3,
+            "completion_critique": False,
+            "proactive_completion_checkpoint": False,
+            "report_partial_on_limit": True,
+            "portfolio_phase": (
+                "Prepare a reusable branch frontier only. Inspect the current "
+                "workspace and environment, and perform at most clearly shared "
+                "setup or diagnosis that would benefit multiple plausible "
+                "solutions. Do not start a long final build, training run, or "
+                "other strategy-specific work. Finish once the common frontier "
+                "is useful; a parent controller will fork isolated solvers."
+            ),
+        },
+        "context_prompt_view": get(session, "context_prompt_view", None),
+    }
+
+
+def portfolio_child_input(parent_input, role, role_instruction):
+    child_turns = standard_clamp(
+        get(parent_input, "max_turns", 10),
+        6,
+        16,
+    )
+    child_rounds = standard_clamp(
+        get(parent_input, "max_rounds", child_turns),
+        6,
+        16,
+    )
+    return {
+        "max_turns": child_turns,
+        "max_rounds": child_rounds,
+        "max_messages": 12,
+        "max_action_context_characters": 32768,
+        "action_memory_projection_tokens": 768,
+        "completion_critique": True,
+        "proactive_completion_checkpoint": True,
+        "report_partial_on_limit": True,
+        "portfolio_role": role,
+        "portfolio_instruction": role_instruction,
+        "benchmark": get(parent_input, "benchmark", ""),
+    }
+
+
+def portfolio_worker(input):
+    session = agent_session()
+    options = standard_agent_options(session.input)
+    result = standard_agent_control(
+        session,
+        options,
+        standard_shell_dispatch,
+        standard_verify_finish,
+        standard_record_progress,
+    )
+    result["_portfolio"] = {
+        "role": input.portfolio_role,
+        "instruction": input.portfolio_instruction,
+        "context_prompt_view": get(session, "context_prompt_view", None),
+        "memory_revision": attempt_info().memory_revision,
+    }
+    return result
+
+
+def portfolio_candidate_summary(outcome, role):
+    status = get(outcome.result, "status", "failed")
+    value = get(outcome.result, "value", {})
+    control = get(value, "_control", {})
+    audit = get(value, "_completion_critique", {})
+    reported_complete = get(value, "complete", True) != False
+    ready = (
+        status == "succeeded"
+        and reported_complete
+        and get(audit, "approved", False)
+    )
+    return {
+        "attempt": outcome.attempt,
+        "role": role,
+        "status": status,
+        "ready": ready,
+        "reported_complete": reported_complete,
+        "answer": slice(str(get(value, "answer", "")), 0, 2048),
+        "completion_audit": audit,
+        "control": {
+            "rounds": get(control, "rounds", 0),
+            "actions": get(control, "actions", 0),
+            "model_calls": get(control, "model_calls", 0),
+            "tool_calls": get(control, "tool_calls", 0),
+            "failed_tools": get(control, "failed_tools", 0),
+            "completion_critiques": get(
+                control,
+                "completion_critiques",
+                0,
+            ),
+            "critic_rejections": get(control, "critic_rejections", 0),
+        },
+    }
+
+
+def portfolio_inspection_summary(inspection):
+    return {
+        "attempt": inspection.attempt.attempt,
+        "resource_state": inspection.resource_state,
+        "resources_reclaimed": inspection.resources_reclaimed,
+        "trace_count": len(inspection.trace),
+        "trace_ops": map(
+            lambda event: get(event, "op", ""),
+            inspection.trace,
+        ),
+        "summary_status": get(inspection.summary, "status", ""),
+        "summary_complete": get(inspection.summary, "complete", None),
+    }
+
+
+def portfolio_select(first, second):
+    inference = model_infer(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "Act as a conservative parent attempt. Compare two isolated "
+                    "candidate reports using only their public completion audits "
+                    "and control evidence. Select the candidate most likely to "
+                    "satisfy every public task requirement. publish_ready may be "
+                    "true only when the selected report is ready=true and its "
+                    "audit visibly supports all requirements. Do not invent "
+                    "workspace state or hidden verifier results."
+                ),
+            },
+            {
+                "role": "user",
+                "content": standard_bounded_payload(
+                    "Fork candidate reports",
+                    {"candidates": [first, second]},
+                    12288,
+                ),
+            },
+        ],
+        portfolio_selection_schema(),
+        retries=1,
+        repair_prompt=(
+            "Correct only the selection response shape. Preserve the judgment."
+        ),
+        schema_prompt=(
+            "Return exactly {\"winner_index\":0|1,"
+            "\"publish_ready\":boolean,\"reason\":nonempty string}."
+        ),
+        model_class="agent",
+        max_output_tokens=384,
+    )
+    return {
+        "winner_index": inference.value.winner_index,
+        "publish_ready": inference.value.publish_ready,
+        "reason": inference.value.reason,
+        "transition_id": inference.response.transition_id,
+        "validation_attempts": inference.validation_attempts,
+    }
+
+
+def portfolio_parent(input):
+    session = agent_session()
+    root = attempt_info()
+    context_write(
+        portfolio_task_key(),
+        "requirement",
+        {
+            "task_id": get(session.task, "id", ""),
+            "objective": get(session.task, "objective", str(session.task)),
+        },
+        status="pending",
+        evidence=["public:task_spec"],
+    )
+
+    phase = portfolio_phase_session(session)
+    phase_result = standard_agent_control(
+        phase,
+        standard_agent_options(phase.input),
+        standard_shell_dispatch,
+        standard_verify_finish,
+        standard_record_progress,
+    )
+    phase_control = get(phase_result, "_control", {})
+    context_write(
+        portfolio_frontier_key(),
+        "progress",
+        {
+            "phase_summary": {
+                "answer": slice(
+                    str(get(phase_result, "answer", "")),
+                    0,
+                    512,
+                ),
+                "complete": get(phase_result, "complete", True),
+                "actions": get(phase_control, "actions", 0),
+                "tool_calls": get(phase_control, "tool_calls", 0),
+                "failed_tools": get(phase_control, "failed_tools", 0),
+                "last_transition_id": get(
+                    phase_control,
+                    "last_transition_id",
+                    "",
+                ),
+            },
+            "workspace_note": (
+                "Both children fork from the workspace immediately after this "
+                "shared-prefix phase."
+            ),
+        },
+        status="verified",
+        evidence=["portfolio:shared-frontier"],
+    )
+
+    roles = [
+        {
+            "name": "direct",
+            "instruction": (
+                "Pursue the most direct robust end-to-end solution from the "
+                "inherited shared frontier. Execute validation for every public "
+                "requirement and finish only when visible evidence supports it."
+            ),
+        },
+        {
+            "name": "skeptical",
+            "instruction": (
+                "Independently audit the inherited frontier, challenge its "
+                "assumptions, and pursue a materially different route where "
+                "useful. Prefer the simplest verifiable solution and execute "
+                "validation for every public requirement before finishing."
+            ),
+        },
+    ]
+    scope = attempt_scope(join_timeout_ms=420000)
+    handles = []
+    outcomes = []
+    summaries = []
+    inspections = []
+
+    # Run sequentially to avoid turning a one-CPU benchmark into a resource
+    # contention test. Both forks still begin at the same unchanged parent
+    # workspace and memory frontier.
+    for role in roles:
+        child = attempt_fork(
+            program=current_program(),
+            entrypoint="portfolio_worker",
+            input=portfolio_child_input(
+                input,
+                role.name,
+                role.instruction,
+            ),
+            context_prompt_view={
+                "required_keys": [
+                    portfolio_task_key(),
+                    portfolio_frontier_key(),
+                ],
+            },
+            start=True,
+            scope=scope,
+        )
+        outcome = attempt_join(child, timeout_ms=420000)
+        handles.append(child)
+        outcomes.append(outcome)
+        summaries.append(portfolio_candidate_summary(outcome, role.name))
+        inspections.append(portfolio_inspection_summary(
+            attempt_inspect(
+                child,
+                include_details=True,
+                trace_limit=48,
+                max_bytes=65536,
+            )
+        ))
+
+    selection = portfolio_select(summaries[0], summaries[1])
+    selected_index = selection.winner_index
+    first_succeeded = summaries[0].status == "succeeded"
+    second_succeeded = summaries[1].status == "succeeded"
+    if first_succeeded and not second_succeeded:
+        selected_index = 0
+    if second_succeeded and not first_succeeded:
+        selected_index = 1
+
+    accepted_attempt = ""
+    selected_ready = False
+    if first_succeeded or second_succeeded:
+        loser_index = 1 if selected_index == 0 else 0
+        attempt_accept(root.attempt, handles[selected_index])
+        accepted_attempt = handles[selected_index].attempt
+        selected_ready = summaries[selected_index].ready
+        attempt_discard(
+            handles[loser_index],
+            reason="fork portfolio non-selected candidate",
+        )
+    else:
+        attempt_discard(
+            handles[0],
+            reason="fork portfolio candidate failed",
+        )
+        attempt_discard(
+            handles[1],
+            reason="fork portfolio candidate failed",
+        )
+
+    publish_ready = (
+        selected_ready
+        and selection.publish_ready
+        and len(accepted_attempt) > 0
+    )
+    selection["selected_index"] = selected_index
+    selection["accepted_attempt"] = accepted_attempt
+    selection["selected_ready"] = selected_ready
+    selection["publish_ready"] = publish_ready
+    context_write(
+        portfolio_selection_key(),
+        "decision",
+        selection,
+        status="verified" if publish_ready else "pending",
+        evidence=["transition:" + selection.transition_id],
+    )
+
+    cleanup = attempt_scope_close(scope)
+    if not cleanup.clean:
+        fail(
+            "fork portfolio scope did not close cleanly",
+            code="portfolio_cleanup_failed",
+            detail=cleanup,
+        )
+
+    answer = "No fork candidate had sufficient visible completion evidence."
+    if len(accepted_attempt) > 0:
+        answer = summaries[selected_index].answer
+    return {
+        "answer": answer,
+        "complete": publish_ready,
+        "phase": phase_result,
+        "candidates": summaries,
+        "selection": selection,
+        "accepted_attempt": accepted_attempt,
+        "inspections": inspections,
+        "scope_clean": cleanup.clean,
+        "_control": {
+            "name": "stone.standard_fork_portfolio_v1",
+            "attempt_forks": 2,
+            "accepted": 1 if len(accepted_attempt) > 0 else 0,
+            "selection_model_calls": selection.validation_attempts,
+        },
+    }

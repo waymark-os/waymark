@@ -1,0 +1,151 @@
+# Typed attempt-oriented Stone agent loop.
+#
+# This is the raw react_agent.stone control flow with one deliberate change:
+# model_infer validates each decision before Stone dispatches it. Its one
+# optional repair is another visible, budgeted model_call transition. Copy and
+# narrow ACTION_SCHEMA when a task needs a more specific action vocabulary.
+
+
+ACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "actions": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "tool": {
+                                "type": "string",
+                                "enum": ["read", "write", "run_linux", "finish"],
+                            },
+                            "input": {"type": "object"},
+                        },
+                        "required": ["tool", "input"],
+                        "additionalProperties": False,
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"final": {"type": "object"}},
+                        "required": ["final"],
+                        "additionalProperties": False,
+                    },
+                ],
+            },
+        },
+    },
+    "required": ["actions"],
+    "additionalProperties": False,
+}
+
+
+def typed_react_agent():
+    spec = task_spec()
+    input = task_input()
+    max_turns = 16
+    max_rounds = 16
+    if input is not None:
+        max_turns = get(input, "max_turns", max_turns)
+        max_rounds = get(input, "max_rounds", max_rounds)
+    messages = [
+        {
+            "role": "system",
+            "content": "Return JSON only as {\"actions\":[...]}. Each action is either {\"tool\":\"read|write|run_linux|finish\",\"input\":{...}} or {\"final\":{...}}. Use argv lists for run_linux. After an observation, choose another tool action or finish.",
+        },
+        {
+            "role": "user",
+            "content": json_dumps({"task_spec": spec, "task_input": input}),
+        },
+    ]
+    turns = 0
+
+    # EXTENSION SEAM: choose retries=0 when a strict budget should fail fast,
+    # or replace the prompt with task-specific correction guidance. The runtime
+    # caps retries at four and never restarts this surrounding loop implicitly.
+    for round in range(max_rounds):
+        inference = model_infer(
+            messages,
+            ACTION_SCHEMA,
+            retries=1,
+            repair_prompt="Correct only the response shape. Preserve the intended next action.",
+            model_class="agent",
+            max_output_tokens=512,
+        )
+        decoded = inference.value
+        actions = decoded.actions
+        messages.append({
+            "role": "assistant",
+            "content": inference.response.content,
+        })
+        saw_tool = False
+
+        for action in actions:
+            if turns >= max_turns:
+                fail(
+                    "agent exceeded max_turns " + str(max_turns),
+                    code="turn_limit_exceeded",
+                )
+            turns += 1
+            tool = get(action, "tool", "")
+            final = get(action, "final", None)
+
+            if final is not None:
+                return final
+            if tool == "finish":
+                return action.input
+
+            saw_tool = True
+            args = action.input
+            if tool == "read":
+                result = {"ok": True, "content": read_text(args.path)}
+            elif tool == "write":
+                write_text(args.path, args.content)
+                result = {"ok": True, "path": args.path}
+            elif tool == "run_linux":
+                result = run(
+                    args.argv,
+                    cwd=get(args, "cwd", None),
+                    stdin=get(args, "stdin", None),
+                    timeout_ms=get(args, "timeout_ms", 60000),
+                    max_stdout_bytes=get(args, "max_stdout_bytes", 16384),
+                    max_stderr_bytes=get(args, "max_stderr_bytes", 8192),
+                )
+                if get(result, "still_running", False):
+                    cleanup = run_terminate(result.run_id)
+                    result = {
+                        "ok": False,
+                        "kind": "timed_out_and_terminated",
+                        "execution": result,
+                        "cleanup": cleanup,
+                    }
+            else:
+                # The schema prevents an unknown tool value from reaching this
+                # branch. Keep it as a defensive assertion for future edits.
+                fail(
+                    "schema-admitted unsupported tool: " + tool,
+                    code="invalid_model_response",
+                )
+
+            messages.append({
+                "role": "user",
+                "content": json_dumps({
+                    "observation": {"tool_call": action, "tool_result": result},
+                    "instruction": "Use this observation to choose the next tool action or final. If tool_result.ok is false, correct the error if possible.",
+                }),
+            })
+
+        if not saw_tool:
+            fail(
+                "model action stream ended without a final value or tool call",
+                code="final_missing",
+            )
+
+    fail(
+        "agent exceeded max_rounds " + str(max_rounds),
+        code="round_limit_exceeded",
+    )
+
+
+emit(typed_react_agent())

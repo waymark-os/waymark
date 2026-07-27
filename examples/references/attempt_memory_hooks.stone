@@ -1,0 +1,102 @@
+# Attempt-memory hook policy reference.
+#
+# This is intentionally a fragment, not a complete agent loop. Compose these
+# functions into pair-local `model_call` and `run` hooks. The outer controller
+# still owns lifecycle branches, budgets, messages, and stopping behavior.
+
+
+# Read authoritative attempt state at each hook invocation. This avoids
+# unsupported ambient/global mutation when a controller is restarted.
+def memory_mode():
+    return read_file("mode.txt")[0]
+
+
+# Promote a requirement observed by a completed transition. A real policy can
+# validate or normalize the parsed record before marking it verified.
+def retain_requirement(step):
+    if memory_mode() != "M" or not step.outcome.ok:
+        return None
+    requirement = json_loads(step.outcome.value.stdout)
+    return context_write(
+        "requirement.pivot_action",
+        "requirement",
+        requirement,
+        status="verified",
+        evidence=["transition:" + step.transition_id],
+    )
+
+
+# Project only the current semantic state and keep it before the newest caller
+# message. The transition's immediate instruction should remain last.
+def prepare_decision(step):
+    if memory_mode() != "M":
+        return None
+    projection = context_project(
+        focus="verified requirement, latest decision, and latest tool outcome",
+        max_tokens=256,
+    )
+    memory_message = {
+        "role": "user",
+        "content": "Active attempt memory:\n" + projection.text,
+    }
+    messages = step.input.messages
+    if len(messages) == 0:
+        return {"messages": [memory_message]}
+    return {
+        "messages": messages[:-1] + [memory_message] + messages[-1:]
+    }
+
+
+# Same-key writes replace hot state while Gateway retains revision history.
+def record_decision(step):
+    if memory_mode() != "M":
+        return None
+    if step.outcome.ok:
+        content = {
+            "ok": True,
+            "transition_id": step.transition_id,
+            "decision": json_loads(step.outcome.value.content),
+        }
+    else:
+        content = {
+            "ok": False,
+            "transition_id": step.transition_id,
+            "error": step.outcome.error,
+        }
+    return context_write(
+        "decision.last",
+        "decision",
+        content,
+        evidence=["transition:" + step.transition_id],
+    )
+
+
+def check_action(step):
+    if len(step.input.argv) == 0:
+        return {"allow": False, "reason": "empty action argv"}
+    return None
+
+
+# A completed nonzero process has outcome.ok=False but still carries its run
+# record in outcome.value. Preserve that evidence instead of dropping it.
+def record_outcome(step):
+    if memory_mode() != "M":
+        return None
+    result = get(step.outcome, "value", None)
+    content = {
+        "ok": step.outcome.ok,
+        "transition_id": step.transition_id,
+        "argv": step.input.argv,
+    }
+    if result == None:
+        content["error"] = step.outcome.error
+    else:
+        content["exit_code"] = result.exit_code
+        content["stdout"] = result.stdout
+        content["stderr"] = result.stderr
+    return context_write(
+        "outcome.last_tool",
+        "outcome",
+        content,
+        evidence=["transition:" + step.transition_id],
+    )

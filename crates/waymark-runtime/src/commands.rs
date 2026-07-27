@@ -27,15 +27,211 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "transition_hooks",
+        signature: r#"transition_hooks(pre: callable? = None, post: callable? = None) -> transition_hooks"#,
+        use_when: "Create a reusable first-class hook value that can be bound to a local, passed through ordinary Stone functions, and supplied as hooks= to model_call, model_infer, run, or must_run.",
+        examples: &[
+            r#"def observe(step):
+    return context_write("outcome.last", "outcome", {"ok": step.outcome.ok})
+hooks = transition_hooks(post=observe)
+result = run(["printf", "ok"], hooks=hooks)"#,
+        ],
+        avoid: &[
+            "Do not place transition_hooks values inside ordinary JSON/data records; pass them as first-class function arguments.",
+            "Handlers still cannot recursively invoke model or run effects.",
+            "A warm session retains the hook value only when every captured value is session-persistable.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "workflow_evidence",
+        signature: r#"workflow_evidence(satisfied: bool, summary: str, evidence: list[str] = []) -> record"#,
+        use_when: "Return bounded, typed completion evidence from a workflow stage evidence handler.",
+        examples: &[
+            r#"return workflow_evidence(probe.ok, "artifact is non-empty", ["stat:artifact.txt"] if probe.ok else [])"#,
+        ],
+        avoid: &[
+            "Do not mark evidence satisfied without at least one compact evidence reference.",
+            "Do not place logs or artifact contents in evidence; use a bounded reference.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "file_nonempty",
+        signature: r#"file_nonempty(path: str) -> workflow_evidence_spec"#,
+        use_when: "Declare an authoritative lazy stage-evidence probe that is satisfied only by a non-empty regular file in the current transactional workspace.",
+        examples: &[
+            r#"@stage(evidence=file_nonempty("artifact.txt"), repair=repair_artifact, max_attempts=2)
+def build_artifact(step):
+    return run(["make", "artifact"])"#,
+        ],
+        avoid: &[
+            "Do not call file_nonempty as a boolean; it returns a typed lazy specification evaluated by workflow_run.",
+            "Do not manufacture the evidence reference yourself; the runtime records the observed path and size.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "stage",
+        signature: r#"@stage(evidence: workflow_evidence_spec | callable, repair: callable? = None, max_attempts: int = 1)
+def name(step): ... -> workflow_stage"#,
+        use_when: "Declare a named evidence-gated workflow stage with its action body directly below the decorator. The function name becomes the first-class stage binding.",
+        examples: &[
+            r#"def repair_artifact(step):
+    return run(["sh", "-c", "printf ready > artifact.txt"])
+
+@stage(evidence=file_nonempty("artifact.txt"), repair=repair_artifact, max_attempts=1)
+def artifact(step):
+    return run(["sh", "-c", "exit 7"])
+
+report = workflow_run(workflow("build", artifact))
+emit(report)"#,
+        ],
+        avoid: &[
+            "Use @stage(...) immediately above a one-argument def; stage(...) is not an ordinary runtime constructor.",
+            "The decorated action and optional repair must return records with boolean ok fields.",
+            "Stage advancement still depends only on evidence, never the action ok field.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "workflow_stage",
+        signature: r#"workflow_stage(name: str, evidence: callable, action: callable, repair: callable? = None, max_attempts: int = 1) -> workflow_stage"#,
+        use_when: "Define one typed stage whose action may run only within a bounded evidence-check and optional repair cycle.",
+        examples: &[
+            r#"stage = workflow_stage("artifact", evidence=check_artifact, action=build_artifact, repair=repair_artifact, max_attempts=2)"#,
+        ],
+        avoid: &[
+            "Do not infer completion from action.ok; the evidence handler alone gates advancement.",
+            "Every handler must accept one structured workflow context record.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "workflow",
+        signature: r#"workflow(name: str, stage: workflow_stage, ...) -> workflow"#,
+        use_when: "Compose one or more uniquely named workflow stages into a first-class deterministic control value.",
+        examples: &[r#"plan = workflow("build-and-check", build_stage, verify_stage)"#],
+        avoid: &[
+            "Do not place workflows inside ordinary JSON/data records; pass them as first-class function arguments.",
+            "This initial primitive is sequential; parallel and cross-attempt stages are not implied.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "workflow_run",
+        signature: r#"workflow_run(plan: workflow) -> workflow_report"#,
+        use_when: "Run stages sequentially with pre/post evidence checks, bounded action attempts, and optional repair checks.",
+        examples: &[r#"report = workflow_run(plan)
+emit({"ok": report.ok, "failed_stage": report.failed_stage, "stages": report.stages})"#],
+        avoid: &[
+            "Do not recursively invoke workflow_run from a workflow handler.",
+            "A normal unmet-evidence outcome returns a compact failed report; callback contract errors still fail the Stone program.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "model_call",
-        signature: r#"model_call(messages: list[record], model_class: str = "agent", model: str = "", temperature: float? = None, top_p: float? = None, seed: int? = None, max_output_tokens: int = 0, response_format: record | str | None = None, metadata: record[str, str] = {}) -> record"#,
-        use_when: "Gateway mode only. Use as the explicit low-level model effect when a Stone program owns the prompt, conversation, retry, and stopping policy.",
-        examples: &[r#"emit(model_call([{"role": "system", "content": "Answer concisely."}, {"role": "user", "content": "Return the word ready."}], model_class="agent", max_output_tokens=64).content)"#],
+        signature: r#"model_call(messages: list[record], model_class: str = "agent", model: str = "", temperature: float? = None, top_p: float? = None, seed: int? = None, max_output_tokens: int = 0, response_format: record | str | None = None, metadata: record[str, str] = {}, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> record"#,
+        use_when: "Gateway mode only. Use as the explicit low-level model effect when a Stone program owns the prompt, conversation, retry, stopping policy, and optional per-call transition hooks.",
+        examples: &[
+            r#"emit(model_call([{"role": "system", "content": "Answer concisely."}, {"role": "user", "content": "Return the word ready."}], model_class="agent", max_output_tokens=64).content)"#,
+            r#"response = model_call([{"role": "user", "content": "Return one JSON object with a ready field."}], response_format={"type": "json_object"}, max_output_tokens=64)
+emit(json_loads(response.content))"#,
+        ],
         avoid: &[
             "Do not pass provider credentials, endpoints, or secret environment-variable names; Gateway owns them.",
             "Do not assume an automatic retry, memory, tool dispatcher, or stopping rule; model_call performs exactly one model effect.",
+            "Every message record requires a role and string content; serialize structured observations with json_dumps before placing them in content.",
+            "For portable JSON-object output, use response_format={\"type\": \"json_object\"}; do not guess a provider-specific JSON Schema shape.",
             "With the current Gateway protobuf, explicit top_p and seed values must be greater than zero; omit them for provider defaults.",
             "Keep messages and options structured; do not encode the request as shell text.",
+            "A hook transition record uses transition_id (not id), kind, phase, and input; post hooks also receive outcome.",
+            "A pre hook may return None, bool, or a record patch containing messages; a post hook observes outcome.ok plus outcome.value or outcome.error.",
+            "Transition hooks may read or write context, but cannot recursively call model_call, run, or must_run.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "model_infer",
+        signature: r#"model_infer(messages: list[record], schema: record, retries: int = 0, repair_prompt: str = "", schema_prompt: str = "", model_class: str = "agent", model: str = "", temperature: float? = None, top_p: float? = None, seed: int? = None, max_output_tokens: int = 0, metadata: record[str, str] = {}, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> {value: Any, response: record, validation_attempts: int, errors: list, usage: record}"#,
+        use_when: "Gateway mode only. Use for one schema-validated JSON decision with an optional explicit bounded repair policy; each attempt remains a separately traced model_call transition.",
+        examples: &[
+            r#"schema = {"type": "object", "properties": {"ready": {"type": "boolean"}}, "required": ["ready"], "additionalProperties": False}
+inference = model_infer([{"role": "user", "content": "Report readiness."}], schema, retries=1, max_output_tokens=64)
+emit(inference.value.ready)"#,
+        ],
+        avoid: &[
+            "Do not pass response_format; model_infer owns portable JSON-object mode and independently validates the result.",
+            "Supported schema keywords are type, properties, required, additionalProperties (boolean), items, minItems, maxItems, minLength, maxLength, minimum, maximum, enum, const, oneOf, and anyOf; unsupported keywords fail before a model effect.",
+            "Retries are explicit, separately traced model calls and are capped at four; validation failure does not silently restart an agent loop.",
+            "Schema validation proves shape, not factual correctness, tool authority, or task completion.",
+            "By default the complete schema is sent to the model. schema_prompt may replace only that model-facing instruction with a bounded compact equivalent; runtime validation still uses the complete schema.",
+            "The schema instruction and repair messages are ordinary model-call inputs visible to hooks and tracing.",
+            "Transition hooks apply to each underlying model_call pair and cannot recursively invoke model_infer, model_call, run, or must_run.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "context_write",
+        signature: r#"context_write(key: str, kind: str, content: Any, status: str = "active", evidence: list = []) -> record"#,
+        use_when: "Experimental Stone context surface. Add or revise stable task state under one key for later reads and bounded prompt projection.",
+        examples: &[r#"item = context_write("requirement.output", "requirement", {"text": "preserve the binary"}, status="verified", evidence=["trace:probe-1"])
+emit({"key": item.key, "revision": item.revision})"#],
+        avoid: &[
+            "Do not copy large logs or files into context; store a concise claim and an evidence reference.",
+            "Attached attempts use durable Gateway state; standalone Stone uses a bounded session-local fallback. Neither defines a fork contract.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "context_read",
+        signature: r#"context_read(query: str = "", keys: list[str] = [], kinds: list[str] = [], limit: int = 20) -> list[record]"#,
+        use_when: "Experimental Stone context surface. Explicitly inspect current retained items by key, kind, or text query before a decision.",
+        examples: &[r#"context_write("risk.cleanup", "risk", "do not delete the generated library")
+emit(context_read(query="generated library", kinds=["risk"], limit=5))"#],
+        avoid: &[
+            "Do not use an empty unbounded read as a substitute for selecting relevant context.",
+            "Use context_project when constructing a token-bounded model prompt.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "context_project",
+        signature: r#"context_project(focus: str = "", max_tokens: int = 512, required_keys: list[str] = []) -> record"#,
+        use_when: "Experimental Stone context surface. Reserve explicitly required stable keys, then select a deterministic token-bounded relevance projection for a model-call prompt.",
+        examples: &[r#"context_write("goal.finish", "goal", "run the public checks before finish")
+projection = context_project(focus="finish verification", max_tokens=128, required_keys=["goal.finish"])
+emit({"text": projection.text, "items": len(projection.items)})"#],
+        avoid: &[
+            "Do not assume projection verifies a memory claim; workspace and verifier evidence remain authoritative.",
+            "Required keys fail closed when missing or when their encoded items do not fit the projection budget.",
+            "Do not replay a full transcript alongside the projection and defeat the context budget.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "correction_apply",
+        signature: "correction_apply(source: str, correction: record, candidate: int = 0) -> record",
+        use_when: "Use after a failed Stone evaluation to validate and apply one advertised local edit to the exact failed source without executing it.",
+        examples: &[r#"source = "context_projet()"
+correction = {
+    "version": 1,
+    "mode": "suggest",
+    "safety": "suggest_only",
+    "auto_apply": False,
+    "retry": "explicit_only",
+    "source_sha256": sha256(source),
+    "received": "context_projet",
+    "candidates": [{
+        "replacement": "context_project",
+        "edit": {"start": 0, "end": 14, "replacement": "context_project"},
+    }],
+}
+emit(correction_apply(source, correction).source)"#],
+        avoid: &[
+            "Do not pass requires_repair guidance; only suggest_only candidates with an unambiguous edit can be applied.",
+            "The returned source has executed=false. Review it and evaluate it separately in the appropriate transaction.",
         ],
         aliases: &[],
     },
@@ -66,7 +262,7 @@ emit({"input": input})"#],
     StoneHelpEntry {
         name: "agent_session",
         signature: "agent_session() -> record",
-        use_when: "Gateway mode only. Build the standard structured session argument for a Stone AgentControl function from the attached task, input, attempt, limits, and available Shell tool families.",
+        use_when: "Gateway mode only. Build the standard structured session argument for a Stone AgentControl function from the attached task, input, attempt, limits, fresh time_budget, and available Shell tool families. session.time_budget includes elapsed_ms and remaining_ms when the attempt declares a wall-time limit or deadline. Calling agent_session() again refreshes that snapshot. session.context_prompt_view carries typed child-admission projection policy independently from task input; session.attempt includes typed controller_run_count, controller_restarted, and controller_phase fields.",
         examples: &[r#"def control(session):
     return {"attempt": session.attempt.attempt, "objective": session.task.objective}
 emit(control(agent_session()))"#],
@@ -115,10 +311,11 @@ emit(control(session).value)"#],
     StoneHelpEntry {
         name: "emit",
         signature: "emit(value: Any? = pipeline_value) -> Any",
-        use_when: "Use to return a structured result from an Stone script or MCP call.",
+        use_when: "Use to publish a structured result from a Stone script or MCP call. emit returns the value to the running program and does not terminate execution.",
         examples: &[r#"emit({"ok": True, "path": "/app/out.json"})"#],
         avoid: &[
             "Do not print final structured results; emit them.",
+            "Do not treat emit as exit; use mutually exclusive control flow or return from a function when later effects must not run.",
             "Do not emit large lists just to inspect them; bind the list and emit len/head/tail summaries.",
         ],
         aliases: &[],
@@ -692,11 +889,17 @@ if starts_with(line, "ERROR"):
     },
     StoneHelpEntry {
         name: "run",
-        signature: r#"run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, background: bool = False, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576) -> record"#,
+        signature: r#"run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, background: bool = False, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> record"#,
         use_when: "Use only when the task explicitly needs a POSIX program. Nonzero exits return ok=false with stdout, stderr, and an explanation record. For task commands that may run more than a few seconds but should eventually exit, pass background=True and manage the returned run_id with run_status/run_wait/run_terminate.",
         examples: &[
             r#"result = run(["wc", "-l", "/app/input.txt"])"#,
             r#"result = run(["printf", "ok"], timeout_ms=5000)"#,
+            r#"result = run(["printf", "ok"], hooks={"pre": lambda step: {"argv": step.input.argv}})"#,
+            r#"result = run(["printf", "not executed"], hooks={"pre": lambda step: {"allow": False, "reason": "command denied"}})"#,
+            r#"def record_run(step):
+    result = step.outcome.value
+    return context_write("outcome.last_run", "outcome", {"ok": step.outcome.ok, "exit_code": result.exit_code, "stderr": result.stderr})
+result = run(["sh", "-c", "printf failed >&2; exit 7"], hooks={"post": record_run})"#,
             r#"result = run(["sh", "-c", "sleep 0.01 && printf done"], cwd="/app", timeout_ms=5000)"#,
             r#"result = run(["sh", "-c", "printf warning >&2"], stdout="suppress", stderr="capture", max_stderr_bytes=12000)"#,
             r#"if not result.ok:
@@ -712,6 +915,10 @@ if starts_with(line, "ERROR"):
             "If result.still_running is true and result.run_id is present, use run_status(result.run_id), run_wait(result.run_id, timeout_ms=...), or run_terminate(result.run_id).",
             "After run_wait returns still_running=false or done=true, do not call run_wait for that run_id again.",
             "If result.timed_out is true without a run_id, inspect partial output first; rerun with a larger timeout_ms only when the command is expected to be slow.",
+            "Use call-local hooks for one action transition; pre may replace argv or veto without executing it. A veto returns ok=false, kind=policy_rejected, and policy_reason so the agent can revise its action; the post hook still records that outcome.",
+            "A hook transition record uses transition_id (not id), kind, phase, and input; post hooks also receive outcome.",
+            "A completed nonzero run gives its post hook outcome.ok=false and the structured run record in outcome.value; outcome.error is for an effect that produced no run record.",
+            "Transition hooks cannot recursively call model_call, run, or must_run.",
         ],
         aliases: &[],
     },
@@ -822,9 +1029,20 @@ if not info.ok:
     StoneHelpEntry {
         name: "attempt_info",
         signature: r#"attempt_info(attempt: str = "") -> record"#,
-        use_when: "Use in Gateway mode to inspect the current task attempt metadata, or a specific attempt when an id is passed.",
-        examples: &[r#"me = attempt_info()"#, r#"emit(attempt_info().state)"#],
-        avoid: &["Do not infer attempt identity from transaction ids; use the structured attempt record."],
+        use_when: "Use in Gateway mode to inspect the current task attempt, or a specific attempt when an id is passed. The record exposes typed controller_run_count (1 for the first running controller), controller_restarted, controller_phase (pending, initial, or restart), memory_ref, and memory_revision.",
+        examples: &[
+            r#"me = attempt_info()"#,
+            r#"emit(attempt_info().state)"#,
+            r#"lifecycle = attempt_info()
+if lifecycle.controller_run_count == 1:
+    emit({"phase": "initial"})
+else:
+    emit({"phase": "restart", "run": lifecycle.controller_run_count})"#,
+        ],
+        avoid: &[
+            "Do not infer attempt identity from transaction ids; use the structured attempt record.",
+            "Do not infer controller restart from a workspace marker; use controller_run_count or controller_restarted.",
+        ],
         aliases: &[],
     },
     StoneHelpEntry {
@@ -833,6 +1051,17 @@ if not info.ok:
         use_when: "Use in Gateway mode to inspect an attempt plus its transaction diff state.",
         examples: &[r#"state = attempt_state()"#, r#"emit(attempt_state(sample_limit=25).clean)"#],
         avoid: &["Do not treat attempt state as a commit; finish the attempt explicitly when work is resolved."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "attempt_inspect",
+        signature: r#"attempt_inspect(attempt: str = "", include_details: bool = False, trace_limit: int = 20, max_bytes: int = 32768) -> record"#,
+        use_when: "Gateway mode only. Page in a bounded child summary, optional full controller envelope, relevant trace tail, and authoritative execution-resource state before or after candidate cleanup.",
+        examples: &[r#"inspection = attempt_inspect(child.attempt, include_details=True, trace_limit=20)"#],
+        avoid: &[
+            "Do not inject full details by default; attempt_join(child).result.value is the compact comparison report.",
+            "Inspection does not select or clean a candidate; call attempt_accept or attempt_discard after deciding.",
+        ],
         aliases: &[],
     },
     StoneHelpEntry {
@@ -870,7 +1099,7 @@ if not info.ok:
     StoneHelpEntry {
         name: "attempt_join",
         signature: r#"attempt_join(attempt: attempt_handle | str | record, timeout_ms: int? = None) -> attempt_outcome"#,
-        use_when: "Gateway mode only. Wait for a child and return an immutable typed outcome with joined, timed_out, state, controller_state, and the final attempt record.",
+        use_when: "Gateway mode only. Wait for a child and return an immutable typed outcome; result.value is the child's compact returned summary.",
         examples: &[r#"outcome = attempt_join(child, timeout_ms=30000)"#],
         avoid: &["Joining observes child completion; it does not accept, merge, publish, or discard the child workspace."],
         aliases: &[],
@@ -930,11 +1159,11 @@ emit(attempt_scope_close(scope).clean)"#],
     },
     StoneHelpEntry {
         name: "attempt_fork",
-        signature: r#"attempt_fork(parent_attempt: attempt_handle | str | record = "", task: str = "", input: Any = None, program: record? = None, entrypoint: str = "", start: bool = False, scope: attempt_scope? = None, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", resource_limits: record = {}, metadata: record = {}) -> attempt_handle"#,
+        signature: r#"attempt_fork(parent_attempt: attempt_handle | str | record = "", task: str = "", input: Any = None, context_prompt_view: {"required_keys": [str, ...]}? = None, program: record? = None, entrypoint: str = "", start: bool = False, scope: attempt_scope? = None, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", resource_limits: record = {}, metadata: record = {}) -> attempt_handle"#,
         use_when: "Use in Gateway mode to create a child attempt from the current or specified parent attempt workspace state.",
         examples: &[
             r#"branch = attempt_fork(task="try-alt-fix", metadata={"strategy": "alternate"})"#,
-            r#"branch = attempt_fork(input={"strategy": "alternate"}, program=current_program(), entrypoint="worker", start=True, scope=scope)"#,
+            r#"branch = attempt_fork(input={"strategy": "alternate"}, context_prompt_view={"required_keys": ["requirement.target"]}, program=current_program(), entrypoint="worker", start=True, scope=scope)"#,
         ],
         avoid: &["Do not assume a fork mutates the parent attempt; it returns a separate attempt and transaction."],
         aliases: &[],
@@ -1197,7 +1426,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "session.task and session.input are structured task data; session.attempt is the current attempt record; session.limits exposes admitted resource limits.",
             "session.tools lists discoverable Shell tool families, while the actual operations remain ordinary Stone builtins such as model_call, run, read_file, and attempt_fork.",
             "A tool name is not authority. The attached attempt's Gateway capabilities mediate protected file, Linux, model, context, and attempt effects.",
-            "Compose controls with ordinary Stone functions: a wrapper may call a base control, inspect its structured result, verify it, retry within a bound, or fall back.",
+            "Compose controls with ordinary Stone functions: named def functions and lambdas are first-class callable values, so a control may accept replaceable dispatch, verification, progress, or fallback adapters.",
             "Use a child attempt when work needs independent workspace/context state, fate, authority, budget, or candidate acceptance; a model call alone is not a child attempt.",
             "The builtin ReAct controller is an optimized AgentControl implementation, not a privileged Gateway mode or Stone language semantic.",
         ],
@@ -1210,7 +1439,8 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "Create scope = attempt_scope() before branching. Pass scope=scope to every attempt_fork or attempt_spawn so unresolved children are automatically cancel-then-join cleaned at evaluation exit.",
             "Fork candidates only while the parent is stable. Prefer one definition-only module and named entrypoints: child = attempt_fork(root.attempt, program=current_program(), entrypoint=\"worker\", start=True, scope=scope).",
             "Each child receives its own scoped LibOS channel. Use attempt_join(child) for one child, attempt_wait_any(scope) for a race, or attempt_wait_all(scope) for a barrier; these are Gateway waits, not sequential Stone polling.",
-            "After attempt_join, inspect each candidate with attempt_state(child.attempt). The child runtime reports its own result automatically; an attached parent cannot report on the child's behalf.",
+            "After attempt_join, compare the compact outcome.result.value reports. Use attempt_state for workspace state and bounded attempt_inspect only when the summary is insufficient; an attached parent cannot report on the child's behalf.",
+            "attempt_inspect remains available after accept/discard: archived report details and trace survive, while resource_state confirms whether controller/process/transaction resources were reclaimed.",
             "Select exactly one useful child with attempt_accept(root.attempt, child.attempt); close every rejected child with attempt_discard(child.attempt, reason=\"...\").",
             "Call attempt_scope_close(scope) and require clean=True. It is also called automatically on normal or exceptional Stone evaluation exit.",
             "After selection, verify the imported files in the parent. A built-in model agent should return finish; its outer controller reports and publishes the root.",
@@ -1253,7 +1483,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "Record fields can be read as row[\"name\"] or row.name when the field name is identifier-shaped.",
             "Operators: +, -, *, /, //, &, |, <<, >>, comparisons, and/or/not, membership, is None.",
             "Conditional expressions use Python's value if condition else fallback shape.",
-            "Functions: def name(arg) works; omitted parameter and return annotations mean Any, optional annotations like def name(arg: str) -> str are checked, and immutable default values are supported. Use -> None for a checked procedure.",
+            "Functions: def name(arg) works; omitted parameter and return annotations mean Any, optional annotations like def name(arg: str) -> str are checked, and immutable default values are supported. Named functions are first-class callable values and may be passed to another function. Use -> None for a checked procedure. @stage(...) is the one supported declaration decorator.",
             "try/except catches runtime evaluation errors; supported handlers are except:, except Exception:, and except Exception as e:.",
             "Lambdas: expression-only callbacks work in sort/map/filter, e.g. lambda r: r[\"name\"].",
             "String methods include strip/lstrip/rstrip, isdigit/isalpha/isalnum, count, split/rsplit/splitlines, replace, join, lower/upper, zfill, startswith, and endswith; split and rsplit accept optional maxsplit and default whitespace splitting.",
@@ -1269,7 +1499,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "No imports/modules/os/pathlib/glob/json; use find/read_json/json_loads/json_dumps.",
             "No isinstance(value, type); use type(value) == \"list\"/\"str\"/\"int\"/\"float\"/\"record\" or direct structural checks.",
             "Lambda is expression-only; use explicit loops when callback logic needs statements or mutation.",
-            "No classes/decorators/async/nested functions.",
+            "No classes, async, nested functions, or general Python decorators; only Stone's @stage(...) declaration decorator is supported.",
             "No mutable default args, *args, **kwargs, or keyword calls to user functions.",
             "No try/finally, try/else, except*, or exception classes other than Exception.",
             "Method keyword arguments are intentionally narrow: split(maxsplit=...) and sort(key=..., reverse=...) are supported; most other methods take positional arguments only.",

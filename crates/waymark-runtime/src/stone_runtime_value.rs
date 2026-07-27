@@ -3,7 +3,10 @@
 use nu_protocol::{ShellError, Span, Value};
 
 use super::stone_error;
-use super::stone_functions::CallableValue;
+use super::stone_functions::{
+    CallableValue, TransitionHooksValue, WorkflowEvidenceSourceValue, WorkflowStageValue,
+    WorkflowValue,
+};
 use super::stone_json_view::{
     materialize_json_array_view, materialize_json_object_view, materialize_json_scalar_view,
     materialize_jsonl_rows, JsonArrayView, JsonObjectView, JsonScalarView, JsonlRows,
@@ -22,6 +25,10 @@ pub(super) enum RuntimeValue {
     JsonArrayView(JsonArrayView),
     JsonScalarView(JsonScalarView),
     Callable(CallableValue),
+    TransitionHooks(TransitionHooksValue),
+    WorkflowEvidenceSource(WorkflowEvidenceSourceValue),
+    WorkflowStage(WorkflowStageValue),
+    Workflow(WorkflowValue),
     AgentControl(AgentControlValue),
     AttemptScope(AttemptScopeValue),
     AttemptHandle(AttemptHandleValue),
@@ -38,6 +45,10 @@ pub(super) enum RuntimeValueTag {
     JsonArrayView,
     JsonScalarView,
     Callable,
+    TransitionHooks,
+    WorkflowEvidenceSource,
+    WorkflowStage,
+    Workflow,
     AgentControl,
     AttemptScope,
     AttemptHandle,
@@ -60,6 +71,10 @@ impl RuntimeValueTag {
             RuntimeValueTag::AttemptScope => 10,
             RuntimeValueTag::AttemptHandle => 11,
             RuntimeValueTag::AttemptOutcome => 12,
+            RuntimeValueTag::TransitionHooks => 13,
+            RuntimeValueTag::WorkflowStage => 14,
+            RuntimeValueTag::Workflow => 15,
+            RuntimeValueTag::WorkflowEvidenceSource => 16,
         }
     }
 }
@@ -85,10 +100,11 @@ impl RuntimeValue {
             RuntimeValue::JsonObjectView(_) => true,
             RuntimeValue::JsonArrayView(_) => true,
             RuntimeValue::JsonScalarView(_) => true,
-            RuntimeValue::Callable(callable) => callable
-                .captures
-                .iter()
-                .all(|(_, value)| value.is_session_persistable()),
+            RuntimeValue::Callable(callable) => callable.captures_are_persistable(),
+            RuntimeValue::TransitionHooks(hooks) => hooks.is_session_persistable(),
+            RuntimeValue::WorkflowEvidenceSource(source) => source.is_session_persistable(),
+            RuntimeValue::WorkflowStage(stage) => stage.is_session_persistable(),
+            RuntimeValue::Workflow(workflow) => workflow.is_session_persistable(),
             RuntimeValue::AgentControl(_) => true,
             RuntimeValue::AttemptScope(_) => false,
             RuntimeValue::AttemptHandle(_) => false,
@@ -108,6 +124,10 @@ impl RuntimeValue {
             RuntimeValue::JsonArrayView(_) => RuntimeValueTag::JsonArrayView,
             RuntimeValue::JsonScalarView(_) => RuntimeValueTag::JsonScalarView,
             RuntimeValue::Callable(_) => RuntimeValueTag::Callable,
+            RuntimeValue::TransitionHooks(_) => RuntimeValueTag::TransitionHooks,
+            RuntimeValue::WorkflowEvidenceSource(_) => RuntimeValueTag::WorkflowEvidenceSource,
+            RuntimeValue::WorkflowStage(_) => RuntimeValueTag::WorkflowStage,
+            RuntimeValue::Workflow(_) => RuntimeValueTag::Workflow,
             RuntimeValue::AgentControl(_) => RuntimeValueTag::AgentControl,
             RuntimeValue::AttemptScope(_) => RuntimeValueTag::AttemptScope,
             RuntimeValue::AttemptHandle(_) => RuntimeValueTag::AttemptHandle,
@@ -137,8 +157,30 @@ impl RuntimeValue {
             RuntimeValue::Callable(callable) => Err(stone_error(
                 context,
                 format!(
-                    "callable lambda#{} is a task-owned runtime value and cannot cross this boundary",
-                    callable.function_id
+                    "callable {} is a task-owned runtime value and cannot cross this boundary",
+                    callable.display_name()
+                ),
+            )),
+            RuntimeValue::TransitionHooks(_) => Err(stone_error(
+                context,
+                "transition hooks are task-owned runtime values and cannot cross this boundary",
+            )),
+            RuntimeValue::WorkflowEvidenceSource(_) => Err(stone_error(
+                context,
+                "workflow evidence specifications are task-owned control values and cannot cross this boundary",
+            )),
+            RuntimeValue::WorkflowStage(stage) => Err(stone_error(
+                context,
+                format!(
+                    "workflow stage `{}` is a task-owned control value and cannot cross this boundary",
+                    stage.name
+                ),
+            )),
+            RuntimeValue::Workflow(workflow) => Err(stone_error(
+                context,
+                format!(
+                    "workflow `{}` is a task-owned control value and cannot cross this boundary",
+                    workflow.name
                 ),
             )),
             RuntimeValue::AgentControl(control) => Err(stone_error(
@@ -185,6 +227,10 @@ mod tests {
         assert_eq!(RuntimeValueTag::AttemptScope.id(), 10);
         assert_eq!(RuntimeValueTag::AttemptHandle.id(), 11);
         assert_eq!(RuntimeValueTag::AttemptOutcome.id(), 12);
+        assert_eq!(RuntimeValueTag::TransitionHooks.id(), 13);
+        assert_eq!(RuntimeValueTag::WorkflowStage.id(), 14);
+        assert_eq!(RuntimeValueTag::Workflow.id(), 15);
+        assert_eq!(RuntimeValueTag::WorkflowEvidenceSource.id(), 16);
     }
 
     #[test]
@@ -200,30 +246,30 @@ mod tests {
 
     #[test]
     fn callables_are_persistable_only_when_captures_are_persistable() {
-        let persistable = RuntimeValue::Callable(CallableValue {
-            function_id: 1,
-            params: Vec::new(),
-            body: Box::new(Expr::None),
-            captures: vec![(
+        let persistable = RuntimeValue::Callable(CallableValue::lambda(
+            1,
+            Vec::new(),
+            Box::new(Expr::None),
+            vec![(
                 "answer".to_string(),
                 RuntimeValue::Nu(Value::int(42, Span::unknown())),
             )],
-        });
+        ));
         assert!(persistable.is_session_persistable());
         assert_eq!(persistable.type_tag(), RuntimeValueTag::Callable);
 
-        let non_persistable = RuntimeValue::Callable(CallableValue {
-            function_id: 2,
-            params: Vec::new(),
-            body: Box::new(Expr::None),
-            captures: vec![(
+        let non_persistable = RuntimeValue::Callable(CallableValue::lambda(
+            2,
+            Vec::new(),
+            Box::new(Expr::None),
+            vec![(
                 "file".to_string(),
                 RuntimeValue::File(FileHandle {
                     scope_index: 0,
                     file_id: 7,
                 }),
             )],
-        });
+        ));
         assert!(!non_persistable.is_session_persistable());
     }
 
@@ -252,12 +298,12 @@ mod tests {
         .expect_err("file handles cannot materialize");
         assert!(file_error.to_string().contains("file boundary"));
 
-        let callable_error = RuntimeValue::Callable(CallableValue {
-            function_id: 99,
-            params: Vec::new(),
-            body: Box::new(Expr::None),
-            captures: Vec::new(),
-        })
+        let callable_error = RuntimeValue::Callable(CallableValue::lambda(
+            99,
+            Vec::new(),
+            Box::new(Expr::None),
+            Vec::new(),
+        ))
         .into_nu_value("callable boundary")
         .expect_err("callables cannot materialize");
         assert!(callable_error.to_string().contains("callable boundary"));
@@ -270,6 +316,10 @@ mod tests {
         metadata.push("controller_result_status", Value::string("succeeded", span));
         let mut attempt = nu_protocol::Record::new();
         attempt.push("metadata", Value::record(metadata, span));
+        let mut reported_result = nu_protocol::Record::new();
+        reported_result.push("candidate", Value::string("cobalt", span));
+        attempt.push("reported_result", Value::record(reported_result, span));
+        attempt.push("reported_error", Value::nothing(span));
         let value = RuntimeValue::AttemptOutcome(AttemptOutcomeValue {
             attempt: "attempt-1".to_string(),
             joined: true,
@@ -291,5 +341,19 @@ mod tests {
             let phase = record.get(phase).unwrap().as_record().unwrap();
             assert_eq!(phase.get("status").unwrap().as_str().unwrap(), expected);
         }
+        let result = record.get("result").unwrap().as_record().unwrap();
+        assert_eq!(
+            result
+                .get("value")
+                .unwrap()
+                .as_record()
+                .unwrap()
+                .get("candidate")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "cobalt"
+        );
+        assert!(result.get("error").unwrap().is_nothing());
     }
 }

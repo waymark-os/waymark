@@ -1,0 +1,171 @@
+# Fork-required debugging canary.
+#
+# The parent creates both an uncommitted workspace input and a hot-memory
+# requirement before branching. Ordinary lifecycle-parented spawn starts from
+# the canonical workspace and empty memory, so it cannot run this experiment.
+# Fork is required to give both isolated candidates the exact same in-progress
+# frontier and to import only the winner.
+
+
+def worker(input):
+    requirement = context_read(keys=["requirement.fork_target"], limit=1)
+    if len(requirement) != 1:
+        fail(
+            "candidate did not inherit the parent requirement",
+            code="fork_needed_memory_missing",
+        )
+    target = requirement[0].content.expected
+    problem = read_text("problem.txt").strip()
+    write_file("answer.txt", input.candidate + "\n")
+    check = run(
+        [
+            "python3",
+            "-c",
+            "from pathlib import Path; "
+            "problem=Path('/app/problem.txt').read_text().strip(); "
+            "answer=Path('/app/answer.txt').read_text().strip(); "
+            "raise SystemExit(0 if answer == problem[::-1] else 1)",
+        ],
+        timeout_ms=10000,
+        max_stdout_bytes=1024,
+        max_stderr_bytes=1024,
+    )
+    passed = check.ok and input.candidate == target
+    context_write(
+        "candidate.result",
+        "candidate",
+        {
+            "candidate": input.candidate,
+            "passed": passed,
+            "problem": problem,
+        },
+        status="verified" if passed else "contradicted",
+        evidence=["candidate:test"],
+    )
+    return {
+        "candidate": input.candidate,
+        "passed": passed,
+        "problem": problem,
+        "inherited_target": target,
+        "test_exit_code": check.exit_code,
+        "memory_keys": map(lambda item: item.key, context_read(limit=8)),
+    }
+
+
+def main(input):
+    if len(input.candidates) != 2:
+        fail("fork canary requires two candidates", code="fork_needed_bad_input")
+    root = attempt_info()
+    write_file("problem.txt", input.problem + "\n")
+    context_write(
+        "requirement.fork_target",
+        "requirement",
+        {"expected": input.expected},
+        status="verified",
+        evidence=["parent:uncommitted-frontier"],
+    )
+
+    scope = attempt_scope(join_timeout_ms=60000)
+    first = attempt_fork(
+        program=current_program(),
+        entrypoint="worker",
+        input={"candidate": input.candidates[0]},
+        start=True,
+        scope=scope,
+    )
+    second = attempt_fork(
+        program=current_program(),
+        entrypoint="worker",
+        input={"candidate": input.candidates[1]},
+        start=True,
+        scope=scope,
+    )
+    joined = attempt_wait_all(scope, timeout_ms=60000)
+    if not joined.completed or len(joined.outcomes) != 2:
+        fail(
+            "candidate forks did not complete",
+            code="fork_needed_join_failed",
+            detail=joined,
+        )
+
+    winner = None
+    loser = None
+    results = []
+    for outcome in joined.outcomes:
+        if outcome.result.status != "succeeded":
+            fail(
+                "candidate controller failed",
+                code="fork_needed_child_failed",
+                detail=outcome,
+            )
+        results.append({
+            "attempt": outcome.attempt,
+            "result": outcome.result.value,
+            "fork_memory_ref": outcome.record.fork_origin.memory_ref,
+            "fork_memory_revision": outcome.record.fork_origin.memory_revision,
+        })
+        if outcome.result.value.passed:
+            if winner != None:
+                fail(
+                    "multiple candidates passed",
+                    code="fork_needed_ambiguous_winner",
+                )
+            winner = outcome
+        else:
+            loser = outcome
+    if winner == None or loser == None:
+        fail(
+            "fork canary did not produce one winner and one loser",
+            code="fork_needed_no_unique_winner",
+            detail=results,
+        )
+
+    accepted = attempt_accept(root.attempt, winner.attempt)
+    attempt_discard(loser.attempt, reason="fork canary losing candidate")
+    cleanup = attempt_scope_close(scope)
+    if not cleanup.clean:
+        fail(
+            "fork canary scope did not close cleanly",
+            code="fork_needed_cleanup_failed",
+            detail=cleanup,
+        )
+
+    answer = read_text("answer.txt").strip()
+    if answer != input.expected:
+        fail(
+            "accepted branch did not import the winning answer",
+            code="fork_needed_accept_failed",
+            detail={"expected": input.expected, "actual": answer},
+        )
+    parent_keys = map(lambda item: item.key, context_read(limit=8))
+    if parent_keys != ["requirement.fork_target"]:
+        fail(
+            "child hot memory leaked into the parent",
+            code="fork_needed_memory_leak",
+            detail=parent_keys,
+        )
+    return {
+        "answer": answer,
+        "winner": winner.attempt,
+        "loser": loser.attempt,
+        "accepted": accepted.child.attempt,
+        "results": results,
+        "parent_memory_ref": attempt_info().memory_ref,
+        "parent_memory_revision": attempt_info().memory_revision,
+        "parent_keys": parent_keys,
+        "clean": cleanup.clean,
+    }
+
+
+control = attempt_info()
+entrypoint = get(control.metadata, "program_entrypoint", "main")
+if entrypoint == "worker":
+    result = worker(task_input())
+else:
+    result = main(task_input())
+attempt_report(
+    status="succeeded",
+    result=result,
+    metadata={"control": "attempt_fork_needed_v1"},
+)
+emit(result)

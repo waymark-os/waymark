@@ -5,6 +5,7 @@ use nu_protocol::{
     PipelineData, ShellError,
 };
 
+use crate::stone_admission::validate_program;
 use crate::stone_ast::{lower_source, Program};
 use crate::stone_eval::{
     eval_program, eval_program_with_output_and_session, EvalProgramOutput, StoneSession,
@@ -25,6 +26,7 @@ pub fn eval_stone_source(
     input: PipelineData,
 ) -> Result<PipelineData, ShellError> {
     let program = lower_stone_source(source)?;
+    validate_program(&program, &[])?;
     eval_program(engine_state, stack, &program, input)
 }
 
@@ -54,6 +56,7 @@ pub(crate) fn eval_stone_source_with_output_session_and_entrypoint(
     entrypoint: Option<&str>,
 ) -> Result<EvalProgramOutput, ShellError> {
     let program = lower_stone_source(source)?;
+    validate_program(&program, &session.admission_bound_names())?;
     eval_program_with_output_and_session(
         engine_state,
         stack,
