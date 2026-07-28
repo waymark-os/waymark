@@ -1745,6 +1745,16 @@ impl Evaluator<'_> {
                             self.state.next_callable_id(),
                             function,
                         )))
+                    } else if name == "true" {
+                        // Agent-authored records frequently cross the
+                        // Python/JSON boundary. Accept JSON scalar spellings
+                        // as literals rather than turning a harmless dialect
+                        // slip into a failed attempt.
+                        Ok(RuntimeValue::Nu(Value::bool(true, span)))
+                    } else if name == "false" {
+                        Ok(RuntimeValue::Nu(Value::bool(false, span)))
+                    } else if name == "null" {
+                        Ok(RuntimeValue::Nu(Value::nothing(span)))
                     } else {
                         Err(stone_error("name", format!("unknown name `{name}`")))
                     }
@@ -2117,6 +2127,7 @@ impl Evaluator<'_> {
             "read_jsonl" => self.eval_read_jsonl_call(call),
             "round" => self.eval_round_call(call),
             "run" => self.eval_run_call(call),
+            "run_complete" => self.eval_run_complete_call(call),
             "must_run" => self.eval_must_run_call(call),
             "run_status" => self.eval_run_status_call(call),
             "run_wait" => self.eval_run_wait_call(call),
@@ -4055,12 +4066,18 @@ impl Evaluator<'_> {
                     .into_nu_value("workflow_evidence")
             })
             .collect::<Result<Vec<_>, ShellError>>()?;
-        let satisfied = value_to_bool(&values[0], "workflow_evidence satisfied")?;
-        let summary = value_to_string(&values[1], "workflow_evidence summary")?;
-        let references = match values.get(2) {
+        let mut summary = value_to_string(&values[1], "workflow_evidence summary")?;
+        let (satisfied, diagnostic) = workflow_evidence_satisfaction(&values[0])?;
+        if let Some(diagnostic) = diagnostic {
+            summary = bounded_text(&format!("{summary}; {diagnostic}"), 1_024);
+        }
+        let mut references = match values.get(2) {
             Some(value) => workflow_evidence_references(value)?,
             None => Vec::new(),
         };
+        if !satisfied {
+            references.clear();
+        }
         let evidence = validate_workflow_evidence(satisfied, summary, references)?;
         Ok(RuntimeValue::Nu(workflow_evidence_value(&evidence)))
     }
@@ -4625,17 +4642,30 @@ impl Evaluator<'_> {
     }
 
     fn eval_run_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        self.eval_run_transition_call(call, "run", false)
+    }
+
+    fn eval_run_complete_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        self.eval_run_transition_call(call, "run_complete", true)
+    }
+
+    fn eval_run_transition_call(
+        &mut self,
+        call: &Call,
+        context: &str,
+        complete: bool,
+    ) -> Result<RuntimeValue, ShellError> {
         if self.state.active_transition_hook {
             return Err(transition_hook_error(
-                "run",
-                "run() cannot be called from a transition hook",
+                context,
+                format!("{context}() cannot be called from a transition hook"),
             ));
         }
         let (mut positional, named, hooks) = self.eval_call_values_with_transition_hooks(call)?;
         let transition_id = self.state.next_transition_id();
         self.state.record_transition_event(json!({
             "id": transition_id,
-            "kind": "run",
+            "kind": context,
             "phase": "start",
             "pre_hook": hooks.pre.is_some(),
             "post_hook": hooks.post.is_some(),
@@ -4645,20 +4675,20 @@ impl Evaluator<'_> {
         if let Some(pre) = hooks.pre.as_ref() {
             let event = transition_event_value(
                 &transition_id,
-                "run",
+                context,
                 "pre",
                 run_transition_input(&positional, &named),
                 None,
             );
             let decision = match self
-                .invoke_transition_hook("run", "pre", pre, event)
-                .and_then(|output| apply_run_pre_hook_output(output, &mut positional))
+                .invoke_transition_hook(context, "pre", pre, event)
+                .and_then(|output| apply_run_pre_hook_output(context, output, &mut positional))
             {
                 Ok(decision) => decision,
                 Err(error) => {
                     self.state.record_transition_event(json!({
                         "id": transition_id,
-                        "kind": "run",
+                        "kind": context,
                         "phase": "pre",
                         "ok": false,
                     }));
@@ -4669,7 +4699,7 @@ impl Evaluator<'_> {
                 RunPreHookDecision::Continue { changed } => {
                     self.state.record_transition_event(json!({
                         "id": transition_id,
-                        "kind": "run",
+                        "kind": context,
                         "phase": "pre",
                         "ok": true,
                         "changed": changed,
@@ -4678,7 +4708,7 @@ impl Evaluator<'_> {
                 RunPreHookDecision::Reject { reason } => {
                     self.state.record_transition_event(json!({
                         "id": transition_id,
-                        "kind": "run",
+                        "kind": context,
                         "phase": "pre",
                         "ok": false,
                         "rejected": true,
@@ -4692,7 +4722,7 @@ impl Evaluator<'_> {
         let effective_input = run_transition_input(&positional, &named);
         let result = match rejected_reason.as_deref() {
             Some(reason) => Ok(run_policy_rejection_record(&positional, &named, reason)),
-            None => self.eval_run_values(&positional, &named, "run"),
+            None => self.eval_run_values(&positional, &named, context, complete),
         }
         .map(|mut record| {
             record.push(
@@ -4707,7 +4737,7 @@ impl Evaluator<'_> {
             .unwrap_or(false);
         self.state.record_transition_event(json!({
             "id": transition_id,
-            "kind": "run",
+            "kind": context,
             "phase": "effect",
             "ok": effect_ok,
             "skipped": rejected_reason.is_some(),
@@ -4717,15 +4747,15 @@ impl Evaluator<'_> {
             let outcome = run_transition_outcome_value(&result);
             let event = transition_event_value(
                 &transition_id,
-                "run",
+                context,
                 "post",
                 effective_input,
                 Some(outcome),
             );
-            let post_result = self.invoke_transition_hook("run", "post", post, event);
+            let post_result = self.invoke_transition_hook(context, "post", post, event);
             self.state.record_transition_event(json!({
                 "id": transition_id,
-                "kind": "run",
+                "kind": context,
                 "phase": "post",
                 "ok": post_result.is_ok(),
             }));
@@ -4752,7 +4782,7 @@ impl Evaluator<'_> {
             ));
         }
         let (positional, named) = self.eval_call_values(call)?;
-        self.eval_run_values(&positional, &named, context)
+        self.eval_run_values(&positional, &named, context, false)
     }
 
     fn eval_run_values(
@@ -4760,11 +4790,13 @@ impl Evaluator<'_> {
         positional: &[Value],
         named: &[(String, Value)],
         context: &str,
+        complete: bool,
     ) -> Result<Record, ShellError> {
         let default_cwd = self.current_cwd_path(context)?;
-        let invocation = run_call_values(context, positional, named, default_cwd, |path| {
-            self.resolve_script_path(path)
-        })?;
+        let invocation =
+            run_call_values(context, positional, named, default_cwd, complete, |path| {
+                self.resolve_script_path(path)
+            })?;
         let mut record = invocation.record;
         #[cfg(not(target_os = "hermit"))]
         self.attach_run_helper_observations(
@@ -8737,6 +8769,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "round",
     "rm",
     "run",
+    "run_complete",
     "run_status",
     "run_terminate",
     "run_wait",
@@ -9314,6 +9347,66 @@ fn workflow_evidence_references(value: &Value) -> Result<Vec<String>, ShellError
         .collect()
 }
 
+fn workflow_evidence_satisfaction(value: &Value) -> Result<(bool, Option<String>), ShellError> {
+    if matches!(value, Value::Bool { .. }) {
+        return value_to_bool(value, "workflow_evidence satisfied")
+            .map(|satisfied| (satisfied, None));
+    }
+    let record = value_record(value, "workflow_evidence result")?;
+    let satisfied = record
+        .get("ok")
+        .ok_or_else(|| workflow_error("workflow_evidence result records must contain boolean `ok`"))
+        .and_then(|ok| value_to_bool(ok, "workflow_evidence result ok"))?;
+    if satisfied {
+        return Ok((true, None));
+    }
+
+    let mut context = Vec::new();
+    if let Some(Value::Int { val, .. }) = record.get("exit_code") {
+        context.push(format!("exit_code={val}"));
+    }
+    if let Some(Value::String { val, .. } | Value::Glob { val, .. }) = record.get("code") {
+        if !val.is_empty() {
+            context.push(format!("code={}", bounded_text(val, 128)));
+        }
+    }
+    let explanation = [
+        ("stderr", "stderr"),
+        ("message", "message"),
+        ("reason", "reason"),
+    ]
+    .into_iter()
+    .find_map(|(field, label)| match record.get(field) {
+        Some(Value::String { val, .. } | Value::Glob { val, .. }) if !val.trim().is_empty() => {
+            Some(format!("{label}={}", bounded_tail_text(val.trim(), 640)))
+        }
+        _ => None,
+    })
+    .or_else(|| {
+        let Value::Record { val, .. } = record.get("explanation")? else {
+            return None;
+        };
+        match val.get("summary") {
+            Some(Value::String { val, .. } | Value::Glob { val, .. }) if !val.trim().is_empty() => {
+                Some(format!(
+                    "explanation={}",
+                    bounded_tail_text(val.trim(), 640)
+                ))
+            }
+            _ => None,
+        }
+    });
+    if let Some(explanation) = explanation {
+        context.push(explanation);
+    }
+    let diagnostic = if context.is_empty() {
+        "action evidence failed".to_string()
+    } else {
+        format!("action evidence failed ({})", context.join(", "))
+    };
+    Ok((false, Some(diagnostic)))
+}
+
 fn validate_workflow_evidence(
     satisfied: bool,
     summary: String,
@@ -9438,6 +9531,8 @@ fn compact_workflow_action_record(record: &Record) -> Value {
         "reason",
         "message",
         "code",
+        "completion_waits",
+        "requested_timeout_ms",
     ];
     let span = Span::unknown();
     let mut compact = Record::new();
@@ -9457,6 +9552,43 @@ fn compact_workflow_action_record(record: &Record) -> Value {
         };
         if let Some(value) = bounded {
             compact.push(*field, value);
+        }
+    }
+    for (field, fallback, limit) in [
+        ("stdout_tail", "stdout", 4_096),
+        ("stderr_tail", "stderr", 4_096),
+    ] {
+        let Some(value) = record.get(field).or_else(|| record.get(fallback)) else {
+            continue;
+        };
+        if let Value::String { val, .. } | Value::Glob { val, .. } = value {
+            if !val.is_empty() {
+                compact.push(field, Value::string(bounded_text(val, limit), span));
+            }
+        }
+    }
+    if let Some(Value::Record { val, .. }) = record.get("explanation") {
+        if let Some(Value::String { val, .. } | Value::Glob { val, .. }) = val.get("summary") {
+            compact.push(
+                "explanation_summary",
+                Value::string(bounded_text(val, 1_024), span),
+            );
+        }
+    }
+    if let Some(Value::Record { val, .. }) = record.get("truncated") {
+        let mut flags = Record::new();
+        for field in ["stdout", "stderr"] {
+            if let Some(Value::Bool { .. }) = val.get(field) {
+                flags.push(
+                    field,
+                    val.get(field)
+                        .expect("workflow truncation field just matched")
+                        .clone(),
+                );
+            }
+        }
+        if !flags.is_empty() {
+            compact.push("truncated", Value::record(flags, span));
         }
     }
     Value::record(compact, span)
@@ -10003,10 +10135,11 @@ fn transition_pre_hook_record(
 }
 
 fn apply_run_pre_hook_output(
+    effect: &str,
     output: RuntimeValue,
     positional: &mut Vec<Value>,
 ) -> Result<RunPreHookDecision, ShellError> {
-    let record = match transition_pre_hook_record("run", output)? {
+    let record = match transition_pre_hook_record(effect, output)? {
         TransitionPreHookDecision::Continue(record) => record,
         TransitionPreHookDecision::Reject(reason) => {
             return Ok(RunPreHookDecision::Reject { reason });
@@ -10018,9 +10151,9 @@ fn apply_run_pre_hook_output(
     for key in record.columns() {
         if !matches!(key.as_str(), "allow" | "reason" | "argv") {
             return Err(transition_hook_error(
-                "run",
+                effect,
                 format!(
-                    "unsupported run pre-hook patch field `{key}`; expected allow, reason, or argv"
+                    "unsupported {effect} pre-hook patch field `{key}`; expected allow, reason, or argv"
                 ),
             ));
         }
@@ -10030,8 +10163,11 @@ fn apply_run_pre_hook_output(
     };
     if !matches!(argv, Value::List { .. }) {
         return Err(transition_hook_error(
-            "run",
-            format!("run pre-hook argv must be a list, got {}", argv.get_type()),
+            effect,
+            format!(
+                "{effect} pre-hook argv must be a list, got {}",
+                argv.get_type()
+            ),
         ));
     }
     if positional.is_empty() {
@@ -10424,6 +10560,19 @@ fn bounded_text(text: &str, max_chars: usize) -> String {
     value
 }
 
+fn bounded_tail_text(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let mut value = String::from("…");
+    value.extend(
+        text.chars()
+            .skip(count.saturating_sub(max_chars.saturating_sub(1))),
+    );
+    value
+}
+
 fn model_input_error(operation: &str, message: impl Into<String>) -> ShellError {
     match operation {
         "model_infer" => model_infer_input_error(message),
@@ -10665,7 +10814,14 @@ fn agent_session_value_at(
     );
     tools.push(
         "linux",
-        names(&["run", "must_run", "run_status", "run_wait", "run_terminate"]),
+        names(&[
+            "run",
+            "run_complete",
+            "must_run",
+            "run_status",
+            "run_wait",
+            "run_terminate",
+        ]),
     );
     tools.push("model", names(&["model_call", "model_infer"]));
     tools.push(
@@ -11977,6 +12133,33 @@ emit({
     }
 
     #[test]
+    fn accepts_json_scalar_spellings_in_agent_authored_records() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("json-scalars")?;
+        let program = lower_source(
+            r#"emit({
+    "enabled": true,
+    "disabled": false,
+    "missing": null,
+    "nested": [true, false, null],
+})"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "enabled": true,
+                "disabled": false,
+                "missing": null,
+                "nested": [true, false, null],
+            })
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
     fn evaluates_if_else_over_typed_values() -> Result<(), ShellError> {
         let (engine_state, mut stack, root) = test_engine("if-else")?;
         let program = lower_source(
@@ -12812,6 +12995,83 @@ emit({
                 "artifact": "ready",
             })
         );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_workflow_report_retains_bounded_action_diagnostics() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("typed-workflow-diagnostics")?;
+        let program = lower_source(
+            r#"def not_ready(step):
+    return workflow_evidence(False, "build artifact is absent", [])
+
+def fail_build(step):
+    return run(["sh", "-c", "printf 'compiler root cause' >&2; exit 2"])
+
+build = workflow_stage(
+    "build",
+    evidence=not_ready,
+    action=fail_build,
+    max_attempts=1,
+)
+report = workflow_run(workflow("diagnostic-build", build))
+action = report.stages[0].last_action
+emit({
+    "ok": action.ok,
+    "exit_code": action.exit_code,
+    "stderr_tail": action.stderr_tail,
+    "explanation": action.explanation_summary,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, Span::unknown())?,
+            json_value!({
+                "ok": false,
+                "exit_code": 2,
+                "stderr_tail": "compiler root cause",
+                "explanation": "Stone successfully ran the external process, but it exited with code 2.",
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_evidence_accepts_action_results_and_retains_failure_diagnostics(
+    ) -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-evidence-result")?;
+        let program = lower_source(
+            r#"probe = run(["sh", "-c", "printf 'accuracy check failed' >&2; exit 9"])
+failed = workflow_evidence(probe, "public completion obligations", ["public:done"])
+passed = workflow_evidence({"ok": True}, "static check passed", ["public:static"])
+emit({"failed": failed, "passed": passed})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+
+        assert_eq!(value["failed"]["satisfied"], json_value!(false));
+        assert_eq!(value["failed"]["evidence"], json_value!([]));
+        let summary = value["failed"]["summary"]
+            .as_str()
+            .expect("failed evidence summary");
+        assert!(summary.contains("exit_code=9"), "{summary}");
+        assert!(summary.contains("accuracy check failed"), "{summary}");
+        assert_eq!(
+            value["passed"],
+            json_value!({
+                "kind": "workflow_evidence",
+                "satisfied": true,
+                "summary": "static check passed",
+                "evidence": ["public:static"],
+            })
+        );
+
         cleanup_dir(&root);
         Ok(())
     }
@@ -15271,6 +15531,30 @@ emit({"ok": ok.ok, "stdout": ok.stdout, "kind": ok.kind})
         assert!(text.contains("stone_must_run_failed"), "{text}");
         assert!(text.contains("exit_code=7"), "{text}");
         assert!(text.contains("nope"), "{text}");
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "hermit"))]
+    #[test]
+    fn evaluates_run_complete_builtin_and_rejects_background_mode() -> Result<(), ShellError> {
+        let (engine_state, mut stack, _root) = test_engine("run-complete-builtin")?;
+        let program = lower_source(
+            r#"result = run_complete(["sh", "-c", "sleep 0.01; printf done"], timeout_ms=5000)
+emit({"ok": result.ok, "stdout": result.stdout, "still_running": result.still_running})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(
+            value,
+            json_value!({"ok": true, "stdout": "done", "still_running": false})
+        );
+
+        let program = lower_source(r#"run_complete(["sh", "-c", "sleep 1"], background=True)"#)?;
+        let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("run_complete must reject delegated lifecycle ownership");
+        let text = format!("{error:?}");
+        assert!(text.contains("background=True conflicts"), "{text}");
         Ok(())
     }
 

@@ -99,6 +99,11 @@ but operators stay strongly typed. Automatic text-to-number parsing is not part
 of operator evaluation. Use explicit conversions such as `int(value)` or
 `float(value)` when input text should become a number.
 
+Python `True`, `False`, and `None` are the canonical scalar literals. Stone also
+accepts the JSON spellings `true`, `false`, and `null`. This narrow compatibility
+rule keeps an otherwise valid agent-authored record from failing when generated
+code crosses the Python/JSON boundary.
+
 Truthiness follows Python's common data model: `False`, `None`, numeric zero,
 empty strings, empty lists, and empty records are falsey; non-empty values and
 non-zero numbers are truthy. Boolean operators short-circuit and return booleans.
@@ -227,8 +232,11 @@ Supported handlers are `except:`, `except Exception:`, and
 
 - `emit(value)`: return a structured success value.
 - `fail(message)`: return a structured failure.
-- `workflow_evidence(satisfied, summary, references=[])`: construct bounded stage
-  evidence; satisfied evidence requires at least one reference.
+- `workflow_evidence(satisfied_or_result, summary, references=[])`: construct
+  bounded stage evidence from a boolean or a typed action result. Passing a
+  result record derives satisfaction from `ok`, retains a bounded failure
+  diagnostic, and clears success references on failure. Satisfied evidence
+  requires at least one reference.
 - `@stage(evidence=..., repair=None, max_attempts=1)`: declare the following
   one-argument action function as a named typed stage.
 - `file_nonempty(path)`: declare a lazy non-empty regular-file proof whose

@@ -1251,11 +1251,20 @@ fn run_sync_timeout_ms(timeout: Duration) -> u64 {
 }
 
 pub(crate) fn run_wait(run_id: &str, timeout: Duration) -> Result<Record, ShellError> {
+    run_wait_limited(run_id, timeout, usize::MAX, usize::MAX)
+}
+
+pub(crate) fn run_wait_limited(
+    run_id: &str,
+    timeout: Duration,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+) -> Result<Record, ShellError> {
     let config = required_config()?;
     let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
     let output = with_client(&config, |client| client.linux_exec_wait(run_id, timeout_ms))?;
     let span = Span::unknown();
-    let mut record = linux_exec_record(output, span, usize::MAX, usize::MAX)?;
+    let mut record = linux_exec_record(output, span, max_stdout_bytes, max_stderr_bytes)?;
     append_run_ownership_fields(&mut record, &config, run_id, span);
     Ok(record)
 }

@@ -17,9 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 #[cfg(not(target_os = "hermit"))]
 use std::thread;
-use std::time::Duration;
-#[cfg(not(target_os = "hermit"))]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use nu_protocol::{shell_error::generic::GenericError, Record, ShellError, Span, Value};
 #[cfg(not(target_os = "hermit"))]
@@ -129,6 +127,7 @@ pub(crate) fn run_call_values(
     positional: &[Value],
     named: &[(String, Value)],
     default_cwd: PathBuf,
+    complete: bool,
     mut resolve_path: impl FnMut(&str) -> Result<PathBuf, ShellError>,
 ) -> Result<StoneRunInvocation, ShellError> {
     if positional.is_empty() || positional.len() > 4 {
@@ -250,24 +249,195 @@ pub(crate) fn run_call_values(
         Some(path) => resolve_path(&path)?,
         None => gateway_runtime::workspace_mount_path().unwrap_or(default_cwd),
     };
-    let record = run_posix_command(
+    if complete && background {
+        return Err(stone_error(
+            context,
+            "background=True conflicts with run_complete(); use run() when the caller will manage the run_id",
+        ));
+    }
+    let timeout = Duration::from_millis(timeout_ms as u64);
+    let started = Instant::now();
+    let mut record = run_posix_command(
         &argv,
         &cwd,
         &env_overrides,
         stdin.as_deref(),
-        Duration::from_millis(timeout_ms as u64),
+        timeout,
         background,
         stdout_target,
         stderr_target,
         max_stdout_bytes,
         max_stderr_bytes,
     )?;
+    if complete && gateway_runtime::enabled() {
+        record = complete_gateway_run(
+            record,
+            timeout,
+            started,
+            stdout_target,
+            stderr_target,
+            max_stdout_bytes,
+            max_stderr_bytes,
+        )?;
+    }
+    if complete {
+        if record.get("still_running").is_none() {
+            record.insert("still_running", Value::bool(false, Span::unknown()));
+        }
+        if record.get("done").is_none() {
+            record.insert("done", Value::bool(true, Span::unknown()));
+        }
+        if record.get("completion_waits").is_none() {
+            record.insert("completion_waits", Value::int(0, Span::unknown()));
+        }
+        record.insert(
+            "requested_timeout_ms",
+            Value::int(timeout_ms, Span::unknown()),
+        );
+    }
     Ok(StoneRunInvocation {
         record,
         argv,
         cwd,
         env_overrides,
     })
+}
+
+fn complete_gateway_run(
+    mut record: Record,
+    timeout: Duration,
+    started: Instant,
+    stdout_target: RunOutputTarget,
+    stderr_target: RunOutputTarget,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+) -> Result<Record, ShellError> {
+    const WAIT_SLICE: Duration = Duration::from_secs(60);
+
+    if !run_record_still_running(&record) {
+        record.insert("completion_waits", Value::int(0, Span::unknown()));
+        return Ok(record);
+    }
+    let run_id = run_record_string(&record, "run_id").ok_or_else(|| {
+        stone_error(
+            "run_complete",
+            "Gateway returned still_running=true without an owned run_id",
+        )
+    })?;
+    let metadata: Vec<(String, Value)> = ["cwd", "argv", "background"]
+        .into_iter()
+        .filter_map(|field| {
+            record
+                .get(field)
+                .cloned()
+                .map(|value| (field.to_owned(), value))
+        })
+        .collect();
+    let mut waits: i64 = 0;
+
+    loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            record = gateway_runtime::run_terminate(&run_id)?;
+            normalize_run_complete_timeout(&mut record, timeout, &run_id);
+            break;
+        }
+        record = gateway_runtime::run_wait_limited(
+            &run_id,
+            remaining.min(WAIT_SLICE),
+            max_stdout_bytes,
+            max_stderr_bytes,
+        )?;
+        waits += 1;
+        if !run_record_still_running(&record) {
+            break;
+        }
+    }
+
+    for (field, value) in metadata {
+        record.insert(field, value);
+    }
+    apply_gateway_output_policy(&mut record, stdout_target, stderr_target);
+    record.insert("completion_waits", Value::int(waits, Span::unknown()));
+    record.insert(
+        "requested_timeout_ms",
+        Value::int(
+            i64::try_from(timeout.as_millis()).unwrap_or(i64::MAX),
+            Span::unknown(),
+        ),
+    );
+    Ok(record)
+}
+
+fn run_record_still_running(record: &Record) -> bool {
+    matches!(
+        record.get("still_running"),
+        Some(Value::Bool { val: true, .. })
+    )
+}
+
+fn run_record_string(record: &Record, field: &str) -> Option<String> {
+    match record.get(field) {
+        Some(Value::String { val, .. }) => Some(val.clone()),
+        _ => None,
+    }
+}
+
+fn apply_gateway_output_policy(
+    record: &mut Record,
+    stdout_target: RunOutputTarget,
+    stderr_target: RunOutputTarget,
+) {
+    let span = Span::unknown();
+    let mut suppressed = Record::new();
+    suppressed.push(
+        "stdout",
+        Value::bool(stdout_target == RunOutputTarget::Suppress, span),
+    );
+    suppressed.push(
+        "stderr",
+        Value::bool(stderr_target == RunOutputTarget::Suppress, span),
+    );
+    if stdout_target == RunOutputTarget::Suppress {
+        record.insert("stdout", Value::string("", span));
+    }
+    if stderr_target == RunOutputTarget::Suppress {
+        record.insert("stderr", Value::string("", span));
+    }
+    record.insert("suppressed", Value::record(suppressed, span));
+    record.insert("stderr_to_stdout", Value::bool(false, span));
+}
+
+fn normalize_run_complete_timeout(record: &mut Record, timeout: Duration, run_id: &str) {
+    let span = Span::unknown();
+    let timeout_ms = i64::try_from(timeout.as_millis()).unwrap_or(i64::MAX);
+    let mut explanation = Record::new();
+    explanation.push(
+        "summary",
+        Value::string(
+            format!(
+                "run_complete reached its total timeout of {timeout_ms} ms and terminated owned run {run_id}"
+            ),
+            span,
+        ),
+    );
+    explanation.push(
+        "next_steps",
+        Value::list(
+            vec![Value::string(
+                "Inspect the bounded stdout/stderr tails and either repair the command or choose a justified larger total timeout.",
+                span,
+            )],
+            span,
+        ),
+    );
+    record.insert("ok", Value::bool(false, span));
+    record.insert("kind", Value::string("timeout", span));
+    record.insert("timed_out", Value::bool(true, span));
+    record.insert("still_running", Value::bool(false, span));
+    record.insert("done", Value::bool(true, span));
+    record.insert("next_action", Value::string("inspect_error_or_retry", span));
+    record.insert("explanation", Value::record(explanation, span));
 }
 
 fn value_to_bool(value: &Value, context: &str) -> Result<bool, ShellError> {

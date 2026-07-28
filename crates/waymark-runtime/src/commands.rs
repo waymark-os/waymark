@@ -29,7 +29,7 @@ const STONE_HELP_ENTRIES: &[StoneHelpEntry] = &[
     StoneHelpEntry {
         name: "transition_hooks",
         signature: r#"transition_hooks(pre: callable? = None, post: callable? = None) -> transition_hooks"#,
-        use_when: "Create a reusable first-class hook value that can be bound to a local, passed through ordinary Stone functions, and supplied as hooks= to model_call, model_infer, run, or must_run.",
+        use_when: "Create a reusable first-class hook value that can be bound to a local, passed through ordinary Stone functions, and supplied as hooks= to model_call, model_infer, run, or run_complete.",
         examples: &[
             r#"def observe(step):
     return context_write("outcome.last", "outcome", {"ok": step.outcome.ok})
@@ -45,10 +45,11 @@ result = run(["printf", "ok"], hooks=hooks)"#,
     },
     StoneHelpEntry {
         name: "workflow_evidence",
-        signature: r#"workflow_evidence(satisfied: bool, summary: str, evidence: list[str] = []) -> record"#,
-        use_when: "Return bounded, typed completion evidence from a workflow stage evidence handler.",
+        signature: r#"workflow_evidence(satisfied_or_result: bool | record{ok: bool}, summary: str, evidence: list[str] = []) -> record"#,
+        use_when: "Return bounded, typed completion evidence from a workflow stage evidence handler. Pass a run/tool result record to retain its bounded failure diagnostic automatically.",
         examples: &[
             r#"return workflow_evidence(probe.ok, "artifact is non-empty", ["stat:artifact.txt"] if probe.ok else [])"#,
+            r#"return workflow_evidence(probe, "artifact validation", ["stat:artifact.txt"])"#,
         ],
         avoid: &[
             "Do not mark evidence satisfied without at least one compact evidence reference.",
@@ -121,7 +122,7 @@ emit(report)"#,
     StoneHelpEntry {
         name: "workflow_run",
         signature: r#"workflow_run(plan: workflow) -> workflow_report"#,
-        use_when: "Run stages sequentially with pre/post evidence checks, bounded action attempts, and optional repair checks.",
+        use_when: "Run stages sequentially with pre/post evidence checks, bounded action attempts, and optional repair checks. Each stage report retains compact status plus bounded stdout/stderr tails and an explanation summary from its latest action or repair.",
         examples: &[r#"report = workflow_run(plan)
 emit({"ok": report.ok, "failed_stage": report.failed_stage, "stages": report.stages})"#],
         avoid: &[
@@ -148,7 +149,7 @@ emit(json_loads(response.content))"#,
             "Keep messages and options structured; do not encode the request as shell text.",
             "A hook transition record uses transition_id (not id), kind, phase, and input; post hooks also receive outcome.",
             "A pre hook may return None, bool, or a record patch containing messages; a post hook observes outcome.ok plus outcome.value or outcome.error.",
-            "Transition hooks may read or write context, but cannot recursively call model_call, run, or must_run.",
+            "Transition hooks may read or write context, but cannot recursively call model_call, run, run_complete, or must_run.",
         ],
         aliases: &[],
     },
@@ -168,7 +169,7 @@ emit(inference.value.ready)"#,
             "Schema validation proves shape, not factual correctness, tool authority, or task completion.",
             "By default the complete schema is sent to the model. schema_prompt may replace only that model-facing instruction with a bounded compact equivalent; runtime validation still uses the complete schema.",
             "The schema instruction and repair messages are ordinary model-call inputs visible to hooks and tracing.",
-            "Transition hooks apply to each underlying model_call pair and cannot recursively invoke model_infer, model_call, run, or must_run.",
+            "Transition hooks apply to each underlying model_call pair and cannot recursively invoke model_infer, model_call, run, run_complete, or must_run.",
         ],
         aliases: &[],
     },
@@ -890,7 +891,7 @@ if starts_with(line, "ERROR"):
     StoneHelpEntry {
         name: "run",
         signature: r#"run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, background: bool = False, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> record"#,
-        use_when: "Use only when the task explicitly needs a POSIX program. Nonzero exits return ok=false with stdout, stderr, and an explanation record. For task commands that may run more than a few seconds but should eventually exit, pass background=True and manage the returned run_id with run_status/run_wait/run_terminate.",
+        use_when: "Use only when the task explicitly needs a POSIX program. Nonzero exits return ok=false with stdout, stderr, and an explanation record. Use run_complete for a bounded task command that must finish before the program continues; use background=True when the program intentionally manages a live run_id.",
         examples: &[
             r#"result = run(["wc", "-l", "/app/input.txt"])"#,
             r#"result = run(["printf", "ok"], timeout_ms=5000)"#,
@@ -908,7 +909,7 @@ result = run(["sh", "-c", "printf failed >&2; exit 7"], hooks={"post": record_ru
         avoid: &[
             "Do not pass shell strings; pass argv lists.",
             "Do not use run for normal file/JSON/CSV work.",
-            "Use background=True for long-running task commands that should eventually exit, such as builds, tests, installs, downloads, benchmarks, or data processing.",
+            "Use run_complete for long task commands that must finish before the next Stone statement, such as builds, tests, installs, downloads, benchmarks, or data processing.",
             "Do not use shell backgrounding, nohup, or `&`; use background=True for long task commands, or start_daemon() for servers/services that must stay running while tests execute.",
             "For noisy commands, suppress or cap output explicitly instead of flooding stdout/stderr.",
             "Do not ignore result.ok; inspect stderr, exit_code, timed_out, and explanation before retrying.",
@@ -918,7 +919,7 @@ result = run(["sh", "-c", "printf failed >&2; exit 7"], hooks={"post": record_ru
             "Use call-local hooks for one action transition; pre may replace argv or veto without executing it. A veto returns ok=false, kind=policy_rejected, and policy_reason so the agent can revise its action; the post hook still records that outcome.",
             "A hook transition record uses transition_id (not id), kind, phase, and input; post hooks also receive outcome.",
             "A completed nonzero run gives its post hook outcome.ok=false and the structured run record in outcome.value; outcome.error is for an effect that produced no run record.",
-            "Transition hooks cannot recursively call model_call, run, or must_run.",
+            "Transition hooks cannot recursively call model_call, run, run_complete, or must_run.",
         ],
         aliases: &[],
     },
@@ -935,6 +936,22 @@ result = run(["sh", "-c", "printf failed >&2; exit 7"], hooks={"post": record_ru
             "Use run() instead when a nonzero exit is expected and should be handled as data.",
             "Do not use must_run for normal file/JSON/CSV work.",
             "Do not pass shell strings; pass argv lists.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "run_complete",
+        signature: r#"run_complete(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> record"#,
+        use_when: "Use for a bounded task command that may outlive one Gateway observation window but must reach a terminal result before the Stone program continues. It lowers to run plus bounded waits, owns the run_id, and terminates the process if the total timeout expires.",
+        examples: &[
+            r#"built = run_complete(["make", "all"], cwd="/app/project", timeout_ms=360000, max_stdout_bytes=4096, max_stderr_bytes=8192)"#,
+            r#"trained = run_complete(["python3", "train.py"], timeout_ms=600000, stdout="suppress", max_stderr_bytes=4096)"#,
+        ],
+        avoid: &[
+            "Use run(..., background=True) when the program intentionally needs to inspect or interleave with a live process.",
+            "Do not pass background=True; run_complete owns the lifecycle through terminal completion.",
+            "Do not use unbounded shell retry or polling loops around run_complete.",
+            "Inspect result.ok, stderr, exit_code, timed_out, and explanation before retrying.",
         ],
         aliases: &[],
     },
