@@ -104,6 +104,48 @@ The workflow runner does not hide callback errors, silently retry exceptions,
 or infer success from `ok=true`. Recursive `workflow_run` calls are rejected in
 this first slice.
 
+## Target Checkpoint Declaration
+
+Stage checkpoints should be semantically visible but physically
+provider-neutral. The proposed declaration is:
+
+```stone
+@stage(
+    evidence=file_nonempty("/app/project/build/output"),
+    checkpoint="forkable",
+)
+def build(step):
+    return run_complete(...)
+```
+
+The declaration is not implemented in the initial workflow slice. Its target
+semantics are:
+
+1. `checkpoint` accepts `none`, `workspace`, `forkable`, or `auto`;
+2. the runtime requests it only after fresh stage evidence is satisfied;
+3. Gateway atomically snapshots the selected Attempt state planes;
+4. the workflow report exposes only an opaque checkpoint reference and
+   forkability/cost metadata;
+5. a later `attempt_fork` may name that reference without seeing Docker, host
+   paths, overlay directories, or VM snapshot identifiers.
+
+Stone deliberately does not expose `linux_env.checkpoint()`. The program knows
+which stage boundary is valuable, but Gateway retains authority over provider
+support, secret and mount exclusion, budgets, deduplication, retention, and
+garbage collection. Running Linux processes are excluded by default;
+application-native resumable artifacts are preferred when work must continue
+mid-stage.
+
+The expected lowering is:
+
+```text
+@stage(checkpoint="forkable")
+  -> typed stage checkpoint policy
+  -> satisfied evidence transition
+  -> Gateway composite checkpoint request
+  -> opaque checkpoint ref in the workflow report
+```
+
 ## Example
 
 ```stone
