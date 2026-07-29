@@ -237,12 +237,15 @@ Supported handlers are `except:`, `except Exception:`, and
   result record derives satisfaction from `ok`, retains a bounded failure
   diagnostic, and clears success references on failure. Satisfied evidence
   requires at least one reference.
-- `@stage(evidence=..., repair=None, max_attempts=1)`: declare the following
-  one-argument action function as a named typed stage.
+- `@stage(evidence=..., repair=None, max_attempts=1, checkpoint="none")`:
+  declare the following one-argument action function as a named typed stage.
+  `checkpoint="workspace"` preserves a freshly proved boundary in Gateway
+  mode and reports an opaque checkpoint reference.
 - `file_nonempty(path)`: declare a lazy non-empty regular-file proof whose
   evidence reference is generated from the authoritative workspace probe.
 - `workflow_stage(name, evidence=..., action=..., repair=None,
-  max_attempts=1)`: define one bounded evidence/action/repair stage.
+  max_attempts=1, checkpoint="none")`: define one bounded
+  evidence/action/repair stage.
 - `workflow(name, stage, ...)`, `workflow_run(plan)`: compose and execute
   sequential evidence-gated stages, returning a compact structured report.
 - `read_text(path)`, `write_text(path, text)`: text file I/O.

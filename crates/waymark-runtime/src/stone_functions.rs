@@ -81,6 +81,35 @@ impl WorkflowEvidenceSourceValue {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WorkflowCheckpointPolicyValue {
+    None,
+    Workspace,
+    Forkable,
+    Auto,
+}
+
+impl WorkflowCheckpointPolicyValue {
+    pub(super) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "workspace" => Some(Self::Workspace),
+            "forkable" => Some(Self::Forkable),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Workspace => "workspace",
+            Self::Forkable => "forkable",
+            Self::Auto => "auto",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct WorkflowStageValue {
     pub(super) name: String,
@@ -88,6 +117,7 @@ pub(super) struct WorkflowStageValue {
     pub(super) action: WorkflowHandlerValue,
     pub(super) repair: Option<WorkflowHandlerValue>,
     pub(super) max_attempts: u32,
+    pub(super) checkpoint: WorkflowCheckpointPolicyValue,
 }
 
 impl WorkflowStageValue {

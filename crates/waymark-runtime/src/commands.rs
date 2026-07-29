@@ -74,9 +74,9 @@ def build_artifact(step):
     },
     StoneHelpEntry {
         name: "stage",
-        signature: r#"@stage(evidence: workflow_evidence_spec | callable, repair: callable? = None, max_attempts: int = 1)
+        signature: r#"@stage(evidence: workflow_evidence_spec | callable, repair: callable? = None, max_attempts: int = 1, checkpoint: str = "none")
 def name(step): ... -> workflow_stage"#,
-        use_when: "Declare a named evidence-gated workflow stage with its action body directly below the decorator. The function name becomes the first-class stage binding.",
+        use_when: "Declare a named evidence-gated workflow stage with its action body directly below the decorator. Use checkpoint=\"workspace\" to preserve a verified stage boundary in Gateway mode.",
         examples: &[
             r#"def repair_artifact(step):
     return run(["sh", "-c", "printf ready > artifact.txt"])
@@ -92,12 +92,13 @@ emit(report)"#,
             "Use @stage(...) immediately above a one-argument def; stage(...) is not an ordinary runtime constructor.",
             "The decorated action and optional repair must return records with boolean ok fields.",
             "Stage advancement still depends only on evidence, never the action ok field.",
+            "A checkpoint is created only after fresh satisfied evidence; an already-satisfied stage is not checkpointed again.",
         ],
         aliases: &[],
     },
     StoneHelpEntry {
         name: "workflow_stage",
-        signature: r#"workflow_stage(name: str, evidence: callable, action: callable, repair: callable? = None, max_attempts: int = 1) -> workflow_stage"#,
+        signature: r#"workflow_stage(name: str, evidence: callable, action: callable, repair: callable? = None, max_attempts: int = 1, checkpoint: str = "none") -> workflow_stage"#,
         use_when: "Define one typed stage whose action may run only within a bounded evidence-check and optional repair cycle.",
         examples: &[
             r#"stage = workflow_stage("artifact", evidence=check_artifact, action=build_artifact, repair=repair_artifact, max_attempts=2)"#,

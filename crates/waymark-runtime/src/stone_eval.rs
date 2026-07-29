@@ -105,9 +105,10 @@ use stone_context::ContextState;
 pub(crate) use stone_functions::StoneSession;
 use stone_functions::{
     CallableValue, TransitionHookHandlerValue as TransitionHookHandler,
-    TransitionHooksValue as TransitionHooks, WorkflowEvidenceSourceValue as WorkflowEvidenceSource,
-    WorkflowHandlerValue as WorkflowHandler, WorkflowStageValue as WorkflowStage,
-    WorkflowValue as Workflow,
+    TransitionHooksValue as TransitionHooks,
+    WorkflowCheckpointPolicyValue as WorkflowCheckpointPolicy,
+    WorkflowEvidenceSourceValue as WorkflowEvidenceSource, WorkflowHandlerValue as WorkflowHandler,
+    WorkflowStageValue as WorkflowStage, WorkflowValue as Workflow,
 };
 use stone_json_view::{
     eval_json_object_view_method, eval_runtime_subscript, json_array_view_iter_values,
@@ -741,6 +742,77 @@ struct WorkflowEvidence {
 struct WorkflowActionResult {
     full: Value,
     compact: Value,
+}
+
+struct WorkflowCheckpointResult {
+    policy: WorkflowCheckpointPolicy,
+    selected_policy: WorkflowCheckpointPolicy,
+    status: &'static str,
+    reference: Option<String>,
+    planes: Vec<&'static str>,
+    reason: Option<String>,
+    error_code: Option<&'static str>,
+    storage_bytes: Option<u64>,
+    create_duration_ms: Option<u64>,
+    copy_files: Option<u64>,
+    copy_bytes: Option<u64>,
+    reflink_attempts: Option<u64>,
+    reflink_successes: Option<u64>,
+}
+
+impl WorkflowCheckpointResult {
+    fn not_requested(policy: WorkflowCheckpointPolicy) -> Self {
+        Self {
+            policy,
+            selected_policy: WorkflowCheckpointPolicy::None,
+            status: "not_requested",
+            reference: None,
+            planes: Vec::new(),
+            reason: None,
+            error_code: None,
+            storage_bytes: None,
+            create_duration_ms: None,
+            copy_files: None,
+            copy_bytes: None,
+            reflink_attempts: None,
+            reflink_successes: None,
+        }
+    }
+
+    fn skipped(policy: WorkflowCheckpointPolicy, reason: impl Into<String>) -> Self {
+        Self {
+            status: "skipped",
+            reason: Some(reason.into()),
+            ..Self::not_requested(policy)
+        }
+    }
+
+    fn failed(
+        policy: WorkflowCheckpointPolicy,
+        selected_policy: WorkflowCheckpointPolicy,
+        code: &'static str,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            policy,
+            selected_policy,
+            status: "failed",
+            reference: None,
+            planes: Vec::new(),
+            reason: Some(reason.into()),
+            error_code: Some(code),
+            storage_bytes: None,
+            create_duration_ms: None,
+            copy_files: None,
+            copy_bytes: None,
+            reflink_attempts: None,
+            reflink_successes: None,
+        }
+    }
+
+    fn is_failed(&self) -> bool {
+        self.status == "failed"
+    }
 }
 
 impl Evaluator<'_> {
@@ -4142,12 +4214,19 @@ impl Evaluator<'_> {
             .map(|expression| self.eval_workflow_max_attempts(expression, "@stage"))
             .transpose()?
             .unwrap_or(1);
+        let checkpoint = decorator
+            .checkpoint
+            .as_ref()
+            .map(|expression| self.eval_workflow_checkpoint_policy(expression, "@stage"))
+            .transpose()?
+            .unwrap_or(WorkflowCheckpointPolicy::None);
         Ok(WorkflowStage {
             name: function.name.clone(),
             evidence,
             action: WorkflowHandler::NamedFunction(function.name.clone()),
             repair,
             max_attempts,
+            checkpoint,
         })
     }
 
@@ -4167,6 +4246,7 @@ impl Evaluator<'_> {
         let mut action = None;
         let mut repair = None;
         let mut max_attempts = 1_u32;
+        let mut checkpoint = WorkflowCheckpointPolicy::None;
         let mut seen = HashSet::new();
         for (field, expression) in &call.named {
             if !seen.insert(field.as_str()) {
@@ -4188,9 +4268,13 @@ impl Evaluator<'_> {
                 "max_attempts" => {
                     max_attempts = self.eval_workflow_max_attempts(expression, "workflow_stage")?;
                 }
+                "checkpoint" => {
+                    checkpoint =
+                        self.eval_workflow_checkpoint_policy(expression, "workflow_stage")?;
+                }
                 other => {
                     return Err(workflow_error(format!(
-                        "unsupported workflow_stage() field `{other}`; expected evidence, action, repair, or max_attempts"
+                        "unsupported workflow_stage() field `{other}`; expected evidence, action, repair, max_attempts, or checkpoint"
                     )));
                 }
             }
@@ -4204,6 +4288,7 @@ impl Evaluator<'_> {
             action,
             repair,
             max_attempts,
+            checkpoint,
         }))
     }
 
@@ -4258,6 +4343,22 @@ impl Evaluator<'_> {
             )));
         }
         Ok(attempts)
+    }
+
+    fn eval_workflow_checkpoint_policy(
+        &mut self,
+        expression: &Expr,
+        context: &str,
+    ) -> Result<WorkflowCheckpointPolicy, ShellError> {
+        let value = self
+            .eval_expr_value(expression, PipelineData::empty())?
+            .into_nu_value(&format!("{context} checkpoint"))?;
+        let policy = value_to_string(&value, &format!("{context} checkpoint"))?;
+        WorkflowCheckpointPolicy::parse(&policy).ok_or_else(|| {
+            workflow_error(format!(
+                "{context} checkpoint must be one of none, workspace, forkable, or auto; got `{policy}`"
+            ))
+        })
     }
 
     fn eval_workflow_handler(
@@ -4384,6 +4485,10 @@ impl Evaluator<'_> {
             checks += 1;
             if evidence.satisfied {
                 completed.push(stage.name.clone());
+                let checkpoint = WorkflowCheckpointResult::skipped(
+                    stage.checkpoint,
+                    "stage was already satisfied; no fresh stage transition was checkpointed",
+                );
                 reports.push(workflow_stage_report(
                     stage,
                     "already_satisfied",
@@ -4393,6 +4498,7 @@ impl Evaluator<'_> {
                     &evidence,
                     last_action,
                     last_repair,
+                    &checkpoint,
                 ));
                 continue;
             }
@@ -4489,6 +4595,27 @@ impl Evaluator<'_> {
             }
 
             if stage_completed {
+                let checkpoint = self.create_workflow_stage_checkpoint(workflow, stage);
+                if checkpoint.is_failed() {
+                    reports.push(workflow_stage_report(
+                        stage,
+                        "checkpoint_failed",
+                        attempts,
+                        repairs,
+                        checks,
+                        &evidence,
+                        last_action,
+                        last_repair,
+                        &checkpoint,
+                    ));
+                    return Ok(workflow_report_value(
+                        workflow,
+                        false,
+                        Some(&stage.name),
+                        completed,
+                        reports,
+                    ));
+                }
                 completed.push(stage.name.clone());
                 reports.push(workflow_stage_report(
                     stage,
@@ -4499,10 +4626,15 @@ impl Evaluator<'_> {
                     &evidence,
                     last_action,
                     last_repair,
+                    &checkpoint,
                 ));
                 continue;
             }
 
+            let checkpoint = WorkflowCheckpointResult::skipped(
+                stage.checkpoint,
+                "stage evidence remained unsatisfied",
+            );
             reports.push(workflow_stage_report(
                 stage,
                 "failed",
@@ -4512,6 +4644,7 @@ impl Evaluator<'_> {
                 &evidence,
                 last_action,
                 last_repair,
+                &checkpoint,
             ));
             return Ok(workflow_report_value(
                 workflow,
@@ -4525,6 +4658,61 @@ impl Evaluator<'_> {
         Ok(workflow_report_value(
             workflow, true, None, completed, reports,
         ))
+    }
+
+    fn create_workflow_stage_checkpoint(
+        &self,
+        workflow: &Workflow,
+        stage: &WorkflowStage,
+    ) -> WorkflowCheckpointResult {
+        let selected_policy = match stage.checkpoint {
+            WorkflowCheckpointPolicy::None => {
+                return WorkflowCheckpointResult::not_requested(stage.checkpoint);
+            }
+            WorkflowCheckpointPolicy::Workspace => WorkflowCheckpointPolicy::Workspace,
+            WorkflowCheckpointPolicy::Auto => WorkflowCheckpointPolicy::Workspace,
+            WorkflowCheckpointPolicy::Forkable => {
+                return WorkflowCheckpointResult::failed(
+                    stage.checkpoint,
+                    WorkflowCheckpointPolicy::Forkable,
+                    "checkpoint_plane_unavailable",
+                    "forkable checkpoints require an environment-plane provider; this runtime currently supports workspace checkpoints only",
+                );
+            }
+        };
+
+        if !gateway_env::enabled() {
+            return WorkflowCheckpointResult::failed(
+                stage.checkpoint,
+                selected_policy,
+                "checkpoint_plane_unavailable",
+                "workspace checkpoints require Gateway mode and an active task transaction",
+            );
+        }
+
+        match gateway_env::workflow_stage_checkpoint(&workflow.name, &stage.name) {
+            Ok(checkpoint) => WorkflowCheckpointResult {
+                policy: stage.checkpoint,
+                selected_policy,
+                status: "created",
+                reference: Some(checkpoint.reference),
+                planes: vec!["workspace"],
+                reason: None,
+                error_code: None,
+                storage_bytes: Some(checkpoint.storage_bytes),
+                create_duration_ms: Some(checkpoint.create_duration_ms),
+                copy_files: Some(checkpoint.copy_files),
+                copy_bytes: Some(checkpoint.copy_bytes),
+                reflink_attempts: Some(checkpoint.reflink_attempts),
+                reflink_successes: Some(checkpoint.reflink_successes),
+            },
+            Err(error) => WorkflowCheckpointResult::failed(
+                stage.checkpoint,
+                selected_policy,
+                "checkpoint_create_failed",
+                bounded_text(&format!("{error:?}"), 1_024),
+            ),
+        }
     }
 
     fn invoke_workflow_evidence_handler(
@@ -9619,6 +9807,10 @@ fn workflow_context_value(
     record.push("attempt", Value::int(attempt as i64, span));
     record.push("max_attempts", Value::int(stage.max_attempts as i64, span));
     record.push(
+        "checkpoint_policy",
+        Value::string(stage.checkpoint.as_str(), span),
+    );
+    record.push(
         "completed_stages",
         Value::list(
             completed_stages
@@ -9651,6 +9843,7 @@ fn workflow_stage_report(
     evidence: &WorkflowEvidence,
     last_action: Option<Value>,
     last_repair: Option<Value>,
+    checkpoint: &WorkflowCheckpointResult,
 ) -> Value {
     let span = Span::unknown();
     let mut record = Record::new();
@@ -9668,6 +9861,68 @@ fn workflow_stage_report(
         "last_repair",
         last_repair.unwrap_or_else(|| Value::nothing(span)),
     );
+    record.push("checkpoint", workflow_checkpoint_result_value(checkpoint));
+    Value::record(record, span)
+}
+
+fn workflow_checkpoint_result_value(checkpoint: &WorkflowCheckpointResult) -> Value {
+    let span = Span::unknown();
+    let mut record = Record::new();
+    record.push("policy", Value::string(checkpoint.policy.as_str(), span));
+    record.push(
+        "selected_policy",
+        Value::string(checkpoint.selected_policy.as_str(), span),
+    );
+    record.push("status", Value::string(checkpoint.status, span));
+    record.push(
+        "reference",
+        checkpoint
+            .reference
+            .as_ref()
+            .map(|reference| Value::string(reference, span))
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    record.push(
+        "planes",
+        Value::list(
+            checkpoint
+                .planes
+                .iter()
+                .map(|plane| Value::string(*plane, span))
+                .collect(),
+            span,
+        ),
+    );
+    record.push(
+        "reason",
+        checkpoint
+            .reason
+            .as_ref()
+            .map(|reason| Value::string(reason, span))
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    record.push(
+        "error_code",
+        checkpoint
+            .error_code
+            .map(|code| Value::string(code, span))
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    for (name, value) in [
+        ("storage_bytes", checkpoint.storage_bytes),
+        ("create_duration_ms", checkpoint.create_duration_ms),
+        ("copy_files", checkpoint.copy_files),
+        ("copy_bytes", checkpoint.copy_bytes),
+        ("reflink_attempts", checkpoint.reflink_attempts),
+        ("reflink_successes", checkpoint.reflink_successes),
+    ] {
+        record.push(
+            name,
+            value
+                .map(|value| Value::int(value.min(i64::MAX as u64) as i64, span))
+                .unwrap_or_else(|| Value::nothing(span)),
+        );
+    }
     Value::record(record, span)
 }
 
@@ -13125,6 +13380,105 @@ emit({
                 "evidence": ["file:artifact.txt:size=5"],
                 "artifact": "ready",
             })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn stage_checkpoint_requires_fresh_evidence_and_gateway_plane() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("stage-checkpoint-plane")?;
+        let program = lower_source(
+            r#"@stage(
+    evidence=file_nonempty("artifact.txt"),
+    checkpoint="workspace",
+)
+def artifact(step):
+    return run(["sh", "-c", "printf ready > artifact.txt"])
+
+report = workflow_run(workflow("checkpoint-build", artifact))
+stage_report = report.stages[0]
+emit({
+    "ok": report.ok,
+    "status": stage_report.status,
+    "evidence_satisfied": stage_report.evidence.satisfied,
+    "checkpoint": stage_report.checkpoint,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(false));
+        assert_eq!(value["status"], json_value!("checkpoint_failed"));
+        assert_eq!(value["evidence_satisfied"], json_value!(true));
+        assert_eq!(value["checkpoint"]["policy"], json_value!("workspace"));
+        assert_eq!(
+            value["checkpoint"]["selected_policy"],
+            json_value!("workspace")
+        );
+        assert_eq!(value["checkpoint"]["status"], json_value!("failed"));
+        assert_eq!(
+            value["checkpoint"]["error_code"],
+            json_value!("checkpoint_plane_unavailable")
+        );
+        assert_eq!(value["checkpoint"]["reference"], json_value!(null));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn stage_checkpoint_skips_an_already_satisfied_stage() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("stage-checkpoint-already-done")?;
+        let program = lower_source(
+            r#"def already_ready(step):
+    return workflow_evidence(True, "fixture is ready", ["fixture:ready"])
+
+stage = workflow_stage(
+    "ready",
+    evidence=already_ready,
+    action=lambda step: {"ok": False},
+    checkpoint="workspace",
+)
+report = workflow_run(workflow("checkpoint-skip", stage))
+emit({
+    "ok": report.ok,
+    "status": report.stages[0].status,
+    "attempts": report.stages[0].attempts,
+    "checkpoint": report.stages[0].checkpoint,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(true));
+        assert_eq!(value["status"], json_value!("already_satisfied"));
+        assert_eq!(value["attempts"], json_value!(0));
+        assert_eq!(value["checkpoint"]["policy"], json_value!("workspace"));
+        assert_eq!(value["checkpoint"]["status"], json_value!("skipped"));
+        assert_eq!(value["checkpoint"]["reference"], json_value!(null));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn stage_checkpoint_rejects_unknown_policy() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("stage-checkpoint-policy")?;
+        let program = lower_source(
+            r#"@stage(evidence=file_nonempty("artifact.txt"), checkpoint="process")
+def artifact(step):
+    return {"ok": True}
+
+workflow_run(workflow("invalid-checkpoint", artifact))
+"#,
+        )?;
+        let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("unknown checkpoint policy must fail");
+        let text = format!("{error:?}");
+        assert!(
+            text.contains("none, workspace, forkable, or auto"),
+            "{text}"
         );
         cleanup_dir(&root);
         Ok(())

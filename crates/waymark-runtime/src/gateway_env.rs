@@ -17,6 +17,36 @@ pub(crate) fn enabled() -> bool {
     config().is_some()
 }
 
+pub(crate) struct WorkflowStageCheckpoint {
+    pub(crate) reference: String,
+    pub(crate) storage_bytes: u64,
+    pub(crate) create_duration_ms: u64,
+    pub(crate) copy_files: u64,
+    pub(crate) copy_bytes: u64,
+    pub(crate) reflink_attempts: u64,
+    pub(crate) reflink_successes: u64,
+}
+
+pub(crate) fn workflow_stage_checkpoint(
+    workflow: &str,
+    stage: &str,
+) -> Result<WorkflowStageCheckpoint, ShellError> {
+    let config = required_config()?;
+    let reason = format!("stone.workflow-stage:{workflow}:{stage}");
+    let checkpoint = with_client(&config, |client| {
+        client.env_checkpoint_with_lifecycle(&config.tx, reason, "attempt")
+    })?;
+    Ok(WorkflowStageCheckpoint {
+        reference: checkpoint.checkpoint,
+        storage_bytes: checkpoint.storage_bytes,
+        create_duration_ms: checkpoint.create_duration_ms,
+        copy_files: checkpoint.copy_files,
+        copy_bytes: checkpoint.copy_bytes,
+        reflink_attempts: checkpoint.reflink_attempts,
+        reflink_successes: checkpoint.reflink_successes,
+    })
+}
+
 pub(crate) fn attempt_info(attempt: String) -> Result<Value, ShellError> {
     let config = required_config()?;
     let attempt = effective_attempt(&config, attempt)?;

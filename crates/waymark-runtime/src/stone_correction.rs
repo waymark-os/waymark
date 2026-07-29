@@ -51,10 +51,13 @@ const KEYWORD_SCHEMAS: &[(&str, &[&str])] = &[
     ("correction_apply", &["source", "correction", "candidate"]),
     ("workflow_evidence", &[]),
     ("file_nonempty", &[]),
-    ("stage", &["evidence", "repair", "max_attempts"]),
+    (
+        "stage",
+        &["evidence", "repair", "max_attempts", "checkpoint"],
+    ),
     (
         "workflow_stage",
-        &["evidence", "action", "repair", "max_attempts"],
+        &["evidence", "action", "repair", "max_attempts", "checkpoint"],
     ),
     ("workflow", &[]),
     ("workflow_run", &[]),

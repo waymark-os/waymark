@@ -64,6 +64,7 @@ pub struct StageDecorator {
     pub evidence: Expr,
     pub repair: Option<Expr>,
     pub max_attempts: Option<Expr>,
+    pub checkpoint: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -414,12 +415,13 @@ fn lower_function_stage_decorator(
         if !call.arguments.args.is_empty() {
             return Err(unsupported_message(
                 "stage declaration",
-                "@stage(...) accepts only evidence=, repair=, and max_attempts= keyword arguments",
+                "@stage(...) accepts only evidence=, repair=, max_attempts=, and checkpoint= keyword arguments",
             ));
         }
         let mut evidence = None;
         let mut repair = None;
         let mut max_attempts = None;
+        let mut checkpoint = None;
         for keyword in call.arguments.keywords {
             let Some(name) = keyword.arg else {
                 return Err(unsupported_message(
@@ -431,11 +433,12 @@ fn lower_function_stage_decorator(
                 "evidence" => &mut evidence,
                 "repair" => &mut repair,
                 "max_attempts" => &mut max_attempts,
+                "checkpoint" => &mut checkpoint,
                 other => {
                     return Err(unsupported_message(
                         "stage declaration",
                         format!(
-                            "unsupported @stage field `{other}`; expected evidence, repair, or max_attempts"
+                            "unsupported @stage field `{other}`; expected evidence, repair, max_attempts, or checkpoint"
                         ),
                     ));
                 }
@@ -458,6 +461,7 @@ fn lower_function_stage_decorator(
             evidence,
             repair,
             max_attempts,
+            checkpoint,
         }));
     };
     Ok(None)
@@ -1821,7 +1825,7 @@ values = sorted([3, 1, 2])
     #[test]
     fn lowers_stage_decorator_to_typed_function_metadata() {
         let program = lower_source(
-            r#"@stage(evidence=file_nonempty("artifact.txt"), repair=repair_artifact, max_attempts=2)
+            r#"@stage(evidence=file_nonempty("artifact.txt"), repair=repair_artifact, max_attempts=2, checkpoint="workspace")
 def artifact(step):
     return run(["make", "artifact"])
 "#,
@@ -1837,6 +1841,7 @@ def artifact(step):
         ));
         assert!(matches!(stage.repair, Some(Expr::Name(ref name)) if name == "repair_artifact"));
         assert!(matches!(stage.max_attempts, Some(Expr::Int(ref value)) if value == "2"));
+        assert!(matches!(stage.checkpoint, Some(Expr::String(ref value)) if value == "workspace"));
     }
 
     #[test]

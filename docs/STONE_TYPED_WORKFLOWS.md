@@ -104,30 +104,37 @@ The workflow runner does not hide callback errors, silently retry exceptions,
 or infer success from `ok=true`. Recursive `workflow_run` calls are rejected in
 this first slice.
 
-## Target Checkpoint Declaration
+## Stage Checkpoint Declaration
 
 Stage checkpoints should be semantically visible but physically
-provider-neutral. The proposed declaration is:
+provider-neutral:
 
 ```stone
 @stage(
     evidence=file_nonempty("/app/project/build/output"),
-    checkpoint="forkable",
+    checkpoint="workspace",
 )
 def build(step):
     return run_complete(...)
 ```
 
-The declaration is not implemented in the initial workflow slice. Its target
-semantics are:
+The declaration accepts `none`, `workspace`, `forkable`, or `auto`.
+The implemented first slice has these semantics:
 
-1. `checkpoint` accepts `none`, `workspace`, `forkable`, or `auto`;
-2. the runtime requests it only after fresh stage evidence is satisfied;
-3. Gateway atomically snapshots the selected Attempt state planes;
-4. the workflow report exposes only an opaque checkpoint reference and
-   forkability/cost metadata;
-5. a later `attempt_fork` may name that reference without seeing Docker, host
-   paths, overlay directories, or VM snapshot identifiers.
+1. `none` is the default and creates no checkpoint;
+2. `workspace` requests a Gateway workspace/environment-map checkpoint only
+   after fresh post-action or post-repair evidence is satisfied;
+3. `auto` currently selects `workspace`, the only implemented stage
+   checkpoint plane;
+4. an already-satisfied or failed stage does not create a checkpoint;
+5. the stage report exposes an opaque `reference`, selected policy, planes,
+   creation cost, and stable failure code, but no host path;
+6. `forkable` fails closed with `checkpoint_plane_unavailable` until the tool
+   environment plane can be snapshotted or rematerialized.
+
+Attempt finish reclaims Stone stage checkpoints owned by that attempt
+transaction. Explicit diagnostic checkpoints and fork source checkpoints use
+their existing independent lifecycles.
 
 Stone deliberately does not expose `linux_env.checkpoint()`. The program knows
 which stage boundary is valuable, but Gateway retains authority over provider
@@ -136,15 +143,20 @@ garbage collection. Running Linux processes are excluded by default;
 application-native resumable artifacts are preferred when work must continue
 mid-stage.
 
-The expected lowering is:
+The lowering is:
 
 ```text
-@stage(checkpoint="forkable")
+@stage(checkpoint="workspace")
   -> typed stage checkpoint policy
   -> satisfied evidence transition
-  -> Gateway composite checkpoint request
+  -> Gateway workspace checkpoint request
   -> opaque checkpoint ref in the workflow report
 ```
+
+The target `forkable` lowering replaces the workspace-only request with a
+Gateway composite checkpoint. A later attempt-fork-by-checkpoint operation is
+also future work; the current `attempt_fork` still snapshots the parent's
+current state.
 
 ## Example
 
@@ -180,10 +192,15 @@ This is a control-flow primitive, not a general workflow service:
 ## Validation
 
 The runtime suite covers repair-required completion, unmet evidence despite
-successful actions, lambda handlers with pre-satisfied skipping, and malformed
-satisfied evidence. The checked-in
+successful actions, lambda handlers with pre-satisfied skipping, malformed
+satisfied evidence, checkpoint policy validation, pre-satisfied checkpoint
+skipping, and explicit unavailable-plane reports. The checked-in
 [`typed_evidence_workflow.stone`](../examples/scripts/typed_evidence_workflow.stone)
 is the standalone model-free canary.
+
+The Gateway repository's `smoke-stone-stage-checkpoint.sh` is the end-to-end
+checkpoint canary. It proves creation after fresh evidence, opaque report
+metadata, restore after later corruption, and cleanup on attempt finish.
 
 A matched three-pair live-model experiment found both the callback kernel and
 `@stage` syntax correct on all first drafts. The syntax reduced mean generated
