@@ -122,19 +122,21 @@ The declaration accepts `none`, `workspace`, `forkable`, or `auto`.
 The implemented first slice has these semantics:
 
 1. `none` is the default and creates no checkpoint;
-2. `workspace` requests a Gateway workspace/environment-map checkpoint only
-   after fresh post-action or post-repair evidence is satisfied;
-3. `auto` currently selects `workspace`, the only implemented stage
-   checkpoint plane;
+2. `workspace` requests a Gateway workspace/environment-map checkpoint plus
+   the bounded attempt-memory frontier, only after fresh post-action or
+   post-repair evidence is satisfied;
+3. `auto` currently selects that `workspace` checkpoint bundle;
 4. an already-satisfied or failed stage does not create a checkpoint;
-5. the stage report exposes an opaque `reference`, selected policy, planes,
-   creation cost, and stable failure code, but no host path;
+5. the stage report exposes an opaque `reference`, selected policy, captured
+   planes, workspace and memory revisions, creation cost, and stable failure
+   code, but no host path;
 6. `forkable` fails closed with `checkpoint_plane_unavailable` until the tool
    environment plane can be snapshotted or rematerialized.
 
-Attempt finish reclaims Stone stage checkpoints owned by that attempt
-transaction. Explicit diagnostic checkpoints and fork source checkpoints use
-their existing independent lifecycles.
+The parent attempt owns its Stone stage checkpoints. They may be borrowed by
+multiple child forks and survive child finish; parent finish reclaims them.
+Explicit diagnostic checkpoints retain their independent lifecycle and cannot
+be used as attempt-fork frontiers.
 
 Stone deliberately does not expose `linux_env.checkpoint()`. The program knows
 which stage boundary is valuable, but Gateway retains authority over provider
@@ -149,14 +151,28 @@ The lowering is:
 @stage(checkpoint="workspace")
   -> typed stage checkpoint policy
   -> satisfied evidence transition
-  -> Gateway workspace checkpoint request
+  -> Gateway workspace + attempt-memory checkpoint request
   -> opaque checkpoint ref in the workflow report
 ```
 
 The target `forkable` lowering replaces the workspace-only request with a
-Gateway composite checkpoint. A later attempt-fork-by-checkpoint operation is
-also future work; the current `attempt_fork` still snapshots the parent's
-current state.
+Gateway composite checkpoint that also captures or rematerializes the
+attempt-owned tool environment.
+
+The implemented checkpoint-backed fork consumes the opaque reference directly:
+
+```stone
+report = workflow_run(workflow("prepare", dependencies))
+checkpoint = report.stages[0].checkpoint.reference
+child = attempt_fork(checkpoint=checkpoint, input={"strategy": "alternate"})
+```
+
+Gateway accepts only an active attempt-owned checkpoint belonging to the
+selected parent. The child receives the checkpoint's workspace and bounded
+memory frontiers, so later parent files and memory cannot leak into the branch.
+The checkpoint is borrowed rather than consumed, allowing sibling explorations.
+This does not make the branch `forkable`: provider tool-environment state is
+still rematerialized from explicit child options until that plane exists.
 
 ## Example
 
@@ -186,8 +202,8 @@ This is a control-flow primitive, not a general workflow service:
 - Waymark retains authority over effects, resources, transactions, and traces.
 - Handlers may call normal Stone and Gateway effects.
 - Evidence references are compact claims, not archived logs or artifact bytes.
-- Cross-attempt distribution, durable restart, parallel stages, and declarative
-  effect records are future extensions.
+- Durable restart, parallel stages, and declarative effect records are future
+  extensions.
 
 ## Validation
 
@@ -200,7 +216,8 @@ is the standalone model-free canary.
 
 The Gateway repository's `smoke-stone-stage-checkpoint.sh` is the end-to-end
 checkpoint canary. It proves creation after fresh evidence, opaque report
-metadata, restore after later corruption, and cleanup on attempt finish.
+metadata, exclusion of later workspace and memory pollution, reusable sibling
+forks, selected-child acceptance, restore, and parent-owned cleanup.
 
 A matched three-pair live-model experiment found both the callback kernel and
 `@stage` syntax correct on all first drafts. The syntax reduced mean generated

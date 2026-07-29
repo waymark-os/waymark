@@ -1177,13 +1177,17 @@ emit(attempt_scope_close(scope).clean)"#],
     },
     StoneHelpEntry {
         name: "attempt_fork",
-        signature: r#"attempt_fork(parent_attempt: attempt_handle | str | record = "", task: str = "", input: Any = None, context_prompt_view: {"required_keys": [str, ...]}? = None, program: record? = None, entrypoint: str = "", start: bool = False, scope: attempt_scope? = None, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", resource_limits: record = {}, metadata: record = {}) -> attempt_handle"#,
-        use_when: "Use in Gateway mode to create a child attempt from the current or specified parent attempt workspace state.",
+        signature: r#"attempt_fork(parent_attempt: attempt_handle | str | record = "", checkpoint: str = "", task: str = "", input: Any = None, context_prompt_view: {"required_keys": [str, ...]}? = None, program: record? = None, entrypoint: str = "", start: bool = False, scope: attempt_scope? = None, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", resource_limits: record = {}, metadata: record = {}) -> attempt_handle"#,
+        use_when: "Use in Gateway mode to create an isolated child from the current parent frontier, or from an opaque verified stage checkpoint owned by that parent.",
         examples: &[
             r#"branch = attempt_fork(task="try-alt-fix", metadata={"strategy": "alternate"})"#,
+            r#"branch = attempt_fork(checkpoint=report.stages[0].checkpoint.reference, input={"strategy": "alternate"})"#,
             r#"branch = attempt_fork(input={"strategy": "alternate"}, context_prompt_view={"required_keys": ["requirement.target"]}, program=current_program(), entrypoint="worker", start=True, scope=scope)"#,
         ],
-        avoid: &["Do not assume a fork mutates the parent attempt; it returns a separate attempt and transaction."],
+        avoid: &[
+            "Do not assume a fork mutates the parent attempt; it returns a separate attempt and transaction.",
+            "Do not treat a workspace checkpoint as a full tool-environment snapshot; forkable provider state is a separate checkpoint plane.",
+        ],
         aliases: &[],
     },
     StoneHelpEntry {

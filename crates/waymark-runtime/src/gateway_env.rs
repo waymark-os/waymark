@@ -19,6 +19,8 @@ pub(crate) fn enabled() -> bool {
 
 pub(crate) struct WorkflowStageCheckpoint {
     pub(crate) reference: String,
+    pub(crate) workspace_revision: u64,
+    pub(crate) memory_revision: Option<u64>,
     pub(crate) storage_bytes: u64,
     pub(crate) create_duration_ms: u64,
     pub(crate) copy_files: u64,
@@ -38,6 +40,10 @@ pub(crate) fn workflow_stage_checkpoint(
     })?;
     Ok(WorkflowStageCheckpoint {
         reference: checkpoint.checkpoint,
+        workspace_revision: checkpoint.source_tx_revision,
+        memory_revision: checkpoint
+            .has_memory_revision
+            .then_some(checkpoint.memory_revision),
         storage_bytes: checkpoint.storage_bytes,
         create_duration_ms: checkpoint.create_duration_ms,
         copy_files: checkpoint.copy_files,
@@ -217,6 +223,7 @@ pub(crate) fn attempt_spawn(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attempt_fork(
     parent_attempt: String,
+    checkpoint: String,
     task: String,
     controller: String,
     capability_profile: String,
@@ -234,6 +241,7 @@ pub(crate) fn attempt_fork(
     let attempt = with_client(&config, |client| {
         client.attempt_fork(AttemptForkRequest {
             parent_attempt: parent_attempt.clone(),
+            checkpoint: checkpoint.clone(),
             task: task.clone(),
             controller: controller.clone(),
             capability_profile: capability_profile.clone(),

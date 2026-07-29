@@ -752,6 +752,8 @@ struct WorkflowCheckpointResult {
     planes: Vec<&'static str>,
     reason: Option<String>,
     error_code: Option<&'static str>,
+    workspace_revision: Option<u64>,
+    memory_revision: Option<u64>,
     storage_bytes: Option<u64>,
     create_duration_ms: Option<u64>,
     copy_files: Option<u64>,
@@ -770,6 +772,8 @@ impl WorkflowCheckpointResult {
             planes: Vec::new(),
             reason: None,
             error_code: None,
+            workspace_revision: None,
+            memory_revision: None,
             storage_bytes: None,
             create_duration_ms: None,
             copy_files: None,
@@ -801,6 +805,8 @@ impl WorkflowCheckpointResult {
             planes: Vec::new(),
             reason: Some(reason.into()),
             error_code: Some(code),
+            workspace_revision: None,
+            memory_revision: None,
             storage_bytes: None,
             create_duration_ms: None,
             copy_files: None,
@@ -4696,9 +4702,11 @@ impl Evaluator<'_> {
                 selected_policy,
                 status: "created",
                 reference: Some(checkpoint.reference),
-                planes: vec!["workspace"],
+                planes: vec!["workspace", "attempt_memory"],
                 reason: None,
                 error_code: None,
+                workspace_revision: Some(checkpoint.workspace_revision),
+                memory_revision: checkpoint.memory_revision,
                 storage_bytes: Some(checkpoint.storage_bytes),
                 create_duration_ms: Some(checkpoint.create_duration_ms),
                 copy_files: Some(checkpoint.copy_files),
@@ -6262,6 +6270,7 @@ impl Evaluator<'_> {
             .map(|value| attempt_id_from_value(value, "attempt_fork parent_attempt"))
             .transpose()?
             .unwrap_or_default();
+        let mut checkpoint = String::new();
         let mut task = String::new();
         let mut controller = String::new();
         let mut capability_profile = String::new();
@@ -6279,6 +6288,7 @@ impl Evaluator<'_> {
                 "parent_attempt" | "attempt" => {
                     parent_attempt = attempt_id_from_value(&value, "attempt_fork parent_attempt")?
                 }
+                "checkpoint" => checkpoint = value_to_string(&value, "attempt_fork checkpoint")?,
                 "task" => task = value_to_string(&value, "attempt_fork task")?,
                 "controller" => controller = value_to_string(&value, "attempt_fork controller")?,
                 "capability_profile" => {
@@ -6323,6 +6333,7 @@ impl Evaluator<'_> {
         apply_stone_entrypoint(&mut program, &entrypoint, "attempt_fork entrypoint")?;
         let child = gateway_env::attempt_fork(
             parent_attempt,
+            checkpoint,
             task,
             controller,
             capability_profile,
@@ -9909,6 +9920,8 @@ fn workflow_checkpoint_result_value(checkpoint: &WorkflowCheckpointResult) -> Va
             .unwrap_or_else(|| Value::nothing(span)),
     );
     for (name, value) in [
+        ("workspace_revision", checkpoint.workspace_revision),
+        ("memory_revision", checkpoint.memory_revision),
         ("storage_bytes", checkpoint.storage_bytes),
         ("create_duration_ms", checkpoint.create_duration_ms),
         ("copy_files", checkpoint.copy_files),
