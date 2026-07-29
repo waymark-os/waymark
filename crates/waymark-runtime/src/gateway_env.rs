@@ -21,6 +21,8 @@ pub(crate) struct WorkflowStageCheckpoint {
     pub(crate) reference: String,
     pub(crate) workspace_revision: u64,
     pub(crate) memory_revision: Option<u64>,
+    pub(crate) tool_environment_generation: Option<String>,
+    pub(crate) tool_environment_disposition: Option<String>,
     pub(crate) storage_bytes: u64,
     pub(crate) create_duration_ms: u64,
     pub(crate) copy_files: u64,
@@ -32,11 +34,12 @@ pub(crate) struct WorkflowStageCheckpoint {
 pub(crate) fn workflow_stage_checkpoint(
     workflow: &str,
     stage: &str,
+    policy: &str,
 ) -> Result<WorkflowStageCheckpoint, ShellError> {
     let config = required_config()?;
     let reason = format!("stone.workflow-stage:{workflow}:{stage}");
     let checkpoint = with_client(&config, |client| {
-        client.env_checkpoint_with_lifecycle(&config.tx, reason, "attempt")
+        client.env_checkpoint_with_lifecycle_and_policy(&config.tx, reason, "attempt", policy)
     })?;
     Ok(WorkflowStageCheckpoint {
         reference: checkpoint.checkpoint,
@@ -44,6 +47,10 @@ pub(crate) fn workflow_stage_checkpoint(
         memory_revision: checkpoint
             .has_memory_revision
             .then_some(checkpoint.memory_revision),
+        tool_environment_generation: (!checkpoint.tool_environment_generation.is_empty())
+            .then_some(checkpoint.tool_environment_generation),
+        tool_environment_disposition: (!checkpoint.tool_environment_disposition.is_empty())
+            .then_some(checkpoint.tool_environment_disposition),
         storage_bytes: checkpoint.storage_bytes,
         create_duration_ms: checkpoint.create_duration_ms,
         copy_files: checkpoint.copy_files,

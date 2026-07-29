@@ -754,6 +754,8 @@ struct WorkflowCheckpointResult {
     error_code: Option<&'static str>,
     workspace_revision: Option<u64>,
     memory_revision: Option<u64>,
+    tool_environment_generation: Option<String>,
+    tool_environment_disposition: Option<String>,
     storage_bytes: Option<u64>,
     create_duration_ms: Option<u64>,
     copy_files: Option<u64>,
@@ -774,6 +776,8 @@ impl WorkflowCheckpointResult {
             error_code: None,
             workspace_revision: None,
             memory_revision: None,
+            tool_environment_generation: None,
+            tool_environment_disposition: None,
             storage_bytes: None,
             create_duration_ms: None,
             copy_files: None,
@@ -807,6 +811,8 @@ impl WorkflowCheckpointResult {
             error_code: Some(code),
             workspace_revision: None,
             memory_revision: None,
+            tool_environment_generation: None,
+            tool_environment_disposition: None,
             storage_bytes: None,
             create_duration_ms: None,
             copy_files: None,
@@ -4677,14 +4683,7 @@ impl Evaluator<'_> {
             }
             WorkflowCheckpointPolicy::Workspace => WorkflowCheckpointPolicy::Workspace,
             WorkflowCheckpointPolicy::Auto => WorkflowCheckpointPolicy::Workspace,
-            WorkflowCheckpointPolicy::Forkable => {
-                return WorkflowCheckpointResult::failed(
-                    stage.checkpoint,
-                    WorkflowCheckpointPolicy::Forkable,
-                    "checkpoint_plane_unavailable",
-                    "forkable checkpoints require an environment-plane provider; this runtime currently supports workspace checkpoints only",
-                );
-            }
+            WorkflowCheckpointPolicy::Forkable => WorkflowCheckpointPolicy::Forkable,
         };
 
         if !gateway_env::enabled() {
@@ -4696,28 +4695,44 @@ impl Evaluator<'_> {
             );
         }
 
-        match gateway_env::workflow_stage_checkpoint(&workflow.name, &stage.name) {
-            Ok(checkpoint) => WorkflowCheckpointResult {
-                policy: stage.checkpoint,
-                selected_policy,
-                status: "created",
-                reference: Some(checkpoint.reference),
-                planes: vec!["workspace", "attempt_memory"],
-                reason: None,
-                error_code: None,
-                workspace_revision: Some(checkpoint.workspace_revision),
-                memory_revision: checkpoint.memory_revision,
-                storage_bytes: Some(checkpoint.storage_bytes),
-                create_duration_ms: Some(checkpoint.create_duration_ms),
-                copy_files: Some(checkpoint.copy_files),
-                copy_bytes: Some(checkpoint.copy_bytes),
-                reflink_attempts: Some(checkpoint.reflink_attempts),
-                reflink_successes: Some(checkpoint.reflink_successes),
-            },
+        match gateway_env::workflow_stage_checkpoint(
+            &workflow.name,
+            &stage.name,
+            selected_policy.as_str(),
+        ) {
+            Ok(checkpoint) => {
+                let mut planes = vec!["workspace", "attempt_memory"];
+                if checkpoint.tool_environment_generation.is_some() {
+                    planes.push("tool_environment");
+                }
+                WorkflowCheckpointResult {
+                    policy: stage.checkpoint,
+                    selected_policy,
+                    status: "created",
+                    reference: Some(checkpoint.reference),
+                    planes,
+                    reason: None,
+                    error_code: None,
+                    workspace_revision: Some(checkpoint.workspace_revision),
+                    memory_revision: checkpoint.memory_revision,
+                    tool_environment_generation: checkpoint.tool_environment_generation,
+                    tool_environment_disposition: checkpoint.tool_environment_disposition,
+                    storage_bytes: Some(checkpoint.storage_bytes),
+                    create_duration_ms: Some(checkpoint.create_duration_ms),
+                    copy_files: Some(checkpoint.copy_files),
+                    copy_bytes: Some(checkpoint.copy_bytes),
+                    reflink_attempts: Some(checkpoint.reflink_attempts),
+                    reflink_successes: Some(checkpoint.reflink_successes),
+                }
+            }
             Err(error) => WorkflowCheckpointResult::failed(
                 stage.checkpoint,
                 selected_policy,
-                "checkpoint_create_failed",
+                if format!("{error:?}").contains("checkpoint_plane_unavailable") {
+                    "checkpoint_plane_unavailable"
+                } else {
+                    "checkpoint_create_failed"
+                },
                 bounded_text(&format!("{error:?}"), 1_024),
             ),
         }
@@ -9891,6 +9906,22 @@ fn workflow_checkpoint_result_value(checkpoint: &WorkflowCheckpointResult) -> Va
             .reference
             .as_ref()
             .map(|reference| Value::string(reference, span))
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    record.push(
+        "tool_environment_generation",
+        checkpoint
+            .tool_environment_generation
+            .as_ref()
+            .map(|value| Value::string(value, span))
+            .unwrap_or_else(|| Value::nothing(span)),
+    );
+    record.push(
+        "tool_environment_disposition",
+        checkpoint
+            .tool_environment_disposition
+            .as_ref()
+            .map(|value| Value::string(value, span))
             .unwrap_or_else(|| Value::nothing(span)),
     );
     record.push(

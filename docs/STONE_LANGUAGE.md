@@ -241,11 +241,14 @@ Supported handlers are `except:`, `except Exception:`, and
   declare the following one-argument action function as a named typed stage.
   `checkpoint="workspace"` preserves a freshly proved workspace and bounded
   attempt-memory frontier in Gateway mode and reports an opaque checkpoint
-  reference.
+  reference. `checkpoint="forkable"` also seals an absent or immutable
+  declared tool-environment reconstruction record. It fails closed for
+  attached containers and mutable provider roots.
 - `attempt_fork(checkpoint=..., ...)`: create an isolated child from an opaque
   verified stage checkpoint owned by the parent. Omitting `checkpoint` forks
   the current parent frontier. A workspace checkpoint does not capture the
-  tool environment; that requires the future `forkable` plane.
+  tool environment; a forkable checkpoint may rematerialize its opaque
+  immutable-image generation.
 - `file_nonempty(path)`: declare a lazy non-empty regular-file proof whose
   evidence reference is generated from the authoritative workspace probe.
 - `workflow_stage(name, evidence=..., action=..., repair=None,

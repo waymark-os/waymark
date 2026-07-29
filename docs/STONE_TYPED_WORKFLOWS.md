@@ -130,8 +130,11 @@ The implemented first slice has these semantics:
 5. the stage report exposes an opaque `reference`, selected policy, captured
    planes, workspace and memory revisions, creation cost, and stable failure
    code, but no host path;
-6. `forkable` fails closed with `checkpoint_plane_unavailable` until the tool
-   environment plane can be snapshotted or rematerialized.
+6. `forkable` additionally seals the tool-environment plane when it is absent
+   or reconstructable from a locally materialized immutable image;
+7. attached containers and mutable provider roots fail closed with
+   `checkpoint_plane_unavailable` rather than silently losing installed
+   packages or configuration.
 
 The parent attempt owns its Stone stage checkpoints. They may be borrowed by
 multiple child forks and survive child finish; parent finish reclaims them.
@@ -155,9 +158,13 @@ The lowering is:
   -> opaque checkpoint ref in the workflow report
 ```
 
-The target `forkable` lowering replaces the workspace-only request with a
-Gateway composite checkpoint that also captures or rematerializes the
-attempt-owned tool environment.
+The first `forkable` lowering replaces the workspace-only request with a
+Gateway composite checkpoint containing an opaque tool-environment generation
+and disposition. Gateway resolves a declared image to its immutable provider
+identity, stores that identity only in the host reconstruction record, and
+gives the child an opaque selector. The child receives a fresh provider
+instance with its own workspace branch; no process, socket, or provider
+instance identity is cloned.
 
 The implemented checkpoint-backed fork consumes the opaque reference directly:
 
@@ -171,8 +178,12 @@ Gateway accepts only an active attempt-owned checkpoint belonging to the
 selected parent. The child receives the checkpoint's workspace and bounded
 memory frontiers, so later parent files and memory cannot leak into the branch.
 The checkpoint is borrowed rather than consumed, allowing sibling explorations.
-This does not make the branch `forkable`: provider tool-environment state is
-still rematerialized from explicit child options until that plane exists.
+This initial backend is deliberately narrow. If setup has already changed a
+container root, `forkable` fails because immutable-image reconstruction would
+lose those changes. Likewise, accepting a child after it starts a mutable
+provider container fails with `fork_join_plane_unavailable`: the workspace
+cannot be accepted while silently dropping the selected provider-root state.
+Mutable Docker/VM generation snapshot and join are the next provider slice.
 
 ## Example
 
@@ -218,6 +229,10 @@ The Gateway repository's `smoke-stone-stage-checkpoint.sh` is the end-to-end
 checkpoint canary. It proves creation after fresh evidence, opaque report
 metadata, exclusion of later workspace and memory pollution, reusable sibling
 forks, selected-child acceptance, restore, and parent-owned cleanup.
+`smoke-stone-forkable-environment.sh` separately proves immutable-image
+resolution, opaque generation reporting, child rematerialization without an
+image argument, workspace isolation, conservative mutable-child join
+rejection, and cleanup.
 
 A matched three-pair live-model experiment found both the callback kernel and
 `@stage` syntax correct on all first drafts. The syntax reduced mean generated

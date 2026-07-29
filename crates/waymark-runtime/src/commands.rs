@@ -76,7 +76,7 @@ def build_artifact(step):
         name: "stage",
         signature: r#"@stage(evidence: workflow_evidence_spec | callable, repair: callable? = None, max_attempts: int = 1, checkpoint: str = "none")
 def name(step): ... -> workflow_stage"#,
-        use_when: "Declare a named evidence-gated workflow stage with its action body directly below the decorator. Use checkpoint=\"workspace\" to preserve a verified stage boundary in Gateway mode.",
+        use_when: "Declare a named evidence-gated workflow stage with its action body directly below the decorator. Use checkpoint=\"workspace\" for workspace plus memory, or checkpoint=\"forkable\" when an absent or immutable declared tool environment must also be reconstructed.",
         examples: &[
             r#"def repair_artifact(step):
     return run(["sh", "-c", "printf ready > artifact.txt"])
@@ -93,6 +93,7 @@ emit(report)"#,
             "The decorated action and optional repair must return records with boolean ok fields.",
             "Stage advancement still depends only on evidence, never the action ok field.",
             "A checkpoint is created only after fresh satisfied evidence; an already-satisfied stage is not checkpointed again.",
+            "Forkable checkpoints fail closed when the attempt uses an attached or mutable provider root; preserve setup in an immutable image or wait for a mutable snapshot provider.",
         ],
         aliases: &[],
     },
@@ -1187,6 +1188,7 @@ emit(attempt_scope_close(scope).clean)"#],
         avoid: &[
             "Do not assume a fork mutates the parent attempt; it returns a separate attempt and transaction.",
             "Do not treat a workspace checkpoint as a full tool-environment snapshot; forkable provider state is a separate checkpoint plane.",
+            "A reconstructed child becomes conservatively non-joinable after it starts a mutable provider container until mutable tool-environment snapshot/join support exists.",
         ],
         aliases: &[],
     },
