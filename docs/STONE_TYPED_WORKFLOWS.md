@@ -104,6 +104,12 @@ The workflow runner does not hide callback errors, silently retry exceptions,
 or infer success from `ok=true`. Recursive `workflow_run` calls are rejected in
 this first slice.
 
+When an attached controller reports its final value, Waymark also bounds each
+result, error, and detail document below the Gateway authority limit.
+Oversized recursive diagnostics are compacted deterministically with preserved
+error identity and `_waymark_compaction` metadata; they are not allowed to turn
+a useful task failure into a failed report syscall.
+
 ## Stage Checkpoint Declaration
 
 Stage checkpoints should be semantically visible but physically
@@ -118,7 +124,8 @@ def build(step):
     return run_complete(...)
 ```
 
-The declaration accepts `none`, `workspace`, `forkable`, or `auto`.
+The declaration accepts `none`, `workspace`, `forkable`, `repairable`, or
+`auto`.
 The implemented first slice has these semantics:
 
 1. `none` is the default and creates no checkpoint;
@@ -133,11 +140,18 @@ The implemented first slice has these semantics:
 6. `forkable` additionally seals the tool-environment plane when it is absent
    or reconstructable from a locally materialized immutable image;
 7. attached containers and mutable provider roots fail closed with
-   `checkpoint_plane_unavailable` rather than silently losing installed
-   packages or configuration.
+   `checkpoint_plane_unavailable` unless the provider exposes an authorized
+   snapshot contract;
+8. `repairable` captures the same planes as `forkable`, but the Gateway retains
+   only the newest such frontier across attempt failure. A repair spawned from
+   that checkpoint restores workspace, memory, and tool environment; failure
+   leaves it reusable, while acceptance, rollback, commit, or publication
+   consumes it.
 
 The parent attempt owns its Stone stage checkpoints. They may be borrowed by
 multiple child forks and survive child finish; parent finish reclaims them.
+Repairable checkpoints are the explicit exception on failure, with
+newest-frontier replacement bounding retention.
 Explicit diagnostic checkpoints retain their independent lifecycle and cannot
 be used as attempt-fork frontiers.
 

@@ -189,7 +189,11 @@ pub(crate) fn attempt_spawn(
     spawn_v1: AttemptSpawnV1,
 ) -> Result<Value, ShellError> {
     let config = required_config()?;
-    let container = if container.is_empty() {
+    let resumes_checkpoint = spawn_v1
+        .workspace_source
+        .as_ref()
+        .is_some_and(|source| !source.checkpoint.is_empty());
+    let container = if container.is_empty() && !resumes_checkpoint {
         config.container.clone().unwrap_or_default()
     } else {
         container

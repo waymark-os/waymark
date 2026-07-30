@@ -623,12 +623,7 @@ fn attempt_report_result_request(
     config: &GatewayRuntimeConfig,
     response: &JsonValue,
 ) -> Result<AttemptReportResultRequest, ShellError> {
-    let details_json = serde_json::to_string(response).map_err(|err| {
-        stone_error(
-            "gateway report",
-            format!("failed to encode task response JSON: {err}"),
-        )
-    })?;
+    let details_json = bounded_controller_report_json("details", response)?;
     let ok = response
         .get("ok")
         .and_then(JsonValue::as_bool)
@@ -642,21 +637,11 @@ fn attempt_report_result_request(
                 .unwrap_or(if ok { "success" } else { "failed" }),
         })
     });
-    let result_json = serde_json::to_string(&summary).map_err(|err| {
-        stone_error(
-            "gateway report",
-            format!("failed to encode task summary JSON: {err}"),
-        )
-    })?;
+    let result_json = bounded_controller_report_json("result", &summary)?;
     let error_json = if ok {
         String::new()
     } else {
-        serde_json::to_string(response.get("error").unwrap_or(response)).map_err(|err| {
-            stone_error(
-                "gateway report",
-                format!("failed to encode task error JSON: {err}"),
-            )
-        })?
+        bounded_controller_report_json("error", response.get("error").unwrap_or(response))?
     };
     let mut metadata = std::collections::HashMap::new();
     metadata.insert("source".to_string(), "waymark-runtime".to_string());
@@ -672,6 +657,157 @@ fn attempt_report_result_request(
         reason: report_reason(response),
         metadata,
     })
+}
+
+const MAX_CONTROLLER_REPORT_JSON_BYTES: usize = 60 * 1024;
+const MAX_CONTROLLER_REPORT_DEPTH: usize = 10;
+const MAX_CONTROLLER_REPORT_ITEMS: usize = 24;
+
+fn bounded_controller_report_json(label: &str, value: &JsonValue) -> Result<String, ShellError> {
+    let encoded = serde_json::to_string(value).map_err(|err| {
+        stone_error(
+            "gateway report",
+            format!("failed to encode task {label} JSON: {err}"),
+        )
+    })?;
+    if encoded.len() <= MAX_CONTROLLER_REPORT_JSON_BYTES {
+        return Ok(encoded);
+    }
+
+    for string_limit in [8192, 4096, 2048, 1024, 512] {
+        let mut compacted = compact_controller_report_value(value, 0, string_limit);
+        let metadata = serde_json::json!({
+            "schema": "waymark.controller-report-compaction.v1",
+            "original_bytes": encoded.len(),
+            "max_bytes": MAX_CONTROLLER_REPORT_JSON_BYTES,
+            "string_character_limit": string_limit,
+        });
+        if let JsonValue::Object(fields) = &mut compacted {
+            fields.insert("_waymark_compaction".to_string(), metadata);
+        } else {
+            compacted = serde_json::json!({
+                "_waymark_compaction": metadata,
+                "value": compacted,
+            });
+        }
+        let candidate = serde_json::to_string(&compacted).map_err(|err| {
+            stone_error(
+                "gateway report",
+                format!("failed to encode compacted task {label} JSON: {err}"),
+            )
+        })?;
+        if candidate.len() <= MAX_CONTROLLER_REPORT_JSON_BYTES {
+            return Ok(candidate);
+        }
+    }
+
+    let fallback = serde_json::json!({
+        "_waymark_compaction": {
+            "schema": "waymark.controller-report-compaction.v1",
+            "original_bytes": encoded.len(),
+            "max_bytes": MAX_CONTROLLER_REPORT_JSON_BYTES,
+            "fallback": true,
+        },
+        "kind": compact_controller_report_value(
+            value.get("kind").unwrap_or(&JsonValue::Null),
+            0,
+            2_048,
+        ),
+        "code": compact_controller_report_value(
+            value.get("code").unwrap_or(&JsonValue::Null),
+            0,
+            2_048,
+        ),
+        "message": compact_controller_report_value(
+            value.get("message").unwrap_or(&JsonValue::Null),
+            0,
+            2_048,
+        ),
+        "serialized_excerpt": bounded_middle_text(&encoded, 6_000),
+    });
+    serde_json::to_string(&fallback).map_err(|err| {
+        stone_error(
+            "gateway report",
+            format!("failed to encode fallback task {label} JSON: {err}"),
+        )
+    })
+}
+
+fn compact_controller_report_value(
+    value: &JsonValue,
+    depth: usize,
+    max_string_chars: usize,
+) -> JsonValue {
+    if depth >= MAX_CONTROLLER_REPORT_DEPTH {
+        return serde_json::json!({
+            "_waymark_omitted": "maximum report depth reached",
+        });
+    }
+    match value {
+        JsonValue::String(text) => JsonValue::String(bounded_middle_text(text, max_string_chars)),
+        JsonValue::Array(items) => {
+            if items.len() <= MAX_CONTROLLER_REPORT_ITEMS {
+                return JsonValue::Array(
+                    items
+                        .iter()
+                        .map(|item| {
+                            compact_controller_report_value(item, depth + 1, max_string_chars)
+                        })
+                        .collect(),
+                );
+            }
+            let keep = MAX_CONTROLLER_REPORT_ITEMS / 2;
+            let mut compacted = items[..keep]
+                .iter()
+                .map(|item| compact_controller_report_value(item, depth + 1, max_string_chars))
+                .collect::<Vec<_>>();
+            compacted.push(serde_json::json!({
+                "_waymark_omitted_items": items.len() - (keep * 2),
+            }));
+            compacted.extend(
+                items[items.len() - keep..]
+                    .iter()
+                    .map(|item| compact_controller_report_value(item, depth + 1, max_string_chars)),
+            );
+            JsonValue::Array(compacted)
+        }
+        JsonValue::Object(fields) => JsonValue::Object(
+            fields
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        compact_controller_report_value(value, depth + 1, max_string_chars),
+                    )
+                })
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn bounded_middle_text(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let mut marker = format!("...<{} characters omitted>...", count - max_chars);
+    let mut keep = max_chars.saturating_sub(marker.chars().count());
+    marker = format!("...<{} characters omitted>...", count - keep);
+    keep = max_chars.saturating_sub(marker.chars().count());
+    let head = keep / 2;
+    let tail = keep - head;
+    let mut bounded = text.chars().take(head).collect::<String>();
+    bounded.push_str(&marker);
+    bounded.extend(
+        text.chars()
+            .rev()
+            .take(tail)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev(),
+    );
+    bounded
 }
 
 fn report_reason(response: &JsonValue) -> String {
@@ -2825,6 +2961,61 @@ mod tests {
         assert_eq!(request.reason, "bad task");
         assert_eq!(error["code"], json!("bad_task"));
         assert_eq!(details["kind"], json!("runner_error"));
+    }
+
+    #[test]
+    fn attempt_report_result_compacts_recursive_controller_errors() {
+        let config = GatewayRuntimeConfig {
+            endpoint: GatewayEndpoint::Unix(PathBuf::from("/tmp/gateway.sock")),
+            attempt: "attempt-1".to_string(),
+            controller_run: "process-1".to_string(),
+            boot_token: String::new(),
+            channel_id: String::new(),
+            channel_epoch: String::new(),
+            provider_lease_id: String::new(),
+            provider_vm_id: String::new(),
+            tx: "tx-1".to_string(),
+            image: "python:3.12".to_string(),
+            container: None,
+            workspace_mount: "/app".to_string(),
+            host_workspace_path: None,
+            capability_profile: "local".to_string(),
+            model_class: "agent".to_string(),
+            control: None,
+        };
+        let repeated = "stage diagnostic\n".repeat(12_000);
+        let request = attempt_report_result_request(
+            &config,
+            &json!({
+                "id": "task-1",
+                "ok": false,
+                "kind": "task_failure",
+                "error": {
+                    "code": "caffe_workflow_failed",
+                    "message": "bundle_runtime failed",
+                    "debug": repeated.clone(),
+                    "detail": repeated,
+                },
+            }),
+        )
+        .unwrap();
+
+        assert!(request.error_json.len() <= MAX_CONTROLLER_REPORT_JSON_BYTES);
+        assert!(request.details_json.len() <= MAX_CONTROLLER_REPORT_JSON_BYTES);
+        let error: JsonValue = serde_json::from_str(&request.error_json).unwrap();
+        let details: JsonValue = serde_json::from_str(&request.details_json).unwrap();
+        assert_eq!(error["code"], json!("caffe_workflow_failed"));
+        assert_eq!(
+            error["_waymark_compaction"]["schema"],
+            json!("waymark.controller-report-compaction.v1")
+        );
+        assert_eq!(
+            details["_waymark_compaction"]["schema"],
+            json!("waymark.controller-report-compaction.v1")
+        );
+        assert!(error["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("characters omitted")));
     }
 
     #[test]

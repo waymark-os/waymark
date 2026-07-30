@@ -76,7 +76,7 @@ def build_artifact(step):
         name: "stage",
         signature: r#"@stage(evidence: workflow_evidence_spec | callable, repair: callable? = None, max_attempts: int = 1, checkpoint: str = "none")
 def name(step): ... -> workflow_stage"#,
-        use_when: "Declare a named evidence-gated workflow stage with its action body directly below the decorator. Use checkpoint=\"workspace\" for workspace plus memory, or checkpoint=\"forkable\" when an absent or immutable declared tool environment must also be reconstructed.",
+        use_when: "Declare a named evidence-gated workflow stage with its action body directly below the decorator. Use checkpoint=\"workspace\" for workspace plus memory, checkpoint=\"forkable\" for an attempt-scoped reconstructable tool environment, or checkpoint=\"repairable\" when a verified frontier must survive a late harness failure.",
         examples: &[
             r#"def repair_artifact(step):
     return run(["sh", "-c", "printf ready > artifact.txt"])

@@ -4368,7 +4368,7 @@ impl Evaluator<'_> {
         let policy = value_to_string(&value, &format!("{context} checkpoint"))?;
         WorkflowCheckpointPolicy::parse(&policy).ok_or_else(|| {
             workflow_error(format!(
-                "{context} checkpoint must be one of none, workspace, forkable, or auto; got `{policy}`"
+                "{context} checkpoint must be one of none, workspace, forkable, repairable, or auto; got `{policy}`"
             ))
         })
     }
@@ -4684,6 +4684,7 @@ impl Evaluator<'_> {
             WorkflowCheckpointPolicy::Workspace => WorkflowCheckpointPolicy::Workspace,
             WorkflowCheckpointPolicy::Auto => WorkflowCheckpointPolicy::Workspace,
             WorkflowCheckpointPolicy::Forkable => WorkflowCheckpointPolicy::Forkable,
+            WorkflowCheckpointPolicy::Repairable => WorkflowCheckpointPolicy::Repairable,
         };
 
         if !gateway_env::enabled() {
@@ -13521,7 +13522,7 @@ workflow_run(workflow("invalid-checkpoint", artifact))
             .expect_err("unknown checkpoint policy must fail");
         let text = format!("{error:?}");
         assert!(
-            text.contains("none, workspace, forkable, or auto"),
+            text.contains("none, workspace, forkable, repairable, or auto"),
             "{text}"
         );
         cleanup_dir(&root);

@@ -241,9 +241,14 @@ Supported handlers are `except:`, `except Exception:`, and
   declare the following one-argument action function as a named typed stage.
   `checkpoint="workspace"` preserves a freshly proved workspace and bounded
   attempt-memory frontier in Gateway mode and reports an opaque checkpoint
-  reference. `checkpoint="forkable"` also seals an absent or immutable
-  declared tool-environment reconstruction record. It fails closed for
-  attached containers and mutable provider roots.
+  reference. `checkpoint="forkable"` also requires the active provider to
+  seal or reconstruct every semantically relevant tool-environment plane;
+  unsupported mutable roots fail closed. `checkpoint="repairable"` captures
+  the same planes and retains only the newest verified frontier across a late
+  attempt failure. A later `attempt_spawn` whose
+  `workspace_source.checkpoint` is that reference restores workspace, attempt
+  memory, and tool environment; failed repairs may reuse it, while acceptance
+  or explicit rollback, commit, or publication consumes it.
 - `attempt_fork(checkpoint=..., ...)`: create an isolated child from an opaque
   verified stage checkpoint owned by the parent. Omitting `checkpoint` forks
   the current parent frontier. A workspace checkpoint does not capture the

@@ -86,6 +86,7 @@ pub(super) enum WorkflowCheckpointPolicyValue {
     None,
     Workspace,
     Forkable,
+    Repairable,
     Auto,
 }
 
@@ -95,6 +96,7 @@ impl WorkflowCheckpointPolicyValue {
             "none" => Some(Self::None),
             "workspace" => Some(Self::Workspace),
             "forkable" => Some(Self::Forkable),
+            "repairable" => Some(Self::Repairable),
             "auto" => Some(Self::Auto),
             _ => None,
         }
@@ -105,6 +107,7 @@ impl WorkflowCheckpointPolicyValue {
             Self::None => "none",
             Self::Workspace => "workspace",
             Self::Forkable => "forkable",
+            Self::Repairable => "repairable",
             Self::Auto => "auto",
         }
     }
