@@ -4,8 +4,8 @@
 
 ## Status
 
-Design proposal, 2026-07-18. This document does not describe implemented Stone
-builtins unless it explicitly says so.
+Living design, with implemented slices recorded through 2026-07-30. A surface
+described as proposed or illustrative is not an implemented Stone builtin.
 
 ## Decision
 
@@ -372,11 +372,17 @@ Neither layer should redefine an attempt around ReAct, critic loops, or any
 other policy. The normative process analogy is specified in
 [Attempt Process And Process-Tree Model](../../waymark-gateway/docs/ATTEMPT_PROCESS_TREE_MODEL.md).
 
-### 7. Failures Are Values At Policy Boundaries
+### 7. Expected Failures Are Values At Policy Boundaries
 
 Transport, rate-limit, malformed-output, tool, timeout, cancellation, and
 verification failures need distinct codes. Stone `try/except` can catch them,
 but retry, repair, fallback, or abort remains visible program policy.
+
+A rejected candidate is an expected policy outcome, not necessarily a
+supervisor exception. It should retain bounded evidence and allow exploration
+to continue. Provider loss, authority denial, corrupt state, and other
+infrastructure failures remain exceptional and must not be mislabeled as a
+bad hypothesis.
 
 ### 8. No Automatic Effect Replay
 
@@ -384,6 +390,17 @@ Model calls consume irreversible budget and external calls may be irreversible.
 A controller retry must not duplicate an effect unless the program explicitly
 requests another sample. Durable execution needs idempotency keys and recorded
 results before transparent resume is safe.
+
+### 9. Proposals Are Hypotheses; Evidence Decides
+
+Typed inference proves that model output has an admitted shape. It does not
+prove that the selected continuation's assumptions hold or that its result is
+correct. A model may propose code, a patch, or candidate ordering; fresh
+execution evidence and independent verification retain acceptance authority.
+
+A retry must express semantic progress: try an untried candidate, revise an
+assumption, obtain new evidence, or apply a stage-scoped patch. Repeating the
+same action against the same state is not a useful control abstraction.
 
 ## Proposed Surface
 
@@ -866,6 +883,69 @@ strategy, and scoring remain Stone library/program policy. Scope cleanup,
 budget conservation, authority attenuation, and immutable outcome delivery are
 attempt-runtime semantics.
 
+### Bounded Candidate Exploration
+
+The Caffe V35-V37 sequence supports this standard control pattern:
+
+```text
+shared proved prefix -> semantic checkpoint
+  -> model proposes an admitted candidate
+  -> child attempt restores the checkpoint
+  -> fresh stage and final evidence
+  -> accept, or reject and try an untried candidate
+```
+
+The model call is optional: a deterministic policy may order candidates. The
+important property is that proposal, execution, evaluation, and acceptance are
+separate transitions.
+
+The next interface should first be an inspectable Stone control library, with
+an illustrative shape such as:
+
+```stone
+result = explore(
+    from_checkpoint=build_checkpoint,
+    candidates=[
+        candidate(
+            name="path_guard",
+            stage="bundle_runtime",
+            assumptions=["source and destination strings are equal"],
+            ensures=["runtime artifact is independently loadable"],
+        ),
+        candidate(
+            name="inode_guard",
+            stage="bundle_runtime",
+            assumptions=["source and destination may name the same inode"],
+            ensures=["runtime artifact is independently loadable"],
+        ),
+    ],
+    propose=lambda observation: model_infer(observation, PATCH_SCHEMA),
+    run=run_candidate,
+    accept=check_final_evidence,
+    max_candidates=2,
+)
+```
+
+This sketch is not syntax or an implemented signature. Its semantic lowering
+is the important contract:
+
+1. validate candidate identity, stage, assumptions, and evidence obligations;
+2. let the proposal choose only among admitted candidates;
+3. fork every tried candidate from the same checkpoint in a supervised scope;
+4. return an expected `CandidateOutcome` when evidence is unsatisfied;
+5. eliminate tried candidates and continue within the declared bound;
+6. accept only a candidate satisfying final evidence; and
+7. discard and reap every rejected or unresolved child.
+
+Only after this ordinary-source form works across several tasks should Stone
+gain dedicated `explore` syntax. Any syntax must lower to the same attempt,
+checkpoint, evidence, and cleanup operations rather than introduce a hidden
+workflow engine.
+
+See the Gateway repository's
+[Caffe Bounded Stage Exploration Experiment](../../waymark-gateway/docs/CAFFE_BOUNDED_STAGE_EXPLORATION_EXPERIMENT.md)
+for the exact claim boundary.
+
 ## Errors, Cancellation, And Resume
 
 ### Error Taxonomy
@@ -1322,8 +1402,18 @@ failed-execution probe also found a protocol integration bug—failed evidence
 must use status `contradicted`, not `rejected`—which is fixed and source-tested.
 See `STONE_STANDARD_COMPLETION_CRITIC_QUALITY_EXPERIMENT.md`.
 
-Continue M2.5 by freezing this corrected V1 treatment for a new untouched task,
-then add verifier-populated outcomes and aggregate budget/event views.
-Compatibility ids remain accepted at syscall boundaries, but new Stone
-control should retain handles. Do not treat the mechanism, specialization, or
+The Caffe V35-V37 sequence adds evidence about repair control. A typed
+single-shot model choice failed because its projected observation omitted an
+applicability fact. Bounded exploration then rejected that candidate from a
+retained post-build frontier and tried the remaining candidate without
+replaying compilation. Independent evaluation of the saved artifact fixed a
+second evidence-boundary error, after which the official verifier passed all
+six checks. This supports the control shape; it does not establish broad
+task-level reliability.
+
+Continue M2.5 with the visible bounded-exploration library described above,
+then test the same interface on cheaper tasks before considering syntax.
+Verifier-populated outcomes and aggregate budget/event views remain necessary.
+Compatibility ids remain accepted at syscall boundaries, but new Stone control
+should retain handles. Do not treat the mechanism, specialization, or
 single-task cells as validation of the broader attempt-first OS hypothesis.

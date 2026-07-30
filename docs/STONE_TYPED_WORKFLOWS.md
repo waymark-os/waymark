@@ -179,6 +179,34 @@ Oversized recursive diagnostics are compacted deterministically with preserved
 error identity and `_waymark_compaction` metadata; they are not allowed to turn
 a useful task failure into a failed report syscall.
 
+### Candidate Contracts And Outcomes
+
+A candidate should eventually declare:
+
+```text
+identity
+target stage
+assumptions and applicability obligations
+expected stage evidence
+expected final evidence
+```
+
+Schema validation can prove only that a proposed identity is admitted. The
+candidate must still run in an isolated attempt restored from the relevant
+semantic checkpoint. Fresh evidence, not the model proposal or an action's
+`ok` field, decides acceptance.
+
+An unsatisfied candidate is an expected bounded `CandidateOutcome` so the
+supervisor can eliminate it and continue. Authority denial, provider loss,
+corrupt checkpoint state, and similar infrastructure faults remain structured
+exceptions. A subsequent attempt is meaningful only if it changes the
+candidate, assumptions, evidence, or stage-local program.
+
+The next convenience interface should be a visible ordinary-Stone `explore`
+library that lowers to existing workflow patches, checkpoint-backed child
+attempts, evidence checks, accept/discard, and scope cleanup. Dedicated syntax
+should wait until that interface has survived multiple tasks.
+
 ## Stage Checkpoint Declaration
 
 Stage checkpoints should be semantically visible but physically
@@ -332,3 +360,14 @@ continuation restored that frontier, reported the build stage
 verifier. The run used zero model calls, left zero open checkpoints or
 transactions, and recorded reward `1.0`. This validates the control primitive,
 not yet LLM patch-synthesis reliability or a stable task success rate.
+
+The later V35-V37 sequence tested model-selected candidates. The first typed
+selection failed because the projected observation omitted an applicability
+fact. Bounded fallback rejected it by stage evidence, restored the same
+post-build checkpoint, and tried the remaining candidate without replaying the
+build. A second failure showed that evidence must measure the saved artifact
+rather than a nearby in-training state. After that boundary was corrected, all
+six official checks passed. This is concrete support for typed,
+evidence-gated exploration, still limited to one task family.
+See
+[Caffe Bounded Stage Exploration Experiment](../../waymark-gateway/docs/CAFFE_BOUNDED_STAGE_EXPLORATION_EXPERIMENT.md).
