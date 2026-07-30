@@ -4447,35 +4447,112 @@ impl Evaluator<'_> {
     }
 
     fn eval_workflow_patch_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        let [workflow, target, replacement] = call.positional.as_slice() else {
+        if call.positional.len() < 3 || call.positional.len() > 66 {
             return Err(workflow_error(
-                "workflow_patch() requires exactly one workflow, target stage name, and replacement stage",
+                "workflow_patch() requires a workflow followed by either a target stage name and replacement stage, or an exact {target, replacement} patch record and one to 64 allowed replacement stages",
             ));
-        };
+        }
         if !call.named.is_empty() {
             return Err(workflow_error(
                 "workflow_patch() does not accept keyword arguments",
             ));
         }
-        let value = self.eval_expr_value(workflow, PipelineData::empty())?;
+        let value = self.eval_expr_value(&call.positional[0], PipelineData::empty())?;
         let RuntimeValue::Workflow(mut workflow) = value else {
             return Err(workflow_error(format!(
                 "workflow_patch() expected workflow as its first argument, got {}",
                 runtime_type_name(&value)
             )));
         };
-        let target = self
-            .eval_expr_value(target, PipelineData::empty())?
-            .into_nu_value("workflow_patch")
-            .and_then(|value| value_to_string(&value, "workflow_patch target"))?;
-        validate_workflow_name(&target, "target stage")?;
-        let value = self.eval_expr_value(replacement, PipelineData::empty())?;
-        let RuntimeValue::WorkflowStage(replacement) = value else {
-            return Err(workflow_error(format!(
-                "workflow_patch() expected workflow_stage as its replacement, got {}",
-                runtime_type_name(&value)
-            )));
+
+        let selector = self.eval_expr_value(&call.positional[1], PipelineData::empty())?;
+        let (target, replacement) = match selector {
+            RuntimeValue::Nu(Value::String { val: target, .. })
+            | RuntimeValue::Nu(Value::Glob { val: target, .. }) => {
+                if call.positional.len() != 3 {
+                    return Err(workflow_error(
+                        "workflow_patch() static form requires exactly workflow, target stage name, and replacement stage",
+                    ));
+                }
+                let value = self.eval_expr_value(&call.positional[2], PipelineData::empty())?;
+                let RuntimeValue::WorkflowStage(replacement) = value else {
+                    return Err(workflow_error(format!(
+                        "workflow_patch() expected workflow_stage as its replacement, got {}",
+                        runtime_type_name(&value)
+                    )));
+                };
+                (target, replacement)
+            }
+            RuntimeValue::Nu(Value::Record { val: patch, .. }) => {
+                for required in ["target", "replacement"] {
+                    if patch.get(required).is_none() {
+                        return Err(workflow_error(format!(
+                            "workflow_patch() patch record is missing required `{required}` field; expected exactly {{target, replacement}}"
+                        )));
+                    }
+                }
+                if patch.len() != 2 {
+                    let mut unexpected = patch
+                        .iter()
+                        .map(|(name, _)| name.as_str())
+                        .filter(|name| *name != "target" && *name != "replacement")
+                        .collect::<Vec<_>>();
+                    unexpected.sort();
+                    return Err(workflow_error(format!(
+                        "workflow_patch() patch record has unexpected fields {}; expected exactly {{target, replacement}}",
+                        unexpected.join(", ")
+                    )));
+                }
+                let target = value_to_string(
+                    patch
+                        .get("target")
+                        .expect("required patch target field was checked"),
+                    "workflow_patch patch target",
+                )?;
+                let replacement_name = value_to_string(
+                    patch
+                        .get("replacement")
+                        .expect("required patch replacement field was checked"),
+                    "workflow_patch patch replacement",
+                )?;
+                validate_workflow_name(&replacement_name, "replacement stage")?;
+
+                let mut candidates = HashMap::new();
+                for expression in &call.positional[2..] {
+                    let value = self.eval_expr_value(expression, PipelineData::empty())?;
+                    let RuntimeValue::WorkflowStage(candidate) = value else {
+                        return Err(workflow_error(format!(
+                            "workflow_patch() data-driven candidates must be workflow_stage values, got {}",
+                            runtime_type_name(&value)
+                        )));
+                    };
+                    if candidates
+                        .insert(candidate.name.clone(), candidate)
+                        .is_some()
+                    {
+                        return Err(workflow_error(
+                            "workflow_patch() data-driven candidate stage names must be unique",
+                        ));
+                    }
+                }
+                let mut allowed = candidates.keys().cloned().collect::<Vec<_>>();
+                allowed.sort();
+                let replacement = candidates.remove(&replacement_name).ok_or_else(|| {
+                    workflow_error(format!(
+                        "workflow_patch() replacement stage `{replacement_name}` is not in the allowed candidate set [{}]; pass the intended workflow_stage explicitly or request a listed replacement",
+                        allowed.join(", ")
+                    ))
+                })?;
+                (target, replacement)
+            }
+            other => {
+                return Err(workflow_error(format!(
+                    "workflow_patch() expected a target stage name or exact {{target, replacement}} patch record as its second argument, got {}",
+                    runtime_type_name(&other)
+                )));
+            }
         };
+        validate_workflow_name(&target, "target stage")?;
         let Some(target_index) = workflow
             .stages
             .iter()
@@ -13485,6 +13562,126 @@ workflow_patch(workflow("build", first, second), "first", second)
         );
         cleanup_dir(&root);
         cleanup_dir(&collision_root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_patch_resolves_typed_patch_record_against_explicit_candidates(
+    ) -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("typed-workflow-data-driven-patch")?;
+        let program = lower_source(
+            r#"def never_ready(step):
+    return workflow_evidence(False, "broken stage remains unmet", [])
+
+def fixed_action(step):
+    return run(["sh", "-c", "printf ready > artifact.txt"])
+
+broken = workflow_stage(
+    "compile_broken",
+    evidence=never_ready,
+    action=lambda step: {"ok": False},
+)
+fixed = workflow_stage(
+    "compile_fixed",
+    evidence=file_nonempty("artifact.txt"),
+    action=fixed_action,
+)
+unused = workflow_stage(
+    "compile_alternate",
+    evidence=never_ready,
+    action=lambda step: {"ok": False},
+)
+base = workflow("build", broken)
+patch = {"target": "compile_broken", "replacement": "compile_fixed"}
+repaired = workflow_patch(base, patch, unused, fixed)
+report = workflow_run(repaired)
+emit({
+    "ok": report.ok,
+    "completed": report.completed_stages,
+    "patches": report.patches,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, Span::unknown())?,
+            json_value!({
+                "ok": true,
+                "completed": ["compile_fixed"],
+                "patches": [{
+                    "target": "compile_broken",
+                    "replacement": "compile_fixed",
+                }],
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_patch_rejects_untrusted_patch_fields_and_unlisted_replacements(
+    ) -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) =
+            test_engine("typed-workflow-data-driven-patch-errors")?;
+        let unexpected = lower_source(
+            r#"broken = workflow_stage(
+    "compile_broken",
+    evidence=lambda step: workflow_evidence(False, "not ready"),
+    action=lambda step: {"ok": False},
+)
+fixed = workflow_stage(
+    "compile_fixed",
+    evidence=lambda step: workflow_evidence(True, "ready", ["fixed"]),
+    action=lambda step: {"ok": True},
+)
+workflow_patch(
+    workflow("build", broken),
+    {
+        "target": "compile_broken",
+        "replacement": "compile_fixed",
+        "execute": "arbitrary source",
+    },
+    fixed,
+)
+"#,
+        )?;
+        let error = eval_program(
+            &engine_state,
+            &mut stack,
+            &unexpected,
+            PipelineData::empty(),
+        )
+        .expect_err("unexpected model-authored patch fields must fail");
+        let text = format!("{error:?}");
+        assert!(text.contains("unexpected fields execute"), "{text}");
+
+        let unlisted = lower_source(
+            r#"broken = workflow_stage(
+    "compile_broken",
+    evidence=lambda step: workflow_evidence(False, "not ready"),
+    action=lambda step: {"ok": False},
+)
+allowed = workflow_stage(
+    "compile_safe",
+    evidence=lambda step: workflow_evidence(True, "ready", ["safe"]),
+    action=lambda step: {"ok": True},
+)
+workflow_patch(
+    workflow("build", broken),
+    {"target": "compile_broken", "replacement": "compile_unlisted"},
+    allowed,
+)
+"#,
+        )?;
+        let error = eval_program(&engine_state, &mut stack, &unlisted, PipelineData::empty())
+            .expect_err("unlisted replacement must fail");
+        let text = format!("{error:?}");
+        assert!(
+            text.contains("not in the allowed candidate set [compile_safe]"),
+            "{text}"
+        );
+        cleanup_dir(&root);
         Ok(())
     }
 

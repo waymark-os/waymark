@@ -48,8 +48,13 @@ result = run(["printf", "ok"], hooks=hooks)"#,
         signature: r#"workflow_evidence(satisfied_or_result: bool | record{ok: bool}, summary: str, evidence: list[str] = []) -> record"#,
         use_when: "Return bounded, typed completion evidence from a workflow stage evidence handler. Pass a run/tool result record to retain its bounded failure diagnostic automatically.",
         examples: &[
-            r#"return workflow_evidence(probe.ok, "artifact is non-empty", ["stat:artifact.txt"] if probe.ok else [])"#,
-            r#"return workflow_evidence(probe, "artifact validation", ["stat:artifact.txt"])"#,
+            r#"def check_artifact(step):
+    return workflow_evidence(True, "artifact is non-empty", ["stat:artifact.txt"])
+evidence = check_artifact({})"#,
+            r#"def check_probe(step):
+    probe = {"ok": False, "kind": "not_found"}
+    return workflow_evidence(probe, "artifact validation")
+evidence = check_probe({})"#,
         ],
         avoid: &[
             "Do not mark evidence satisfied without at least one compact evidence reference.",
@@ -62,9 +67,15 @@ result = run(["printf", "ok"], hooks=hooks)"#,
         signature: r#"file_nonempty(path: str) -> workflow_evidence_spec"#,
         use_when: "Declare an authoritative lazy stage-evidence probe that is satisfied only by a non-empty regular file in the current transactional workspace.",
         examples: &[
-            r#"@stage(evidence=file_nonempty("artifact.txt"), repair=repair_artifact, max_attempts=2)
+            r#"def repair_artifact(step):
+    write_text("artifact.txt", "ready")
+    return {"ok": True}
+
+@stage(evidence=file_nonempty("artifact.txt"), repair=repair_artifact, max_attempts=2)
 def build_artifact(step):
-    return run(["make", "artifact"])"#,
+    return {"ok": False}
+
+report = workflow_run(workflow("build", build_artifact))"#,
         ],
         avoid: &[
             "Do not call file_nonempty as a boolean; it returns a typed lazy specification evaluated by workflow_run.",
@@ -102,7 +113,11 @@ emit(report)"#,
         signature: r#"workflow_stage(name: str, evidence: callable, action: callable, repair: callable? = None, max_attempts: int = 1, checkpoint: str = "none") -> workflow_stage"#,
         use_when: "Define one typed stage whose action may run only within a bounded evidence-check and optional repair cycle.",
         examples: &[
-            r#"stage = workflow_stage("artifact", evidence=check_artifact, action=build_artifact, repair=repair_artifact, max_attempts=2)"#,
+            r#"stage = workflow_stage(
+    "artifact",
+    evidence=lambda step: workflow_evidence(True, "ready", ["artifact"]),
+    action=lambda step: {"ok": True},
+)"#,
         ],
         avoid: &[
             "Do not infer completion from action.ok; the evidence handler alone gates advancement.",
@@ -114,7 +129,17 @@ emit(report)"#,
         name: "workflow",
         signature: r#"workflow(name: str, stage: workflow_stage, ...) -> workflow"#,
         use_when: "Compose one or more uniquely named workflow stages into a first-class deterministic control value.",
-        examples: &[r#"plan = workflow("build-and-check", build_stage, verify_stage)"#],
+        examples: &[r#"build_stage = workflow_stage(
+    "build",
+    evidence=lambda step: workflow_evidence(True, "built", ["build"]),
+    action=lambda step: {"ok": True},
+)
+verify_stage = workflow_stage(
+    "verify",
+    evidence=lambda step: workflow_evidence(True, "verified", ["verify"]),
+    action=lambda step: {"ok": True},
+)
+plan = workflow("build-and-check", build_stage, verify_stage)"#],
         avoid: &[
             "Do not place workflows inside ordinary JSON/data records; pass them as first-class function arguments.",
             "This initial primitive is sequential; parallel and cross-attempt stages are not implied.",
@@ -123,14 +148,28 @@ emit(report)"#,
     },
     StoneHelpEntry {
         name: "workflow_patch",
-        signature: r#"workflow_patch(plan: workflow, target: str, replacement: workflow_stage) -> workflow"#,
-        use_when: "Produce a new workflow by replacing exactly one named stage while retaining stage order and recording patch provenance in the workflow report.",
-        examples: &[
-            r#"repaired = workflow_patch(plan, "compile_broken", compile_fixed)
-report = workflow_run(repaired)"#,
-        ],
+        signature: r#"workflow_patch(plan: workflow, target: str, replacement: workflow_stage) -> workflow
+workflow_patch(plan: workflow, patch: record, allowed_replacement: workflow_stage, ...) -> workflow"#,
+        use_when: "Produce a new workflow by replacing exactly one named stage while retaining stage order and recording patch provenance in the workflow report. The data-driven form resolves an exact {target, replacement} record only against explicitly passed candidate stages.",
+        examples: &[r#"compile_broken = workflow_stage(
+    "compile_broken",
+    evidence=lambda step: workflow_evidence(False, "not ready"),
+    action=lambda step: {"ok": False},
+)
+compile_fixed = workflow_stage(
+    "compile_fixed",
+    evidence=lambda step: workflow_evidence(True, "ready", ["fixed"]),
+    action=lambda step: {"ok": True},
+)
+plan = workflow("compile", compile_broken)
+selected = workflow_patch(
+    plan,
+    {"target": "compile_broken", "replacement": "compile_fixed"},
+    compile_fixed,
+)"#],
         avoid: &[
             "Do not use a missing target or a replacement whose name duplicates another remaining stage.",
+            "Do not dynamically evaluate model-authored source when a bounded patch record and explicit candidate stages can express the repair.",
             "The input workflow is immutable; retain the returned workflow and run that value.",
         ],
         aliases: &[],
@@ -139,7 +178,13 @@ report = workflow_run(repaired)"#,
         name: "workflow_run",
         signature: r#"workflow_run(plan: workflow) -> workflow_report"#,
         use_when: "Run stages sequentially with pre/post evidence checks, bounded action attempts, and optional repair checks. Each stage report retains compact status plus bounded stdout/stderr tails and an explanation summary from its latest action or repair.",
-        examples: &[r#"report = workflow_run(plan)
+        examples: &[r#"stage = workflow_stage(
+    "verify",
+    evidence=lambda step: workflow_evidence(True, "verified", ["verify"]),
+    action=lambda step: {"ok": True},
+)
+plan = workflow("check", stage)
+report = workflow_run(plan)
 emit({"ok": report.ok, "failed_stage": report.failed_stage, "stages": report.stages})"#],
         avoid: &[
             "Do not recursively invoke workflow_run from a workflow handler.",
@@ -960,7 +1005,7 @@ result = run(["sh", "-c", "printf failed >&2; exit 7"], hooks={"post": record_ru
         signature: r#"run_complete(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> record"#,
         use_when: "Use for a bounded task command that may outlive one Gateway observation window but must reach a terminal result before the Stone program continues. It lowers to run plus bounded waits, owns the run_id, and terminates the process if the total timeout expires.",
         examples: &[
-            r#"built = run_complete(["make", "all"], cwd="/app/project", timeout_ms=360000, max_stdout_bytes=4096, max_stderr_bytes=8192)"#,
+            r#"built = run_complete(["sh", "-c", "printf built"], cwd="/app", timeout_ms=360000, max_stdout_bytes=4096, max_stderr_bytes=8192)"#,
             r#"trained = run_complete(["python3", "train.py"], timeout_ms=600000, stdout="suppress", max_stderr_bytes=4096)"#,
         ],
         avoid: &[

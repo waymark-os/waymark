@@ -125,6 +125,28 @@ another stage fails. The resulting report includes bounded
 `patches=[{target, replacement}]` provenance. This makes a repair a typed,
 stage-local program transformation rather than whole-program regeneration.
 
+For a model-authored or otherwise data-driven selection, pass an exact patch
+record followed by the explicitly allowed replacement stages:
+
+```stone
+inference = model_infer(messages, patch_schema)
+repaired = workflow_patch(
+    base,
+    inference.value,
+    bundle_runtime_fixed,
+    bundle_runtime_alternate,
+)
+```
+
+The record must contain exactly the string fields `target` and `replacement`.
+The named replacement must resolve to one of the supplied
+`workflow_stage` values. Missing fields, extra fields, repeated candidates, and
+unlisted replacements fail before the workflow runs. This keeps model output
+as bounded typed data; it does not dynamically evaluate authored source or
+grant access to undeclared stages. See the runnable
+[`workflow_model_patch_canary.stone`](../examples/scripts/workflow_model_patch_canary.stone)
+for a live `model_infer` example.
+
 The intended control pattern is:
 
 ```text

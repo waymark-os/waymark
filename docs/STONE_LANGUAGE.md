@@ -353,6 +353,12 @@ Supported handlers are `except:`, `except Exception:`, and
   [`model_infer_repair.stone`](../examples/scripts/model_infer_repair.stone),
   and the reusable
   [`typed_react_agent.stone`](../examples/scripts/typed_react_agent.stone).
+- `workflow_patch(plan, target, replacement)` or
+  `workflow_patch(plan, patch_record, allowed_replacement, ...)`: construct a
+  new workflow with exactly one named stage replaced by a `workflow_stage`,
+  preserving order and recording bounded patch provenance. The data-driven
+  form requires exactly `{target, replacement}` and resolves the replacement
+  only against explicitly supplied candidate stages.
 - The checked-in
   [`standard_attempt_agent.stone`](../examples/scripts/standard_attempt_agent.stone)
   composes typed inference with replaceable named-function adapters for

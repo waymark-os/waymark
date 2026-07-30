@@ -1,0 +1,67 @@
+# A live model selects one stage-local repair as typed data. The program keeps
+# control authority by admitting only explicit workflow_stage candidates.
+
+
+def never_ready(step):
+    return workflow_evidence(False, "artifact is absent", [])
+
+
+def already_fixed(step):
+    return workflow_evidence(True, "fixed candidate is valid", ["canary:fixed"])
+
+
+def main(input):
+    broken = workflow_stage(
+        "compile_broken",
+        evidence=never_ready,
+        action=lambda step: {"ok": False},
+    )
+    fixed = workflow_stage(
+        "compile_fixed",
+        evidence=already_fixed,
+        action=lambda step: {"ok": True},
+    )
+    base = workflow("model-patch-canary", broken)
+    failed = workflow_run(base)
+    if failed.ok or failed.failed_stage != "compile_broken":
+        fail("canary did not produce the expected failed workflow")
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "target": {"type": "string", "enum": ["compile_broken"]},
+            "replacement": {"type": "string", "enum": ["compile_fixed"]},
+        },
+        "required": ["target", "replacement"],
+        "additionalProperties": False,
+    }
+    inference = model_infer(
+        [
+            {
+                "role": "user",
+                "content": json_dumps({
+                    "failed_workflow": failed,
+                    "allowed_replacements": ["compile_fixed"],
+                }),
+            },
+        ],
+        schema,
+        retries=0,
+        max_output_tokens=64,
+    )
+    repaired = workflow_patch(base, inference.value, fixed)
+    report = workflow_run(repaired)
+    if (
+        not report.ok
+        or len(report.patches) != 1
+        or report.patches[0].target != "compile_broken"
+        or report.patches[0].replacement != "compile_fixed"
+    ):
+        fail("model-authored patch did not pass the typed workflow gate")
+    return {
+        "answer": "live workflow patch passed",
+        "patch": inference.value,
+        "validation_attempts": inference.validation_attempts,
+        "transition_id": inference.response.transition_id,
+        "report": report,
+    }
