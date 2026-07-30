@@ -104,6 +104,37 @@ The workflow runner does not hide callback errors, silently retry exceptions,
 or infer success from `ok=true`. Recursive `workflow_run` calls are rejected in
 this first slice.
 
+## Stage-Scoped Repair
+
+`workflow_patch` constructs a new workflow by replacing exactly one named
+stage:
+
+```stone
+base = workflow("build", compile, bundle_runtime_broken, verify)
+repaired = workflow_patch(
+    base,
+    "bundle_runtime_broken",
+    bundle_runtime_fixed,
+)
+report = workflow_run(repaired)
+```
+
+The base value is unchanged. The replacement retains the target's ordered
+position, a missing target fails, and a replacement name that collides with
+another stage fails. The resulting report includes bounded
+`patches=[{target, replacement}]` provenance. This makes a repair a typed,
+stage-local program transformation rather than whole-program regeneration.
+
+The intended control pattern is:
+
+```text
+proved stage -> repairable checkpoint -> later stage fails
+  -> supervisor inspects evidence
+  -> patch only the failed stage
+  -> second repair restores the proved frontier
+  -> earlier stage is already_satisfied
+```
+
 When an attached controller reports its final value, Waymark also bounds each
 result, error, and detail document below the Gateway authority limit.
 Oversized recursive diagnostics are compacted deterministically with preserved
@@ -233,9 +264,10 @@ This is a control-flow primitive, not a general workflow service:
 ## Validation
 
 The runtime suite covers repair-required completion, unmet evidence despite
-successful actions, lambda handlers with pre-satisfied skipping, malformed
-satisfied evidence, checkpoint policy validation, pre-satisfied checkpoint
-skipping, and explicit unavailable-plane reports. The checked-in
+successful actions, lambda handlers with pre-satisfied skipping, immutable
+stage-scoped patches and collision rejection, malformed satisfied evidence,
+checkpoint policy validation, pre-satisfied checkpoint skipping, and explicit
+unavailable-plane reports. The checked-in
 [`typed_evidence_workflow.stone`](../examples/scripts/typed_evidence_workflow.stone)
 is the standalone model-free canary.
 
@@ -253,3 +285,12 @@ A matched three-pair live-model experiment found both the callback kernel and
 source from 558 to 307 bytes and from three to two function definitions with no
 repair attempts. See
 [Stone Stage Syntax Authorship Experiment](STONE_STAGE_SYNTAX_AUTHORSHIP_EXPERIMENT.md).
+
+An official Caffe mechanism cell then exercised the complete repair pattern:
+the first continuation built Caffe, sealed a repairable post-build frontier,
+and failed at an intentionally defective runtime-bundling stage. A second
+continuation restored that frontier, reported the build stage
+`already_satisfied`, applied one `workflow_patch`, and passed the fresh-container
+verifier. The run used zero model calls, left zero open checkpoints or
+transactions, and recorded reward `1.0`. This validates the control primitive,
+not yet LLM patch-synthesis reliability or a stable task success rate.

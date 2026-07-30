@@ -108,7 +108,8 @@ use stone_functions::{
     TransitionHooksValue as TransitionHooks,
     WorkflowCheckpointPolicyValue as WorkflowCheckpointPolicy,
     WorkflowEvidenceSourceValue as WorkflowEvidenceSource, WorkflowHandlerValue as WorkflowHandler,
-    WorkflowStageValue as WorkflowStage, WorkflowValue as Workflow,
+    WorkflowPatchValue as WorkflowPatch, WorkflowStageValue as WorkflowStage,
+    WorkflowValue as Workflow,
 };
 use stone_json_view::{
     eval_json_object_view_method, eval_runtime_subscript, json_array_view_iter_values,
@@ -2164,6 +2165,7 @@ impl Evaluator<'_> {
             "stage" => self.eval_stage_marker_call(call),
             "workflow_stage" => self.eval_workflow_stage_call(call),
             "workflow" => self.eval_workflow_call(call),
+            "workflow_patch" => self.eval_workflow_patch_call(call),
             "workflow_run" => self.eval_workflow_run_call(call),
             "model_call" => self.eval_model_call_call(call),
             "model_infer" => self.eval_model_infer_call(call),
@@ -4437,7 +4439,71 @@ impl Evaluator<'_> {
             }
             stages.push(stage);
         }
-        Ok(RuntimeValue::Workflow(Workflow { name, stages }))
+        Ok(RuntimeValue::Workflow(Workflow {
+            name,
+            stages,
+            patches: Vec::new(),
+        }))
+    }
+
+    fn eval_workflow_patch_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let [workflow, target, replacement] = call.positional.as_slice() else {
+            return Err(workflow_error(
+                "workflow_patch() requires exactly one workflow, target stage name, and replacement stage",
+            ));
+        };
+        if !call.named.is_empty() {
+            return Err(workflow_error(
+                "workflow_patch() does not accept keyword arguments",
+            ));
+        }
+        let value = self.eval_expr_value(workflow, PipelineData::empty())?;
+        let RuntimeValue::Workflow(mut workflow) = value else {
+            return Err(workflow_error(format!(
+                "workflow_patch() expected workflow as its first argument, got {}",
+                runtime_type_name(&value)
+            )));
+        };
+        let target = self
+            .eval_expr_value(target, PipelineData::empty())?
+            .into_nu_value("workflow_patch")
+            .and_then(|value| value_to_string(&value, "workflow_patch target"))?;
+        validate_workflow_name(&target, "target stage")?;
+        let value = self.eval_expr_value(replacement, PipelineData::empty())?;
+        let RuntimeValue::WorkflowStage(replacement) = value else {
+            return Err(workflow_error(format!(
+                "workflow_patch() expected workflow_stage as its replacement, got {}",
+                runtime_type_name(&value)
+            )));
+        };
+        let Some(target_index) = workflow
+            .stages
+            .iter()
+            .position(|stage| stage.name == target)
+        else {
+            return Err(workflow_error(format!(
+                "workflow_patch() target stage `{target}` is not present in workflow `{}`",
+                workflow.name
+            )));
+        };
+        if replacement.name != target
+            && workflow
+                .stages
+                .iter()
+                .any(|stage| stage.name == replacement.name)
+        {
+            return Err(workflow_error(format!(
+                "workflow_patch() replacement stage `{}` would duplicate a stage in workflow `{}`",
+                replacement.name, workflow.name
+            )));
+        }
+        let replacement_name = replacement.name.clone();
+        workflow.stages[target_index] = replacement;
+        workflow.patches.push(WorkflowPatch {
+            target,
+            replacement: replacement_name,
+        });
+        Ok(RuntimeValue::Workflow(workflow))
     }
 
     fn eval_workflow_run_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -8964,6 +9030,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "stage",
     "workflow_stage",
     "workflow",
+    "workflow_patch",
     "workflow_run",
     "mkdir",
     "must_run",
@@ -9997,6 +10064,25 @@ fn workflow_report_value(
             completed_stages
                 .into_iter()
                 .map(|name| Value::string(name, span))
+                .collect(),
+            span,
+        ),
+    );
+    record.push(
+        "patches",
+        Value::list(
+            workflow
+                .patches
+                .iter()
+                .map(|patch| {
+                    let mut patch_record = Record::new();
+                    patch_record.push("target", Value::string(patch.target.clone(), span));
+                    patch_record.push(
+                        "replacement",
+                        Value::string(patch.replacement.clone(), span),
+                    );
+                    Value::record(patch_record, span)
+                })
                 .collect(),
             span,
         ),
@@ -13296,6 +13382,109 @@ emit({
             })
         );
         cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_patch_is_immutable_stage_scoped_and_auditable() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("typed-workflow-patch")?;
+        let program = lower_source(
+            r#"def never_ready(step):
+    return workflow_evidence(False, "broken stage remains unmet", [])
+
+def broken_action(step):
+    return run(["sh", "-c", "exit 7"])
+
+def fixed_action(step):
+    return run(["sh", "-c", "printf ready > artifact.txt"])
+
+broken = workflow_stage("compile_broken", evidence=never_ready, action=broken_action)
+fixed = workflow_stage(
+    "compile_fixed",
+    evidence=file_nonempty("artifact.txt"),
+    action=fixed_action,
+)
+base = workflow("build", broken)
+repaired = workflow_patch(base, "compile_broken", fixed)
+base_report = workflow_run(base)
+repaired_report = workflow_run(repaired)
+emit({
+    "base_ok": base_report.ok,
+    "base_failed_stage": base_report.failed_stage,
+    "base_patches": base_report.patches,
+    "repaired_ok": repaired_report.ok,
+    "repaired_stage": repaired_report.completed_stages[0],
+    "repaired_patches": repaired_report.patches,
+    "artifact": read_text("artifact.txt"),
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, Span::unknown())?,
+            json_value!({
+                "base_ok": false,
+                "base_failed_stage": "compile_broken",
+                "base_patches": [],
+                "repaired_ok": true,
+                "repaired_stage": "compile_fixed",
+                "repaired_patches": [{
+                    "target": "compile_broken",
+                    "replacement": "compile_fixed",
+                }],
+                "artifact": "ready",
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_patch_rejects_missing_targets_and_name_collisions() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("typed-workflow-patch-errors")?;
+        let missing = lower_source(
+            r#"stage = workflow_stage(
+    "present",
+    evidence=lambda step: workflow_evidence(False, "not ready"),
+    action=lambda step: {"ok": True},
+)
+workflow_patch(workflow("build", stage), "absent", stage)
+"#,
+        )?;
+        let error = eval_program(&engine_state, &mut stack, &missing, PipelineData::empty())
+            .expect_err("missing workflow patch target must fail");
+        let text = format!("{error:?}");
+        assert!(
+            text.contains("target stage `absent` is not present"),
+            "{text}"
+        );
+
+        let (engine_state, mut stack, collision_root) =
+            test_engine("typed-workflow-patch-collision")?;
+        let collision = lower_source(
+            r#"first = workflow_stage(
+    "first",
+    evidence=lambda step: workflow_evidence(False, "not ready"),
+    action=lambda step: {"ok": True},
+)
+second = workflow_stage(
+    "second",
+    evidence=lambda step: workflow_evidence(False, "not ready"),
+    action=lambda step: {"ok": True},
+)
+workflow_patch(workflow("build", first, second), "first", second)
+"#,
+        )?;
+        let error = eval_program(&engine_state, &mut stack, &collision, PipelineData::empty())
+            .expect_err("workflow patch replacement collision must fail");
+        let text = format!("{error:?}");
+        assert!(
+            text.contains("replacement stage `second` would duplicate"),
+            "{text}"
+        );
+        cleanup_dir(&root);
+        cleanup_dir(&collision_root);
         Ok(())
     }
 

@@ -122,6 +122,20 @@ emit(report)"#,
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "workflow_patch",
+        signature: r#"workflow_patch(plan: workflow, target: str, replacement: workflow_stage) -> workflow"#,
+        use_when: "Produce a new workflow by replacing exactly one named stage while retaining stage order and recording patch provenance in the workflow report.",
+        examples: &[
+            r#"repaired = workflow_patch(plan, "compile_broken", compile_fixed)
+report = workflow_run(repaired)"#,
+        ],
+        avoid: &[
+            "Do not use a missing target or a replacement whose name duplicates another remaining stage.",
+            "The input workflow is immutable; retain the returned workflow and run that value.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "workflow_run",
         signature: r#"workflow_run(plan: workflow) -> workflow_report"#,
         use_when: "Run stages sequentially with pre/post evidence checks, bounded action attempts, and optional repair checks. Each stage report retains compact status plus bounded stdout/stderr tails and an explanation summary from its latest action or repair.",

@@ -138,6 +138,13 @@ impl WorkflowStageValue {
 pub(super) struct WorkflowValue {
     pub(super) name: String,
     pub(super) stages: Vec<WorkflowStageValue>,
+    pub(super) patches: Vec<WorkflowPatchValue>,
+}
+
+#[derive(Clone)]
+pub(super) struct WorkflowPatchValue {
+    pub(super) target: String,
+    pub(super) replacement: String,
 }
 
 impl WorkflowValue {
