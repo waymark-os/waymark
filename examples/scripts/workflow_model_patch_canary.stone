@@ -1,36 +1,63 @@
-# A live model selects one stage-local repair as typed data. The program keeps
-# control authority by admitting only explicit workflow_stage candidates.
+# A live model selects one stage-local repair as typed data after a same-inode
+# copy failure. The program keeps control authority by admitting only explicit
+# workflow_stage candidates.
 
 
 def never_ready(step):
     return workflow_evidence(False, "artifact is absent", [])
 
 
-def already_fixed(step):
-    return workflow_evidence(True, "fixed candidate is valid", ["canary:fixed"])
+def inode_guard_ready(step):
+    return workflow_evidence(
+        True,
+        "same-inode guard satisfies runtime evidence",
+        ["canary:inode-guard"],
+    )
+
+
+def path_guard_not_ready(step):
+    return workflow_evidence(
+        False,
+        "lexically different paths can still name the same inode",
+        [],
+    )
 
 
 def main(input):
     broken = workflow_stage(
-        "compile_broken",
+        "bundle_runtime_broken",
         evidence=never_ready,
         action=lambda step: {"ok": False},
     )
     fixed = workflow_stage(
-        "compile_fixed",
-        evidence=already_fixed,
+        "bundle_runtime",
+        evidence=inode_guard_ready,
         action=lambda step: {"ok": True},
+    )
+    path_guard = workflow_stage(
+        "bundle_runtime_path_guard",
+        evidence=path_guard_not_ready,
+        action=lambda step: {"ok": False},
     )
     base = workflow("model-patch-canary", broken)
     failed = workflow_run(base)
-    if failed.ok or failed.failed_stage != "compile_broken":
+    if failed.ok or failed.failed_stage != "bundle_runtime_broken":
         fail("canary did not produce the expected failed workflow")
 
     schema = {
         "type": "object",
         "properties": {
-            "target": {"type": "string", "enum": ["compile_broken"]},
-            "replacement": {"type": "string", "enum": ["compile_fixed"]},
+            "target": {
+                "type": "string",
+                "enum": ["bundle_runtime_broken"],
+            },
+            "replacement": {
+                "type": "string",
+                "enum": [
+                    "bundle_runtime_path_guard",
+                    "bundle_runtime",
+                ],
+            },
         },
         "required": ["target", "replacement"],
         "additionalProperties": False,
@@ -41,7 +68,33 @@ def main(input):
                 "role": "user",
                 "content": json_dumps({
                     "failed_workflow": failed,
-                    "allowed_replacements": ["compile_fixed"],
+                    "observed_failure": {
+                        "stderr": (
+                            "cp: source and destination are the same file"
+                        ),
+                        "source_path": (
+                            "/app/caffe/.build_release/lib/libcaffe.so"
+                        ),
+                        "destination_path": (
+                            ".build_release/lib/libcaffe.so"
+                        ),
+                    },
+                    "allowed_replacements": [
+                        {
+                            "name": "bundle_runtime_path_guard",
+                            "action_guard": (
+                                "skip cp only when source and destination "
+                                "path strings are equal"
+                            ),
+                        },
+                        {
+                            "name": "bundle_runtime",
+                            "action_guard": (
+                                "skip cp when source and destination refer "
+                                "to the same inode"
+                            ),
+                        },
+                    ],
                 }),
             },
         ],
@@ -49,18 +102,32 @@ def main(input):
         retries=0,
         max_output_tokens=64,
     )
-    repaired = workflow_patch(base, inference.value, fixed)
-    report = workflow_run(repaired)
+    selected = workflow_patch(base, inference.value, path_guard, fixed)
+    selected_report = workflow_run(selected)
+    fallback_patch = None
+    report = selected_report
+    if not selected_report.ok:
+        fallback_replacement = "bundle_runtime_path_guard"
+        if inference.value.replacement == "bundle_runtime_path_guard":
+            fallback_replacement = "bundle_runtime"
+        fallback_patch = {
+            "target": "bundle_runtime_broken",
+            "replacement": fallback_replacement,
+        }
+        fallback = workflow_patch(base, fallback_patch, path_guard, fixed)
+        report = workflow_run(fallback)
     if (
         not report.ok
         or len(report.patches) != 1
-        or report.patches[0].target != "compile_broken"
-        or report.patches[0].replacement != "compile_fixed"
+        or report.patches[0].target != "bundle_runtime_broken"
+        or report.patches[0].replacement != "bundle_runtime"
     ):
         fail("model-authored patch did not pass the typed workflow gate")
     return {
         "answer": "live workflow patch passed",
-        "patch": inference.value,
+        "selected_patch": inference.value,
+        "selected_candidate_ok": selected_report.ok,
+        "fallback_patch": fallback_patch,
         "validation_attempts": inference.validation_attempts,
         "transition_id": inference.response.transition_id,
         "report": report,

@@ -157,6 +157,22 @@ proved stage -> repairable checkpoint -> later stage fails
   -> earlier stage is already_satisfied
 ```
 
+When several candidates are plausible, treat model selection as a proposal,
+not as acceptance:
+
+```text
+model proposes an admitted candidate
+  -> run it from the repairable checkpoint
+  -> reject it if stage evidence fails
+  -> run an untried candidate from the same checkpoint
+  -> accept only a candidate that satisfies final evidence
+```
+
+The runnable canary deliberately supports this bounded fallback. This explicit
+control flow is also a lowering target for a future Stone candidate-exploration
+construct; failed candidates remain ordinary attempt outcomes rather than
+prompt-only reasoning.
+
 When an attached controller reports its final value, Waymark also bounds each
 result, error, and detail document below the Gateway authority limit.
 Oversized recursive diagnostics are compacted deterministically with preserved
