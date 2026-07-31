@@ -539,6 +539,13 @@ fn lower_assign_target(target: &py::Expr) -> Result<AssignTarget, ShellError> {
             value: Box::new(lower_assign_target(subscript.value.as_ref())?),
             index: lower_expr(*subscript.slice.clone())?,
         }),
+        py::Expr::Attribute(attribute) => Err(unsupported_message(
+            "assignment",
+            format!(
+                "attribute assignment like record.{} = value is not supported; use item assignment record[\"{}\"] = value",
+                attribute.attr, attribute.attr
+            ),
+        )),
         _ => Err(unsupported_message(
             "assignment",
             "only simple name, fixed tuple/list, and item assignment are supported yet",
@@ -1782,6 +1789,22 @@ for i, item in enumerate(items):
                     }
                 )
         ));
+    }
+
+    #[test]
+    fn attribute_assignment_suggests_item_assignment() {
+        let error = lower_source(
+            r#"record = {"status": "rejected"}
+record.status = "accepted"
+"#,
+        )
+        .expect_err("attribute assignment should explain the Stone form");
+        let text = format!("{error:?}");
+        assert!(
+            text.contains("record.status = value")
+                && text.contains(r#"record[\"status\"] = value"#),
+            "{text}"
+        );
     }
 
     #[test]

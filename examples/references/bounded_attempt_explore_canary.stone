@@ -1,0 +1,191 @@
+# Cheap task specialization for bounded_attempt_explore.stone.
+#
+# The parent prepares an uncommitted problem and requirement, seals that state
+# as a semantic workflow checkpoint, then proposes the known-wrong lexical
+# candidate. explore() rejects it by fresh evidence and restores the same
+# checkpoint for the winning candidate.
+
+
+def prepare_ready(step):
+    probe = run(["test", "-s", "problem.txt"])
+    return workflow_evidence(
+        probe.ok,
+        "problem input is ready" if probe.ok else "problem input is absent",
+        ["canary:problem-ready"] if probe.ok else [],
+    )
+
+
+def prepare_frontier(step):
+    write_file("problem.txt", "stressed\n")
+    context_write(
+        "requirement.explore_target",
+        "requirement",
+        {"expected": "desserts"},
+        status="verified",
+        evidence=["canary:parent-frontier"],
+    )
+    return {"ok": True}
+
+
+def propose_lexical_first(candidates):
+    return {
+        "candidate": "deserts",
+        "source": "fixture_proposal",
+        "reason": "lexical edit is the first admitted hypothesis",
+    }
+
+
+def evaluate_candidate(item, outcome):
+    result = outcome.result.value
+    return {
+        "accepted": result.passed,
+        "summary": result.summary,
+        "evidence": result.evidence,
+    }
+
+
+def worker(input):
+    item = input.candidate
+    requirement = context_read(
+        keys=["requirement.explore_target"],
+        limit=1,
+    )
+    if len(requirement) != 1:
+        fail(
+            "candidate did not inherit checkpoint memory",
+            code="explore_canary_memory_missing",
+        )
+    problem = read_text("problem.txt").strip()
+    answer = item.input.answer
+    write_file("answer.txt", answer + "\n")
+    check = run(
+        [
+            "python3",
+            "-c",
+            "from pathlib import Path; "
+            "problem=Path('/app/problem.txt').read_text().strip(); "
+            "answer=Path('/app/answer.txt').read_text().strip(); "
+            "raise SystemExit(0 if answer == problem[::-1] else 1)",
+        ],
+        timeout_ms=10000,
+        max_stdout_bytes=1024,
+        max_stderr_bytes=1024,
+    )
+    passed = (
+        answer == requirement[0].content.expected
+        and check.ok
+    )
+    context_write(
+        "candidate.explore_result",
+        "candidate",
+        {
+            "name": item.name,
+            "answer": answer,
+            "passed": passed,
+        },
+        status="verified" if passed else "contradicted",
+        evidence=["canary:candidate-check"],
+    )
+    return {
+        "candidate": item.name,
+        "answer": answer,
+        "passed": passed,
+        "summary": (
+            "candidate satisfies independent reversal evidence"
+            if passed
+            else "candidate does not reverse the checkpoint problem"
+        ),
+        "evidence": ["canary:reversal"] if passed else [],
+        "problem": problem,
+        "test_exit_code": check.exit_code,
+        "memory_revision_after_result": attempt_info().memory_revision,
+    }
+
+
+def main(input):
+    prepare = workflow_stage(
+        "prepare",
+        evidence=prepare_ready,
+        action=prepare_frontier,
+        checkpoint="workspace",
+    )
+    prepared = workflow_run(workflow("prepare-exploration", prepare))
+    if not prepared.ok:
+        fail(
+            "failed to prepare exploration frontier",
+            code="explore_canary_prepare_failed",
+            detail=prepared,
+        )
+    checkpoint = prepared.stages[0].checkpoint.reference
+    result = explore(
+        checkpoint=checkpoint,
+        candidates=[
+            candidate(
+                name="deserts",
+                input={"answer": "deserts"},
+                assumptions=["one-letter lexical edit may be sufficient"],
+                ensures=["answer reverses the checkpoint problem"],
+            ),
+            candidate(
+                name="desserts",
+                input={"answer": "desserts"},
+                assumptions=["double-s spelling may be required"],
+                ensures=["answer reverses the checkpoint problem"],
+            ),
+        ],
+        worker_entrypoint="worker",
+        propose=propose_lexical_first,
+        evaluate=evaluate_candidate,
+        max_candidates=2,
+        timeout_ms=60000,
+    )
+    if (
+        not result.ok
+        or result.tried != 2
+        or result.outcomes[0].status != "rejected"
+        or result.outcomes[0].candidate != "deserts"
+        or result.outcomes[1].status != "accepted"
+        or result.outcomes[1].candidate != "desserts"
+    ):
+        fail(
+            "bounded exploration did not reject then recover",
+            code="explore_canary_search_failed",
+            detail=result,
+        )
+    answer = read_text("answer.txt").strip()
+    parent_keys = map(lambda item: item.key, context_read(limit=8))
+    if answer != "desserts":
+        fail(
+            "accepted candidate workspace was not imported",
+            code="explore_canary_accept_failed",
+        )
+    if parent_keys != ["requirement.explore_target"]:
+        fail(
+            "candidate memory leaked into the parent",
+            code="explore_canary_memory_leak",
+            detail=parent_keys,
+        )
+    return {
+        "answer": answer,
+        "checkpoint": checkpoint,
+        "proposal": result.proposal,
+        "outcomes": result.outcomes,
+        "accepted_attempt": result.accepted_attempt,
+        "tried": result.tried,
+        "clean": result.clean,
+        "parent_keys": parent_keys,
+    }
+
+
+control = attempt_info()
+entrypoint = get(control.metadata, "program_entrypoint", "main")
+if entrypoint == "worker":
+    result = worker(task_input())
+else:
+    result = main(task_input())
+attempt_report(
+    status="succeeded",
+    result=result,
+    metadata={"control": "bounded_attempt_explore_canary_v1"},
+)
+emit(result)

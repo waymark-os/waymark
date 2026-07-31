@@ -175,9 +175,26 @@ to be a checked procedure. This preserves the Python-shaped expectation that
 
 Default expressions are evaluated when a call omits that argument. Mutable
 default literals such as `[]` and `{}` are rejected to avoid shared mutable
-state surprises. Calls to user-defined functions currently accept positional
-arguments only; keyword arguments are reserved for builtins such as `run(...)`
-and `model_call(...)`.
+state surprises. Calls to user-defined functions, stored named functions, and
+lambdas accept positional and keyword arguments. Unknown keywords report the
+accepted parameter names; duplicate positional/keyword bindings and missing
+required arguments name the affected parameter.
+
+This permits readable policy interfaces:
+
+```python
+result = explore(
+    checkpoint=checkpoint,
+    candidates=candidates,
+    worker_entrypoint="worker",
+    evaluate=evaluate_candidate,
+    max_candidates=2,
+)
+```
+
+An optional task-owned callable can be tested with `callback is None` or
+`callback is not None` without serializing it. Opaque optimized
+`agent_control` values still use their documented positional invocation.
 
 Named functions are also first-class callable values. This supports visible
 control adapters without lambda wrappers:

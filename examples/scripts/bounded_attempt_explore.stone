@@ -1,0 +1,290 @@
+# Visible bounded exploration control for attempt programs.
+#
+# This is ordinary Stone source, not a builtin or hidden workflow engine.
+# Task programs provide the worker entrypoint, optional proposal callback, and
+# acceptance-evidence callback. The control owns attempt scope, checkpoint
+# reuse, candidate elimination, acceptance, and cleanup.
+#
+# Public interface:
+#
+#   candidate(
+#       name=...,
+#       input=...,
+#       assumptions=[...],
+#       ensures=[...],
+#   )
+#
+#   explore(
+#       checkpoint=...,
+#       candidates=[...],
+#       worker_entrypoint=...,
+#       evaluate=...,
+#       propose=None,
+#       max_candidates=4,
+#       timeout_ms=60000,
+#       context_prompt_view=None,
+#   )
+
+
+def candidate(name, input, assumptions, ensures):
+    if name == "":
+        fail(
+            "candidate name must be non-empty",
+            code="explore_candidate_name_empty",
+        )
+    if len(assumptions) > 16 or len(ensures) == 0 or len(ensures) > 16:
+        fail(
+            "candidate requires 1..16 ensures and at most 16 assumptions",
+            code="explore_candidate_contract_invalid",
+        )
+    for statement in assumptions + ensures:
+        if statement == "" or len(statement) > 512:
+            fail(
+                "candidate contract statements must be 1..512 characters",
+                code="explore_candidate_contract_invalid",
+            )
+    return {
+        "name": name,
+        "input": input,
+        "assumptions": assumptions,
+        "ensures": ensures,
+    }
+
+
+def explore_validate_candidates(candidates):
+    if len(candidates) == 0 or len(candidates) > 8:
+        fail(
+            "explore requires between one and eight admitted candidates",
+            code="explore_candidate_count_invalid",
+        )
+    names = []
+    for item in candidates:
+        name = get(item, "name", "")
+        assumptions = get(item, "assumptions", [])
+        ensures = get(item, "ensures", [])
+        if (
+            name == ""
+            or "input" not in keys(item)
+            or len(assumptions) > 16
+            or len(ensures) == 0
+            or len(ensures) > 16
+        ):
+            fail(
+                "every candidate needs name, input, 0..16 assumptions, and 1..16 ensures",
+                code="explore_candidate_contract_invalid",
+            )
+        for statement in assumptions + ensures:
+            if statement == "" or len(statement) > 512:
+                fail(
+                    "candidate contract statements must be 1..512 characters",
+                    code="explore_candidate_contract_invalid",
+                    detail={"candidate": name},
+                )
+        if name in names:
+            fail(
+                "candidate names must be unique",
+                code="explore_candidate_name_duplicate",
+                detail={"name": name},
+            )
+        names.append(name)
+    return names
+
+
+def explore_validate_gate(candidate_name, gate):
+    accepted = get(gate, "accepted", None)
+    summary = get(gate, "summary", "")
+    evidence = get(gate, "evidence", [])
+    if accepted != True and accepted != False:
+        fail(
+            "candidate evaluation must return boolean accepted",
+            code="explore_gate_invalid",
+            detail={"candidate": candidate_name},
+        )
+    if summary == "" or len(summary) > 1024:
+        fail(
+            "candidate evaluation summary must be 1..1024 characters",
+            code="explore_gate_invalid",
+            detail={"candidate": candidate_name},
+        )
+    if len(evidence) > 16 or (accepted and len(evidence) == 0):
+        fail(
+            "accepted candidates require 1..16 evidence references",
+            code="explore_gate_invalid",
+            detail={"candidate": candidate_name},
+        )
+    for reference in evidence:
+        if reference == "" or len(reference) > 256:
+            fail(
+                "candidate evidence references must be 1..256 characters",
+                code="explore_gate_invalid",
+                detail={"candidate": candidate_name},
+            )
+    return {
+        "accepted": accepted,
+        "summary": summary,
+        "evidence": evidence,
+    }
+
+
+def explore(
+    checkpoint,
+    candidates,
+    worker_entrypoint,
+    evaluate,
+    propose=None,
+    max_candidates=4,
+    timeout_ms=60000,
+    context_prompt_view=None,
+):
+    names = explore_validate_candidates(candidates)
+    if checkpoint == "":
+        fail(
+            "explore requires a semantic checkpoint",
+            code="explore_checkpoint_missing",
+        )
+    if worker_entrypoint == "":
+        fail(
+            "explore requires a worker entrypoint",
+            code="explore_worker_missing",
+        )
+    if max_candidates < 1 or max_candidates > 8:
+        fail(
+            "max_candidates must be between one and eight",
+            code="explore_limit_invalid",
+        )
+    if timeout_ms < 1 or timeout_ms > 3600000:
+        fail(
+            "timeout_ms must be between 1 and 3600000",
+            code="explore_timeout_invalid",
+        )
+
+    proposal = {
+        "candidate": names[0],
+        "source": "declared_order",
+    }
+    if propose is not None:
+        proposal = propose(candidates)
+    proposed_name = get(proposal, "candidate", "")
+    if proposed_name not in names:
+        fail(
+            "proposal must select one admitted candidate",
+            code="explore_proposal_not_admitted",
+            detail={
+                "proposed": proposed_name,
+                "admitted": names,
+            },
+        )
+
+    ordered = []
+    for item in candidates:
+        if item.name == proposed_name:
+            ordered.append(item)
+    for item in candidates:
+        if item.name != proposed_name:
+            ordered.append(item)
+
+    root = attempt_info()
+    scope = attempt_scope(join_timeout_ms=timeout_ms)
+    outcomes = []
+    limit = min(max_candidates, len(ordered))
+    for index in range(limit):
+        item = ordered[index]
+        child_input = {
+            "candidate": item,
+            "proposal": proposal,
+            "ordinal": index,
+        }
+        if context_prompt_view is None:
+            child = attempt_fork(
+                checkpoint=checkpoint,
+                program=current_program(),
+                entrypoint=worker_entrypoint,
+                input=child_input,
+                start=True,
+                scope=scope,
+            )
+        else:
+            child = attempt_fork(
+                checkpoint=checkpoint,
+                program=current_program(),
+                entrypoint=worker_entrypoint,
+                input=child_input,
+                context_prompt_view=context_prompt_view,
+                start=True,
+                scope=scope,
+            )
+        outcome = attempt_join(child, timeout_ms=timeout_ms)
+        if not outcome.joined or outcome.result.status != "succeeded":
+            fail(
+                "candidate controller did not return an evaluable result",
+                code="explore_candidate_infrastructure_failure",
+                detail={
+                    "candidate": item.name,
+                    "outcome": outcome,
+                },
+            )
+
+        gate = explore_validate_gate(
+            item.name,
+            evaluate(item, outcome),
+        )
+        if gate.accepted:
+            accepted = attempt_accept(root.attempt, outcome)
+            outcomes.append({
+                "candidate": item.name,
+                "attempt": outcome.attempt,
+                "status": "accepted",
+                "summary": gate.summary,
+                "evidence": gate.evidence,
+                "result": outcome.result.value,
+            })
+            cleanup = attempt_scope_close(scope)
+            if not cleanup.clean:
+                fail(
+                    "accepted exploration scope did not close cleanly",
+                    code="explore_cleanup_failed",
+                    detail=cleanup,
+                )
+            return {
+                "ok": True,
+                "status": "accepted",
+                "checkpoint": checkpoint,
+                "proposal": proposal,
+                "winner": item,
+                "accepted_attempt": accepted.child.attempt,
+                "outcomes": outcomes,
+                "tried": len(outcomes),
+                "clean": cleanup.clean,
+            }
+
+        attempt_discard(
+            outcome,
+            reason="candidate rejected: " + gate.summary,
+        )
+        outcomes.append({
+            "candidate": item.name,
+            "attempt": outcome.attempt,
+            "status": "rejected",
+            "summary": gate.summary,
+            "evidence": gate.evidence,
+            "result": outcome.result.value,
+        })
+
+    cleanup = attempt_scope_close(scope)
+    if not cleanup.clean:
+        fail(
+            "exhausted exploration scope did not close cleanly",
+            code="explore_cleanup_failed",
+            detail=cleanup,
+        )
+    return {
+        "ok": False,
+        "status": "exhausted",
+        "checkpoint": checkpoint,
+        "proposal": proposal,
+        "winner": None,
+        "accepted_attempt": None,
+        "outcomes": outcomes,
+        "tried": len(outcomes),
+        "clean": cleanup.clean,
+    }

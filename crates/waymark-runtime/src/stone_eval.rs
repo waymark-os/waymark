@@ -2286,12 +2286,6 @@ impl Evaluator<'_> {
     }
 
     fn eval_user_function_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        if !call.named.is_empty() {
-            return Err(stone_error(
-                "function call",
-                "user functions only support positional arguments for now",
-            ));
-        }
         let function = self
             .state
             .functions
@@ -2300,12 +2294,31 @@ impl Evaluator<'_> {
             .ok_or_else(|| {
                 stone_error("function call", format!("unknown function `{}`", call.name))
             })?;
+        let parameter_names = function
+            .params
+            .iter()
+            .map(|param| param.name.clone())
+            .collect::<Vec<_>>();
+        validate_stone_call_shape(
+            "function call",
+            &format!("{}()", function.name),
+            &parameter_names,
+            call,
+        )?;
         let args = call
             .positional
             .iter()
             .map(|expression| self.eval_expr_value(expression, PipelineData::empty()))
             .collect::<Result<Vec<_>, _>>()?;
-        self.invoke_user_function_values(&function, args)
+        let named = call
+            .named
+            .iter()
+            .map(|(name, expression)| {
+                self.eval_expr_value(expression, PipelineData::empty())
+                    .map(|value| (name.clone(), value))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.invoke_user_function_values_with_named(&function, args, named)
     }
 
     fn invoke_user_function_values(
@@ -2313,34 +2326,75 @@ impl Evaluator<'_> {
         function: &FunctionDef,
         args: Vec<RuntimeValue>,
     ) -> Result<RuntimeValue, ShellError> {
-        let required = function
-            .params
-            .iter()
-            .filter(|param| param.default.is_none())
-            .count();
-        if args.len() < required || args.len() > function.params.len() {
+        self.invoke_user_function_values_with_named(function, args, Vec::new())
+    }
+
+    fn invoke_user_function_values_with_named(
+        &mut self,
+        function: &FunctionDef,
+        args: Vec<RuntimeValue>,
+        named: Vec<(String, RuntimeValue)>,
+    ) -> Result<RuntimeValue, ShellError> {
+        if args.len() > function.params.len() {
             return Err(stone_error(
                 "function call",
                 format!(
-                    "{}() expected {} to {} argument(s), got {}",
+                    "{}() accepts at most {} positional argument(s), got {}",
                     function.name,
-                    required,
                     function.params.len(),
                     args.len()
                 ),
             ));
         }
 
-        let mut supplied = args.into_iter();
+        let mut supplied = function
+            .params
+            .iter()
+            .map(|_| None)
+            .collect::<Vec<Option<RuntimeValue>>>();
+        for (index, value) in args.into_iter().enumerate() {
+            supplied[index] = Some(value);
+        }
+        for (name, value) in named {
+            let Some(index) = function.params.iter().position(|param| param.name == name) else {
+                let available = function
+                    .params
+                    .iter()
+                    .map(|param| param.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(stone_error(
+                    "function call",
+                    format!(
+                        "{}() got unexpected keyword argument `{name}`; accepted parameters: {available}",
+                        function.name
+                    ),
+                ));
+            };
+            if supplied[index].is_some() {
+                return Err(stone_error(
+                    "function call",
+                    format!(
+                        "{}() got multiple values for argument `{name}`",
+                        function.name
+                    ),
+                ));
+            }
+            supplied[index] = Some(value);
+        }
+
         let mut bindings = Vec::with_capacity(function.params.len());
-        for param in &function.params {
-            let value = match supplied.next() {
+        for (param, supplied) in function.params.iter().zip(supplied) {
+            let value = match supplied {
                 Some(value) => value,
                 None => self.eval_expr_value(
                     param.default.as_ref().ok_or_else(|| {
                         stone_error(
                             "function call",
-                            format!("missing required argument `{}`", param.name),
+                            format!(
+                                "{}() missing required argument `{}`",
+                                function.name, param.name
+                            ),
                         )
                     })?,
                     PipelineData::empty(),
@@ -2371,24 +2425,68 @@ impl Evaluator<'_> {
     }
 
     fn eval_named_callable_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        if !call.named.is_empty() {
-            return Err(stone_error(
-                "callable",
-                "lambda calls only support positional arguments for now",
-            ));
-        }
         let callable = self
             .state
             .get_local(&call.name)
             .ok_or_else(|| unknown_stone_call_error(&call.name))?;
+        match &callable {
+            RuntimeValue::Callable(CallableValue::Named { function, .. }) => {
+                let parameter_names = function
+                    .params
+                    .iter()
+                    .map(|param| param.name.clone())
+                    .collect::<Vec<_>>();
+                validate_stone_call_shape(
+                    "function call",
+                    &format!("{}()", function.name),
+                    &parameter_names,
+                    call,
+                )?;
+            }
+            RuntimeValue::Callable(CallableValue::Lambda {
+                function_id,
+                params,
+                ..
+            }) => {
+                validate_stone_call_shape(
+                    "callable",
+                    &format!("lambda#{function_id}"),
+                    params,
+                    call,
+                )?;
+            }
+            RuntimeValue::AgentControl(_) if !call.named.is_empty() => {
+                return Err(stone_error(
+                    "callable",
+                    "agent-control values currently accept positional arguments only",
+                ));
+            }
+            _ => {}
+        }
         let args = call
             .positional
             .iter()
             .map(|arg| self.eval_expr_value(arg, PipelineData::empty()))
             .collect::<Result<Vec<_>, _>>()?;
+        let named = call
+            .named
+            .iter()
+            .map(|(name, expression)| {
+                self.eval_expr_value(expression, PipelineData::empty())
+                    .map(|value| (name.clone(), value))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         match callable {
-            RuntimeValue::Callable(callable) => self.invoke_callable(&callable, args),
-            RuntimeValue::AgentControl(control) => self.invoke_agent_control(&control, args),
+            RuntimeValue::Callable(callable) => {
+                self.invoke_callable_with_named(&callable, args, named)
+            }
+            RuntimeValue::AgentControl(control) if named.is_empty() => {
+                self.invoke_agent_control(&control, args)
+            }
+            RuntimeValue::AgentControl(_) => Err(stone_error(
+                "callable",
+                "agent-control values currently accept positional arguments only",
+            )),
             _ => Err(stone_error(
                 "callable",
                 format!("{} is not callable", call.name),
@@ -2483,9 +2581,18 @@ impl Evaluator<'_> {
         callable: &CallableValue,
         args: Vec<RuntimeValue>,
     ) -> Result<RuntimeValue, ShellError> {
+        self.invoke_callable_with_named(callable, args, Vec::new())
+    }
+
+    fn invoke_callable_with_named(
+        &mut self,
+        callable: &CallableValue,
+        args: Vec<RuntimeValue>,
+        named: Vec<(String, RuntimeValue)>,
+    ) -> Result<RuntimeValue, ShellError> {
         match callable {
             CallableValue::Named { function, .. } => {
-                self.invoke_user_function_values(function, args)
+                self.invoke_user_function_values_with_named(function, args, named)
             }
             CallableValue::Lambda {
                 function_id,
@@ -2493,21 +2600,58 @@ impl Evaluator<'_> {
                 body,
                 captures,
             } => {
-                if args.len() != params.len() {
+                if args.len() > params.len() {
                     return Err(stone_error(
                         "callable",
                         format!(
-                            "lambda#{function_id} expected {} argument(s), got {}",
+                            "lambda#{function_id} accepts at most {} positional argument(s), got {}",
                             params.len(),
                             args.len()
                         ),
                     ));
                 }
+                let mut supplied = params
+                    .iter()
+                    .map(|_| None)
+                    .collect::<Vec<Option<RuntimeValue>>>();
+                for (index, value) in args.into_iter().enumerate() {
+                    supplied[index] = Some(value);
+                }
+                for (name, value) in named {
+                    let Some(index) = params.iter().position(|param| param == &name) else {
+                        let available = params.join(", ");
+                        return Err(stone_error(
+                            "callable",
+                            format!(
+                                "lambda#{function_id} got unexpected keyword argument `{name}`; accepted parameters: {available}"
+                            ),
+                        ));
+                    };
+                    if supplied[index].is_some() {
+                        return Err(stone_error(
+                            "callable",
+                            format!(
+                                "lambda#{function_id} got multiple values for argument `{name}`"
+                            ),
+                        ));
+                    }
+                    supplied[index] = Some(value);
+                }
+                let mut bindings = Vec::with_capacity(params.len());
+                for (name, value) in params.iter().zip(supplied) {
+                    let value = value.ok_or_else(|| {
+                        stone_error(
+                            "callable",
+                            format!("lambda#{function_id} missing required argument `{name}`"),
+                        )
+                    })?;
+                    bindings.push((name, value));
+                }
                 self.state.push_scope();
                 for (name, value) in captures {
                     self.state.set_local(name.clone(), value.clone());
                 }
-                for (name, value) in params.iter().zip(args) {
+                for (name, value) in bindings {
                     self.state.set_local(name.clone(), value);
                 }
                 let result = self.eval_expr_value(body, PipelineData::empty());
@@ -6598,6 +6742,19 @@ impl Evaluator<'_> {
     }
 
     fn eval_attempt_join_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        for (name, _) in &call.named {
+            if name != "attempt" && name != "timeout_ms" {
+                let help = if name == "scope" {
+                    "; the child is already registered when attempt_fork(..., scope=scope) runs, so omit scope here"
+                } else {
+                    "; accepted keywords: attempt, timeout_ms"
+                };
+                return Err(stone_error(
+                    "attempt_join",
+                    format!("unexpected keyword argument `{name}`{help}"),
+                ));
+            }
+        }
         let (positional, named) = self.eval_call_values(call)?;
         if positional.len() > 2 {
             return Err(stone_error(
@@ -8962,14 +9119,25 @@ impl Evaluator<'_> {
                 ));
             }
 
-            let mut left_value = self
-                .eval_expr_value(left, PipelineData::empty())?
-                .into_nu_value("comparison")?;
+            let mut left_value = self.eval_expr_value(left, PipelineData::empty())?;
             for (op, comparator) in ops.iter().zip(comparators) {
-                let right_value = self
-                    .eval_expr_value(comparator, PipelineData::empty())?
-                    .into_nu_value("comparison")?;
-                if !compare_values(&left_value, *op, &right_value)? {
+                let right_value = self.eval_expr_value(comparator, PipelineData::empty())?;
+                let matches = if matches!(op, CompareOp::Is | CompareOp::IsNot)
+                    && (runtime_value_is_none(&left_value) || runtime_value_is_none(&right_value))
+                {
+                    let equal =
+                        runtime_value_is_none(&left_value) && runtime_value_is_none(&right_value);
+                    if *op == CompareOp::Is {
+                        equal
+                    } else {
+                        !equal
+                    }
+                } else {
+                    let left = left_value.clone().into_nu_value("comparison")?;
+                    let right = right_value.clone().into_nu_value("comparison")?;
+                    compare_values(&left, *op, &right)?
+                };
+                if !matches {
                     return Ok(RuntimeValue::Nu(Value::bool(false, Span::unknown())));
                 }
                 left_value = right_value;
@@ -10194,6 +10362,47 @@ fn runtime_type_name(value: &RuntimeValue) -> &'static str {
         RuntimeValue::AttemptHandle(_) => "attempt_handle",
         RuntimeValue::AttemptOutcome(_) => "attempt_outcome",
     }
+}
+
+fn runtime_value_is_none(value: &RuntimeValue) -> bool {
+    matches!(value, RuntimeValue::Nu(Value::Nothing { .. }))
+}
+
+fn validate_stone_call_shape(
+    error_kind: &str,
+    display_name: &str,
+    parameter_names: &[String],
+    call: &Call,
+) -> Result<(), ShellError> {
+    if call.positional.len() > parameter_names.len() {
+        return Err(stone_error(
+            error_kind,
+            format!(
+                "{display_name} accepts at most {} positional argument(s), got {}",
+                parameter_names.len(),
+                call.positional.len()
+            ),
+        ));
+    }
+    let mut seen = HashSet::new();
+    for (name, _) in &call.named {
+        let Some(index) = parameter_names.iter().position(|param| param == name) else {
+            return Err(stone_error(
+                error_kind,
+                format!(
+                    "{display_name} got unexpected keyword argument `{name}`; accepted parameters: {}",
+                    parameter_names.join(", ")
+                ),
+            ));
+        };
+        if index < call.positional.len() || !seen.insert(name) {
+            return Err(stone_error(
+                error_kind,
+                format!("{display_name} got multiple values for argument `{name}`"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn format_fstring_value(value: &Value, spec: &StoneFormatSpec) -> Result<String, ShellError> {
@@ -12329,6 +12538,118 @@ emit({
                 "mapped": [2, 3, 4],
             })
         );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn user_functions_and_callable_values_accept_keyword_arguments() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("function-keyword-arguments")?;
+        let program = lower_source(
+            r#"def configure(required, mode="safe", limit=2):
+    return {"required": required, "mode": mode, "limit": limit}
+
+def has_callback(callback=None):
+    return callback is not None
+
+selected = configure
+combine = lambda left, right: left + right
+emit({
+    "direct": configure(limit=5, required="artifact"),
+    "mixed": configure("workspace", limit=3),
+    "stored": selected(mode="fast", required="checkpoint"),
+    "lambda": combine(right=4, left=3),
+    "optional_callback": [has_callback(), has_callback(callback=configure)],
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, Span::unknown())?,
+            json_value!({
+                "direct": {
+                    "required": "artifact",
+                    "mode": "safe",
+                    "limit": 5,
+                },
+                "mixed": {
+                    "required": "workspace",
+                    "mode": "safe",
+                    "limit": 3,
+                },
+                "stored": {
+                    "required": "checkpoint",
+                    "mode": "fast",
+                    "limit": 2,
+                },
+                "lambda": 7,
+                "optional_callback": [false, true],
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn user_function_keyword_errors_name_the_recovery() -> Result<(), ShellError> {
+        for (label, call, expected) in [
+            (
+                "unknown",
+                "configure(required=\"artifact\", limt=missing_value)",
+                "unexpected keyword argument `limt`; accepted parameters: required, mode, limit",
+            ),
+            (
+                "duplicate",
+                "configure(\"artifact\", required=\"workspace\")",
+                "got multiple values for argument `required`",
+            ),
+            (
+                "missing",
+                "configure(limit=3)",
+                "missing required argument `required`",
+            ),
+        ] {
+            let (engine_state, mut stack, root) =
+                test_engine(&format!("function-keyword-{label}"))?;
+            let program = lower_source(&format!(
+                r#"def configure(required, mode="safe", limit=2):
+    return {{"required": required, "mode": mode, "limit": limit}}
+
+{call}
+"#
+            ))?;
+            let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+                .expect_err("invalid keyword call should fail");
+            let text = format!("{error:?}");
+            assert!(text.contains(expected), "unexpected error: {text}");
+            cleanup_dir(&root);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn attempt_join_rejects_scope_before_evaluating_task_owned_value() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("attempt-join-scope-diagnostic")?;
+        let program = lower_source(
+            r#"attempt_join(
+    "attempt-child",
+    timeout_ms=1000,
+    scope=attempt_scope(),
+)
+"#,
+        )?;
+        let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("attempt_join scope keyword should fail");
+        let text = format!("{error:?}");
+        assert!(
+            text.contains("unexpected keyword argument `scope`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("attempt_fork(..., scope=scope)") && text.contains("omit scope"),
+            "{text}"
+        );
+        assert!(!text.contains("cannot cross this boundary"), "{text}");
         cleanup_dir(&root);
         Ok(())
     }

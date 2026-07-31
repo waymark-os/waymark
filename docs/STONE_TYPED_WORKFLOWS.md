@@ -181,15 +181,17 @@ a useful task failure into a failed report syscall.
 
 ### Candidate Contracts And Outcomes
 
-A candidate should eventually declare:
+A candidate at this boundary declares:
 
 ```text
 identity
-target stage
+task-specific input
 assumptions and applicability obligations
-expected stage evidence
-expected final evidence
+expected acceptance evidence
 ```
+
+A stage-patch candidate additionally names its target stage and expected stage
+evidence in task-specific input.
 
 Schema validation can prove only that a proposed identity is admitted. The
 candidate must still run in an isolated attempt restored from the relevant
@@ -202,10 +204,20 @@ corrupt checkpoint state, and similar infrastructure faults remain structured
 exceptions. A subsequent attempt is meaningful only if it changes the
 candidate, assumptions, evidence, or stage-local program.
 
-The next convenience interface should be a visible ordinary-Stone `explore`
-library that lowers to existing workflow patches, checkpoint-backed child
-attempts, evidence checks, accept/discard, and scope cleanup. Dedicated syntax
-should wait until that interface has survived multiple tasks.
+The first convenience interface is now the visible ordinary-Stone
+[`bounded_attempt_explore.stone`](../examples/scripts/bounded_attempt_explore.stone)
+library. Its `candidate(...)` records expose identity, assumptions, and ensures.
+Its `explore(...)` control lowers to checkpoint-backed child attempts, evidence
+checks, accept/discard, and scope cleanup. It keeps expected rejection as a
+bounded outcome while controller/infrastructure failure remains exceptional.
+
+In a three-pair authorship comparison, the library arm passed 3/3 first
+responses with no repair and averaged 390 authored bytes. Explicit lifecycle
+control passed 1/3 first responses and 2/3 after two repairs, averaging 2,523
+bytes among passing sources. See
+[Stone Bounded Exploration Authorship Experiment](STONE_BOUNDED_EXPLORATION_AUTHORSHIP_EXPERIMENT.md).
+Dedicated syntax should still wait until the same source survives multiple
+task shapes.
 
 ## Stage Checkpoint Declaration
 
@@ -371,3 +383,12 @@ six official checks passed. This is concrete support for typed,
 evidence-gated exploration, still limited to one task family.
 See
 [Caffe Bounded Stage Exploration Experiment](../../waymark-gateway/docs/CAFFE_BOUNDED_STAGE_EXPLORATION_EXPERIMENT.md).
+
+The next official cell lowered that search to the unchanged visible
+`bounded_attempt_explore.stone` library. It rejected the same lexical candidate,
+reused the post-build frontier for the inode candidate, and passed all six
+checks. This validates transfer of the library control, while exposing a
+frontier typing gap: ordinary parent-owned checkpoints and retained
+foreign-owner repair checkpoints currently require different attempt
+primitives. See
+[Caffe Bounded-Explore Library Experiment](../../waymark-gateway/docs/CAFFE_BOUNDED_EXPLORE_LIBRARY_EXPERIMENT.md).

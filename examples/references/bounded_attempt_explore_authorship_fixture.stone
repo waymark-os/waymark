@@ -1,0 +1,175 @@
+# Fixed task support for the bounded-exploration authorship A/B.
+#
+# The author model supplies only main(input). The evaluator prepends either the
+# visible exploration library or no library and appends a fixed controller
+# dispatcher. This keeps the compared behavior fixed around the control-flow
+# surface being tested.
+
+
+def fixture_prepare_ready(step):
+    probe = run(["test", "-s", "problem.txt"])
+    return workflow_evidence(
+        probe.ok,
+        "problem input is ready" if probe.ok else "problem input is absent",
+        ["authorship:problem-ready"] if probe.ok else [],
+    )
+
+
+def fixture_prepare_frontier(step):
+    write_file("problem.txt", "stressed\n")
+    context_write(
+        "requirement.explore_target",
+        "requirement",
+        {"expected": "desserts"},
+        status="verified",
+        evidence=["authorship:parent-frontier"],
+    )
+    return {"ok": True}
+
+
+def fixture_prepare_checkpoint():
+    prepare = workflow_stage(
+        "prepare",
+        evidence=fixture_prepare_ready,
+        action=fixture_prepare_frontier,
+        checkpoint="workspace",
+    )
+    report = workflow_run(workflow("prepare-exploration", prepare))
+    if not report.ok:
+        fail(
+            "failed to prepare authorship frontier",
+            code="explore_authorship_prepare_failed",
+            detail=report,
+        )
+    return report.stages[0].checkpoint.reference
+
+
+def fixture_candidates():
+    return [
+        {
+            "name": "deserts",
+            "input": {"answer": "deserts"},
+            "assumptions": ["one-letter lexical edit may be sufficient"],
+            "ensures": ["answer reverses the checkpoint problem"],
+        },
+        {
+            "name": "desserts",
+            "input": {"answer": "desserts"},
+            "assumptions": ["double-s spelling may be required"],
+            "ensures": ["answer reverses the checkpoint problem"],
+        },
+    ]
+
+
+def propose_lexical_first(candidates):
+    return {
+        "candidate": "deserts",
+        "source": "fixture_proposal",
+        "reason": "lexical edit is the first admitted hypothesis",
+    }
+
+
+def evaluate_candidate(item, outcome):
+    result = outcome.result.value
+    return {
+        "accepted": result.passed,
+        "summary": result.summary,
+        "evidence": result.evidence,
+    }
+
+
+def worker(input):
+    item = input.candidate
+    requirement = context_read(
+        keys=["requirement.explore_target"],
+        limit=1,
+    )
+    if len(requirement) != 1:
+        fail(
+            "candidate did not inherit checkpoint memory",
+            code="explore_authorship_memory_missing",
+        )
+    problem = read_text("problem.txt").strip()
+    answer = item.input.answer
+    write_file("answer.txt", answer + "\n")
+    check = run(
+        [
+            "python3",
+            "-c",
+            "from pathlib import Path; "
+            "problem=Path('/app/problem.txt').read_text().strip(); "
+            "answer=Path('/app/answer.txt').read_text().strip(); "
+            "raise SystemExit(0 if answer == problem[::-1] else 1)",
+        ],
+        timeout_ms=10000,
+        max_stdout_bytes=1024,
+        max_stderr_bytes=1024,
+    )
+    passed = (
+        answer == requirement[0].content.expected
+        and check.ok
+    )
+    context_write(
+        "candidate.explore_result",
+        "candidate",
+        {
+            "name": item.name,
+            "answer": answer,
+            "passed": passed,
+        },
+        status="verified" if passed else "contradicted",
+        evidence=["authorship:candidate-check"],
+    )
+    return {
+        "candidate": item.name,
+        "answer": answer,
+        "passed": passed,
+        "summary": (
+            "candidate satisfies independent reversal evidence"
+            if passed
+            else "candidate does not reverse the checkpoint problem"
+        ),
+        "evidence": ["canary:reversal"] if passed else [],
+        "problem": problem,
+        "memory_revision_after_result": attempt_info().memory_revision,
+    }
+
+
+def fixture_finalize(result):
+    if (
+        not result.ok
+        or result.status != "accepted"
+        or result.tried != 2
+        or result.outcomes[0].candidate != "deserts"
+        or result.outcomes[0].status != "rejected"
+        or result.outcomes[1].candidate != "desserts"
+        or result.outcomes[1].status != "accepted"
+    ):
+        fail(
+            "authored control did not reject then recover",
+            code="explore_authorship_search_failed",
+            detail=result,
+        )
+    answer = read_text("answer.txt").strip()
+    parent_keys = map(lambda item: item.key, context_read(limit=8))
+    if answer != "desserts":
+        fail(
+            "authored control did not import the accepted workspace",
+            code="explore_authorship_accept_failed",
+        )
+    if parent_keys != ["requirement.explore_target"]:
+        fail(
+            "authored control leaked child memory",
+            code="explore_authorship_memory_leak",
+            detail=parent_keys,
+        )
+    return {
+        "answer": answer,
+        "checkpoint": result.checkpoint,
+        "proposal": result.proposal,
+        "outcomes": result.outcomes,
+        "accepted_attempt": result.accepted_attempt,
+        "tried": result.tried,
+        "clean": result.clean,
+        "parent_keys": parent_keys,
+    }

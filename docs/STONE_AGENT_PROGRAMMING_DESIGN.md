@@ -899,48 +899,54 @@ The model call is optional: a deterministic policy may order candidates. The
 important property is that proposal, execution, evaluation, and acceptance are
 separate transitions.
 
-The next interface should first be an inspectable Stone control library, with
-an illustrative shape such as:
+The first interface is now the inspectable
+[`bounded_attempt_explore.stone`](../examples/scripts/bounded_attempt_explore.stone)
+control library. Its current ordinary-source shape is:
 
 ```stone
 result = explore(
-    from_checkpoint=build_checkpoint,
+    checkpoint=build_checkpoint,
     candidates=[
         candidate(
             name="path_guard",
-            stage="bundle_runtime",
+            input={"replacement": "bundle_runtime_path_guard"},
             assumptions=["source and destination strings are equal"],
             ensures=["runtime artifact is independently loadable"],
         ),
         candidate(
             name="inode_guard",
-            stage="bundle_runtime",
+            input={"replacement": "bundle_runtime"},
             assumptions=["source and destination may name the same inode"],
             ensures=["runtime artifact is independently loadable"],
         ),
     ],
-    propose=lambda observation: model_infer(observation, PATCH_SCHEMA),
-    run=run_candidate,
-    accept=check_final_evidence,
+    worker_entrypoint="repair_worker",
+    evaluate=evaluate_candidate,
+    propose=propose_candidate,
     max_candidates=2,
 )
 ```
 
-This sketch is not syntax or an implemented signature. Its semantic lowering
-is the important contract:
+The library implements this semantic contract:
 
-1. validate candidate identity, stage, assumptions, and evidence obligations;
+1. validate candidate identity, input, assumptions, and evidence obligations;
 2. let the proposal choose only among admitted candidates;
 3. fork every tried candidate from the same checkpoint in a supervised scope;
-4. return an expected `CandidateOutcome` when evidence is unsatisfied;
+4. return a bounded rejected-candidate record when evidence is unsatisfied;
 5. eliminate tried candidates and continue within the declared bound;
 6. accept only a candidate satisfying final evidence; and
 7. discard and reap every rejected or unresolved child.
 
-Only after this ordinary-source form works across several tasks should Stone
-gain dedicated `explore` syntax. Any syntax must lower to the same attempt,
-checkpoint, evidence, and cleanup operations rather than introduce a hidden
-workflow engine.
+Stone user functions now support keyword arguments so the policy-bearing call
+is self-describing. In a frozen three-pair authorship comparison, the library
+passed 3/3 first responses with no repair and reduced passing authored source
+from 2,523 to 390 mean bytes versus explicit lifecycle control. See
+[Stone Bounded Exploration Authorship Experiment](STONE_BOUNDED_EXPLORATION_AUTHORSHIP_EXPERIMENT.md).
+
+Only after this ordinary-source form works across several task shapes should
+Stone gain dedicated `explore` syntax. Any syntax must lower to the same
+attempt, checkpoint, evidence, and cleanup operations rather than introduce a
+hidden workflow engine.
 
 See the Gateway repository's
 [Caffe Bounded Stage Exploration Experiment](../../waymark-gateway/docs/CAFFE_BOUNDED_STAGE_EXPLORATION_EXPERIMENT.md)
@@ -1411,9 +1417,14 @@ second evidence-boundary error, after which the official verifier passed all
 six checks. This supports the control shape; it does not establish broad
 task-level reliability.
 
-Continue M2.5 with the visible bounded-exploration library described above,
-then test the same interface on cheaper tasks before considering syntax.
-Verifier-populated outcomes and aggregate budget/event views remain necessary.
+The visible bounded-exploration library now passes its deterministic mechanism
+gate, a three-pair authorship comparison, and an unchanged-library transfer to
+the official Caffe task. In the Caffe cell it rejected the model's first
+candidate, reused the post-build frontier, and passed all six checks. Continue
+M2.5 by generalizing the frontier argument across parent-owned fork checkpoints
+and retained repair checkpoints before considering syntax. Verifier-populated
+outcomes and aggregate budget/event views remain necessary. See
+[Caffe Bounded-Explore Library Experiment](../../waymark-gateway/docs/CAFFE_BOUNDED_EXPLORE_LIBRARY_EXPERIMENT.md).
 Compatibility ids remain accepted at syscall boundaries, but new Stone control
 should retain handles. Do not treat the mechanism, specialization, or
 single-task cells as validation of the broader attempt-first OS hypothesis.
