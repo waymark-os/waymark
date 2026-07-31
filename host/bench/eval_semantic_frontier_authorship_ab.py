@@ -121,7 +121,9 @@ Stone is Python-shaped. The evaluator supplies:
 - fixture_finalize(interface, parent_source, retained_source, parent_outcome,
   repaired_outcome, parent_child, owner, repaired, cleanup) -> final verified
   result. For the raw arm, sources are checkpoint records. For the typed arm,
-  sources are semantic_frontier values.
+  sources are semantic_frontier values. parent_child, owner, and repaired must
+  remain attempt_handle values; attempt_accept(...) returns a distinct
+  attempt_acceptance transition result.
 
 main must:
 

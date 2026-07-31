@@ -77,12 +77,17 @@ pub struct FunctionParam {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoneType {
     Any,
+    AttemptAcceptance,
+    AttemptHandle,
+    AttemptOutcome,
+    AttemptScope,
     Bool,
     Float,
     Int,
     List,
     None,
     Record,
+    SemanticFrontier,
     Str,
 }
 
@@ -490,12 +495,17 @@ fn lower_type_annotation(annotation: &py::Expr) -> Result<StoneType, ShellError>
     match annotation {
         py::Expr::Name(name) => match name.id.as_str() {
             "Any" | "any" => Ok(StoneType::Any),
+            "attempt_acceptance" => Ok(StoneType::AttemptAcceptance),
+            "attempt_handle" => Ok(StoneType::AttemptHandle),
+            "attempt_outcome" => Ok(StoneType::AttemptOutcome),
+            "attempt_scope" => Ok(StoneType::AttemptScope),
             "bool" => Ok(StoneType::Bool),
             "float" => Ok(StoneType::Float),
             "int" => Ok(StoneType::Int),
             "list" => Ok(StoneType::List),
             "None" => Ok(StoneType::None),
             "record" | "dict" => Ok(StoneType::Record),
+            "semantic_frontier" => Ok(StoneType::SemanticFrontier),
             "str" => Ok(StoneType::Str),
             other => Err(unsupported_message(
                 "type annotation",
@@ -1974,6 +1984,41 @@ value = normalize("01/02/2024")
         assert_eq!(function.params[0].default, None);
         assert_eq!(function.return_type, StoneType::Str);
         assert!(matches!(function.body.last(), Some(Stmt::Return(Some(_)))));
+    }
+
+    #[test]
+    fn accepts_nominal_attempt_control_annotations() {
+        let program = lower_source(
+            r#"def select(
+    frontier: semantic_frontier,
+    scope: attempt_scope,
+    child: attempt_handle,
+    outcome: attempt_outcome,
+    accepted: attempt_acceptance,
+) -> attempt_handle:
+    return accepted.selected
+"#,
+        )
+        .expect("lower nominal attempt types");
+
+        let Stmt::FunctionDef(function) = &program.statements[0] else {
+            panic!("expected function definition");
+        };
+        assert_eq!(
+            function
+                .params
+                .iter()
+                .map(|param| param.ty)
+                .collect::<Vec<_>>(),
+            vec![
+                StoneType::SemanticFrontier,
+                StoneType::AttemptScope,
+                StoneType::AttemptHandle,
+                StoneType::AttemptOutcome,
+                StoneType::AttemptAcceptance,
+            ]
+        );
+        assert_eq!(function.return_type, StoneType::AttemptHandle);
     }
 
     #[test]

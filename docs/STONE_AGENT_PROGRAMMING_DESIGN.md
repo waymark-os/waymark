@@ -1169,6 +1169,14 @@ The M2.5 implementation now establishes the control and supervision seams:
   `outcome.result.value` or `outcome.result.error`. Ordinary info/list records
   omit report bodies, so comparison is explicit without making every lifecycle
   observation carry child payloads.
+- `attempt_accept` returns nominal `attempt_acceptance`, not an untyped import
+  record. It preserves the structured parent/child diff report, exposes the
+  selected attempt id directly, and keeps `accepted.selected` as a nominal
+  `attempt_handle`. User functions may annotate `attempt_handle`,
+  `attempt_outcome`, `attempt_scope`, `semantic_frontier`, and
+  `attempt_acceptance`; mismatching acceptance and handle values fails at the
+  function boundary with lifecycle-specific repair guidance. The compact
+  runtime tags are intentionally suitable for later JIT specialization.
 - `attempt_inspect(child, include_details=False, trace_limit=20,
   max_bytes=32768)` is the bounded drill-down path. It returns the compact
   summary, optional archived controller envelope, a relevant trace tail, and

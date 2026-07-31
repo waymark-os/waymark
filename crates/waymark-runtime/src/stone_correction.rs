@@ -189,6 +189,17 @@ pub(crate) fn correction_for_error(err: &ShellError, source: &str) -> Option<Jso
         ));
     }
 
+    if detail.contains("expected attempt_handle, got attempt_acceptance") {
+        return Some(repair_envelope(
+            source,
+            phase,
+            "lifecycle_type",
+            "attempt_acceptance",
+            vec!["attempt_handle"],
+            "attempt_accept() returns a typed lifecycle result. Preserve the original child handle, or pass accepted.selected when the callee requires attempt_handle.",
+        ));
+    }
+
     None
 }
 
@@ -811,5 +822,25 @@ mod tests {
         .expect("role correction");
         assert_eq!(role["class"], json!("message_role"));
         assert_eq!(role["safety"], json!("requires_repair"));
+    }
+
+    #[test]
+    fn acceptance_handle_confusion_gets_typed_lifecycle_guidance() {
+        let correction = correction_for_error(
+            &error(
+                "stone_script_error",
+                "argument `repaired` expected attempt_handle, got attempt_acceptance",
+            ),
+            "return fixture_finalize(accepted)",
+        )
+        .expect("lifecycle type correction");
+        assert_eq!(correction["class"], json!("lifecycle_type"));
+        assert_eq!(correction["received"], json!("attempt_acceptance"));
+        assert_eq!(correction["expected"], json!(["attempt_handle"]));
+        assert_eq!(correction["safety"], json!("requires_repair"));
+        assert!(correction["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("accepted.selected"));
     }
 }

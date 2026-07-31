@@ -13,7 +13,9 @@ use super::stone_json_view::{
 };
 use crate::stone_agent_control::AgentControlValue;
 use crate::stone_attempt_scope::AttemptScopeValue;
-use crate::stone_attempt_value::{AttemptHandleValue, AttemptOutcomeValue, SemanticFrontierValue};
+use crate::stone_attempt_value::{
+    AttemptAcceptanceValue, AttemptHandleValue, AttemptOutcomeValue, SemanticFrontierValue,
+};
 
 #[derive(Clone)]
 pub(super) enum RuntimeValue {
@@ -33,6 +35,7 @@ pub(super) enum RuntimeValue {
     AttemptScope(AttemptScopeValue),
     AttemptHandle(AttemptHandleValue),
     AttemptOutcome(AttemptOutcomeValue),
+    AttemptAcceptance(AttemptAcceptanceValue),
     SemanticFrontier(SemanticFrontierValue),
 }
 
@@ -54,6 +57,7 @@ pub(super) enum RuntimeValueTag {
     AttemptScope,
     AttemptHandle,
     AttemptOutcome,
+    AttemptAcceptance,
     SemanticFrontier,
 }
 
@@ -78,6 +82,7 @@ impl RuntimeValueTag {
             RuntimeValueTag::Workflow => 15,
             RuntimeValueTag::WorkflowEvidenceSource => 16,
             RuntimeValueTag::SemanticFrontier => 17,
+            RuntimeValueTag::AttemptAcceptance => 18,
         }
     }
 }
@@ -112,6 +117,7 @@ impl RuntimeValue {
             RuntimeValue::AttemptScope(_) => false,
             RuntimeValue::AttemptHandle(_) => false,
             RuntimeValue::AttemptOutcome(_) => true,
+            RuntimeValue::AttemptAcceptance(_) => false,
             RuntimeValue::SemanticFrontier(_) => false,
             RuntimeValue::File(_) => false,
         }
@@ -136,6 +142,7 @@ impl RuntimeValue {
             RuntimeValue::AttemptScope(_) => RuntimeValueTag::AttemptScope,
             RuntimeValue::AttemptHandle(_) => RuntimeValueTag::AttemptHandle,
             RuntimeValue::AttemptOutcome(_) => RuntimeValueTag::AttemptOutcome,
+            RuntimeValue::AttemptAcceptance(_) => RuntimeValueTag::AttemptAcceptance,
             RuntimeValue::SemanticFrontier(_) => RuntimeValueTag::SemanticFrontier,
         }
     }
@@ -205,6 +212,7 @@ impl RuntimeValue {
             )),
             RuntimeValue::AttemptHandle(handle) => Ok(handle.materialize()),
             RuntimeValue::AttemptOutcome(outcome) => Ok(outcome.materialize()),
+            RuntimeValue::AttemptAcceptance(acceptance) => Ok(acceptance.materialize()),
             RuntimeValue::SemanticFrontier(_) => Err(stone_error(
                 context,
                 "semantic frontiers are task-owned authority values and cannot cross this boundary",
@@ -220,7 +228,7 @@ mod tests {
     use super::super::stone_functions::CallableValue;
     use super::{FileHandle, RuntimeValue, RuntimeValueTag, TextLines};
     use crate::stone_ast::Expr;
-    use crate::stone_attempt_value::AttemptOutcomeValue;
+    use crate::stone_attempt_value::{AttemptAcceptanceValue, AttemptOutcomeValue};
 
     #[test]
     fn runtime_value_tags_have_stable_compact_ids() {
@@ -241,6 +249,7 @@ mod tests {
         assert_eq!(RuntimeValueTag::Workflow.id(), 15);
         assert_eq!(RuntimeValueTag::WorkflowEvidenceSource.id(), 16);
         assert_eq!(RuntimeValueTag::SemanticFrontier.id(), 17);
+        assert_eq!(RuntimeValueTag::AttemptAcceptance.id(), 18);
     }
 
     #[test]
@@ -367,5 +376,50 @@ mod tests {
             "cobalt"
         );
         assert!(result.get("error").unwrap().is_nothing());
+    }
+
+    #[test]
+    fn attempt_acceptance_preserves_a_nominal_selected_handle() {
+        let span = Span::unknown();
+        let mut child = nu_protocol::Record::new();
+        child.push("attempt", Value::string("attempt-child", span));
+        child.push("state", Value::string("accepted", span));
+        let child = Value::record(child, span);
+        let mut report = nu_protocol::Record::new();
+        report.push("parent", Value::nothing(span));
+        report.push("child", child);
+        report.push("file_changes", Value::int(1, span));
+        report.push("env_changes", Value::int(0, span));
+        let acceptance =
+            AttemptAcceptanceValue::new("attempt-child".to_string(), Value::record(report, span))
+                .expect("acceptance");
+        let selected = RuntimeValue::AttemptHandle(acceptance.selected_handle());
+        assert_eq!(selected.type_tag(), RuntimeValueTag::AttemptHandle);
+
+        let value = RuntimeValue::AttemptAcceptance(acceptance)
+            .into_nu_value("test")
+            .expect("acceptance should materialize");
+        let record = value.as_record().expect("acceptance record");
+        assert_eq!(
+            record.get("type").unwrap().as_str().unwrap(),
+            "attempt_acceptance"
+        );
+        assert_eq!(
+            record.get("attempt").unwrap().as_str().unwrap(),
+            "attempt-child"
+        );
+        assert_eq!(record.get("accepted").unwrap().as_bool().unwrap(), true);
+        assert_eq!(
+            record
+                .get("selected")
+                .unwrap()
+                .as_record()
+                .unwrap()
+                .get("attempt")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "attempt-child"
+        );
     }
 }

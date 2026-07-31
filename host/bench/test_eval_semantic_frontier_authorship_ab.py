@@ -82,6 +82,17 @@ class SemanticFrontierAuthorshipTests(unittest.TestCase):
         self.assertIn('entrypoint == "setup_owner"', composed)
         self.assertIn("result = main(task_input())", composed)
 
+    def test_fixture_requires_handles_at_the_lifecycle_boundary(self) -> None:
+        fixture = (
+            ROOT
+            / "examples/references/semantic_frontier_authorship_fixture.stone"
+        ).read_text(encoding="utf-8")
+        self.assertIn("parent_outcome: attempt_outcome", fixture)
+        self.assertIn("repaired_outcome: attempt_outcome", fixture)
+        self.assertIn("parent_child: attempt_handle", fixture)
+        self.assertIn("owner: attempt_handle", fixture)
+        self.assertIn("repaired: attempt_handle", fixture)
+
 
 if __name__ == "__main__":
     unittest.main()

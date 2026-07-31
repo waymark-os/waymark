@@ -330,6 +330,28 @@ establish an authorship-rate gain. It does identify the next typing seam:
 lifecycle reports should not be easy to confuse with the capabilities they
 transform.
 
+The follow-up makes that seam nominal. `attempt_accept` now returns an
+`attempt_acceptance` transition:
+
+```stone
+accepted = attempt_accept(root, child)
+selected = accepted.selected
+```
+
+`accepted.selected` retains type `attempt_handle`; the acceptance itself
+carries `status`, `attempt`, `parent`, `child`, and import-diff fields. Stone
+function annotations recognize the attempt-control types, so a parameter
+declared `repaired: attempt_handle` rejects an `attempt_acceptance` before
+entering the helper body and emits targeted repair guidance. These stable
+runtime tags are also a useful boundary for future JIT work, without requiring
+static inference in the current interpreter.
+
+A fresh one-pair, no-repair authorship smoke passed both interfaces on the
+first response. The typed draft preserved its repaired handle across
+`attempt_accept` and used 27 lines versus 55 in the raw draft. Treat this as a
+learnability canary only; the earlier frozen three-pair result remains the
+comparative evidence.
+
 This initial backend is deliberately narrow. If setup has already changed a
 container root, `forkable` fails because immutable-image reconstruction would
 lose those changes. Likewise, accepting a child after it starts a mutable

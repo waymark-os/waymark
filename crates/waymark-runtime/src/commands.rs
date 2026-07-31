@@ -851,8 +851,12 @@ for key, value in items(counts):
     StoneHelpEntry {
         name: "type",
         signature: "type(value: Any) -> str",
-        use_when: "Use for lightweight validation when checking task outputs.",
-        examples: &[r#"ok = type(row["name"]) == "str""#],
+        use_when: "Use for lightweight validation when checking task outputs or nominal control values. Attempt control reports attempt_handle, attempt_outcome, attempt_scope, semantic_frontier, and attempt_acceptance without flattening them to record.",
+        examples: &[
+            r#"ok = type(row["name"]) == "str""#,
+            r#"accepted = attempt_accept(root, child)
+ok = type(accepted) == "attempt_acceptance""#,
+        ],
         avoid: &["Prefer direct conversions like int()/float() when you need numeric values."],
         aliases: &[],
     },
@@ -1304,12 +1308,18 @@ child = attempt_branch(frontier, input={"strategy": "alternate"}, program=curren
     },
     StoneHelpEntry {
         name: "attempt_accept",
-        signature: "attempt_accept(parent: str, child: str) -> record",
-        use_when: "Use in Gateway mode to import one successfully reported direct child's workspace state into its unchanged parent.",
-        examples: &[r#"accepted = attempt_accept(root.attempt, child.attempt)"#],
+        signature:
+            "attempt_accept(parent: attempt_handle | str | record, child: attempt_handle | attempt_outcome | str | record) -> attempt_acceptance",
+        use_when: "Use in Gateway mode to import one successfully reported direct child's workspace state into its unchanged parent. The nominal result exposes status=\"accepted\", attempt, a typed selected attempt_handle, and the structured import report.",
+        examples: &[
+            r#"accepted = attempt_accept(root.attempt, child)
+emit({"attempt": accepted.attempt, "changes": accepted.file_changes})"#,
+            r#"selected = attempt_accept(root.attempt, child).selected"#,
+        ],
         avoid: &[
             "Do not accept an unreported or failed child.",
             "The parent must not change between fork and accept; fork candidates from the same stable parent and select before editing it.",
+            "An attempt_acceptance is a lifecycle transition result, not an attempt_handle; use accepted.selected when a later typed helper requires the selected handle.",
         ],
         aliases: &[],
     },
@@ -1598,7 +1608,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "Record fields can be read as row[\"name\"] or row.name when the field name is identifier-shaped.",
             "Operators: +, -, *, /, //, &, |, <<, >>, comparisons, and/or/not, membership, is None.",
             "Conditional expressions use Python's value if condition else fallback shape.",
-            "Functions: def name(arg) works; omitted parameter and return annotations mean Any, optional annotations like def name(arg: str) -> str are checked, and immutable default values are supported. Named functions are first-class callable values and may be passed to another function. Use -> None for a checked procedure. @stage(...) is the one supported declaration decorator.",
+            "Functions: def name(arg) works; omitted parameter and return annotations mean Any, optional annotations like def name(arg: str) -> str are checked, and immutable default values are supported. Attempt controls also support attempt_handle, attempt_outcome, attempt_scope, semantic_frontier, and attempt_acceptance annotations. Named functions are first-class callable values and may be passed to another function. Use -> None for a checked procedure. @stage(...) is the one supported declaration decorator.",
             "try/except catches runtime evaluation errors; supported handlers are except:, except Exception:, and except Exception as e:.",
             "Lambdas: expression-only callbacks work in sort/map/filter, e.g. lambda r: r[\"name\"].",
             "String methods include strip/lstrip/rstrip, isdigit/isalpha/isalnum, count, split/rsplit/splitlines, replace, join, lower/upper, zfill, startswith, and endswith; split and rsplit accept optional maxsplit and default whitespace splitting.",

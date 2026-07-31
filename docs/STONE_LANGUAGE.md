@@ -173,6 +173,25 @@ zero-argument function. Use an explicit `-> None` when a function is intended
 to be a checked procedure. This preserves the Python-shaped expectation that
 `def solve(): ...; return value` may return a value without an annotation.
 
+Alongside `bool`, `float`, `int`, `list`, `None`, `record`/`dict`, and `str`,
+Stone recognizes nominal attempt-control annotations:
+
+```python
+def choose(
+    frontier: semantic_frontier,
+    scope: attempt_scope,
+    child: attempt_handle,
+    outcome: attempt_outcome,
+    accepted: attempt_acceptance,
+) -> attempt_handle:
+    return accepted.selected
+```
+
+The interpreter checks these types at function boundaries without flattening
+the control value to a record. Their compact runtime tags are also a stable
+input to future whole-function analysis and JIT specialization; Stone does not
+yet claim static inference across arbitrary assignments.
+
 Default expressions are evaluated when a call omits that argument. Mutable
 default literals such as `[]` and `{}` are rejected to avoid shared mutable
 state surprises. Calls to user-defined functions, stored named functions, and

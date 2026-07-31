@@ -145,7 +145,20 @@ def main(input):
             code="semantic_frontier_retained_branch_failed",
             detail=repaired_outcome,
         )
-    attempt_accept(attempt_info(), repaired)
+    acceptance = attempt_accept(attempt_info(), repaired)
+    selected = acceptance.selected
+    if (
+        type(acceptance) != "attempt_acceptance"
+        or acceptance.status != "accepted"
+        or acceptance.attempt != repaired.attempt
+        or type(selected) != "attempt_handle"
+        or selected.attempt != repaired.attempt
+    ):
+        fail(
+            "attempt acceptance lost its typed selected handle",
+            code="semantic_frontier_acceptance_type_failed",
+            detail=acceptance,
+        )
     cleanup = attempt_scope_close(scope)
     if not cleanup.clean:
         fail(
@@ -186,6 +199,7 @@ def main(input):
             "retained": repaired.attempt,
         },
         "accepted": read_text("branch.txt").strip(),
+        "acceptance_type": type(acceptance),
         "owner_resource_state": owner_inspection.resource_state,
         "clean": cleanup.clean,
     }

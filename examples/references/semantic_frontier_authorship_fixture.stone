@@ -91,16 +91,16 @@ def fixture_checkpoint_cost(checkpoint):
 
 
 def fixture_finalize(
-    interface,
+    interface: str,
     parent_source,
     retained_source,
-    parent_outcome,
-    repaired_outcome,
-    parent_child,
-    owner,
-    repaired,
-    cleanup,
-):
+    parent_outcome: attempt_outcome,
+    repaired_outcome: attempt_outcome,
+    parent_child: attempt_handle,
+    owner: attempt_handle,
+    repaired: attempt_handle,
+    cleanup: record,
+) -> record:
     if (
         not parent_outcome.joined
         or parent_outcome.result.status != "succeeded"

@@ -217,6 +217,59 @@ impl AttemptOutcomeValue {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct AttemptAcceptanceValue {
+    pub(super) attempt: String,
+    record: Value,
+    selected_record: Value,
+}
+
+impl AttemptAcceptanceValue {
+    pub(super) fn new(attempt: String, record: Value) -> Result<Self, ShellError> {
+        let selected_record = attempt_record_field(&record, "child").ok_or_else(|| {
+            stone_error(
+                "attempt_acceptance",
+                "Gateway acceptance result did not contain a selected child record",
+            )
+        })?;
+        Ok(Self {
+            attempt,
+            record,
+            selected_record,
+        })
+    }
+
+    pub(super) fn selected_handle(&self) -> AttemptHandleValue {
+        AttemptHandleValue::new(self.attempt.clone(), self.selected_record.clone())
+    }
+
+    pub(super) fn materialize(&self) -> Value {
+        let span = Span::unknown();
+        let mut acceptance = Record::new();
+        acceptance.push("type", Value::string("attempt_acceptance", span));
+        acceptance.push("status", Value::string("accepted", span));
+        acceptance.push("accepted", Value::bool(true, span));
+        acceptance.push("attempt", Value::string(self.attempt.clone(), span));
+        acceptance.push("selected", self.selected_record.clone());
+        if let Value::Record { val, .. } = &self.record {
+            for (field, value) in val.iter() {
+                if matches!(
+                    field.as_str(),
+                    "type" | "status" | "accepted" | "attempt" | "selected"
+                ) {
+                    continue;
+                }
+                acceptance.push(field.clone(), value.clone());
+            }
+        }
+        Value::record(acceptance, span)
+    }
+
+    pub(super) fn attribute(&self, attr: &str) -> Result<Value, ShellError> {
+        record_attribute(&self.materialize(), attr, "attempt_acceptance")
+    }
+}
+
 fn attempt_record_field(value: &Value, key: &str) -> Option<Value> {
     let Value::Record { val, .. } = value else {
         return None;

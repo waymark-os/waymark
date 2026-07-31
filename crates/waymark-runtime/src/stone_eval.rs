@@ -46,7 +46,8 @@ use crate::stone_ast::{
 };
 use crate::stone_attempt_scope::AttemptScopeValue;
 use crate::stone_attempt_value::{
-    AttemptHandleValue, AttemptOutcomeValue, SemanticFrontierMode, SemanticFrontierValue,
+    AttemptAcceptanceValue, AttemptHandleValue, AttemptOutcomeValue, SemanticFrontierMode,
+    SemanticFrontierValue,
 };
 use crate::stone_builtins::{
     add_values, bitwise_int_values, compare_values, div_values, enumerate_builtin,
@@ -2572,6 +2573,12 @@ impl Evaluator<'_> {
         }
         if let RuntimeValue::AttemptOutcome(outcome) = receiver {
             return outcome.attribute(attr).map(RuntimeValue::Nu);
+        }
+        if let RuntimeValue::AttemptAcceptance(acceptance) = receiver {
+            if attr == "selected" {
+                return Ok(RuntimeValue::AttemptHandle(acceptance.selected_handle()));
+            }
+            return acceptance.attribute(attr).map(RuntimeValue::Nu);
         }
         if let RuntimeValue::SemanticFrontier(frontier) = receiver {
             return frontier.attribute(attr).map(RuntimeValue::Nu);
@@ -7384,6 +7391,7 @@ impl Evaluator<'_> {
                 .collect()),
             RuntimeValue::AttemptHandle(handle) => Ok(vec![handle.attempt]),
             RuntimeValue::AttemptOutcome(outcome) => Ok(vec![outcome.attempt]),
+            RuntimeValue::AttemptAcceptance(acceptance) => Ok(vec![acceptance.attempt]),
             RuntimeValue::Nu(Value::List { vals, .. }) => vals
                 .iter()
                 .map(|value| attempt_id_from_value(value, context))
@@ -7779,7 +7787,9 @@ impl Evaluator<'_> {
         for scope in &self.state.attempt_scopes {
             scope.mark_resolved(&child)?;
         }
-        Ok(RuntimeValue::Nu(accepted))
+        Ok(RuntimeValue::AttemptAcceptance(
+            AttemptAcceptanceValue::new(child, accepted)?,
+        ))
     }
 
     fn eval_attempt_discard_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -10001,12 +10011,39 @@ fn ensure_runtime_type(
     if expected == StoneType::Any {
         return Ok(());
     }
+    let nominal_match = match expected {
+        StoneType::AttemptAcceptance => Some(matches!(value, RuntimeValue::AttemptAcceptance(_))),
+        StoneType::AttemptHandle => Some(matches!(value, RuntimeValue::AttemptHandle(_))),
+        StoneType::AttemptOutcome => Some(matches!(value, RuntimeValue::AttemptOutcome(_))),
+        StoneType::AttemptScope => Some(matches!(value, RuntimeValue::AttemptScope(_))),
+        StoneType::SemanticFrontier => Some(matches!(value, RuntimeValue::SemanticFrontier(_))),
+        _ => None,
+    };
+    if let Some(ok) = nominal_match {
+        return if ok {
+            Ok(())
+        } else {
+            Err(stone_error(
+                "type check",
+                format!(
+                    "{context} expected {}, got {}",
+                    stone_type_name(expected),
+                    runtime_type_name(value)
+                ),
+            ))
+        };
+    }
     ensure_type(&value.clone().into_nu_value(context)?, expected, context)
 }
 
 fn ensure_type(value: &Value, expected: StoneType, context: &str) -> Result<(), ShellError> {
     let ok = match expected {
         StoneType::Any => true,
+        StoneType::AttemptAcceptance
+        | StoneType::AttemptHandle
+        | StoneType::AttemptOutcome
+        | StoneType::AttemptScope
+        | StoneType::SemanticFrontier => false,
         StoneType::Bool => matches!(value, Value::Bool { .. }),
         StoneType::Float => matches!(value, Value::Float { .. } | Value::Int { .. }),
         StoneType::Int => matches!(value, Value::Int { .. }),
@@ -10085,12 +10122,17 @@ fn shell_error_record(err: &ShellError) -> Value {
 fn stone_type_name(ty: StoneType) -> &'static str {
     match ty {
         StoneType::Any => "Any",
+        StoneType::AttemptAcceptance => "attempt_acceptance",
+        StoneType::AttemptHandle => "attempt_handle",
+        StoneType::AttemptOutcome => "attempt_outcome",
+        StoneType::AttemptScope => "attempt_scope",
         StoneType::Bool => "bool",
         StoneType::Float => "float",
         StoneType::Int => "int",
         StoneType::List => "list",
         StoneType::None => "None",
         StoneType::Record => "record",
+        StoneType::SemanticFrontier => "semantic_frontier",
         StoneType::Str => "str",
     }
 }
@@ -10820,6 +10862,7 @@ fn runtime_type_name(value: &RuntimeValue) -> &'static str {
         RuntimeValue::AttemptScope(_) => "attempt_scope",
         RuntimeValue::AttemptHandle(_) => "attempt_handle",
         RuntimeValue::AttemptOutcome(_) => "attempt_outcome",
+        RuntimeValue::AttemptAcceptance(_) => "attempt_acceptance",
         RuntimeValue::SemanticFrontier(_) => "semantic_frontier",
     }
 }
@@ -11058,6 +11101,9 @@ fn value_to_iter_values(value: &RuntimeValue) -> Result<Vec<Value>, ShellError> 
         }
         RuntimeValue::AttemptOutcome(outcome) => {
             value_to_iter_values(&RuntimeValue::Nu(outcome.materialize()))
+        }
+        RuntimeValue::AttemptAcceptance(acceptance) => {
+            value_to_iter_values(&RuntimeValue::Nu(acceptance.materialize()))
         }
         RuntimeValue::SemanticFrontier(_) => Err(stone_error(
             "iteration",
@@ -12608,18 +12654,19 @@ mod tests {
     #[cfg(not(target_os = "hermit"))]
     use super::cleanup_stale_run_temp_files;
     use super::{
-        agent_session_value_at, context_prompt_required_keys_from_value, eval_program,
-        eval_program_with_options, eval_program_with_output, eval_program_with_output_and_session,
-        match_fused_map_update_if, semantic_frontier_guidance, transition_id_for_scope,
-        EvalHotLoopDiagnostics, EvalOptions, RuntimeValue, StoneSession, TextLines,
-        STONE_BUILTIN_NAMES,
+        agent_session_value_at, context_prompt_required_keys_from_value, ensure_runtime_type,
+        eval_program, eval_program_with_options, eval_program_with_output,
+        eval_program_with_output_and_session, match_fused_map_update_if,
+        semantic_frontier_guidance, transition_id_for_scope, EvalHotLoopDiagnostics, EvalOptions,
+        RuntimeValue, StoneSession, TextLines, STONE_BUILTIN_NAMES,
     };
     use crate::{
         commands::{
             stone_help_documented_names_for_tests, stone_help_entries_without_examples_for_tests,
         },
         json,
-        stone_ast::lower_source,
+        stone_ast::{lower_source, StoneType},
+        stone_attempt_value::AttemptAcceptanceValue,
         stone_vm::LoopIrOptimizationDiagnostic,
     };
     use nu_protocol::{
@@ -12652,6 +12699,24 @@ mod tests {
         assert_eq!(level, "low");
         assert_eq!(code, "checkpoint_cost_low");
         assert!(!prefer_reuse);
+    }
+
+    #[test]
+    fn nominal_attempt_types_reject_acceptance_handle_confusion() {
+        let span = Span::unknown();
+        let mut child = nu_protocol::Record::new();
+        child.push("attempt", Value::string("attempt-child", span));
+        let mut report = nu_protocol::Record::new();
+        report.push("child", Value::record(child, span));
+        let value = RuntimeValue::AttemptAcceptance(
+            AttemptAcceptanceValue::new("attempt-child".to_string(), Value::record(report, span))
+                .expect("acceptance"),
+        );
+        ensure_runtime_type(&value, StoneType::AttemptAcceptance, "argument `accepted`")
+            .expect("matching nominal type");
+        let error = ensure_runtime_type(&value, StoneType::AttemptHandle, "argument `repaired`")
+            .expect_err("acceptance must not satisfy attempt_handle");
+        assert!(format!("{error:?}").contains("expected attempt_handle, got attempt_acceptance"));
     }
 
     #[test]
