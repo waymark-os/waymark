@@ -127,6 +127,19 @@ class BoundedAttemptExploreTests(unittest.TestCase):
             ("", ["attempt-rejected", "attempt-accepted"]),
         )
 
+        error_payload = {
+            "ok": False,
+            "error": {
+                "declared_code": "semantic_frontier_unwind_canary",
+                "detail": "injected failure after retained frontier construction",
+                "related": [],
+            },
+        }
+        self.assertEqual(
+            canary.assert_result(error_payload, "retained", "error"),
+            ("", []),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

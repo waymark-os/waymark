@@ -463,3 +463,11 @@ capability's status to `released`, and prevents later branches. Matched live
 cells covered parent and retained origins with both terminal outcomes; all four
 had no active checkpoint before root cleanup. Gateway verifies that the
 attached releaser is the owner or the retained owner's direct parent.
+
+Semantic frontiers also have evaluation-scope cleanup. After automatically
+closing open child scopes, Stone releases every frontier that was not already
+released explicitly. This covers parseable programs that exit through `fail`
+or another runtime exception after sealing a frontier. The original program
+error remains primary; a failed release is attached as a related cleanup error.
+Diagnostics distinguish `explicit` from `evaluation_cleanup` release and count
+automatically released values.

@@ -64,6 +64,7 @@ pub(super) struct SemanticFrontierValue {
     record: Value,
     branch_count: Arc<AtomicU64>,
     released: Arc<AtomicBool>,
+    released_by_cleanup: Arc<AtomicBool>,
 }
 
 impl SemanticFrontierValue {
@@ -95,6 +96,7 @@ impl SemanticFrontierValue {
             record,
             branch_count: Arc::new(AtomicU64::new(0)),
             released: Arc::new(AtomicBool::new(false)),
+            released_by_cleanup: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -127,8 +129,23 @@ impl SemanticFrontierValue {
         self.released.store(true, Ordering::Release);
     }
 
+    pub(super) fn mark_released_by_cleanup(&self) {
+        self.released_by_cleanup.store(true, Ordering::Relaxed);
+        self.released.store(true, Ordering::Release);
+    }
+
     pub(super) fn is_released(&self) -> bool {
         self.released.load(Ordering::Acquire)
+    }
+
+    pub(super) fn release_origin(&self) -> Option<&'static str> {
+        if !self.is_released() {
+            None
+        } else if self.released_by_cleanup.load(Ordering::Relaxed) {
+            Some("evaluation_cleanup")
+        } else {
+            Some("explicit")
+        }
     }
 
     pub(super) fn diagnostic(&self) -> JsonValue {
@@ -138,6 +155,7 @@ impl SemanticFrontierValue {
             "branch_count": self.branch_count(),
             "unused": self.branch_count() == 0,
             "released": self.is_released(),
+            "release_origin": self.release_origin(),
             "seal_duration_ms": self.seal_duration_ms,
             "storage_bytes": self.storage_bytes,
             "guidance_level": self.guidance_level,
@@ -340,10 +358,34 @@ mod tests {
         assert!(!frontier.is_released());
         clone.mark_released();
         assert!(frontier.is_released());
+        assert_eq!(frontier.release_origin(), Some("explicit"));
         assert_eq!(
             frontier.attribute("status").unwrap().as_str().unwrap(),
             "released"
         );
         assert_eq!(frontier.diagnostic()["released"], json!(true));
+    }
+
+    #[test]
+    fn semantic_frontier_records_evaluation_cleanup_release() {
+        let frontier = SemanticFrontierValue::new(
+            2,
+            "cp-cleanup".to_string(),
+            "attempt-owner".to_string(),
+            "repo".to_string(),
+            "task".to_string(),
+            "repo".to_string(),
+            SemanticFrontierMode::Parent,
+            10,
+            20,
+            "low",
+            Value::record(Record::new(), Span::unknown()),
+        );
+        frontier.mark_released_by_cleanup();
+        assert_eq!(frontier.release_origin(), Some("evaluation_cleanup"));
+        assert_eq!(
+            frontier.diagnostic()["release_origin"],
+            json!("evaluation_cleanup")
+        );
     }
 }

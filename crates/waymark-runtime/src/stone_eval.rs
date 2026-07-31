@@ -657,7 +657,9 @@ fn eval_program_with_source_options(
         }
         _ => evaluator.eval_program(program, input),
     };
-    let cleanup = evaluator.close_open_attempt_scopes("Stone evaluation ended");
+    let scope_cleanup = evaluator.close_open_attempt_scopes("Stone evaluation ended");
+    let frontier_cleanup = evaluator.release_open_semantic_frontiers();
+    let cleanup = combine_cleanup_results(scope_cleanup, frontier_cleanup);
     evaluator.state.profiler.emit();
     let hot_loop_diagnostics = evaluator.state.hot_loop_diagnostics.json_value(
         evaluator.state.hot_loop_enabled,
@@ -708,11 +710,18 @@ fn eval_program_with_source_options(
             .iter()
             .filter(|frontier| frontier["guidance_level"] == JsonValue::String("high".to_string()))
             .count();
+        let auto_released = frontiers
+            .iter()
+            .filter(|frontier| {
+                frontier["release_origin"] == JsonValue::String("evaluation_cleanup".to_string())
+            })
+            .count();
         diagnostics["semantic_frontiers"] = json!({
             "created": frontiers.len(),
             "dropped": evaluator.state.semantic_frontier_diagnostics_dropped,
             "unused": unused,
             "high_cost": high_cost,
+            "auto_released": auto_released,
             "frontiers": frontiers,
         });
     }
@@ -6894,6 +6903,7 @@ impl Evaluator<'_> {
                 "frontier_id": frontier.frontier_id,
                 "status": "released",
                 "already_released": already_released,
+                "release_origin": frontier.release_origin(),
                 "availability": frontier.mode.as_str(),
                 "branches": frontier.branch_count(),
                 "checkpoint_reclaimed": true,
@@ -7788,6 +7798,43 @@ impl Evaluator<'_> {
                     "automatic cancel-then-join cleanup was incomplete: {}",
                     JsonValue::Array(failed)
                 ),
+            ))
+        }
+    }
+
+    fn release_open_semantic_frontiers(&mut self) -> Result<(), ShellError> {
+        let frontiers = self.state.semantic_frontiers.clone();
+        let mut failed = Vec::new();
+        let mut failed_ids = Vec::new();
+        for frontier in frontiers {
+            if frontier.is_released() {
+                continue;
+            }
+            match gateway_env::semantic_frontier_release(frontier.checkpoint.clone()) {
+                Ok(()) => frontier.mark_released_by_cleanup(),
+                Err(error) => {
+                    failed_ids.push(frontier.frontier_id);
+                    failed.push(error);
+                }
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(ShellError::Generic(
+                GenericError::new_internal(
+                    "Stone semantic frontier cleanup error",
+                    format!(
+                        "automatic release failed for semantic frontiers {}",
+                        failed_ids
+                            .iter()
+                            .map(u64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )
+                .with_code("stone_script_error")
+                .with_inner(failed),
             ))
         }
     }
@@ -11212,6 +11259,24 @@ fn attach_cleanup_error(program_error: ShellError, cleanup_error: ShellError) ->
             .with_code("stone_script_error")
             .with_inner(vec![other, cleanup_error]),
         ),
+    }
+}
+
+fn combine_cleanup_results(
+    scope_cleanup: Result<(), ShellError>,
+    frontier_cleanup: Result<(), ShellError>,
+) -> Result<(), ShellError> {
+    match (scope_cleanup, frontier_cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(scope_error), Err(frontier_error)) => Err(ShellError::Generic(
+            GenericError::new_internal(
+                "Stone evaluation cleanup error",
+                "attempt-scope and semantic-frontier cleanup both failed",
+            )
+            .with_code("stone_script_error")
+            .with_inner(vec![scope_error, frontier_error]),
+        )),
     }
 }
 

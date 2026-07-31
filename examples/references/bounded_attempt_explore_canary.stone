@@ -130,6 +130,11 @@ def main(input):
         )
     checkpoint = prepared.stages[0].checkpoint
     frontier = semantic_frontier(checkpoint)
+    if get(input, "unwind", False):
+        fail(
+            "injected failure after parent frontier construction",
+            code="semantic_frontier_unwind_canary",
+        )
     result = explore_frontier(
         frontier=frontier,
         candidates=[

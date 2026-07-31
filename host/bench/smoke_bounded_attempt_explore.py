@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--expected-status",
-        choices=("accepted", "exhausted"),
+        choices=("accepted", "exhausted", "error"),
         default="accepted",
     )
     parser.add_argument("--image", default="python:3.12")
@@ -68,6 +68,16 @@ def assert_result(
     expected_origin: str = "parent",
     expected_status: str = "accepted",
 ) -> tuple[str, list[str]]:
+    if expected_status == "error":
+        if payload.get("ok") is not False:
+            raise AssertionError(f"frontier unwind fixture unexpectedly succeeded: {payload}")
+        error = payload.get("error") or {}
+        if error.get("declared_code") != "semantic_frontier_unwind_canary":
+            raise AssertionError(f"frontier cleanup masked the primary error: {payload}")
+        related = error.get("related") or []
+        if any("cleanup" in str(item.get("detail") or "") for item in related):
+            raise AssertionError(f"frontier cleanup failed during unwind: {payload}")
+        return "", []
     if payload.get("ok") is not True:
         raise AssertionError(f"bounded exploration controller failed: {payload}")
     value = payload.get("value") or {}
@@ -227,7 +237,10 @@ def main() -> int:
                     ),
                     "task_input="
                     + json.dumps(
-                        {"exhaust": args.expected_status == "exhausted"},
+                        {
+                            "exhaust": args.expected_status == "exhausted",
+                            "unwind": args.expected_status == "error",
+                        },
                         separators=(",", ":"),
                     ),
                     'workspace_source={"workspace":"repo"}',
@@ -313,7 +326,15 @@ def main() -> int:
             trace = (
                 data_root / "traces" / "operations.jsonl"
             ).read_text(encoding="utf-8")
-            if args.expected_origin == "parent":
+            if args.expected_status == "error":
+                expected_forks = 0 if args.expected_origin == "parent" else 1
+                if trace.count('"op":"attempt.fork"') != expected_forks:
+                    raise AssertionError(
+                        f"unwind trace does not contain exactly {expected_forks} setup forks"
+                    )
+                if '"semantic_frontier_availability":"retained"' in trace:
+                    raise AssertionError("unwind trace unexpectedly started a repair candidate")
+            elif args.expected_origin == "parent":
                 if trace.count('"op":"attempt.fork"') != 2:
                     raise AssertionError(
                         "trace does not contain exactly two candidate forks"
@@ -329,6 +350,10 @@ def main() -> int:
                 raise AssertionError(
                     f"trace does not contain exactly {expected_accepts} acceptance operations"
                 )
+            if args.expected_status == "error" and trace.count(
+                '"op":"env.discard_checkpoint"'
+            ) < 1:
+                raise AssertionError("unwind cleanup did not release the semantic frontier")
             active_checkpoints = smoke.gateway(
                 args.gateway_bin,
                 data_root,

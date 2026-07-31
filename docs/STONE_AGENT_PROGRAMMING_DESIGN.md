@@ -950,6 +950,10 @@ interface: it also preserves the same `context_prompt_view` admission contract
 across both runtime lowerings. The typed entrypoint consumes the frontier for
 that bounded search. `semantic_frontier_release(frontier)` is the explicit
 lower-level lifetime operation when another control library owns the policy.
+As a safety net, evaluation teardown closes child scopes first and then
+releases every still-live frontier. This is resource cleanup, not exploration
+policy: exceptions retain their original error identity, with any release
+failure attached as related cleanup evidence.
 
 Stone user functions now support keyword arguments so the policy-bearing call
 is self-describing. In a frozen three-pair authorship comparison, the library

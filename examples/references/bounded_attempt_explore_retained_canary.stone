@@ -149,6 +149,11 @@ def main(input):
     )
 
     frontier = semantic_frontier(checkpoint, owner=owner)
+    if get(input, "unwind", False):
+        fail(
+            "injected failure after retained frontier construction",
+            code="semantic_frontier_unwind_canary",
+        )
     result = explore_frontier(
         frontier=frontier,
         candidates=[
