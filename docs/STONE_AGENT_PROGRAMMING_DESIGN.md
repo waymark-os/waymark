@@ -941,12 +941,15 @@ The library implements this semantic contract:
 4. return a bounded rejected-candidate record when evidence is unsatisfied;
 5. eliminate tried candidates and continue within the declared bound;
 6. accept only a candidate satisfying final evidence; and
-7. discard and reap every rejected or unresolved child.
+7. discard and reap every rejected or unresolved child; and
+8. release the semantic frontier after acceptance or exhaustion.
 
 `explore(checkpoint=...)` remains a compatibility entrypoint for a raw
 parent-owned checkpoint. `explore_frontier(...)` is the policy-bearing
 interface: it also preserves the same `context_prompt_view` admission contract
-across both runtime lowerings.
+across both runtime lowerings. The typed entrypoint consumes the frontier for
+that bounded search. `semantic_frontier_release(frontier)` is the explicit
+lower-level lifetime operation when another control library owns the policy.
 
 Stone user functions now support keyword arguments so the policy-bearing call
 is self-describing. In a frozen three-pair authorship comparison, the library

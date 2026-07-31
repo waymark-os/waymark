@@ -17,10 +17,11 @@ def prepare_ready(step):
 
 def prepare_frontier(step):
     write_file("problem.txt", "stressed\n")
+    exhaust = get(task_input(), "exhaust", False)
     context_write(
         "requirement.explore_target",
         "requirement",
-        {"expected": "desserts"},
+        {"expected": "unreachable" if exhaust else "desserts"},
         status="verified",
         evidence=["canary:parent-frontier"],
     )
@@ -113,6 +114,7 @@ def worker(input):
 
 
 def main(input):
+    exhaust = get(input, "exhaust", False)
     prepare = workflow_stage(
         "prepare",
         evidence=prepare_ready,
@@ -153,24 +155,50 @@ def main(input):
             "required_keys": ["requirement.explore_target"],
         },
     )
-    if (
+    release_error = ""
+    try:
+        attempt_branch(frontier)
+    except Exception as error:
+        release_error = str(error)
+    if "released" not in release_error:
+        fail(
+            "released frontier remained branchable",
+            code="explore_canary_released_frontier_reused",
+            detail=release_error,
+        )
+    accepted_shape = (
+        result.ok
+        and result.status == "accepted"
+        and result.outcomes[0].status == "rejected"
+        and result.outcomes[0].candidate == "deserts"
+        and result.outcomes[1].status == "accepted"
+        and result.outcomes[1].candidate == "desserts"
+    )
+    exhausted_shape = (
         not result.ok
-        or result.tried != 2
-        or result.outcomes[0].status != "rejected"
-        or result.outcomes[0].candidate != "deserts"
-        or result.outcomes[1].status != "accepted"
-        or result.outcomes[1].candidate != "desserts"
+        and result.status == "exhausted"
+        and result.outcomes[0].status == "rejected"
+        and result.outcomes[1].status == "rejected"
+        and result.accepted_attempt is None
+    )
+    if (
+        result.tried != 2
+        or result.release.status != "released"
+        or frontier.status != "released"
+        or (exhaust and not exhausted_shape)
+        or (not exhaust and not accepted_shape)
     ):
         fail(
-            "bounded exploration did not reject then recover",
+            "bounded exploration returned the wrong terminal shape",
             code="explore_canary_search_failed",
             detail=result,
         )
-    answer = read_text("answer.txt").strip()
+    answer_exists = run(["test", "-e", "answer.txt"]).ok
+    answer = read_text("answer.txt").strip() if answer_exists else None
     parent_keys = map(lambda item: item.key, context_read(limit=8))
-    if answer != "desserts":
+    if (exhaust and answer_exists) or (not exhaust and answer != "desserts"):
         fail(
-            "accepted candidate workspace was not imported",
+            "parent workspace does not match exploration terminal state",
             code="explore_canary_accept_failed",
         )
     if parent_keys != ["requirement.explore_target"]:
@@ -184,6 +212,10 @@ def main(input):
         "checkpoint": checkpoint.reference,
         "origin": result.source.availability,
         "source_type": result.source.type,
+        "status": result.status,
+        "release": result.release,
+        "frontier_status": frontier.status,
+        "release_guard": True,
         "proposal": result.proposal,
         "outcomes": result.outcomes,
         "accepted_attempt": result.accepted_attempt,

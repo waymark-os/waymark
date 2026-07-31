@@ -30,6 +30,7 @@ class BoundedAttemptExploreTests(unittest.TestCase):
         self.assertIn("attempt_accept(", source)
         self.assertIn("attempt_discard(", source)
         self.assertIn("attempt_scope_close(", source)
+        self.assertIn("semantic_frontier_release(", source)
         self.assertIn("explore_candidate_infrastructure_failure", source)
 
     def test_specialization_uses_keyword_api_and_semantic_checkpoint(self) -> None:
@@ -43,7 +44,7 @@ class BoundedAttemptExploreTests(unittest.TestCase):
         self.assertIn('propose=propose_lexical_first', source)
         self.assertIn('evaluate=evaluate_candidate', source)
         self.assertIn('"candidate": "deserts"', source)
-        self.assertIn('result.outcomes[0].status != "rejected"', source)
+        self.assertIn('result.outcomes[0].status == "rejected"', source)
         self.assertNotIn("attempt_fork(", source)
         self.assertNotIn("attempt_accept(", source)
         self.assertNotIn("attempt_discard(", source)
@@ -68,6 +69,14 @@ class BoundedAttemptExploreTests(unittest.TestCase):
                 "checkpoint": "cp-frontier",
                 "origin": "parent",
                 "source_type": "semantic_frontier",
+                "status": "accepted",
+                "release": {
+                    "status": "released",
+                    "checkpoint_reclaimed": True,
+                    "branches": 2,
+                },
+                "frontier_status": "released",
+                "release_guard": True,
                 "proposal": {"candidate": canary.REJECTED},
                 "tried": 2,
                 "clean": True,
@@ -99,13 +108,23 @@ class BoundedAttemptExploreTests(unittest.TestCase):
         }
         self.assertEqual(
             canary.assert_result(payload),
-            ("attempt-accepted", "attempt-rejected"),
+            ("attempt-accepted", ["attempt-rejected"]),
         )
 
         payload["value"]["origin"] = "retained"
         self.assertEqual(
             canary.assert_result(payload, "retained"),
-            ("attempt-accepted", "attempt-rejected"),
+            ("attempt-accepted", ["attempt-rejected"]),
+        )
+
+        payload["value"]["answer"] = None
+        payload["value"]["status"] = "exhausted"
+        payload["value"]["accepted_attempt"] = None
+        payload["value"]["outcomes"][1]["status"] = "rejected"
+        payload["value"]["outcomes"][1]["evidence"] = []
+        self.assertEqual(
+            canary.assert_result(payload, "retained", "exhausted"),
+            ("", ["attempt-rejected", "attempt-accepted"]),
         )
 
 

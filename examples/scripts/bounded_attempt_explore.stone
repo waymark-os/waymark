@@ -39,7 +39,8 @@
 # explore(checkpoint=...) is the compatibility entrypoint for a raw
 # parent-owned checkpoint reference. New control should prefer
 # explore_frontier(semantic_frontier(...)); it works for both parent-owned and
-# retained repair frontiers.
+# retained repair frontiers. explore_frontier owns the supplied capability for
+# this bounded search and releases it after acceptance or exhaustion.
 
 
 def candidate(name, input, assumptions, ensures):
@@ -335,6 +336,11 @@ def explore_control(
                     code="explore_cleanup_failed",
                     detail=cleanup,
                 )
+            release = (
+                semantic_frontier_release(frontier)
+                if frontier is not None
+                else None
+            )
             return {
                 "ok": True,
                 "status": "accepted",
@@ -358,6 +364,7 @@ def explore_control(
                 "outcomes": outcomes,
                 "tried": len(outcomes),
                 "clean": cleanup.clean,
+                "release": release,
             }
 
         attempt_discard(
@@ -380,6 +387,11 @@ def explore_control(
             code="explore_cleanup_failed",
             detail=cleanup,
         )
+    release = (
+        semantic_frontier_release(frontier)
+        if frontier is not None
+        else None
+    )
     return {
         "ok": False,
         "status": "exhausted",
@@ -403,4 +415,5 @@ def explore_control(
         "outcomes": outcomes,
         "tried": len(outcomes),
         "clean": cleanup.clean,
+        "release": release,
     }

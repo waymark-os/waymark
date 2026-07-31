@@ -118,10 +118,11 @@ def worker(input):
 
 
 def main(input):
+    exhaust = get(input, "exhaust", False)
     context_write(
         "requirement.explore_target",
         "requirement",
-        {"expected": "desserts"},
+        {"expected": "unreachable" if exhaust else "desserts"},
         status="verified",
         evidence=["retained-canary:root-requirement"],
     )
@@ -173,6 +174,17 @@ def main(input):
             "required_keys": ["requirement.explore_target"],
         },
     )
+    release_error = ""
+    try:
+        attempt_branch(frontier)
+    except Exception as error:
+        release_error = str(error)
+    if "released" not in release_error:
+        fail(
+            "released retained frontier remained branchable",
+            code="retained_explore_released_frontier_reused",
+            detail=release_error,
+        )
     owner_cleanup = attempt_scope_close(
         owner_scope,
         reason="retained exploration owner consumed",
@@ -183,16 +195,30 @@ def main(input):
             code="retained_explore_owner_cleanup_failed",
             detail=owner_cleanup,
         )
-    if (
+    accepted_shape = (
+        result.ok
+        and result.status == "accepted"
+        and result.outcomes[0].status == "rejected"
+        and result.outcomes[1].status == "accepted"
+    )
+    exhausted_shape = (
         not result.ok
-        or result.source.type != "semantic_frontier"
+        and result.status == "exhausted"
+        and result.outcomes[0].status == "rejected"
+        and result.outcomes[1].status == "rejected"
+        and result.accepted_attempt is None
+    )
+    if (
+        result.source.type != "semantic_frontier"
         or result.source.availability != "retained"
         or result.tried != 2
-        or result.outcomes[0].status != "rejected"
-        or result.outcomes[1].status != "accepted"
+        or result.release.status != "released"
+        or frontier.status != "released"
+        or (exhaust and not exhausted_shape)
+        or (not exhaust and not accepted_shape)
     ):
         fail(
-            "retained bounded exploration did not reject then recover",
+            "retained bounded exploration returned the wrong terminal shape",
             code="retained_explore_search_failed",
             detail=result,
         )
@@ -204,11 +230,12 @@ def main(input):
             code="retained_explore_owner_resources_live",
             detail=owner_inspection,
         )
-    answer = read_text("answer.txt").strip()
+    answer_exists = run(["test", "-e", "answer.txt"]).ok
+    answer = read_text("answer.txt").strip() if answer_exists else None
     parent_keys = map(lambda item: item.key, context_read(limit=8))
-    if answer != "desserts":
+    if (exhaust and answer_exists) or (not exhaust and answer != "desserts"):
         fail(
-            "accepted retained candidate was not imported",
+            "parent workspace does not match retained exploration terminal state",
             code="retained_explore_accept_failed",
         )
     if parent_keys != ["requirement.explore_target"]:
@@ -222,6 +249,10 @@ def main(input):
         "checkpoint": checkpoint.reference,
         "origin": result.source.availability,
         "source_type": result.source.type,
+        "status": result.status,
+        "release": result.release,
+        "frontier_status": frontier.status,
+        "release_guard": True,
         "proposal": result.proposal,
         "outcomes": result.outcomes,
         "accepted_attempt": result.accepted_attempt,

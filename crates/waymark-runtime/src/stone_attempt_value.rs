@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use nu_protocol::{Record, ShellError, Span, Value};
@@ -63,6 +63,7 @@ pub(super) struct SemanticFrontierValue {
     pub(super) guidance_level: &'static str,
     record: Value,
     branch_count: Arc<AtomicU64>,
+    released: Arc<AtomicBool>,
 }
 
 impl SemanticFrontierValue {
@@ -93,12 +94,23 @@ impl SemanticFrontierValue {
             guidance_level,
             record,
             branch_count: Arc::new(AtomicU64::new(0)),
+            released: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub(super) fn attribute(&self, attr: &str) -> Result<Value, ShellError> {
         if attr == "type" {
             return Ok(Value::string("semantic_frontier", Span::unknown()));
+        }
+        if attr == "status" {
+            return Ok(Value::string(
+                if self.is_released() {
+                    "released"
+                } else {
+                    "ready"
+                },
+                Span::unknown(),
+            ));
         }
         record_attribute(&self.record, attr, "semantic_frontier")
     }
@@ -111,12 +123,21 @@ impl SemanticFrontierValue {
         self.branch_count.load(Ordering::Relaxed)
     }
 
+    pub(super) fn mark_released(&self) {
+        self.released.store(true, Ordering::Release);
+    }
+
+    pub(super) fn is_released(&self) -> bool {
+        self.released.load(Ordering::Acquire)
+    }
+
     pub(super) fn diagnostic(&self) -> JsonValue {
         json!({
             "frontier_id": self.frontier_id,
             "availability": self.mode.as_str(),
             "branch_count": self.branch_count(),
             "unused": self.branch_count() == 0,
+            "released": self.is_released(),
             "seal_duration_ms": self.seal_duration_ms,
             "storage_bytes": self.storage_bytes,
             "guidance_level": self.guidance_level,
@@ -294,4 +315,35 @@ fn record_attribute(value: &Value, attr: &str, kind: &str) -> Result<Value, Shel
     val.get(attr)
         .cloned()
         .ok_or_else(|| stone_error("attribute", format!("{kind} has no attribute `{attr}`")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semantic_frontier_release_state_is_shared_across_capability_clones() {
+        let frontier = SemanticFrontierValue::new(
+            1,
+            "cp-test".to_string(),
+            "attempt-owner".to_string(),
+            "repo".to_string(),
+            "task".to_string(),
+            "repo".to_string(),
+            SemanticFrontierMode::RetainedRepair,
+            10,
+            20,
+            "low",
+            Value::record(Record::new(), Span::unknown()),
+        );
+        let clone = frontier.clone();
+        assert!(!frontier.is_released());
+        clone.mark_released();
+        assert!(frontier.is_released());
+        assert_eq!(
+            frontier.attribute("status").unwrap().as_str().unwrap(),
+            "released"
+        );
+        assert_eq!(frontier.diagnostic()["released"], json!(true));
+    }
 }

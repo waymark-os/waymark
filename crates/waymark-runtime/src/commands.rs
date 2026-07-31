@@ -1288,6 +1288,18 @@ child = attempt_branch(frontier, input={"strategy": "alternate"}, program=curren
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "semantic_frontier_release",
+        signature:
+            "semantic_frontier_release(frontier: semantic_frontier) -> record",
+        use_when: "Gateway mode only. Explicitly release a semantic frontier after selection or exhaustion. The runtime uses the frontier's opaque authority, Gateway verifies the owner relationship, and repeated release is safe.",
+        examples: &[r#"released = semantic_frontier_release(frontier)"#],
+        avoid: &[
+            "Do not release a frontier while child attempts still depend on it; close their supervision scope first.",
+            "Do not branch from a released frontier; create a new evidenced checkpoint if more exploration is required.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "attempt_finish",
         signature: r#"attempt_finish(action: "commit" | "rollback" | "fail" | "kill", attempt: str = "", message: str = "", reason: str = "", allow_risky: bool = False) -> record"#,
         use_when: "Gateway mode only. Compatibility lifecycle operation for closing an attempt by committing, rolling back, failing, or killing it.",

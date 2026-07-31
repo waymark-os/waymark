@@ -736,6 +736,14 @@ pub(crate) fn env_discard_checkpoint(checkpoint: String, force: bool) -> Result<
     Ok(Value::record(record, span))
 }
 
+pub(crate) fn semantic_frontier_release(checkpoint: String) -> Result<(), ShellError> {
+    let config = required_config()?;
+    with_client(&config, |client| {
+        client.attempt_checkpoint_release(checkpoint.clone())
+    })?;
+    Ok(())
+}
+
 pub(crate) fn env_commit(message: String, allow_risky: bool) -> Result<Value, ShellError> {
     let config = required_config()?;
     let effective_allow_risky = allow_risky || blind_agent_surface_enabled();

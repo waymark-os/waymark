@@ -455,3 +455,11 @@ accepted the second, and admitted the same required-memory projection to both
 workers. This closes the library-level frontier gap: task policy no longer
 needs to know whether the runtime will fork a current parent or restore a
 retained repair checkpoint.
+
+`explore_frontier(...)` now owns the supplied frontier for the duration of that
+bounded search and calls `semantic_frontier_release(...)` after either
+acceptance or exhaustion. Release is idempotent, changes the nominal
+capability's status to `released`, and prevents later branches. Matched live
+cells covered parent and retained origins with both terminal outcomes; all four
+had no active checkpoint before root cleanup. Gateway verifies that the
+attached releaser is the owner or the retained owner's direct parent.

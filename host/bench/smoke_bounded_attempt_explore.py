@@ -45,6 +45,11 @@ def parse_args() -> argparse.Namespace:
         choices=("parent", "retained"),
         default="parent",
     )
+    parser.add_argument(
+        "--expected-status",
+        choices=("accepted", "exhausted"),
+        default="accepted",
+    )
     parser.add_argument("--image", default="python:3.12")
     parser.add_argument("--timeout", type=float, default=180.0)
     return parser.parse_args()
@@ -61,12 +66,23 @@ def composed_source(library: Path, specialization: Path) -> str:
 def assert_result(
     payload: dict[str, Any],
     expected_origin: str = "parent",
-) -> tuple[str, str]:
+    expected_status: str = "accepted",
+) -> tuple[str, list[str]]:
     if payload.get("ok") is not True:
         raise AssertionError(f"bounded exploration controller failed: {payload}")
     value = payload.get("value") or {}
-    if value.get("answer") != EXPECTED or value.get("tried") != 2:
-        raise AssertionError(f"bounded exploration did not recover: {value}")
+    expected_answer = EXPECTED if expected_status == "accepted" else None
+    if value.get("answer") != expected_answer or value.get("tried") != 2:
+        raise AssertionError(f"bounded exploration returned the wrong result: {value}")
+    if value.get("status") != expected_status:
+        raise AssertionError(f"bounded exploration returned the wrong status: {value}")
+    release = value.get("release") or {}
+    if (
+        release.get("status") != "released"
+        or release.get("checkpoint_reclaimed") is not True
+        or release.get("branches") != 2
+    ):
+        raise AssertionError(f"semantic frontier was not released: {value}")
     if value.get("clean") is not True:
         raise AssertionError(f"exploration scope did not close cleanly: {value}")
     if value.get("parent_keys") != ["requirement.explore_target"]:
@@ -75,6 +91,10 @@ def assert_result(
         raise AssertionError(f"exploration used the wrong frontier origin: {value}")
     if value.get("source_type") != "semantic_frontier":
         raise AssertionError(f"exploration did not use the typed frontier API: {value}")
+    if value.get("frontier_status") != "released":
+        raise AssertionError(f"nominal frontier capability remained usable: {value}")
+    if value.get("release_guard") is not True:
+        raise AssertionError(f"released frontier accepted another branch: {value}")
     if (value.get("proposal") or {}).get("candidate") != REJECTED:
         raise AssertionError(f"fixture did not propose the losing candidate: {value}")
     if not str(value.get("checkpoint") or "").startswith("cp-"):
@@ -83,15 +103,20 @@ def assert_result(
     outcomes = value.get("outcomes") or []
     if len(outcomes) != 2:
         raise AssertionError(f"expected two sequential candidate outcomes: {value}")
-    rejected, accepted = outcomes
-    if rejected.get("candidate") != REJECTED or rejected.get("status") != "rejected":
-        raise AssertionError(f"first candidate was not rejected: {rejected}")
-    if rejected.get("evidence") != []:
-        raise AssertionError(f"rejected candidate claimed evidence: {rejected}")
-    if accepted.get("candidate") != EXPECTED or accepted.get("status") != "accepted":
-        raise AssertionError(f"fallback candidate was not accepted: {accepted}")
-    if accepted.get("evidence") != ["canary:reversal"]:
-        raise AssertionError(f"accepted candidate lacks fresh evidence: {accepted}")
+    first, second = outcomes
+    if first.get("candidate") != REJECTED or first.get("status") != "rejected":
+        raise AssertionError(f"first candidate was not rejected: {first}")
+    if first.get("evidence") != []:
+        raise AssertionError(f"rejected candidate claimed evidence: {first}")
+    if second.get("candidate") != EXPECTED:
+        raise AssertionError(f"fallback candidate identity changed: {second}")
+    if expected_status == "accepted":
+        if second.get("status") != "accepted":
+            raise AssertionError(f"fallback candidate was not accepted: {second}")
+        if second.get("evidence") != ["canary:reversal"]:
+            raise AssertionError(f"accepted candidate lacks fresh evidence: {second}")
+    elif second.get("status") != "rejected" or second.get("evidence") != []:
+        raise AssertionError(f"exhausted fallback was not rejected cleanly: {second}")
     for outcome in outcomes:
         result = outcome.get("result") or {}
         if result.get("problem") != PROBLEM:
@@ -100,12 +125,21 @@ def assert_result(
             raise AssertionError(f"candidate missed checkpoint memory: {outcome}")
 
     accepted_attempt = str(value.get("accepted_attempt") or "")
-    rejected_attempt = str(rejected.get("attempt") or "")
-    if accepted_attempt != str(accepted.get("attempt") or ""):
-        raise AssertionError(f"accepted attempt identity is inconsistent: {value}")
-    if not accepted_attempt or not rejected_attempt:
+    rejected_attempts = [
+        str(outcome.get("attempt") or "")
+        for outcome in outcomes
+        if outcome.get("status") == "rejected"
+    ]
+    if expected_status == "accepted":
+        if accepted_attempt != str(second.get("attempt") or ""):
+            raise AssertionError(f"accepted attempt identity is inconsistent: {value}")
+        if not accepted_attempt:
+            raise AssertionError(f"accepted attempt identity is missing: {value}")
+    elif accepted_attempt:
+        raise AssertionError(f"exhausted search reported an accepted attempt: {value}")
+    if not rejected_attempts or any(not attempt for attempt in rejected_attempts):
         raise AssertionError(f"candidate attempt identities are missing: {value}")
-    return accepted_attempt, rejected_attempt
+    return accepted_attempt, rejected_attempts
 
 
 def main() -> int:
@@ -182,7 +216,7 @@ def main() -> int:
         }
         attempt = ""
         accepted_attempt = ""
-        rejected_attempt = ""
+        rejected_attempts: list[str] = []
         try:
             base.wait_for_socket(socket_path, server)
             spawn_source = "emit(attempt_spawn(" + ",".join(
@@ -191,7 +225,11 @@ def main() -> int:
                         'task_spec={"id":"bounded-explore-smoke",'
                         '"objective":"reject one candidate and accept a fallback"}'
                     ),
-                    "task_input={}",
+                    "task_input="
+                    + json.dumps(
+                        {"exhaust": args.expected_status == "exhausted"},
+                        separators=(",", ":"),
+                    ),
                     'workspace_source={"workspace":"repo"}',
                     "program="
                     + json.dumps(
@@ -243,17 +281,22 @@ def main() -> int:
             if not isinstance(payload, dict):
                 raise AssertionError(f"controller logs had no Stone response: {logs}")
             try:
-                accepted_attempt, rejected_attempt = assert_result(
+                accepted_attempt, rejected_attempts = assert_result(
                     payload,
                     args.expected_origin,
+                    args.expected_status,
                 )
             except AssertionError as error:
                 raise AssertionError(f"{error}\ncontroller logs:\n{logs}") from error
 
-            for label, child in (
-                ("accepted", accepted_attempt),
-                ("rejected", rejected_attempt),
-            ):
+            candidates = [
+                *(([("accepted", accepted_attempt)]) if accepted_attempt else []),
+                *[
+                    (f"rejected-{index}", child)
+                    for index, child in enumerate(rejected_attempts, start=1)
+                ],
+            ]
+            for label, child in candidates:
                 info = smoke.parse_info(
                     smoke.gateway(
                         args.gateway_bin,
@@ -281,8 +324,25 @@ def main() -> int:
                 raise AssertionError(
                     "trace does not contain two retained-frontier candidate restores"
                 )
-            if trace.count('"op":"attempt.accept"') != 1:
-                raise AssertionError("trace does not contain exactly one acceptance")
+            expected_accepts = 1 if args.expected_status == "accepted" else 0
+            if trace.count('"op":"attempt.accept"') != expected_accepts:
+                raise AssertionError(
+                    f"trace does not contain exactly {expected_accepts} acceptance operations"
+                )
+            active_checkpoints = smoke.gateway(
+                args.gateway_bin,
+                data_root,
+                "env",
+                "list-checkpoints",
+                "--workspace",
+                "repo",
+                env=client_env,
+            ).stdout.strip()
+            if active_checkpoints:
+                raise AssertionError(
+                    "semantic frontier release left active checkpoints: "
+                    + active_checkpoints
+                )
         finally:
             if attempt:
                 smoke.gateway(
@@ -329,8 +389,9 @@ def main() -> int:
                 "ok": True,
                 "library": str(args.library),
                 "specialization": str(args.specialization),
+                "status": args.expected_status,
                 "accepted_attempt": accepted_attempt,
-                "rejected_attempt": rejected_attempt,
+                "rejected_attempts": rejected_attempts,
             },
             sort_keys=True,
         )

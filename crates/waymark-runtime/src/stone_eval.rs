@@ -2271,6 +2271,7 @@ impl Evaluator<'_> {
             "attempt_spawn" => self.eval_attempt_spawn_call(call),
             "attempt_fork" => self.eval_attempt_fork_call(call),
             "semantic_frontier" => self.eval_semantic_frontier_call(call),
+            "semantic_frontier_release" => self.eval_semantic_frontier_release_call(call),
             "attempt_branch" => self.eval_attempt_branch_call(call),
             "attempt_finish" => self.eval_attempt_finish_call(call),
             "attempt_report" => self.eval_attempt_report_call(call),
@@ -6842,6 +6843,65 @@ impl Evaluator<'_> {
         Ok(RuntimeValue::SemanticFrontier(frontier))
     }
 
+    fn eval_semantic_frontier_release_call(
+        &mut self,
+        call: &Call,
+    ) -> Result<RuntimeValue, ShellError> {
+        if call.positional.len() > 1 {
+            return Err(stone_error(
+                "semantic_frontier_release",
+                "semantic_frontier_release() accepts exactly one semantic frontier",
+            ));
+        }
+        let mut frontier = call
+            .positional
+            .first()
+            .map(|expr| self.eval_expr_value(expr, PipelineData::empty()))
+            .transpose()?;
+        for (name, expression) in &call.named {
+            let value = self.eval_expr_value(expression, PipelineData::empty())?;
+            match name.as_str() {
+                "frontier" if frontier.is_none() => frontier = Some(value),
+                "frontier" => {
+                    return Err(stone_error(
+                        "semantic_frontier_release",
+                        "`frontier` was supplied more than once",
+                    ));
+                }
+                _ => {
+                    return Err(stone_error(
+                        "semantic_frontier_release",
+                        format!("unexpected semantic_frontier_release keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        let Some(RuntimeValue::SemanticFrontier(frontier)) = frontier else {
+            return Err(stone_error(
+                "semantic_frontier_release",
+                "frontier must be a semantic_frontier created by semantic_frontier()",
+            ));
+        };
+
+        let already_released = frontier.is_released();
+        if !already_released {
+            gateway_env::semantic_frontier_release(frontier.checkpoint.clone())?;
+            frontier.mark_released();
+        }
+        Ok(RuntimeValue::Nu(json_to_nu_value(
+            json!({
+                "type": "semantic_frontier_release",
+                "frontier_id": frontier.frontier_id,
+                "status": "released",
+                "already_released": already_released,
+                "availability": frontier.mode.as_str(),
+                "branches": frontier.branch_count(),
+                "checkpoint_reclaimed": true,
+            }),
+            Span::unknown(),
+        )))
+    }
+
     fn eval_attempt_branch_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         if call.positional.len() > 1 {
             return Err(stone_error(
@@ -6892,6 +6952,12 @@ impl Evaluator<'_> {
                 "frontier must be a semantic_frontier created by semantic_frontier()",
             ));
         };
+        if frontier.is_released() {
+            return Err(stone_error(
+                "attempt_branch",
+                "semantic frontier has been released; create a new evidenced checkpoint before branching again",
+            ));
+        }
 
         let mut task = String::new();
         let mut controller = String::new();
@@ -9676,6 +9742,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "attempt_run_process",
     "attempt_spawn",
     "semantic_frontier",
+    "semantic_frontier_release",
     "attempt_start",
     "attempt_state",
     "attempt_inspect",
