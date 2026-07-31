@@ -4322,6 +4322,7 @@ impl Evaluator<'_> {
             return self.eval_transition_hook_entries(effect, entries);
         }
         match self.eval_expr_value(expression, PipelineData::empty())? {
+            RuntimeValue::Nu(Value::Nothing { .. }) => Ok(TransitionHooks::default()),
             RuntimeValue::TransitionHooks(hooks) => Ok(hooks),
             other => Err(transition_hook_error(
                 effect,
@@ -14666,6 +14667,31 @@ emit({
             vec!["start", "pre", "effect", "post"]
         );
         assert_eq!(events[1]["changed"], json_value!(true));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn optional_transition_hook_binding_accepts_none() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("optional-transition-hooks-none")?;
+        let program = lower_source(
+            r#"optional_hooks = None
+result = run(["printf", "plain"], hooks=optional_hooks)
+emit({"stdout": result.stdout, "transition_id": result.transition_id})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, Span::unknown())?,
+            json_value!({"stdout": "plain", "transition_id": "transition-1"})
+        );
+        let events = output.diagnostics["transitions"]
+            .as_array()
+            .expect("transition diagnostics");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["phase"], json_value!("start"));
+        assert_eq!(events[1]["phase"], json_value!("effect"));
         cleanup_dir(&root);
         Ok(())
     }
