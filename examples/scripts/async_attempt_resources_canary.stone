@@ -1,0 +1,88 @@
+# Prove narrow async attempt effects over real Gateway resources.
+
+
+def root_ready(step):
+    return workflow_evidence(
+        run(["test", "-s", "root.txt"]).ok,
+        "async frontier is ready",
+        ["canary:async-root"],
+    )
+
+
+def prepare_root(step):
+    write_file("root.txt", "root\n")
+    return {"ok": True}
+
+
+def worker(input):
+    inherited = read_text("root.txt").strip()
+    if inherited != "root":
+        fail(
+            "async branch did not restore its frontier",
+            code="async_frontier_restore_failed",
+            detail={"actual": inherited},
+        )
+    return {"inherited": inherited, "label": input.label}
+
+
+async def main(input):
+    stage = workflow_stage(
+        "prepare-root",
+        evidence=root_ready,
+        action=prepare_root,
+        checkpoint="forkable",
+    )
+    report = workflow_run(workflow("async-attempt-resources", stage))
+    if not report.ok or report.stages[0].checkpoint.status != "created":
+        fail(
+            "failed to seal async frontier",
+            code="async_frontier_checkpoint_failed",
+            detail=report,
+        )
+
+    async with attempt_scope(join_timeout_ms=30000) as scope:
+        async with semantic_frontier(report.stages[0].checkpoint) as frontier:
+            child = scope.branch(
+                frontier,
+                input={"label": "async-child"},
+                program=current_program(),
+                entrypoint="worker",
+                start=True,
+            )
+            outcome = await child.wait(timeout_ms=30000)
+            if (
+                not outcome.joined
+                or outcome.result.status != "succeeded"
+                or outcome.result.value.inherited != "root"
+            ):
+                fail("async child failed", code="async_child_failed", detail=outcome)
+            child.discard(reason="async resource canary complete")
+            inspection = child.inspect()
+            if not inspection.resources_reclaimed:
+                fail(
+                    "child resources were not reclaimed",
+                    code="async_child_resources_live",
+                    detail=inspection,
+                )
+
+    return {
+        "frontier_status": frontier.status,
+        "scope_closed": scope.closed,
+        "child": child.attempt,
+        "child_result": outcome.result.value,
+        "child_resource_state": inspection.resource_state,
+    }
+
+
+control = attempt_info()
+entrypoint = get(control.metadata, "program_entrypoint", "main")
+if entrypoint == "worker":
+    result = worker(task_input())
+else:
+    result = main(task_input())
+attempt_report(
+    status="succeeded",
+    result=result,
+    metadata={"control": "async_attempt_resources_canary_v1"},
+)
+emit(result)

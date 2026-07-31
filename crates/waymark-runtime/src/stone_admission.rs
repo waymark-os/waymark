@@ -10,9 +10,11 @@ use crate::stone_ast::{
 use crate::stone_correction::expected_keywords;
 use crate::stone_eval::stone_builtin_names;
 
+#[derive(Clone)]
 struct AdmissionNames {
     callable: HashSet<String>,
     schema_shadow: HashSet<String>,
+    async_context: bool,
 }
 
 pub(crate) fn validate_program(
@@ -31,6 +33,7 @@ pub(crate) fn validate_program(
     let names = AdmissionNames {
         callable,
         schema_shadow: bound_names,
+        async_context: false,
     };
 
     validate_statements(&program.statements, &names)
@@ -59,7 +62,15 @@ fn validate_statements(statements: &[Stmt], names: &AdmissionNames) -> Result<()
                 validate_statements(then_branch, names)?;
                 validate_statements(else_branch, names)?;
             }
-            Stmt::With { context, body, .. } => {
+            Stmt::With {
+                is_async,
+                context,
+                body,
+                ..
+            } => {
+                if *is_async && !names.async_context {
+                    return Err(admission_error("async with is only valid inside async def"));
+                }
                 validate_expr(context, names)?;
                 validate_statements(body, names)?;
             }
@@ -84,7 +95,9 @@ fn validate_statements(statements: &[Stmt], names: &AdmissionNames) -> Result<()
                         validate_expr(default, names)?;
                     }
                 }
-                validate_statements(&function.body, names)?;
+                let mut function_names = names.clone();
+                function_names.async_context = function.is_async;
+                validate_statements(&function.body, &function_names)?;
             }
             Stmt::Return(Some(value)) | Stmt::Expr(value) => {
                 validate_expr(value, names)?;
@@ -169,6 +182,32 @@ fn validate_expr(expr: &Expr, names: &AdmissionNames) -> Result<(), ShellError> 
             validate_expr(else_expr, names)?;
         }
         Expr::Not(value) | Expr::Neg(value) | Expr::Invert(value) => {
+            validate_expr(value, names)?;
+        }
+        Expr::Await(value) => {
+            if !names.async_context {
+                return Err(admission_error("await is only valid inside async def"));
+            }
+            let supported = match value.as_ref() {
+                Expr::Name(_) => true,
+                Expr::MethodCall { method, .. } => {
+                    matches!(method.as_str(), "wait" | "wait_any" | "wait_all" | "accept")
+                }
+                Expr::Call(call) => matches!(
+                    call.name.as_str(),
+                    "attempt_wait"
+                        | "attempt_join"
+                        | "attempt_wait_any"
+                        | "attempt_wait_all"
+                        | "attempt_accept"
+                ),
+                _ => false,
+            };
+            if !supported {
+                return Err(admission_error(
+                    "await currently supports an attempt handle, child.wait(), scope.wait_any(), scope.wait_all(), root.accept(), and their functional attempt_* forms",
+                ));
+            }
             validate_expr(value, names)?;
         }
         Expr::Add { left, right }
@@ -285,6 +324,7 @@ fn collect_statement_bindings(statements: &[Stmt], names: &mut HashSet<String>) 
                 target,
                 context,
                 body,
+                ..
             } => {
                 if let Some(target) = target {
                     names.insert(target.clone());
@@ -427,7 +467,7 @@ fn collect_expr_bindings(expr: &Expr, names: &mut HashSet<String>) {
             collect_expr_bindings(condition, names);
             collect_expr_bindings(else_expr, names);
         }
-        Expr::Not(value) | Expr::Neg(value) | Expr::Invert(value) => {
+        Expr::Not(value) | Expr::Neg(value) | Expr::Invert(value) | Expr::Await(value) => {
             collect_expr_bindings(value, names);
         }
         Expr::Add { left, right }
@@ -517,6 +557,38 @@ mod tests {
             lower_source("attempt_branch(frontier=value, entypoint=\"worker\")").expect("lower");
         let error = validate_program(&frontier_keyword, &[]).expect_err("unknown frontier keyword");
         assert!(format!("{error:?}").contains("entypoint"));
+    }
+
+    #[test]
+    fn admits_only_narrow_async_attempt_effects() {
+        let valid = lower_source(
+            r#"async def main():
+    async with attempt_scope() as scope:
+        outcome = await child.wait(timeout_ms=1000)
+    return outcome
+"#,
+        )
+        .expect("lower valid async control");
+        validate_program(&valid, &[]).expect("admit valid async control");
+
+        let unsupported = lower_source(
+            r#"async def main():
+    return await run(["true"])
+"#,
+        )
+        .expect("lower unsupported await target");
+        let error = validate_program(&unsupported, &[]).expect_err("reject broad await");
+        assert!(format!("{error:?}").contains("await currently supports"));
+
+        let sync_with = lower_source(
+            r#"def main():
+    async with attempt_scope() as scope:
+        pass
+"#,
+        )
+        .expect("lower misplaced async with");
+        let error = validate_program(&sync_with, &[]).expect_err("reject misplaced async with");
+        assert!(format!("{error:?}").contains("async with is only valid"));
     }
 
     #[test]

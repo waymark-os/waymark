@@ -34,6 +34,7 @@ pub enum Stmt {
         else_branch: Vec<Stmt>,
     },
     With {
+        is_async: bool,
         target: Option<String>,
         context: Expr,
         body: Vec<Stmt>,
@@ -53,6 +54,7 @@ pub enum Stmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionDef {
     pub name: String,
+    pub is_async: bool,
     pub params: Vec<FunctionParam>,
     pub return_type: StoneType,
     pub body: Vec<Stmt>,
@@ -151,6 +153,7 @@ pub enum Expr {
     Not(Box<Expr>),
     Neg(Box<Expr>),
     Invert(Box<Expr>),
+    Await(Box<Expr>),
     Add {
         left: Box<Expr>,
         right: Box<Expr>,
@@ -332,13 +335,14 @@ fn lower_stmt(statement: py::Stmt) -> Result<Stmt, ShellError> {
 }
 
 fn lower_function_def(function: py::StmtFunctionDef) -> Result<Stmt, ShellError> {
-    if function.is_async {
+    let is_async = function.is_async;
+    let stage = lower_function_stage_decorator(function.decorator_list)?;
+    if is_async && stage.is_some() {
         return Err(unsupported_message(
             "function definition",
-            "async def is not supported",
+            "@stage on async def is not supported yet; put async attempt control inside an undecorated helper",
         ));
     }
-    let stage = lower_function_stage_decorator(function.decorator_list)?;
     if function.type_params.is_some() {
         return Err(unsupported_message(
             "function definition",
@@ -375,6 +379,7 @@ fn lower_function_def(function: py::StmtFunctionDef) -> Result<Stmt, ShellError>
     };
     Ok(Stmt::FunctionDef(FunctionDef {
         name: function.name.to_string(),
+        is_async,
         params,
         return_type,
         body: lower_stmt_block(function.body)?,
@@ -752,12 +757,7 @@ fn lower_while(while_stmt: py::StmtWhile) -> Result<Stmt, ShellError> {
 }
 
 fn lower_with(with_stmt: py::StmtWith) -> Result<Stmt, ShellError> {
-    if with_stmt.is_async {
-        return Err(unsupported_message(
-            "with statement",
-            "async with statements are not supported",
-        ));
-    }
+    let is_async = with_stmt.is_async;
     let [item] = with_stmt.items.as_slice() else {
         return Err(unsupported_message(
             "with statement",
@@ -777,6 +777,7 @@ fn lower_with(with_stmt: py::StmtWith) -> Result<Stmt, ShellError> {
         None => None,
     };
     Ok(Stmt::With {
+        is_async,
         target,
         context: lower_expr(item.context_expr.clone())?,
         body: lower_stmt_block(with_stmt.body)?,
@@ -876,6 +877,7 @@ fn lower_expr(expression: py::Expr) -> Result<Expr, ShellError> {
         py::Expr::UnaryOp(unary_op) if matches!(unary_op.op, py::UnaryOp::Invert) => {
             Ok(Expr::Invert(Box::new(lower_expr(*unary_op.operand)?)))
         }
+        py::Expr::Await(await_expr) => Ok(Expr::Await(Box::new(lower_expr(*await_expr.value)?))),
         py::Expr::Lambda(lambda) => lower_lambda(lambda),
         py::Expr::Generator(generator) => lower_generator(generator),
         py::Expr::Subscript(subscript) => Ok(Expr::Subscript {
@@ -1224,6 +1226,14 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
                     | "lower"
                     | "read"
                     | "readlines"
+                    | "accept"
+                    | "branch"
+                    | "discard"
+                    | "inspect"
+                    | "release"
+                    | "wait"
+                    | "wait_any"
+                    | "wait_all"
                     | "replace"
                     | "rsplit"
                     | "rstrip"
@@ -1296,6 +1306,26 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
                             }
                         }
                     }
+                } else if matches!(
+                    method.as_str(),
+                    "accept"
+                        | "branch"
+                        | "discard"
+                        | "inspect"
+                        | "release"
+                        | "wait"
+                        | "wait_any"
+                        | "wait_all"
+                ) {
+                    for keyword in call.arguments.keywords.into_vec() {
+                        let Some(name) = keyword.arg else {
+                            return Err(unsupported_message(
+                                "method call",
+                                "keyword spread is not supported yet",
+                            ));
+                        };
+                        named.push((name.to_string(), lower_expr(keyword.value)?));
+                    }
                 } else {
                     for keyword in call.arguments.keywords.into_vec() {
                         let Some(name) = keyword.arg else {
@@ -1307,7 +1337,7 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
                         return Err(unsupported_message(
                             "method call",
                             format!(
-                                "unsupported {method}() keyword argument `{name}`; method keyword arguments are supported only for split(maxsplit=...) and sort(key=..., reverse=...)"
+                                "unsupported {method}() keyword argument `{name}`; keyword arguments are supported on split, sort, and nominal attempt-resource methods"
                             ),
                         ));
                     }
@@ -2099,6 +2129,7 @@ else:
             target,
             context,
             body,
+            ..
         }] = program.statements.as_slice()
         else {
             panic!("expected with statement");
@@ -2112,6 +2143,38 @@ else:
             panic!("expected if in for body");
         };
         assert!(matches!(else_branch[0], Stmt::If { .. }));
+    }
+
+    #[test]
+    fn accepts_nominal_attempt_resource_methods_with_keywords() {
+        let program = lower_source(
+            r#"with semantic_frontier(checkpoint) as frontier:
+    with attempt_scope() as scope:
+        child = scope.branch(frontier, entrypoint="worker", start=True)
+        outcome = child.wait(timeout_ms=30000)
+        batch = scope.wait_all(timeout_ms=30000)
+        detail = child.inspect(include_details=True)
+        accepted = root.accept(child)
+        child.discard(reason="not selected")
+        frontier.release()
+"#,
+        )
+        .expect("lower nominal resource methods");
+
+        let [Stmt::With { body, .. }] = program.statements.as_slice() else {
+            panic!("expected frontier with statement");
+        };
+        let [Stmt::With { body, .. }] = body.as_slice() else {
+            panic!("expected attempt-scope with statement");
+        };
+        assert_eq!(body.len(), 7);
+        assert!(body.iter().all(|statement| matches!(
+            statement,
+            Stmt::Assign {
+                value: Expr::MethodCall { .. },
+                ..
+            } | Stmt::Expr(Expr::MethodCall { .. })
+        )));
     }
 
     #[test]
@@ -2151,7 +2214,6 @@ else:
         for source in [
             "import os",
             "from json import loads",
-            "async def f():\n    pass",
             "class C:\n    pass",
             "try:\n    x = 1\nfinally:\n    x = 2",
             "try:\n    x = 1\nexcept ValueError:\n    x = 2",
@@ -2159,6 +2221,35 @@ else:
         ] {
             assert_unsupported(source);
         }
+    }
+
+    #[test]
+    fn accepts_narrow_async_attempt_control_syntax() {
+        let program = lower_source(
+            r#"async def main() -> attempt_outcome:
+    async with attempt_scope() as scope:
+        child = scope.branch(frontier, entrypoint="worker")
+        outcome = await child.wait(timeout_ms=30000)
+    return outcome
+"#,
+        )
+        .expect("lower async attempt control");
+
+        let [Stmt::FunctionDef(function)] = program.statements.as_slice() else {
+            panic!("expected async function");
+        };
+        assert!(function.is_async);
+        let [Stmt::With { is_async, body, .. }, Stmt::Return(_)] = function.body.as_slice() else {
+            panic!("expected async with followed by return");
+        };
+        assert!(*is_async);
+        assert!(matches!(
+            body.get(1),
+            Some(Stmt::Assign {
+                value: Expr::Await(_),
+                ..
+            })
+        ));
     }
 
     #[test]

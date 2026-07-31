@@ -1462,6 +1462,25 @@ supported. The repair was caused by rebinding a child handle to the
 frontier abstraction as a source/kernel boundary; next improve nominal
 lifecycle-result ergonomics before claiming an authorship advantage or moving
 to a task-shaped transfer.
+
+The lexical-resource experiment adds that ergonomics without a new Gateway
+ABI. `with` owns `attempt_scope` and `semantic_frontier` values through normal,
+return, and exceptional exit; methods lower to the existing lifecycle kernel.
+The first authorship run exposed a Stone bug rather than an ownership failure:
+`with` hid body bindings unlike Python. After separating name visibility from
+resource authority, corrected scoped syntax passed 3/3 first responses with no
+repairs and was slightly smaller than typed-functional control. Leaving a block
+now revokes the resource but preserves the handle/evidence for finalization.
+
+A narrow async follow-up admits `async def`, attempt-resource `async with`, and
+`await` on joins, wait sets, and acceptance. It also passed 3/3 first responses,
+but was slightly larger than synchronous scoped syntax. The interpreter
+currently lowers these markers to blocking Gateway effects; this is useful
+effect notation, not a general coroutine system. Keep synchronous scoped
+control as the block-shaped default, the functional forms as the explicit
+kernel surface, and async experimental until actual operation overlap requires
+it. See [Scoped Attempt Resources Experiment](STONE_SCOPED_ATTEMPT_RESOURCES_EXPERIMENT.md)
+and [Async Attempt Control Experiment](STONE_ASYNC_ATTEMPT_CONTROL_EXPERIMENT.md).
 Verifier-populated outcomes and aggregate budget/event views remain necessary.
 See
 [Caffe Bounded-Explore Library Experiment](../../waymark-gateway/docs/CAFFE_BOUNDED_EXPLORE_LIBRARY_EXPERIMENT.md).

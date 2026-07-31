@@ -237,7 +237,9 @@ These are common in Python but lower value for Stone's shell role:
 - `import` and `from ... import ...`: keep rejected with targeted guidance to
   use Stone builtins/helpers.
 - `class`: likely not aligned with Stone's agent-shell role.
-- decorators, async/await, yield: low current value.
+- general decorators, coroutine/task async, and yield remain low value. Stone
+  now has a deliberately narrow async attempt-effect experiment; do not widen
+  it without a concrete overlap/select use case.
 - complex numbers: outside the current shell/data domain.
 - broad Python exception hierarchy: prefer structured Stone error records.
 

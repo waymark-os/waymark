@@ -46,13 +46,20 @@ class SemanticFrontierAuthorshipTests(unittest.TestCase):
     def test_prompts_name_checkpoint_and_attempt_roles(self) -> None:
         raw = EXPERIMENT.arm_prompt("raw", help_topics())
         typed = EXPERIMENT.arm_prompt("typed", help_topics())
-        for prompt in (raw, typed):
+        scoped = EXPERIMENT.arm_prompt("scoped", help_topics())
+        async_prompt = EXPERIMENT.arm_prompt("async", help_topics())
+        for prompt in (raw, typed, scoped, async_prompt):
             self.assertIn("checkpoint = fixture_prepare_checkpoint()", prompt)
             self.assertIn("root = attempt_info()", prompt)
             self.assertIn("root is the current attempt record", prompt)
             self.assertIn('"attempt_info"', prompt)
         self.assertIn("workspace_source", raw)
         self.assertIn("Do not call attempt_fork", typed)
+        self.assertIn("with scope:", scoped)
+        self.assertIn("scope.branch", scoped)
+        self.assertIn("async def main(input)", async_prompt)
+        self.assertIn("async with attempt_scope", async_prompt)
+        self.assertIn("Await each `child.wait", async_prompt)
 
     def test_reference_sources_pass_only_their_own_structural_gate(self) -> None:
         raw_source = (
@@ -63,16 +70,36 @@ class SemanticFrontierAuthorshipTests(unittest.TestCase):
             ROOT
             / "examples/references/semantic_frontier_authorship_typed_reference.stone"
         ).read_text(encoding="utf-8")
+        scoped_source = (
+            ROOT
+            / "examples/references/semantic_frontier_authorship_scoped_reference.stone"
+        ).read_text(encoding="utf-8")
+        async_source = (
+            ROOT
+            / "examples/references/semantic_frontier_authorship_async_reference.stone"
+        ).read_text(encoding="utf-8")
         raw = EXPERIMENT.source_features(raw_source)
         typed = EXPERIMENT.source_features(typed_source)
+        scoped = EXPERIMENT.source_features(scoped_source)
+        async_features = EXPERIMENT.source_features(async_source)
         self.assertTrue(EXPERIMENT.structural_gate("raw", raw)[0])
         self.assertTrue(EXPERIMENT.structural_gate("typed", typed)[0])
+        self.assertTrue(EXPERIMENT.structural_gate("scoped", scoped)[0])
+        self.assertTrue(EXPERIMENT.structural_gate("async", async_features)[0])
         self.assertFalse(EXPERIMENT.structural_gate("raw", typed)[0])
         self.assertFalse(EXPERIMENT.structural_gate("typed", raw)[0])
+        self.assertFalse(EXPERIMENT.structural_gate("typed", scoped)[0])
+        self.assertFalse(EXPERIMENT.structural_gate("scoped", typed)[0])
+        self.assertFalse(EXPERIMENT.structural_gate("typed", async_features)[0])
+        self.assertFalse(EXPERIMENT.structural_gate("async", typed)[0])
         self.assertEqual(raw["redundant_seal_requests"], 0)
         self.assertEqual(typed["redundant_seal_requests"], 0)
+        self.assertEqual(scoped["redundant_seal_requests"], 0)
+        self.assertEqual(async_features["redundant_seal_requests"], 0)
+        self.assertEqual(async_features["awaits"], 4)
+        self.assertEqual(async_features["async_with_statements"], 3)
 
-    def test_composition_dispatches_all_three_entrypoints(self) -> None:
+    def test_composition_dispatches_all_entrypoints(self) -> None:
         composed = EXPERIMENT.compose_source(
             "def main(input):\n    return input\n",
             "def worker(input):\n    return input\n"

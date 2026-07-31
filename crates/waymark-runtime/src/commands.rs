@@ -1214,9 +1214,19 @@ else:
     StoneHelpEntry {
         name: "attempt_scope",
         signature: r#"attempt_scope(exit_policy: "cancel_then_join" = "cancel_then_join", join_timeout_ms: int = 5000) -> attempt_scope"#,
-        use_when: "Create a task-owned supervision scope before spawning child attempts; any unresolved registered child is boundedly terminated, joined, and rolled back when the scope closes or Stone evaluation exits.",
+        use_when: "Create a task-owned supervision scope before spawning child attempts. Use `with scope:` when every consumer fits naturally inside one block; otherwise call attempt_scope_close explicitly. `scope.branch(frontier, ...)`, `scope.wait_any(...)`, and `scope.wait_all(...)` are thin method forms of the existing lifecycle operations.",
         examples: &[r#"scope = attempt_scope(join_timeout_ms=2000)
-emit({"type": type(scope), "policy": scope.exit_policy, "children": scope.children})"#],
+with scope:
+    child = scope.branch(frontier, program=current_program(), entrypoint="worker", start=True)
+    outcome = child.wait(timeout_ms=30000)
+    child.discard(reason="probe complete")
+emit(scope.closed)"#,
+            r#"async def explore():
+    async with attempt_scope(join_timeout_ms=2000) as scope:
+        child = scope.branch(frontier, program=current_program(), entrypoint="worker", start=True)
+        outcome = await child.wait(timeout_ms=30000)
+    return {"outcome": outcome, "clean": scope.closed}"#,
+        ],
         avoid: &[
             "Do not persist an open attempt scope across Stone evaluations; it is closed automatically at the current evaluation boundary.",
             "Do not treat scope cleanup as candidate selection; explicitly accept the winner and discard known losers.",
@@ -1263,13 +1273,14 @@ emit(attempt_scope_close(scope).clean)"#],
         examples: &[
             r#"frontier = semantic_frontier(report.stages[0].checkpoint)"#,
             r#"frontier = semantic_frontier(failed_report.stages[1].checkpoint, owner=failed_child)"#,
-            r#"if frontier.guidance.prefer_reuse:
-    emit(frontier.cost)"#,
+            r#"with semantic_frontier(report.stages[0].checkpoint) as frontier:
+    child = scope.branch(frontier, input={"strategy": "alternate"})"#,
         ],
         avoid: &[
             "Do not pass only checkpoint.reference; the full checkpoint record carries policy, planes, and measured seal cost.",
             "Do not serialize or reconstruct a semantic frontier; it is a task-owned authority value.",
             "A frontier reported as unused in evaluation diagnostics paid seal cost without feeding attempt_branch during that evaluation.",
+            "Leaving the block releases frontier authority. Names remain visible afterward for evidence and finalization, but cannot be used to create another branch.",
         ],
         aliases: &[],
     },
@@ -1622,6 +1633,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "Conditional expressions use Python's value if condition else fallback shape.",
             "Functions: def name(arg) works; omitted parameter and return annotations mean Any, optional annotations like def name(arg: str) -> str are checked, and immutable default values are supported. Attempt controls also support attempt_handle, attempt_outcome, attempt_scope, semantic_frontier, and attempt_acceptance annotations. Named functions are first-class callable values and may be passed to another function. Use -> None for a checked procedure. @stage(...) is the one supported declaration decorator.",
             "try/except catches runtime evaluation errors; supported handlers are except:, except Exception:, and except Exception as e:.",
+            "with follows Python block visibility: targets and body assignments remain visible after exit. For files, attempt_scope, and semantic_frontier values it performs checked cleanup on fallthrough, return, or error. Nominal lifecycle methods include scope.branch/wait_any/wait_all, child.wait/inspect/discard, root.accept, and frontier.release.",
             "Lambdas: expression-only callbacks work in sort/map/filter, e.g. lambda r: r[\"name\"].",
             "String methods include strip/lstrip/rstrip, isdigit/isalpha/isalnum, count, split/rsplit/splitlines, replace, join, lower/upper, zfill, startswith, and endswith; split and rsplit accept optional maxsplit and default whitespace splitting.",
             "File handles support read(), readlines()/splitlines(), write(text), and close().",

@@ -65,6 +65,7 @@ pub(super) struct SemanticFrontierValue {
     branch_count: Arc<AtomicU64>,
     released: Arc<AtomicBool>,
     released_by_cleanup: Arc<AtomicBool>,
+    released_by_scope: Arc<AtomicBool>,
 }
 
 impl SemanticFrontierValue {
@@ -97,6 +98,7 @@ impl SemanticFrontierValue {
             branch_count: Arc::new(AtomicU64::new(0)),
             released: Arc::new(AtomicBool::new(false)),
             released_by_cleanup: Arc::new(AtomicBool::new(false)),
+            released_by_scope: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -134,6 +136,11 @@ impl SemanticFrontierValue {
         self.released.store(true, Ordering::Release);
     }
 
+    pub(super) fn mark_released_by_scope(&self) {
+        self.released_by_scope.store(true, Ordering::Relaxed);
+        self.released.store(true, Ordering::Release);
+    }
+
     pub(super) fn is_released(&self) -> bool {
         self.released.load(Ordering::Acquire)
     }
@@ -141,6 +148,8 @@ impl SemanticFrontierValue {
     pub(super) fn release_origin(&self) -> Option<&'static str> {
         if !self.is_released() {
             None
+        } else if self.released_by_scope.load(Ordering::Relaxed) {
+            Some("scope_exit")
         } else if self.released_by_cleanup.load(Ordering::Relaxed) {
             Some("evaluation_cleanup")
         } else {
@@ -387,5 +396,25 @@ mod tests {
             frontier.diagnostic()["release_origin"],
             json!("evaluation_cleanup")
         );
+    }
+
+    #[test]
+    fn semantic_frontier_records_lexical_scope_release() {
+        let frontier = SemanticFrontierValue::new(
+            3,
+            "cp-scope".to_string(),
+            "attempt-owner".to_string(),
+            "repo".to_string(),
+            "task".to_string(),
+            "repo".to_string(),
+            SemanticFrontierMode::Parent,
+            10,
+            20,
+            "low",
+            Value::record(Record::new(), Span::unknown()),
+        );
+        frontier.mark_released_by_scope();
+        assert_eq!(frontier.release_origin(), Some("scope_exit"));
+        assert_eq!(frontier.diagnostic()["release_origin"], json!("scope_exit"));
     }
 }

@@ -1,0 +1,76 @@
+def main(input):
+    checkpoint = fixture_prepare_checkpoint()
+    root = attempt_info()
+    scope = attempt_scope(join_timeout_ms=30000)
+
+    with scope:
+        with semantic_frontier(checkpoint) as parent_source:
+            parent_child = scope.branch(
+                parent_source,
+                input={
+                    "label": "parent-branch",
+                    "path": "root.txt",
+                    "expected": "root",
+                },
+                program=current_program(),
+                entrypoint="worker",
+                start=True,
+            )
+            parent_outcome = parent_child.wait(timeout_ms=30000)
+            if (
+                not parent_outcome.joined
+                or parent_outcome.result.status != "succeeded"
+            ):
+                fail("parent branch failed", code="frontier_authorship_parent_failed")
+            parent_child.discard(reason="parent branch checked")
+
+            owner = scope.branch(
+                parent_source,
+                input={},
+                program=current_program(),
+                entrypoint="setup_owner",
+                start=True,
+            )
+            owner_outcome = owner.wait(timeout_ms=30000)
+            if not owner_outcome.joined or owner_outcome.result.status != "succeeded":
+                fail("owner setup failed", code="frontier_authorship_owner_failed")
+            repair_checkpoint = owner_outcome.result.value.checkpoint
+            attempt_finish("fail", attempt=owner, reason="injected late failure")
+
+            with semantic_frontier(
+                repair_checkpoint,
+                owner=owner,
+            ) as retained_source:
+                repaired = scope.branch(
+                    retained_source,
+                    input={
+                        "label": "retained-branch",
+                        "path": "owner.txt",
+                        "expected": "owner",
+                    },
+                    program=current_program(),
+                    entrypoint="worker",
+                    start=True,
+                )
+                repaired_outcome = repaired.wait(timeout_ms=30000)
+                if (
+                    not repaired_outcome.joined
+                    or repaired_outcome.result.status != "succeeded"
+                ):
+                    fail(
+                        "retained branch failed",
+                        code="frontier_authorship_repair_failed",
+                    )
+                root.accept(repaired)
+                result = fixture_finalize(
+                    "typed",
+                    parent_source,
+                    retained_source,
+                    parent_outcome,
+                    repaired_outcome,
+                    parent_child,
+                    owner,
+                    repaired,
+                    {"clean": True},
+                )
+    return result

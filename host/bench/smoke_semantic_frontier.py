@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument(
         "--expected-interface",
-        choices=("typed", "raw"),
+        choices=("typed", "raw", "scoped", "async"),
         default="typed",
     )
     return parser.parse_args()
@@ -48,6 +48,38 @@ def assert_result(
     if payload.get("ok") is not True:
         raise AssertionError(f"semantic-frontier controller failed: {payload}")
     value = payload.get("value") or {}
+    if expected_interface in ("scoped", "async"):
+        if value.get("frontier_status") != "released":
+            raise AssertionError(f"lexical frontier was not released: {value}")
+        if value.get("scope_closed") is not True:
+            raise AssertionError(f"lexical attempt scope was not closed: {value}")
+        if value.get("child_resource_state") != "reclaimed":
+            raise AssertionError(f"scoped child resources were not reclaimed: {value}")
+        child = str(value.get("child") or "")
+        if not child:
+            raise AssertionError(f"scoped child identity is missing: {value}")
+        diagnostics = (payload.get("diagnostics") or {}).get("semantic_frontiers") or {}
+        frontiers = diagnostics.get("frontiers") or []
+        if (
+            diagnostics.get("created") != 1
+            or diagnostics.get("unused") != 0
+            or len(frontiers) != 1
+            or frontiers[0].get("release_origin") != "scope_exit"
+        ):
+            raise AssertionError(f"lexical release diagnostics are wrong: {diagnostics}")
+        result = {"diagnostics": diagnostics}
+        if expected_interface == "async":
+            async_diagnostics = (payload.get("diagnostics") or {}).get("async") or {}
+            if (
+                async_diagnostics.get("lowering") != "blocking_attempt_effects"
+                or async_diagnostics.get("functions_entered") != 1
+                or async_diagnostics.get("awaits") != 1
+            ):
+                raise AssertionError(
+                    f"async lowering diagnostics are wrong: {async_diagnostics}"
+                )
+            result["async"] = async_diagnostics
+        return [child], result
     if value.get("accepted") != "retained-branch" or value.get("clean") is not True:
         raise AssertionError(f"retained branch was not accepted cleanly: {value}")
     if value.get("owner_resource_state") != "reclaimed":
@@ -93,7 +125,7 @@ def assert_result(
             raise AssertionError(f"frontier branch counts are wrong: {diagnostics}")
     elif diagnostics:
         raise AssertionError(f"raw arm unexpectedly constructed typed frontiers: {diagnostics}")
-    return children, {
+    summary = {
         "parent": {
             "cost": parent.get("cost"),
             "guidance": parent.get("guidance"),
@@ -104,6 +136,10 @@ def assert_result(
         },
         "diagnostics": diagnostics,
     }
+    async_diagnostics = (payload.get("diagnostics") or {}).get("async")
+    if async_diagnostics:
+        summary["async"] = async_diagnostics
+    return children, summary
 
 
 def main() -> int:
@@ -276,14 +312,18 @@ def main() -> int:
             trace = (data_root / "traces" / "operations.jsonl").read_text(
                 encoding="utf-8"
             )
-            if trace.count('"op":"attempt.fork"') != 2:
-                raise AssertionError("trace does not contain two parent-frontier forks")
-            if trace.count('"op":"attempt.spawn"') != 2:
-                raise AssertionError(
-                    "trace does not contain initial spawn plus retained-frontier spawn"
-                )
-            if trace.count('"op":"attempt.accept"') != 1:
-                raise AssertionError("trace does not contain exactly one acceptance")
+            expected_trace_counts = (
+                {"attempt.fork": 1, "attempt.spawn": 1, "attempt.accept": 0}
+                if args.expected_interface in ("scoped", "async")
+                else {"attempt.fork": 2, "attempt.spawn": 2, "attempt.accept": 1}
+            )
+            for operation, expected_count in expected_trace_counts.items():
+                actual_count = trace.count(f'"op":"{operation}"')
+                if actual_count != expected_count:
+                    raise AssertionError(
+                        f"trace contains {actual_count} {operation} operations; "
+                        f"expected {expected_count}"
+                    )
         finally:
             if attempt:
                 smoke.gateway(

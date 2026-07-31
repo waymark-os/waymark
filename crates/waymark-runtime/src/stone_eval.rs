@@ -137,6 +137,9 @@ pub struct EvalState {
     agent_time_anchor: Option<(Instant, u64)>,
     active_transition_hook: bool,
     active_workflow_run: bool,
+    active_async_depth: usize,
+    async_functions_entered: u64,
+    async_await_count: u64,
     transition_events: Vec<JsonValue>,
     attempt_scopes: Vec<AttemptScopeValue>,
     semantic_frontiers: Vec<SemanticFrontierValue>,
@@ -628,6 +631,9 @@ fn eval_program_with_source_options(
             agent_time_anchor: None,
             active_transition_hook: false,
             active_workflow_run: false,
+            active_async_depth: 0,
+            async_functions_entered: 0,
+            async_await_count: 0,
             transition_events: Vec::new(),
             attempt_scopes: Vec::new(),
             semantic_frontiers: Vec::new(),
@@ -694,6 +700,13 @@ fn eval_program_with_source_options(
     }
     if !evaluator.state.transition_events.is_empty() {
         diagnostics["transitions"] = JsonValue::Array(evaluator.state.transition_events.clone());
+    }
+    if evaluator.state.async_functions_entered > 0 || evaluator.state.async_await_count > 0 {
+        diagnostics["async"] = json!({
+            "lowering": "blocking_attempt_effects",
+            "functions_entered": evaluator.state.async_functions_entered,
+            "awaits": evaluator.state.async_await_count,
+        });
     }
     if !evaluator.state.semantic_frontiers.is_empty() {
         let frontiers = evaluator
@@ -1108,10 +1121,11 @@ impl Evaluator<'_> {
                 self.eval_block(branch, PipelineData::empty(), false)
             }
             Stmt::With {
+                is_async,
                 target,
                 context,
                 body,
-            } => self.eval_with_stmt(target.as_deref(), context, body),
+            } => self.eval_with_stmt(*is_async, target.as_deref(), context, body),
             Stmt::Try { body, handlers } => self.eval_try_stmt(body, handlers),
             Stmt::Break => Ok(EvalFlow::Break),
             Stmt::Continue => Ok(EvalFlow::Continue),
@@ -1445,24 +1459,65 @@ impl Evaluator<'_> {
 
     fn eval_with_stmt(
         &mut self,
+        is_async: bool,
         target: Option<&str>,
         context: &Expr,
         body: &[Stmt],
     ) -> Result<EvalFlow, ShellError> {
-        self.state.push_scope();
-        let value = match self.eval_expr_value(context, PipelineData::empty()) {
-            Ok(value) => value,
-            Err(err) => {
-                self.state.pop_scope()?;
-                return Err(err);
-            }
-        };
+        if is_async && self.state.active_async_depth == 0 {
+            return Err(stone_error(
+                "async with",
+                "async with is only valid inside async def",
+            ));
+        }
+        let value = self.eval_expr_value(context, PipelineData::empty())?;
+        if is_async
+            && !matches!(
+                value,
+                RuntimeValue::AttemptScope(_) | RuntimeValue::SemanticFrontier(_)
+            )
+        {
+            let cleanup = self.close_with_resource(&value);
+            return match cleanup {
+                Ok(()) => Err(stone_error(
+                    "async with",
+                    "async with currently supports attempt_scope() and semantic_frontier(); use with for synchronous resources",
+                )),
+                Err(error) => Err(error),
+            };
+        }
+        let owned_value = value.clone();
         if let Some(target) = target {
             self.state.set_local(target.to_owned(), value);
         }
         let result = self.eval_block(body, PipelineData::empty(), false);
-        self.state.pop_scope_merging_nu_locals(target)?;
-        result
+        let cleanup = self.close_with_resource(&owned_value);
+        match (result, cleanup) {
+            (Ok(flow), Ok(())) => Ok(flow),
+            (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+            (Err(program_error), Ok(())) => Err(program_error),
+            (Err(program_error), Err(cleanup_error)) => {
+                Err(attach_cleanup_error(program_error, cleanup_error))
+            }
+        }
+    }
+
+    fn close_with_resource(&mut self, value: &RuntimeValue) -> Result<(), ShellError> {
+        match value {
+            RuntimeValue::AttemptScope(scope) => {
+                self.close_attempt_scope_checked(scope, "Stone attempt scope exited")
+            }
+            RuntimeValue::SemanticFrontier(frontier) => {
+                if frontier.is_released() {
+                    return Ok(());
+                }
+                gateway_env::semantic_frontier_release(frontier.checkpoint.clone())?;
+                frontier.mark_released_by_scope();
+                Ok(())
+            }
+            RuntimeValue::File(handle) => self.eval_file_method(*handle, "close", &[]).map(|_| ()),
+            _ => Ok(()),
+        }
     }
 
     fn eval_try_stmt(
@@ -1951,6 +2006,7 @@ impl Evaluator<'_> {
                     let value = value_to_operator_i64(&value, "bitwise invert")?;
                     Ok(RuntimeValue::Nu(Value::int(!value, span)))
                 }
+                Expr::Await(value) => self.eval_await_expr(value),
                 Expr::Add { left, right } => {
                     let left = self
                         .eval_expr_value(left, PipelineData::empty())?
@@ -2084,6 +2140,48 @@ impl Evaluator<'_> {
         })();
         self.state.profiler.finish(EvalProfileBucket::Expr, started);
         result
+    }
+
+    fn eval_await_expr(&mut self, expression: &Expr) -> Result<RuntimeValue, ShellError> {
+        if self.state.active_async_depth == 0 {
+            return Err(stone_error("await", "await is only valid inside async def"));
+        }
+        let supported = match expression {
+            Expr::Name(_) => true,
+            Expr::MethodCall { method, .. } => {
+                matches!(method.as_str(), "wait" | "wait_any" | "wait_all" | "accept")
+            }
+            Expr::Call(call) => matches!(
+                call.name.as_str(),
+                "attempt_wait"
+                    | "attempt_join"
+                    | "attempt_wait_any"
+                    | "attempt_wait_all"
+                    | "attempt_accept"
+            ),
+            _ => false,
+        };
+        if !supported {
+            return Err(stone_error(
+                "await",
+                "await currently supports an attempt handle, child.wait(), scope.wait_any(), scope.wait_all(), root.accept(), and their functional attempt_* forms",
+            ));
+        }
+        self.state.async_await_count = self.state.async_await_count.saturating_add(1);
+        let value = self.eval_expr_value(expression, PipelineData::empty())?;
+        match (expression, value) {
+            (_, RuntimeValue::AttemptHandle(handle)) => {
+                self.eval_attempt_join_id(handle.attempt, None)
+            }
+            (Expr::Name(_), value) => Err(stone_error(
+                "await",
+                format!(
+                    "bare await requires an attempt_handle, got {}; call a supported wait or acceptance operation instead",
+                    runtime_type_name(&value)
+                ),
+            )),
+            (_, value) => Ok(value),
+        }
     }
 
     fn try_eval_json_object_literal_subscript(
@@ -2453,7 +2551,15 @@ impl Evaluator<'_> {
         for (name, value) in bindings {
             self.state.set_local(name, value);
         }
+        if function.is_async {
+            self.state.active_async_depth = self.state.active_async_depth.saturating_add(1);
+            self.state.async_functions_entered =
+                self.state.async_functions_entered.saturating_add(1);
+        }
         let flow = self.eval_block(&function.body, PipelineData::empty(), false);
+        if function.is_async {
+            self.state.active_async_depth = self.state.active_async_depth.saturating_sub(1);
+        }
         self.state.pop_scope()?;
         let value = match flow? {
             EvalFlow::Return(value) => value,
@@ -7329,6 +7435,14 @@ impl Evaluator<'_> {
                 "attempt_join() requires a child attempt",
             ));
         }
+        self.eval_attempt_join_id(attempt, timeout_ms)
+    }
+
+    fn eval_attempt_join_id(
+        &mut self,
+        attempt: String,
+        timeout_ms: Option<u32>,
+    ) -> Result<RuntimeValue, ShellError> {
         let waited = gateway_env::attempt_wait(attempt.clone(), timeout_ms)?;
         let state = attempt_record_state(&waited)
             .unwrap_or("unknown")
@@ -7773,6 +7887,23 @@ impl Evaluator<'_> {
             }),
             Span::unknown(),
         ))
+    }
+
+    fn close_attempt_scope_checked(
+        &mut self,
+        scope: &AttemptScopeValue,
+        reason: &str,
+    ) -> Result<(), ShellError> {
+        let report = self.close_attempt_scope(scope, reason)?;
+        let report_json = nu_to_json_value(&report);
+        if report_json.get("clean").and_then(JsonValue::as_bool) == Some(true) {
+            Ok(())
+        } else {
+            Err(stone_error(
+                "attempt scope cleanup",
+                format!("cancel-then-join cleanup was incomplete: {report_json}"),
+            ))
+        }
     }
 
     fn close_open_attempt_scopes(&mut self, reason: &str) -> Result<(), ShellError> {
@@ -9217,6 +9348,81 @@ impl Evaluator<'_> {
     ) -> Result<RuntimeValue, ShellError> {
         let started = self.state.profiler.start();
         let result = (|| {
+            let resource_call = match method {
+                "branch" => {
+                    let mut named = named.to_vec();
+                    named.push(("scope".to_string(), receiver.clone()));
+                    Some(("attempt_branch", positional.to_vec(), named))
+                }
+                "wait_any" => Some((
+                    "attempt_wait_any",
+                    std::iter::once(receiver.clone())
+                        .chain(positional.iter().cloned())
+                        .collect(),
+                    named.to_vec(),
+                )),
+                "wait_all" => Some((
+                    "attempt_wait_all",
+                    std::iter::once(receiver.clone())
+                        .chain(positional.iter().cloned())
+                        .collect(),
+                    named.to_vec(),
+                )),
+                "wait" => Some((
+                    "attempt_join",
+                    std::iter::once(receiver.clone())
+                        .chain(positional.iter().cloned())
+                        .collect(),
+                    named.to_vec(),
+                )),
+                "inspect" => Some((
+                    "attempt_inspect",
+                    std::iter::once(receiver.clone())
+                        .chain(positional.iter().cloned())
+                        .collect(),
+                    named.to_vec(),
+                )),
+                "accept" => Some((
+                    "attempt_accept",
+                    std::iter::once(receiver.clone())
+                        .chain(positional.iter().cloned())
+                        .collect(),
+                    named.to_vec(),
+                )),
+                "discard" => Some((
+                    "attempt_discard",
+                    std::iter::once(receiver.clone())
+                        .chain(positional.iter().cloned())
+                        .collect(),
+                    named.to_vec(),
+                )),
+                "release" => Some((
+                    "semantic_frontier_release",
+                    std::iter::once(receiver.clone())
+                        .chain(positional.iter().cloned())
+                        .collect(),
+                    named.to_vec(),
+                )),
+                _ => None,
+            };
+            if let Some((name, positional, named)) = resource_call {
+                let call = Call {
+                    name: name.to_string(),
+                    positional,
+                    named,
+                };
+                return match name {
+                    "attempt_branch" => self.eval_attempt_branch_call(&call),
+                    "attempt_wait_any" => self.eval_attempt_wait_set_call(&call, false),
+                    "attempt_wait_all" => self.eval_attempt_wait_set_call(&call, true),
+                    "attempt_join" => self.eval_attempt_join_call(&call),
+                    "attempt_inspect" => self.eval_attempt_inspect_call(&call),
+                    "attempt_accept" => self.eval_attempt_accept_call(&call),
+                    "attempt_discard" => self.eval_attempt_discard_call(&call),
+                    "semantic_frontier_release" => self.eval_semantic_frontier_release_call(&call),
+                    _ => unreachable!("resource method lowering must name a lifecycle builtin"),
+                };
+            }
             if !named.is_empty() && method != "sort" {
                 return Err(stone_error(
                     "method call",
@@ -11253,7 +11459,7 @@ fn attach_cleanup_error(program_error: ShellError, cleanup_error: ShellError) ->
         ShellError::Generic(error) => ShellError::Generic(error.with_inner(vec![cleanup_error])),
         other => ShellError::Generic(
             GenericError::new_internal(
-                "Stone evaluation and attempt-scope cleanup both failed",
+                "Stone evaluation and resource cleanup both failed",
                 "inspect both related errors before resuming the attempt",
             )
             .with_code("stone_script_error")
@@ -13429,6 +13635,119 @@ emit({
     }
 
     #[test]
+    fn with_attempt_scope_closes_at_the_lexical_boundary() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("with-attempt-scope")?;
+        let program = lower_source(
+            r#"scope = attempt_scope()
+with scope:
+    marker = "inside"
+emit({"closed": scope.closed, "marker": marker})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, Span::unknown())?,
+            json_value!({"closed": true, "marker": "inside"})
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn with_attempt_scope_closes_before_exception_recovery() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("with-attempt-scope-error")?;
+        let program = lower_source(
+            r#"scope = attempt_scope()
+try:
+    with scope:
+        fail("injected body failure", code="injected_failure")
+except Exception:
+    recovered = scope.closed
+emit({"closed": scope.closed, "recovered": recovered})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, Span::unknown())?,
+            json_value!({"closed": true, "recovered": true})
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn async_with_attempt_scope_closes_and_preserves_bindings() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("async-with-attempt-scope")?;
+        let program = lower_source(
+            r#"async def main():
+    async with attempt_scope() as scope:
+        marker = "inside"
+    return {"closed": scope.closed, "marker": marker}
+
+main()
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, Span::unknown())?,
+            json_value!({"closed": true, "marker": "inside"})
+        );
+        assert_eq!(
+            output.diagnostics["async"],
+            json_value!({
+                "lowering": "blocking_attempt_effects",
+                "functions_entered": 1,
+                "awaits": 0,
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn await_rejects_non_attempt_values_without_hidden_coercion() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("await-non-attempt")?;
+        let program = lower_source(
+            r#"async def main():
+    value = 7
+    return await value
+
+main()
+"#,
+        )?;
+        let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("awaiting an integer should fail");
+        let text = format!("{error:?}");
+        assert!(
+            text.contains("bare await requires an attempt_handle"),
+            "{text}"
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn nominal_scope_methods_lower_to_checked_lifecycle_operations() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("attempt-scope-methods")?;
+        let program = lower_source(
+            r#"scope = attempt_scope()
+with scope:
+    scope.wait_all(timeout_ms=1)
+"#,
+        )?;
+        let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("an empty scope has no wait set");
+        let text = format!("{error:?}");
+        assert!(
+            text.contains("attempt wait set requires at least one child"),
+            "{text}"
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
     fn evaluates_wait_for_predicate_builtin() -> Result<(), ShellError> {
         let (engine_state, mut stack, root) = test_engine("wait-for-builtin")?;
         let program = lower_source(
@@ -15596,10 +15915,10 @@ emit(f.read())
 "#,
         )?;
         let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
-            .expect_err("with binding should not leak");
+            .expect_err("with binding should remain visible but closed");
         let debug = format!("{err:?}");
         assert!(
-            debug.contains("unknown name `f`"),
+            debug.contains("I/O operation on closed file"),
             "unexpected error: {debug}"
         );
 

@@ -471,3 +471,19 @@ or another runtime exception after sealing a frontier. The original program
 error remains primary; a failed release is attached as a related cleanup error.
 Diagnostics distinguish `explicit` from `evaluation_cleanup` release and count
 automatically released values.
+
+The scoped-resource follow-up makes ownership visible in ordinary Stone.
+`with semantic_frontier(...) as frontier:` releases the checkpoint at that
+boundary, while `with scope:` performs checked cancel-then-join cleanup.
+Nominal methods lower to the existing kernel operations. The first authorship
+run failed because Stone unexpectedly hid bindings after `with`; after adopting
+Python block visibility, scoped syntax passed 3/3 first responses with no
+repairs and was slightly smaller than typed-functional control. Resources are
+closed at exit, but their handles and evidence remain visible for finalization.
+
+Restricted `async def`/`async with`/`await` syntax also passed 3/3 without
+repairs. It currently marks blocking attempt effects and did not improve on the
+synchronous scoped form, so it remains experimental rather than a general
+async runtime. See
+[Scoped Attempt Resources Experiment](STONE_SCOPED_ATTEMPT_RESOURCES_EXPERIMENT.md)
+and [Async Attempt Control Experiment](STONE_ASYNC_ATTEMPT_CONTROL_EXPERIMENT.md).

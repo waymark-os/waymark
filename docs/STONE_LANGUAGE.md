@@ -192,6 +192,63 @@ the control value to a record. Their compact runtime tags are also a stable
 input to future whole-function analysis and JIT specialization; Stone does not
 yet claim static inference across arbitrary assignments.
 
+Nominal attempt resources support lexical ownership:
+
+```python
+scope = attempt_scope(join_timeout_ms=30000)
+with scope:
+    with semantic_frontier(checkpoint) as frontier:
+        child = scope.branch(frontier, entrypoint="worker", start=True)
+        outcome = child.wait(timeout_ms=30000)
+        child.discard(reason="candidate rejected")
+```
+
+Leaving an `attempt_scope` performs checked cancel-then-join cleanup. Leaving a
+`semantic_frontier` releases its checkpoint authority. Both happen on normal
+fallthrough, `return`, or an error; if the body and cleanup both fail, the body
+error remains primary and cleanup is attached as related evidence. Explicit
+close/release remains idempotent. Values introduced inside the lexical block
+follow Python's block rule: `with` does not create a name scope. The target and
+body assignments remain visible after exit, but owned resources are already
+closed or released. A file target likewise remains bound as a closed file.
+This separates value visibility from resource authority.
+
+Nominal methods are intentionally thin spellings of the functional kernel:
+`scope.branch` -> `attempt_branch`, `scope.wait_any`/`wait_all` -> the Gateway
+wait-set operations, `child.wait` -> `attempt_join`, `child.inspect` ->
+`attempt_inspect`, `root.accept` -> `attempt_accept`, `child.discard` ->
+`attempt_discard`, and `frontier.release` -> `semantic_frontier_release`.
+Ordinary records do not gain these lifecycle methods. An initial frozen pilot
+failed because Stone hid nominal bindings after `with`, unlike Python. After
+making block visibility Python-compatible, scoped methods passed 3/3 first
+responses with no repairs and were slightly smaller than the typed-functional
+baseline. They are therefore the preferred ownership spelling when the
+lifetime is naturally block-shaped; the functional forms remain the explicit
+kernel surface.
+
+Stone also accepts a narrow async attempt-control form:
+
+```python
+async def explore(frontier):
+    async with attempt_scope(join_timeout_ms=30000) as scope:
+        child = scope.branch(frontier, entrypoint="worker", start=True)
+        outcome = await child.wait(timeout_ms=30000)
+    return {"outcome": outcome, "clean": scope.closed}
+```
+
+`await` is currently admitted only for an attempt handle, child/scope wait
+methods, root acceptance, and their functional `attempt_*` forms. `async with`
+is limited to attempt scopes and semantic frontiers. The interpreter lowers
+these effect boundaries onto the existing blocking Gateway operations; child
+attempts still execute concurrently, but Stone does not yet expose general
+coroutine values or a local async scheduler. Diagnostics report this as
+`lowering="blocking_attempt_effects"`.
+
+In a frozen three-pair authorship comparison, async passed 3/3 first responses
+with no repairs, but did not beat corrected synchronous scoped syntax: both
+averaged 27 lines, while async was about 2% larger. Keep async as an explicit
+effect-oriented option, not as evidence that Stone needs general-purpose async.
+
 Default expressions are evaluated when a call omits that argument. Mutable
 default literals such as `[]` and `{}` are rejected to avoid shared mutable
 state surprises. Calls to user-defined functions, stored named functions, and
@@ -428,6 +485,13 @@ Supported handlers are `except:`, `except Exception:`, and
   remains available after `attempt_accept` or `attempt_discard`: archives
   persist while the child controller, operations, runs, and transaction are
   reclaimed.
+- `with attempt_scope(...)` and `with semantic_frontier(...)` provide lexical
+  cleanup for attempt trees and reusable checkpoints. Their nominal methods
+  are described above and exercised by
+  [`scoped_attempt_resources_canary.stone`](../examples/scripts/scoped_attempt_resources_canary.stone).
+- `async def`, `async with`, and restricted `await` make attempt wait and
+  acceptance boundaries explicit without introducing general coroutines. See
+  [`async_attempt_resources_canary.stone`](../examples/scripts/async_attempt_resources_canary.stone).
 - `task_spec()`: read the attached attempt's admitted objective, named inputs
   and outputs, success criteria, constraints, and metadata as a structured
   record. This is a read-only view, not a rendered prompt.

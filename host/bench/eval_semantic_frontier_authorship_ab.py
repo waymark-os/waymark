@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare raw fork/repair ABI with Stone's typed semantic-frontier interface."""
+"""Compare raw, typed-functional, scoped, and async Stone attempt resources."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ import eval_stone_stage_syntax_ab as stage_ab
 
 ROOT = Path(__file__).resolve().parents[2]
 SANDBOX = ROOT.parent
-ARMS = ("raw", "typed")
+ARMS = ("raw", "typed", "scoped", "async")
 DISPATCHER = r'''
 control = attempt_info()
 entrypoint = get(control.metadata, "program_entrypoint", "main")
@@ -85,6 +85,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--scoped-reference",
+        type=Path,
+        default=(
+            ROOT
+            / "examples/references/semantic_frontier_authorship_scoped_reference.stone"
+        ),
+    )
+    parser.add_argument(
+        "--async-reference",
+        type=Path,
+        default=(
+            ROOT
+            / "examples/references/semantic_frontier_authorship_async_reference.stone"
+        ),
+    )
+    parser.add_argument(
         "--run-root",
         type=Path,
         default=ROOT / "target/runs/semantic-frontier-authorship-ab-v1",
@@ -120,9 +136,9 @@ Stone is Python-shaped. The evaluator supplies:
   {checkpoint: one full repairable workflow checkpoint record}.
 - fixture_finalize(interface, parent_source, retained_source, parent_outcome,
   repaired_outcome, parent_child, owner, repaired, cleanup) -> final verified
-  result. For the raw arm, sources are checkpoint records. For the typed arm,
-  sources are semantic_frontier values. parent_child, owner, and repaired must
-  remain attempt_handle values; attempt_accept(...) returns a distinct
+  result. For the raw arm, sources are checkpoint records. For the typed,
+  scoped, and async arms, sources are semantic_frontier values. parent_child, owner, and
+  repaired must remain attempt_handle values; acceptance returns a distinct
   attempt_acceptance transition result.
 
 main must:
@@ -140,13 +156,15 @@ main must:
 5. Branch from that retained checkpoint to worker with
    {label:"retained-branch", path:"owner.txt", expected:"owner"}, join it, and
    require joined and succeeded.
-6. Accept the repaired child into the root, close the scope, and return
+6. Accept the repaired child into the root, resolve the scope as required by
+   the experiment arm, and return
    fixture_finalize(...) with every argument in its documented order.
 
 All three started children must use program=current_program(), the named
-entrypoint, start=True, and scope=scope. Pass scope only while creating the
-child, never to attempt_join. Infrastructure failure must call fail with a
-short code. Do not create workflows/checkpoints, call the preparation twice,
+entrypoint, and start=True. Every child must be registered with scope: raw and
+typed calls pass scope=scope, while scoped and async calls use scope.branch(...). Never
+pass scope to a child wait. Infrastructure failure must call fail with a short
+code. Do not create workflows/checkpoints, call the preparation twice,
 parallelize, retry, or hide lifecycle in another function.
 """
 
@@ -163,6 +181,43 @@ def arm_prompt(arm: str, help_topics: dict[str, dict[str, Any]]) -> str:
 Do not call attempt_fork, attempt_spawn, or construct workspace_source records.
 Pass "typed" as fixture_finalize's interface argument."""
         help_names = ("semantic_frontier", "attempt_branch")
+    elif arm == "scoped":
+        interface = """Use only lexical ownership and nominal resource methods.
+
+- Enclose the complete lifecycle in `with scope:`.
+- Enclose parent work in `with semantic_frontier(checkpoint) as parent_source:`.
+- Inside it, create the retained frontier with
+  `with semantic_frontier(repair_checkpoint, owner=owner) as retained_source:`.
+- Create children with `scope.branch(frontier, ...)` and do not pass scope=.
+- Use child.wait(...), child.discard(...), and root.accept(child).
+- Do not call attempt_branch, attempt_join, attempt_discard, attempt_accept,
+  attempt_scope_close, or semantic_frontier_release.
+- Because cleanup occurs while returning from `with`, pass {"clean":True} as
+  fixture_finalize's cleanup argument and pass "typed" as its interface.
+
+Keep parent_child and owner inside the parent-frontier block, nest the retained
+block inside it, assign fixture_finalize(...) to ordinary `result`, and return
+result only after both frontier blocks and the scope have exited."""
+        help_names = ("semantic_frontier", "attempt_scope")
+    elif arm == "async":
+        interface = """Use only narrow async attempt control and nominal resource methods.
+
+- Define `async def main(input)`.
+- Own resources with `async with attempt_scope(...) as scope:` and sequential
+  `async with semantic_frontier(...) as ...:` blocks.
+- Create children with `scope.branch(frontier, ...)` and do not pass scope=.
+- Await each `child.wait(timeout_ms=30000)` and `root.accept(repaired)`.
+- Use synchronous child.discard(...) after checking the parent result.
+- Do not call attempt_branch, attempt_join, attempt_discard, attempt_accept,
+  attempt_scope_close, or semantic_frontier_release.
+- Stone follows Python block visibility: names bound in async-with bodies remain
+  visible after exit, while their resources are closed/released. Call
+  fixture_finalize only after the scope exits, pass {"clean":scope.closed},
+  and pass "typed" as its interface.
+
+Use the parent frontier for both parent_child and owner. Exit it before opening
+the retained frontier created from repair_checkpoint and owner."""
+        help_names = ("semantic_frontier", "attempt_scope")
     elif arm == "raw":
         interface = """Use only the raw kernel-shaped interface.
 
@@ -211,8 +266,9 @@ def source_features(source: str) -> dict[str, Any]:
     checkpoint_declarations = count(r"""checkpoint\s*=\s*["']""")
     prepare_calls = source.count("fixture_prepare_checkpoint(")
     return {
-        "main_defs": count(r"(?m)^def\s+main\s*\("),
-        "all_defs": count(r"(?m)^def\s+"),
+        "main_defs": count(r"(?m)^(?:async\s+)?def\s+main\s*\("),
+        "async_main_defs": count(r"(?m)^async\s+def\s+main\s*\("),
+        "all_defs": count(r"(?m)^(?:async\s+)?def\s+"),
         "fixture_prepare_calls": prepare_calls,
         "redundant_seal_requests": max(0, prepare_calls - 1) + checkpoint_declarations,
         "checkpoint_declarations": checkpoint_declarations,
@@ -230,6 +286,14 @@ def source_features(source: str) -> dict[str, Any]:
         "attempt_finish": source.count("attempt_finish("),
         "attempt_info": source.count("attempt_info("),
         "attempt_scope_close": source.count("attempt_scope_close("),
+        "method_branch": count(r"\.branch\s*\("),
+        "method_wait": count(r"\.wait\s*\("),
+        "method_accept": count(r"\.accept\s*\("),
+        "method_discard": count(r"\.discard\s*\("),
+        "method_release": count(r"\.release\s*\("),
+        "with_statements": count(r"(?m)^\s*with\s+"),
+        "async_with_statements": count(r"(?m)^\s*async\s+with\s+"),
+        "awaits": count(r"\bawait\s+"),
         "fixture_finalize": source.count("fixture_finalize("),
         "current_program": source.count("current_program()"),
         "top_level_emit": bool(re.search(r"(?m)^emit\s*\(", source)),
@@ -250,17 +314,22 @@ def structural_gate(arm: str, features: dict[str, Any]) -> tuple[bool, list[str]
         violations.append("source emitted top-level code")
     for field, expected in (
         ("attempt_scope", 1),
-        ("attempt_join", 3),
-        ("attempt_accept", 1),
-        ("attempt_discard", 1),
         ("attempt_finish", 1),
         ("attempt_info", 1),
-        ("attempt_scope_close", 1),
         ("fixture_finalize", 1),
         ("current_program", 3),
     ):
         if features[field] != expected:
             violations.append(f"{field} count={features[field]}, expected {expected}")
+    if arm in ("raw", "typed"):
+        for field, expected in (
+            ("attempt_join", 3),
+            ("attempt_accept", 1),
+            ("attempt_discard", 1),
+            ("attempt_scope_close", 1),
+        ):
+            if features[field] != expected:
+                violations.append(f"{field} count={features[field]}, expected {expected}")
     if arm == "typed":
         for field, expected in (("semantic_frontier", 2), ("attempt_branch", 3)):
             if features[field] != expected:
@@ -268,7 +337,7 @@ def structural_gate(arm: str, features: dict[str, Any]) -> tuple[bool, list[str]
         for field in ("attempt_fork", "attempt_spawn", "workspace_source"):
             if features[field] != 0:
                 violations.append(f"typed arm used raw {field}")
-    else:
+    elif arm == "raw":
         for field, expected in (
             ("attempt_fork", 2),
             ("attempt_spawn", 1),
@@ -280,6 +349,66 @@ def structural_gate(arm: str, features: dict[str, Any]) -> tuple[bool, list[str]
         for field in ("semantic_frontier", "attempt_branch"):
             if features[field] != 0:
                 violations.append(f"raw arm used typed {field}")
+    elif arm == "scoped":
+        for field, expected in (
+            ("semantic_frontier", 2),
+            ("method_branch", 3),
+            ("method_wait", 3),
+            ("method_accept", 1),
+            ("method_discard", 1),
+            ("with_statements", 3),
+        ):
+            if features[field] != expected:
+                violations.append(
+                    f"scoped arm {field} count={features[field]}, expected {expected}"
+                )
+        for field in (
+            "attempt_branch",
+            "attempt_fork",
+            "attempt_spawn",
+            "attempt_join",
+            "attempt_accept",
+            "attempt_discard",
+            "attempt_scope_close",
+            "method_release",
+            "workspace_source",
+        ):
+            if features[field] != 0:
+                violations.append(f"scoped arm used explicit lifecycle {field}")
+        if features["async_main_defs"] != 0 or features["async_with_statements"] != 0:
+            violations.append("scoped arm unexpectedly used async syntax")
+    elif arm == "async":
+        for field, expected in (
+            ("semantic_frontier", 2),
+            ("method_branch", 3),
+            ("method_wait", 3),
+            ("method_accept", 1),
+            ("method_discard", 1),
+            ("async_main_defs", 1),
+            ("async_with_statements", 3),
+            ("awaits", 4),
+        ):
+            if features[field] != expected:
+                violations.append(
+                    f"async arm {field} count={features[field]}, expected {expected}"
+                )
+        if features["with_statements"] != 0:
+            violations.append("async arm used synchronous with")
+        for field in (
+            "attempt_branch",
+            "attempt_fork",
+            "attempt_spawn",
+            "attempt_join",
+            "attempt_accept",
+            "attempt_discard",
+            "attempt_scope_close",
+            "method_release",
+            "workspace_source",
+        ):
+            if features[field] != 0:
+                violations.append(f"async arm used explicit lifecycle {field}")
+    else:
+        violations.append(f"unknown arm {arm}")
     return not violations, violations
 
 
@@ -311,7 +440,7 @@ def execute_source(
         "--source",
         str(full_path),
         "--expected-interface",
-        arm,
+        "typed" if arm in ("scoped", "async") else arm,
         "--timeout",
         str(args.execution_timeout),
     ]
@@ -339,10 +468,20 @@ def execute_source(
         payload = json.loads(completed.stdout)
     except json.JSONDecodeError:
         pass
-    return {
-        "ok": completed.returncode == 0
+    ok = (
+        completed.returncode == 0
         and isinstance(payload, dict)
-        and payload.get("ok"),
+        and payload.get("ok") is True
+    )
+    if ok and arm == "async":
+        async_diagnostics = (payload.get("frontiers") or {}).get("async") or {}
+        ok = (
+            async_diagnostics.get("lowering") == "blocking_attempt_effects"
+            and async_diagnostics.get("functions_entered") == 1
+            and async_diagnostics.get("awaits") == 4
+        )
+    return {
+        "ok": ok,
         "exit_code": completed.returncode,
         "timed_out": timed_out,
         "duration_seconds": duration,
@@ -497,6 +636,8 @@ def main() -> int:
         "fixture",
         "raw_reference",
         "typed_reference",
+        "scoped_reference",
+        "async_reference",
     ):
         path = getattr(args, field).resolve()
         setattr(args, field, path)
@@ -515,6 +656,8 @@ def main() -> int:
         references = {
             "raw": args.raw_reference,
             "typed": args.typed_reference,
+            "scoped": args.scoped_reference,
+            "async": args.async_reference,
         }
         results = {}
         for arm, path in references.items():
@@ -594,6 +737,8 @@ def main() -> int:
     arms = {arm: summarize_arm(results[arm]) for arm in ARMS}
     raw = arms["raw"]
     typed = arms["typed"]
+    scoped = arms["scoped"]
+    async_arm = arms["async"]
     complete = all(
         cell.get("codex_exit_code") == 0
         and cell.get("output_error") is None
@@ -615,8 +760,30 @@ def main() -> int:
         and raw["mean_source_bytes"] is not None
         and typed["mean_source_bytes"] <= raw["mean_source_bytes"] * 0.85
     )
+    scoped_success_noninferior = (
+        scoped["eventual_passes"] >= typed["eventual_passes"]
+        and scoped["first_response_passes"] >= typed["first_response_passes"]
+    )
+    scoped_repair_noninferior = (
+        scoped["repair_attempts"] <= typed["repair_attempts"]
+    )
+    scoped_size_noninferior = (
+        scoped["mean_source_bytes"] is not None
+        and typed["mean_source_bytes"] is not None
+        and scoped["mean_source_bytes"] <= typed["mean_source_bytes"]
+    )
+    async_success_noninferior = (
+        async_arm["eventual_passes"] >= typed["eventual_passes"]
+        and async_arm["first_response_passes"] >= typed["first_response_passes"]
+    )
+    async_repair_noninferior = async_arm["repair_attempts"] <= typed["repair_attempts"]
+    async_size_noninferior = (
+        async_arm["mean_source_bytes"] is not None
+        and typed["mean_source_bytes"] is not None
+        and async_arm["mean_source_bytes"] <= typed["mean_source_bytes"]
+    )
     aggregate = {
-        "schema": "waymark.semantic-frontier-authorship-ab.v1",
+        "schema": "waymark.semantic-frontier-authorship-ab.v3",
         "complete": complete,
         "model": args.model,
         "reasoning_effort": args.reasoning_effort,
@@ -627,6 +794,48 @@ def main() -> int:
         "repair_noninferior": repair_noninferior,
         "redundant_seals_noninferior": seal_noninferior,
         "source_reduction_at_least_15_percent": source_reduction,
+        "scoped_vs_typed": {
+            "first_response_pass_delta": (
+                scoped["first_response_passes"] - typed["first_response_passes"]
+            ),
+            "eventual_pass_delta": scoped["eventual_passes"]
+            - typed["eventual_passes"],
+            "repair_attempt_delta": scoped["repair_attempts"]
+            - typed["repair_attempts"],
+            "mean_source_byte_ratio": (
+                scoped["mean_source_bytes"] / typed["mean_source_bytes"]
+                if scoped["mean_source_bytes"] is not None
+                and typed["mean_source_bytes"] is not None
+                else None
+            ),
+        },
+        "scoped_hypothesis_supported": (
+            complete
+            and scoped_success_noninferior
+            and scoped_repair_noninferior
+            and scoped_size_noninferior
+        ),
+        "async_vs_typed": {
+            "first_response_pass_delta": (
+                async_arm["first_response_passes"] - typed["first_response_passes"]
+            ),
+            "eventual_pass_delta": async_arm["eventual_passes"]
+            - typed["eventual_passes"],
+            "repair_attempt_delta": async_arm["repair_attempts"]
+            - typed["repair_attempts"],
+            "mean_source_byte_ratio": (
+                async_arm["mean_source_bytes"] / typed["mean_source_bytes"]
+                if async_arm["mean_source_bytes"] is not None
+                and typed["mean_source_bytes"] is not None
+                else None
+            ),
+        },
+        "async_hypothesis_supported": (
+            complete
+            and async_success_noninferior
+            and async_repair_noninferior
+            and async_size_noninferior
+        ),
         "hypothesis_supported": (
             complete
             and success_noninferior

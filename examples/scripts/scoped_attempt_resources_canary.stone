@@ -1,0 +1,111 @@
+# Prove lexical ownership and nominal methods over real Gateway resources.
+
+
+def root_ready(step):
+    return workflow_evidence(
+        run(["test", "-s", "root.txt"]).ok,
+        "scoped frontier is ready",
+        ["canary:scoped-root"],
+    )
+
+
+def prepare_root(step):
+    write_file("root.txt", "root\n")
+    return {"ok": True}
+
+
+def worker(input):
+    inherited = read_text("root.txt").strip()
+    if inherited != "root":
+        fail(
+            "scoped branch did not restore its frontier",
+            code="scoped_frontier_restore_failed",
+            detail={"actual": inherited},
+        )
+    return {"inherited": inherited, "label": input.label}
+
+
+def main(input):
+    stage = workflow_stage(
+        "prepare-root",
+        evidence=root_ready,
+        action=prepare_root,
+        checkpoint="forkable",
+    )
+    report = workflow_run(workflow("scoped-attempt-resources", stage))
+    if not report.ok or report.stages[0].checkpoint.status != "created":
+        fail(
+            "failed to seal scoped frontier",
+            code="scoped_frontier_checkpoint_failed",
+            detail=report,
+        )
+
+    scope = attempt_scope(join_timeout_ms=30000)
+    frontier = semantic_frontier(report.stages[0].checkpoint)
+    child_id = ""
+    child_result = None
+    child_resource_state = ""
+    with scope:
+        with frontier:
+            child = scope.branch(
+                frontier,
+                input={"label": "scoped-child"},
+                program=current_program(),
+                entrypoint="worker",
+                start=True,
+            )
+            child_id = child.attempt
+            outcome = child.wait(timeout_ms=30000)
+            if (
+                not outcome.joined
+                or outcome.result.status != "succeeded"
+                or outcome.result.value.inherited != "root"
+            ):
+                fail(
+                    "scoped child failed",
+                    code="scoped_child_failed",
+                    detail=outcome,
+                )
+            child_result = outcome.result.value
+            child.discard(reason="scoped resource canary complete")
+            inspection = child.inspect()
+            if not inspection.resources_reclaimed:
+                fail(
+                    "child resources were not reclaimed",
+                    code="scoped_child_resources_live",
+                    detail=inspection,
+                )
+            child_resource_state = inspection.resource_state
+
+        if frontier.status != "released":
+            fail(
+                "frontier remained live after its lexical scope",
+                code="scoped_frontier_release_failed",
+            )
+
+    if not scope.closed:
+        fail(
+            "attempt scope remained live after its lexical scope",
+            code="scoped_attempt_scope_close_failed",
+        )
+    return {
+        "frontier_status": frontier.status,
+        "scope_closed": scope.closed,
+        "child": child_id,
+        "child_result": child_result,
+        "child_resource_state": child_resource_state,
+    }
+
+
+control = attempt_info()
+entrypoint = get(control.metadata, "program_entrypoint", "main")
+if entrypoint == "worker":
+    result = worker(task_input())
+else:
+    result = main(task_input())
+attempt_report(
+    status="succeeded",
+    result=result,
+    metadata={"control": "scoped_attempt_resources_canary_v1"},
+)
+emit(result)
