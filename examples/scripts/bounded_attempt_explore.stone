@@ -24,6 +24,22 @@
 #       timeout_ms=60000,
 #       context_prompt_view=None,
 #   )
+#
+#   explore_frontier(
+#       frontier=...,
+#       candidates=[...],
+#       worker_entrypoint=...,
+#       evaluate=...,
+#       propose=None,
+#       max_candidates=4,
+#       timeout_ms=60000,
+#       context_prompt_view=None,
+#   )
+#
+# explore(checkpoint=...) is the compatibility entrypoint for a raw
+# parent-owned checkpoint reference. New control should prefer
+# explore_frontier(semantic_frontier(...)); it works for both parent-owned and
+# retained repair frontiers.
 
 
 def candidate(name, input, assumptions, ensures):
@@ -136,11 +152,64 @@ def explore(
     timeout_ms=60000,
     context_prompt_view=None,
 ):
+    return explore_control(
+        frontier=None,
+        checkpoint=checkpoint,
+        candidates=candidates,
+        worker_entrypoint=worker_entrypoint,
+        evaluate=evaluate,
+        propose=propose,
+        max_candidates=max_candidates,
+        timeout_ms=timeout_ms,
+        context_prompt_view=context_prompt_view,
+    )
+
+
+def explore_frontier(
+    frontier: semantic_frontier,
+    candidates,
+    worker_entrypoint,
+    evaluate,
+    propose=None,
+    max_candidates=4,
+    timeout_ms=60000,
+    context_prompt_view=None,
+):
+    return explore_control(
+        frontier=frontier,
+        checkpoint=None,
+        candidates=candidates,
+        worker_entrypoint=worker_entrypoint,
+        evaluate=evaluate,
+        propose=propose,
+        max_candidates=max_candidates,
+        timeout_ms=timeout_ms,
+        context_prompt_view=context_prompt_view,
+    )
+
+
+def explore_control(
+    frontier,
+    checkpoint,
+    candidates,
+    worker_entrypoint,
+    evaluate,
+    propose,
+    max_candidates,
+    timeout_ms,
+    context_prompt_view,
+):
     names = explore_validate_candidates(candidates)
-    if checkpoint == "":
+    if frontier is None and (checkpoint is None or checkpoint == ""):
         fail(
-            "explore requires a semantic checkpoint",
+            "explore requires a checkpoint or semantic frontier",
             code="explore_checkpoint_missing",
+        )
+    if frontier is not None and type(frontier) != "semantic_frontier":
+        fail(
+            "explore_frontier requires semantic_frontier",
+            code="explore_frontier_invalid",
+            detail={"type": type(frontier)},
         )
     if worker_entrypoint == "":
         fail(
@@ -194,25 +263,46 @@ def explore(
             "proposal": proposal,
             "ordinal": index,
         }
-        if context_prompt_view is None:
-            child = attempt_fork(
-                checkpoint=checkpoint,
-                program=current_program(),
-                entrypoint=worker_entrypoint,
-                input=child_input,
-                start=True,
-                scope=scope,
-            )
+        if frontier is not None:
+            if context_prompt_view is None:
+                child = attempt_branch(
+                    frontier,
+                    program=current_program(),
+                    entrypoint=worker_entrypoint,
+                    input=child_input,
+                    start=True,
+                    scope=scope,
+                )
+            else:
+                child = attempt_branch(
+                    frontier,
+                    program=current_program(),
+                    entrypoint=worker_entrypoint,
+                    input=child_input,
+                    context_prompt_view=context_prompt_view,
+                    start=True,
+                    scope=scope,
+                )
         else:
-            child = attempt_fork(
-                checkpoint=checkpoint,
-                program=current_program(),
-                entrypoint=worker_entrypoint,
-                input=child_input,
-                context_prompt_view=context_prompt_view,
-                start=True,
-                scope=scope,
-            )
+            if context_prompt_view is None:
+                child = attempt_fork(
+                    checkpoint=checkpoint,
+                    program=current_program(),
+                    entrypoint=worker_entrypoint,
+                    input=child_input,
+                    start=True,
+                    scope=scope,
+                )
+            else:
+                child = attempt_fork(
+                    checkpoint=checkpoint,
+                    program=current_program(),
+                    entrypoint=worker_entrypoint,
+                    input=child_input,
+                    context_prompt_view=context_prompt_view,
+                    start=True,
+                    scope=scope,
+                )
         outcome = attempt_join(child, timeout_ms=timeout_ms)
         if not outcome.joined or outcome.result.status != "succeeded":
             fail(
@@ -249,9 +339,22 @@ def explore(
                 "ok": True,
                 "status": "accepted",
                 "checkpoint": checkpoint,
+                "source": (
+                    {
+                        "type": type(frontier),
+                        "availability": frontier.availability,
+                        "policy": frontier.policy,
+                        "cost": frontier.cost,
+                    }
+                    if frontier is not None
+                    else {
+                        "type": "checkpoint_reference",
+                        "availability": "parent",
+                    }
+                ),
                 "proposal": proposal,
                 "winner": item,
-                "accepted_attempt": accepted.child.attempt,
+                "accepted_attempt": accepted.attempt,
                 "outcomes": outcomes,
                 "tried": len(outcomes),
                 "clean": cleanup.clean,
@@ -281,6 +384,19 @@ def explore(
         "ok": False,
         "status": "exhausted",
         "checkpoint": checkpoint,
+        "source": (
+            {
+                "type": type(frontier),
+                "availability": frontier.availability,
+                "policy": frontier.policy,
+                "cost": frontier.cost,
+            }
+            if frontier is not None
+            else {
+                "type": "checkpoint_reference",
+                "availability": "parent",
+            }
+        ),
         "proposal": proposal,
         "winner": None,
         "accepted_attempt": None,

@@ -1,30 +1,38 @@
-# Cheap task specialization for bounded_attempt_explore.stone.
-#
-# The parent prepares an uncommitted problem and requirement, seals that state
-# as a semantic frontier, then proposes the known-wrong lexical candidate.
-# explore_frontier() rejects it by fresh evidence and restores the same
-# frontier for the winning candidate.
+# Task-shaped specialization proving the visible exploration library can reuse
+# a repair frontier retained from a failed child. The library rejects the
+# proposed lexical candidate, restores the same retained frontier, and accepts
+# the fallback without replaying owner setup.
 
 
-def prepare_ready(step):
+def owner_ready(step):
     probe = run(["test", "-s", "problem.txt"])
     return workflow_evidence(
         probe.ok,
-        "problem input is ready" if probe.ok else "problem input is absent",
-        ["canary:problem-ready"] if probe.ok else [],
+        "owner problem is ready" if probe.ok else "owner problem is absent",
+        ["retained-canary:problem-ready"] if probe.ok else [],
     )
 
 
-def prepare_frontier(step):
+def prepare_owner(step):
     write_file("problem.txt", "stressed\n")
-    context_write(
-        "requirement.explore_target",
-        "requirement",
-        {"expected": "desserts"},
-        status="verified",
-        evidence=["canary:parent-frontier"],
-    )
     return {"ok": True}
+
+
+def setup_owner(input):
+    stage = workflow_stage(
+        "prepare-retained-problem",
+        evidence=owner_ready,
+        action=prepare_owner,
+        checkpoint="repairable",
+    )
+    report = workflow_run(workflow("prepare-retained-exploration", stage))
+    if not report.ok or report.stages[0].checkpoint.status != "created":
+        fail(
+            "failed to prepare retained exploration frontier",
+            code="retained_explore_prepare_failed",
+            detail=report,
+        )
+    return {"checkpoint": report.stages[0].checkpoint}
 
 
 def propose_lexical_first(candidates):
@@ -52,8 +60,8 @@ def worker(input):
         or view.required_keys != ["requirement.explore_target"]
     ):
         fail(
-            "candidate did not receive the bounded context projection",
-            code="explore_canary_context_projection_missing",
+            "retained candidate did not receive the bounded context projection",
+            code="retained_explore_context_projection_missing",
             detail=view,
         )
     requirement = context_read(
@@ -62,8 +70,8 @@ def worker(input):
     )
     if len(requirement) != 1:
         fail(
-            "candidate did not inherit checkpoint memory",
-            code="explore_canary_memory_missing",
+            "candidate did not inherit retained memory",
+            code="retained_explore_memory_missing",
         )
     problem = read_text("problem.txt").strip()
     answer = item.input.answer
@@ -81,10 +89,7 @@ def worker(input):
         max_stdout_bytes=1024,
         max_stderr_bytes=1024,
     )
-    passed = (
-        answer == requirement[0].content.expected
-        and check.ok
-    )
+    passed = answer == requirement[0].content.expected and check.ok
     context_write(
         "candidate.explore_result",
         "candidate",
@@ -94,7 +99,7 @@ def worker(input):
             "passed": passed,
         },
         status="verified" if passed else "contradicted",
-        evidence=["canary:candidate-check"],
+        evidence=["retained-canary:candidate-check"],
     )
     return {
         "candidate": item.name,
@@ -103,7 +108,7 @@ def worker(input):
         "summary": (
             "candidate satisfies independent reversal evidence"
             if passed
-            else "candidate does not reverse the checkpoint problem"
+            else "candidate does not reverse the retained problem"
         ),
         "evidence": ["canary:reversal"] if passed else [],
         "problem": problem,
@@ -113,21 +118,36 @@ def worker(input):
 
 
 def main(input):
-    prepare = workflow_stage(
-        "prepare",
-        evidence=prepare_ready,
-        action=prepare_frontier,
-        checkpoint="forkable",
+    context_write(
+        "requirement.explore_target",
+        "requirement",
+        {"expected": "desserts"},
+        status="verified",
+        evidence=["retained-canary:root-requirement"],
     )
-    prepared = workflow_run(workflow("prepare-exploration", prepare))
-    if not prepared.ok:
+    owner_scope = attempt_scope(join_timeout_ms=60000)
+    owner = attempt_fork(
+        input={},
+        program=current_program(),
+        entrypoint="setup_owner",
+        start=True,
+        scope=owner_scope,
+    )
+    owner_outcome = attempt_join(owner, timeout_ms=60000)
+    if not owner_outcome.succeeded:
         fail(
-            "failed to prepare exploration frontier",
-            code="explore_canary_prepare_failed",
-            detail=prepared,
+            "repair-frontier owner did not complete setup",
+            code="retained_explore_owner_failed",
+            detail=owner_outcome,
         )
-    checkpoint = prepared.stages[0].checkpoint
-    frontier = semantic_frontier(checkpoint)
+    checkpoint = owner_outcome.result.value.checkpoint
+    attempt_finish(
+        "fail",
+        attempt=owner,
+        reason="injected late failure after retained frontier",
+    )
+
+    frontier = semantic_frontier(checkpoint, owner=owner)
     result = explore_frontier(
         frontier=frontier,
         candidates=[
@@ -135,13 +155,13 @@ def main(input):
                 name="deserts",
                 input={"answer": "deserts"},
                 assumptions=["one-letter lexical edit may be sufficient"],
-                ensures=["answer reverses the checkpoint problem"],
+                ensures=["answer reverses the retained problem"],
             ),
             candidate(
                 name="desserts",
                 input={"answer": "desserts"},
                 assumptions=["double-s spelling may be required"],
-                ensures=["answer reverses the checkpoint problem"],
+                ensures=["answer reverses the retained problem"],
             ),
         ],
         worker_entrypoint="worker",
@@ -153,30 +173,48 @@ def main(input):
             "required_keys": ["requirement.explore_target"],
         },
     )
+    owner_cleanup = attempt_scope_close(
+        owner_scope,
+        reason="retained exploration owner consumed",
+    )
+    if not owner_cleanup.clean:
+        fail(
+            "retained owner scope did not close cleanly",
+            code="retained_explore_owner_cleanup_failed",
+            detail=owner_cleanup,
+        )
     if (
         not result.ok
+        or result.source.type != "semantic_frontier"
+        or result.source.availability != "retained"
         or result.tried != 2
         or result.outcomes[0].status != "rejected"
-        or result.outcomes[0].candidate != "deserts"
         or result.outcomes[1].status != "accepted"
-        or result.outcomes[1].candidate != "desserts"
     ):
         fail(
-            "bounded exploration did not reject then recover",
-            code="explore_canary_search_failed",
+            "retained bounded exploration did not reject then recover",
+            code="retained_explore_search_failed",
             detail=result,
+        )
+
+    owner_inspection = attempt_inspect(owner)
+    if not owner_inspection.resources_reclaimed:
+        fail(
+            "retained owner resources were not reclaimed",
+            code="retained_explore_owner_resources_live",
+            detail=owner_inspection,
         )
     answer = read_text("answer.txt").strip()
     parent_keys = map(lambda item: item.key, context_read(limit=8))
     if answer != "desserts":
         fail(
-            "accepted candidate workspace was not imported",
-            code="explore_canary_accept_failed",
+            "accepted retained candidate was not imported",
+            code="retained_explore_accept_failed",
         )
     if parent_keys != ["requirement.explore_target"]:
         fail(
-            "candidate memory leaked into the parent",
-            code="explore_canary_memory_leak",
+            "retained candidate memory leaked into parent",
+            code="retained_explore_memory_leak",
             detail=parent_keys,
         )
     return {
@@ -188,8 +226,9 @@ def main(input):
         "outcomes": result.outcomes,
         "accepted_attempt": result.accepted_attempt,
         "tried": result.tried,
-        "clean": result.clean,
+        "clean": result.clean and owner_cleanup.clean,
         "parent_keys": parent_keys,
+        "owner_resource_state": owner_inspection.resource_state,
     }
 
 
@@ -197,11 +236,13 @@ control = attempt_info()
 entrypoint = get(control.metadata, "program_entrypoint", "main")
 if entrypoint == "worker":
     result = worker(task_input())
+elif entrypoint == "setup_owner":
+    result = setup_owner(task_input())
 else:
     result = main(task_input())
 attempt_report(
     status="succeeded",
     result=result,
-    metadata={"control": "bounded_attempt_explore_canary_v1"},
+    metadata={"control": "bounded_explore_retained_canary_v1"},
 )
 emit(result)

@@ -171,6 +171,7 @@ pub(crate) struct AttemptSpawnV1 {
     pub workspace_source: Option<WorkspaceSource>,
     pub context_source: Option<ContextSource>,
     pub capabilities: Option<CapabilityRequest>,
+    pub context_prompt_required_keys: Option<Vec<String>>,
     pub task_input_json: String,
     pub start: bool,
 }
@@ -226,6 +227,10 @@ pub(crate) fn attempt_spawn(
             capabilities: spawn_v1.capabilities.clone(),
             start: spawn_v1.start,
             task_input_json: spawn_v1.task_input_json.clone(),
+            context_prompt_view: spawn_v1
+                .context_prompt_required_keys
+                .clone()
+                .map(|required_keys| AttemptContextPromptView { required_keys }),
         })
     })?;
     attempt_record_value(attempt, Span::unknown())

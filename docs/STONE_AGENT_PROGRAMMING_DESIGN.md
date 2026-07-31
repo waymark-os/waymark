@@ -904,8 +904,9 @@ The first interface is now the inspectable
 control library. Its current ordinary-source shape is:
 
 ```stone
-result = explore(
-    checkpoint=build_checkpoint,
+frontier = semantic_frontier(build_checkpoint)
+result = explore_frontier(
+    frontier=frontier,
     candidates=[
         candidate(
             name="path_guard",
@@ -924,6 +925,9 @@ result = explore(
     evaluate=evaluate_candidate,
     propose=propose_candidate,
     max_candidates=2,
+    context_prompt_view={
+        "required_keys": ["requirement.target"],
+    },
 )
 ```
 
@@ -931,11 +935,18 @@ The library implements this semantic contract:
 
 1. validate candidate identity, input, assumptions, and evidence obligations;
 2. let the proposal choose only among admitted candidates;
-3. fork every tried candidate from the same checkpoint in a supervised scope;
+3. branch every tried candidate from the same semantic frontier in a supervised
+   scope, independent of whether the runtime forks a current parent or restores
+   a retained repair checkpoint;
 4. return a bounded rejected-candidate record when evidence is unsatisfied;
 5. eliminate tried candidates and continue within the declared bound;
 6. accept only a candidate satisfying final evidence; and
 7. discard and reap every rejected or unresolved child.
+
+`explore(checkpoint=...)` remains a compatibility entrypoint for a raw
+parent-owned checkpoint. `explore_frontier(...)` is the policy-bearing
+interface: it also preserves the same `context_prompt_view` admission contract
+across both runtime lowerings.
 
 Stone user functions now support keyword arguments so the policy-bearing call
 is self-describing. In a frozen three-pair authorship comparison, the library

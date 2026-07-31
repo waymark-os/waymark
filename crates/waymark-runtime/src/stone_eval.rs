@@ -6541,6 +6541,13 @@ impl Evaluator<'_> {
                             )
                         })?;
                 }
+                "context_prompt_view" => {
+                    spawn_v1.context_prompt_required_keys =
+                        Some(context_prompt_required_keys_from_value(
+                            &value,
+                            "attempt_spawn context_prompt_view",
+                        )?)
+                }
                 "program" => {
                     spawn_v1.program = Some(program_from_value(&value, "attempt_spawn program")?);
                 }
@@ -6893,6 +6900,7 @@ impl Evaluator<'_> {
         let mut workspace_mount = String::new();
         let mut resource_limits = Vec::new();
         let mut metadata = Vec::new();
+        let mut context_prompt_required_keys = None;
         let mut task_input_json = String::new();
         let mut program = None;
         let mut entrypoint = String::new();
@@ -6915,6 +6923,12 @@ impl Evaluator<'_> {
                 }
                 "metadata" | "meta" => {
                     metadata = value_to_string_pairs(&value, "attempt_branch metadata")?
+                }
+                "context_prompt_view" => {
+                    context_prompt_required_keys = Some(context_prompt_required_keys_from_value(
+                        &value,
+                        "attempt_branch context_prompt_view",
+                    )?)
                 }
                 "input" | "task_input" => {
                     task_input_json =
@@ -6957,7 +6971,7 @@ impl Evaluator<'_> {
                 workspace_mount,
                 resource_limits,
                 metadata,
-                None,
+                context_prompt_required_keys,
                 task_input_json,
                 program,
                 start,
@@ -6965,6 +6979,7 @@ impl Evaluator<'_> {
             SemanticFrontierMode::RetainedRepair => {
                 let mut spawn = gateway_env::AttemptSpawnV1 {
                     task_input_json,
+                    context_prompt_required_keys,
                     program,
                     workspace_source: Some(WorkspaceSource {
                         kind: "repair-checkpoint".to_string(),

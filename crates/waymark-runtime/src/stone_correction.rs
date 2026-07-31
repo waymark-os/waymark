@@ -69,6 +69,7 @@ const KEYWORD_SCHEMAS: &[(&str, &[&str])] = &[
             "task",
             "input",
             "task_input",
+            "context_prompt_view",
             "program",
             "entrypoint",
             "start",
@@ -782,6 +783,23 @@ mod tests {
         assert_eq!(
             correction["candidates"][0]["replacement"],
             json!("max_tokens")
+        );
+    }
+
+    #[test]
+    fn attempt_branch_schema_includes_context_prompt_view() {
+        let correction = correction_for_error(
+            &error(
+                "stone_admission_error",
+                "unexpected attempt_branch keyword argument `context_prompt_vew`",
+            ),
+            "attempt_branch(frontier, context_prompt_vew={})",
+        )
+        .expect("correction");
+        assert_eq!(correction["class"], json!("keyword"));
+        assert_eq!(
+            correction["candidates"][0]["replacement"],
+            json!("context_prompt_view")
         );
     }
 

@@ -1157,7 +1157,7 @@ else:
     },
     StoneHelpEntry {
         name: "attempt_spawn",
-        signature: r#"attempt_spawn(task: str = "", workspace: str = "", task_spec: record = {}, task_input: Any = None, program: record = {}, entrypoint: str = "", workspace_source: record = {}, context_source: record = {}, capabilities: record = {}, start: bool = false, scope: attempt_scope? = None, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", parent_attempt: str = "", resource_limits: record = {}, metadata: record = {}) -> attempt_handle"#,
+        signature: r#"attempt_spawn(task: str = "", workspace: str = "", task_spec: record = {}, task_input: Any = None, context_prompt_view: {"required_keys": [str, ...]}? = None, program: record = {}, entrypoint: str = "", workspace_source: record = {}, context_source: record = {}, capabilities: record = {}, start: bool = false, scope: attempt_scope? = None, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", parent_attempt: str = "", resource_limits: record = {}, metadata: record = {}) -> attempt_handle"#,
         use_when: "Use in Gateway mode when a controller needs to create a new top-level task attempt with its own transaction and explicit task/control-flow definition.",
         examples: &[r#"child = attempt_spawn(task_spec={"id": "task-debug", "objective": "write hello.txt"}, workspace_source={"workspace": "repo"}, program={"kind": "stone", "source": "write_file(\"hello.txt\", \"hello\")"})"#],
         avoid: &["Do not spawn attempts for ordinary file edits inside the current attempt; use workspace builtins directly."],
@@ -1275,7 +1275,7 @@ emit(attempt_scope_close(scope).clean)"#],
     },
     StoneHelpEntry {
         name: "attempt_branch",
-        signature: r#"attempt_branch(frontier: semantic_frontier, task: str = "", input: Any = None, program: record? = None, entrypoint: str = "", start: bool = False, scope: attempt_scope? = None, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", resource_limits: record = {}, metadata: record = {}) -> attempt_handle"#,
+        signature: r#"attempt_branch(frontier: semantic_frontier, task: str = "", input: Any = None, context_prompt_view: {"required_keys": [str, ...]}? = None, program: record? = None, entrypoint: str = "", start: bool = False, scope: attempt_scope? = None, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", resource_limits: record = {}, metadata: record = {}) -> attempt_handle"#,
         use_when: "Gateway mode only. Create a child from a semantic frontier without deciding whether the checkpoint is owned by the current parent or retained by a failed owner. The runtime lowers to the authoritative fork or repair-restore operation and preserves the same supervision interface.",
         examples: &[r#"frontier = semantic_frontier(report.stages[0].checkpoint)
 scope = attempt_scope()

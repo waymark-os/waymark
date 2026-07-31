@@ -207,9 +207,13 @@ candidate, assumptions, evidence, or stage-local program.
 The first convenience interface is now the visible ordinary-Stone
 [`bounded_attempt_explore.stone`](../examples/scripts/bounded_attempt_explore.stone)
 library. Its `candidate(...)` records expose identity, assumptions, and ensures.
-Its `explore(...)` control lowers to checkpoint-backed child attempts, evidence
-checks, accept/discard, and scope cleanup. It keeps expected rejection as a
-bounded outcome while controller/infrastructure failure remains exceptional.
+Its compatibility `explore(checkpoint=...)` control accepts a raw parent-owned
+checkpoint. New programs use
+`explore_frontier(frontier=semantic_frontier(...))`, which applies the same
+policy loop to parent-owned and retained repair frontiers. Both lowerings carry
+the same optional bounded context projection, evidence checks, accept/discard,
+and scope cleanup. Expected rejection remains a bounded outcome while
+controller/infrastructure failure remains exceptional.
 
 In a three-pair authorship comparison, the library arm passed 3/3 first
 responses with no repair and averaged 390 authored bytes. Explicit lifecycle
@@ -444,3 +448,10 @@ authoring gap: the same `attempt_branch` call passed for a parent-owned
 checkpoint and a retained failed-owner checkpoint, with authoritative cleanup
 and zero leaked transactions or checkpoints. See
 [Caffe Bounded-Explore Library Experiment](../../waymark-gateway/docs/CAFFE_BOUNDED_EXPLORE_LIBRARY_EXPERIMENT.md).
+
+A later task-shaped canary passed the full visible library through both
+frontier origins. Each path rejected one candidate, reused the same checkpoint,
+accepted the second, and admitted the same required-memory projection to both
+workers. This closes the library-level frontier gap: task policy no longer
+needs to know whether the runtime will fork a current parent or restore a
+retained repair checkpoint.

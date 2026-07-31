@@ -40,6 +40,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=ROOT / "examples/references/bounded_attempt_explore_canary.stone",
     )
+    parser.add_argument(
+        "--expected-origin",
+        choices=("parent", "retained"),
+        default="parent",
+    )
     parser.add_argument("--image", default="python:3.12")
     parser.add_argument("--timeout", type=float, default=180.0)
     return parser.parse_args()
@@ -53,7 +58,10 @@ def composed_source(library: Path, specialization: Path) -> str:
     )
 
 
-def assert_result(payload: dict[str, Any]) -> tuple[str, str]:
+def assert_result(
+    payload: dict[str, Any],
+    expected_origin: str = "parent",
+) -> tuple[str, str]:
     if payload.get("ok") is not True:
         raise AssertionError(f"bounded exploration controller failed: {payload}")
     value = payload.get("value") or {}
@@ -63,6 +71,10 @@ def assert_result(payload: dict[str, Any]) -> tuple[str, str]:
         raise AssertionError(f"exploration scope did not close cleanly: {value}")
     if value.get("parent_keys") != ["requirement.explore_target"]:
         raise AssertionError(f"candidate memory leaked into the parent: {value}")
+    if value.get("origin") != expected_origin:
+        raise AssertionError(f"exploration used the wrong frontier origin: {value}")
+    if value.get("source_type") != "semantic_frontier":
+        raise AssertionError(f"exploration did not use the typed frontier API: {value}")
     if (value.get("proposal") or {}).get("candidate") != REJECTED:
         raise AssertionError(f"fixture did not propose the losing candidate: {value}")
     if not str(value.get("checkpoint") or "").startswith("cp-"):
@@ -231,7 +243,10 @@ def main() -> int:
             if not isinstance(payload, dict):
                 raise AssertionError(f"controller logs had no Stone response: {logs}")
             try:
-                accepted_attempt, rejected_attempt = assert_result(payload)
+                accepted_attempt, rejected_attempt = assert_result(
+                    payload,
+                    args.expected_origin,
+                )
             except AssertionError as error:
                 raise AssertionError(f"{error}\ncontroller logs:\n{logs}") from error
 
@@ -255,8 +270,17 @@ def main() -> int:
             trace = (
                 data_root / "traces" / "operations.jsonl"
             ).read_text(encoding="utf-8")
-            if trace.count('"op":"attempt.fork"') != 2:
-                raise AssertionError("trace does not contain exactly two candidate forks")
+            if args.expected_origin == "parent":
+                if trace.count('"op":"attempt.fork"') != 2:
+                    raise AssertionError(
+                        "trace does not contain exactly two candidate forks"
+                    )
+            elif trace.count(
+                '"semantic_frontier_availability":"retained"'
+            ) < 2:
+                raise AssertionError(
+                    "trace does not contain two retained-frontier candidate restores"
+                )
             if trace.count('"op":"attempt.accept"') != 1:
                 raise AssertionError("trace does not contain exactly one acceptance")
         finally:
