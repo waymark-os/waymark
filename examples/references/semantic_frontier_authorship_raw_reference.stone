@@ -1,0 +1,67 @@
+def main(input):
+    checkpoint = fixture_prepare_checkpoint()
+    root = attempt_info()
+    scope = attempt_scope(join_timeout_ms=30000)
+
+    parent_child = attempt_fork(
+        checkpoint=checkpoint.reference,
+        input={"label": "parent-branch", "path": "root.txt", "expected": "root"},
+        program=current_program(),
+        entrypoint="worker",
+        start=True,
+        scope=scope,
+    )
+    parent_outcome = attempt_join(parent_child, timeout_ms=30000)
+    if not parent_outcome.joined or parent_outcome.result.status != "succeeded":
+        fail("parent branch failed", code="frontier_authorship_parent_failed")
+    attempt_discard(parent_child, reason="parent branch checked")
+
+    owner = attempt_fork(
+        checkpoint=checkpoint.reference,
+        input={},
+        program=current_program(),
+        entrypoint="setup_owner",
+        start=True,
+        scope=scope,
+    )
+    owner_outcome = attempt_join(owner, timeout_ms=30000)
+    if not owner_outcome.joined or owner_outcome.result.status != "succeeded":
+        fail("owner setup failed", code="frontier_authorship_owner_failed")
+    repair_checkpoint = owner_outcome.result.value.checkpoint
+    attempt_finish("fail", attempt=owner, reason="injected late failure")
+
+    repaired = attempt_spawn(
+        task=root.task,
+        workspace=root.workspace,
+        workspace_source={
+            "kind": "repair-checkpoint",
+            "workspace": root.workspace,
+            "attempt": owner.attempt,
+            "checkpoint": repair_checkpoint.reference,
+        },
+        task_input={
+            "label": "retained-branch",
+            "path": "owner.txt",
+            "expected": "owner",
+        },
+        program=current_program(),
+        entrypoint="worker",
+        start=True,
+        scope=scope,
+    )
+    repaired_outcome = attempt_join(repaired, timeout_ms=30000)
+    if not repaired_outcome.joined or repaired_outcome.result.status != "succeeded":
+        fail("retained branch failed", code="frontier_authorship_repair_failed")
+    attempt_accept(root.attempt, repaired)
+    cleanup = attempt_scope_close(scope)
+    return fixture_finalize(
+        "raw",
+        checkpoint,
+        repair_checkpoint,
+        parent_outcome,
+        repaired_outcome,
+        parent_child,
+        owner,
+        repaired,
+        cleanup,
+    )

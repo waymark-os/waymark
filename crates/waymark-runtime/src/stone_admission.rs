@@ -512,6 +512,11 @@ mod tests {
                 .expect("lower");
         let error = validate_program(&workflow_keyword, &[]).expect_err("unknown workflow keyword");
         assert!(format!("{error:?}").contains("evidnce"));
+
+        let frontier_keyword =
+            lower_source("attempt_branch(frontier=value, entypoint=\"worker\")").expect("lower");
+        let error = validate_program(&frontier_keyword, &[]).expect_err("unknown frontier keyword");
+        assert!(format!("{error:?}").contains("entypoint"));
     }
 
     #[test]

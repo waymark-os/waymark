@@ -1420,10 +1420,24 @@ task-level reliability.
 The visible bounded-exploration library now passes its deterministic mechanism
 gate, a three-pair authorship comparison, and an unchanged-library transfer to
 the official Caffe task. In the Caffe cell it rejected the model's first
-candidate, reused the post-build frontier, and passed all six checks. Continue
-M2.5 by generalizing the frontier argument across parent-owned fork checkpoints
-and retained repair checkpoints before considering syntax. Verifier-populated
-outcomes and aggregate budget/event views remain necessary. See
+candidate, reused the post-build frontier, and passed all six checks. The next
+mechanism cell generalized that argument into a nominal `semantic_frontier`
+and one `attempt_branch` operation. The same source call passed against both a
+parent-owned fork checkpoint and a retained failed-owner repair checkpoint;
+the runtime selected the kernel operation, exposed deterministic seal-cost
+guidance, counted frontier use, and left no open transaction or checkpoint.
+
+A matched three-pair authorship cell then reached 3/3 eventual success with
+both the raw and typed interfaces and emitted no redundant seals. Typed
+programs averaged 42.7 rather than 53.7 lines, but required one repair while
+raw programs required none; the frozen aggregate hypothesis was therefore not
+supported. The repair was caused by rebinding a child handle to the
+`attempt_accept` report, not by frontier selection or lowering. Keep the
+frontier abstraction as a source/kernel boundary; next improve nominal
+lifecycle-result ergonomics before claiming an authorship advantage or moving
+to a task-shaped transfer.
+Verifier-populated outcomes and aggregate budget/event views remain necessary.
+See
 [Caffe Bounded-Explore Library Experiment](../../waymark-gateway/docs/CAFFE_BOUNDED_EXPLORE_LIBRARY_EXPERIMENT.md).
 Compatibility ids remain accepted at syscall boundaries, but new Stone control
 should retain handles. Do not treat the mechanism, specialization, or

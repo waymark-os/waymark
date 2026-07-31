@@ -1,0 +1,207 @@
+# Exercise one Stone branch API across both checkpoint ownership modes.
+
+
+def root_ready(step):
+    return workflow_evidence(
+        run(["test", "-s", "root.txt"]).ok,
+        "root frontier is ready",
+        ["canary:root"],
+    )
+
+
+def prepare_root(step):
+    write_file("root.txt", "root\n")
+    return {"ok": True}
+
+
+def owner_ready(step):
+    return workflow_evidence(
+        run(["test", "-s", "owner.txt"]).ok,
+        "repair owner frontier is ready",
+        ["canary:owner"],
+    )
+
+
+def prepare_owner(step):
+    write_file("owner.txt", "owner\n")
+    return {"ok": True}
+
+
+def worker(input):
+    if input.expected == "root":
+        inherited = read_text("root.txt").strip()
+    else:
+        inherited = read_text("owner.txt").strip()
+    if inherited != input.expected:
+        fail(
+            "branch did not restore the expected semantic frontier",
+            code="semantic_frontier_restore_failed",
+            detail={"expected": input.expected, "actual": inherited},
+        )
+    write_file("branch.txt", input.label + "\n")
+    return {
+        "label": input.label,
+        "expected": input.expected,
+        "inherited": inherited,
+    }
+
+
+def setup_owner(input):
+    stage = workflow_stage(
+        "prepare-owner",
+        evidence=owner_ready,
+        action=prepare_owner,
+        checkpoint="repairable",
+    )
+    report = workflow_run(workflow("semantic-frontier-owner", stage))
+    if not report.ok or report.stages[0].checkpoint.status != "created":
+        fail(
+            "failed to seal repairable owner frontier",
+            code="semantic_frontier_owner_checkpoint_failed",
+            detail=report,
+        )
+    return {"checkpoint": report.stages[0].checkpoint}
+
+
+def main(input):
+    scope = attempt_scope(join_timeout_ms=30000)
+    stage = workflow_stage(
+        "prepare-root",
+        evidence=root_ready,
+        action=prepare_root,
+        checkpoint="forkable",
+    )
+    report = workflow_run(workflow("semantic-frontier-root", stage))
+    if not report.ok or report.stages[0].checkpoint.status != "created":
+        fail(
+            "failed to seal parent frontier",
+            code="semantic_frontier_parent_checkpoint_failed",
+            detail=report,
+        )
+
+    parent_frontier = semantic_frontier(report.stages[0].checkpoint)
+    parent_child = attempt_branch(
+        parent_frontier,
+        input={"label": "parent-branch", "expected": "root"},
+        program=current_program(),
+        entrypoint="worker",
+        start=True,
+        scope=scope,
+    )
+    parent_outcome = attempt_join(parent_child, timeout_ms=30000)
+    if (
+        not parent_outcome.joined
+        or parent_outcome.result.status != "succeeded"
+        or parent_outcome.result.value.inherited != "root"
+    ):
+        fail(
+            "parent-owned semantic frontier branch failed",
+            code="semantic_frontier_parent_branch_failed",
+            detail=parent_outcome,
+        )
+    attempt_discard(parent_child, reason="parent semantic-frontier canary complete")
+
+    setup = attempt_branch(
+        parent_frontier,
+        input={},
+        program=current_program(),
+        entrypoint="setup_owner",
+        start=True,
+        scope=scope,
+    )
+    setup_outcome = attempt_join(setup, timeout_ms=30000)
+    if not setup_outcome.joined or setup_outcome.result.status != "succeeded":
+        fail(
+            "repair-owner setup failed",
+            code="semantic_frontier_setup_failed",
+            detail=setup_outcome,
+        )
+    attempt_finish(
+        "fail",
+        attempt=setup,
+        reason="injected late failure after verified repairable frontier",
+    )
+
+    retained_frontier = semantic_frontier(
+        setup_outcome.result.value.checkpoint,
+        owner=setup,
+    )
+    repaired = attempt_branch(
+        retained_frontier,
+        input={"label": "retained-branch", "expected": "owner"},
+        program=current_program(),
+        entrypoint="worker",
+        start=True,
+        scope=scope,
+    )
+    repaired_outcome = attempt_join(repaired, timeout_ms=30000)
+    if (
+        not repaired_outcome.joined
+        or repaired_outcome.result.status != "succeeded"
+        or repaired_outcome.result.value.inherited != "owner"
+    ):
+        fail(
+            "retained semantic frontier branch failed",
+            code="semantic_frontier_retained_branch_failed",
+            detail=repaired_outcome,
+        )
+    attempt_accept(attempt_info(), repaired)
+    cleanup = attempt_scope_close(scope)
+    if not cleanup.clean:
+        fail(
+            "semantic frontier scope did not close cleanly",
+            code="semantic_frontier_cleanup_failed",
+            detail=cleanup,
+        )
+    owner_inspection = attempt_inspect(setup)
+    if not owner_inspection.resources_reclaimed:
+        fail(
+            "failed checkpoint owner retained live execution resources",
+            code="semantic_frontier_owner_resources_live",
+            detail=owner_inspection,
+        )
+    if read_text("branch.txt").strip() != "retained-branch":
+        fail(
+            "accepted retained branch was not imported",
+            code="semantic_frontier_accept_failed",
+        )
+    return {
+        "parent": {
+            "type": type(parent_frontier),
+            "availability": parent_frontier.availability,
+            "guidance": parent_frontier.guidance,
+            "cost": parent_frontier.cost,
+            "result": parent_outcome.result.value,
+        },
+        "retained": {
+            "type": type(retained_frontier),
+            "availability": retained_frontier.availability,
+            "guidance": retained_frontier.guidance,
+            "cost": retained_frontier.cost,
+            "result": repaired_outcome.result.value,
+        },
+        "attempts": {
+            "parent": parent_child.attempt,
+            "owner": setup.attempt,
+            "retained": repaired.attempt,
+        },
+        "accepted": read_text("branch.txt").strip(),
+        "owner_resource_state": owner_inspection.resource_state,
+        "clean": cleanup.clean,
+    }
+
+
+control = attempt_info()
+entrypoint = get(control.metadata, "program_entrypoint", "main")
+if entrypoint == "worker":
+    result = worker(task_input())
+elif entrypoint == "setup_owner":
+    result = setup_owner(task_input())
+else:
+    result = main(task_input())
+attempt_report(
+    status="succeeded",
+    result=result,
+    metadata={"control": "semantic_frontier_canary_v1"},
+)
+emit(result)

@@ -1107,9 +1107,10 @@ if not info.ok:
     StoneHelpEntry {
         name: "attempt_info",
         signature: r#"attempt_info(attempt: str = "") -> record"#,
-        use_when: "Use in Gateway mode to inspect the current task attempt, or a specific attempt when an id is passed. The record exposes typed controller_run_count (1 for the first running controller), controller_restarted, controller_phase (pending, initial, or restart), memory_ref, and memory_revision.",
+        use_when: "Use in Gateway mode to inspect the current task attempt, or a specific attempt when an id is passed. The record exposes attempt, task, workspace, typed controller_run_count (1 for the first running controller), controller_restarted, controller_phase (pending, initial, or restart), memory_ref, and memory_revision.",
         examples: &[
             r#"me = attempt_info()"#,
+            r#"emit({"attempt": me.attempt, "task": me.task, "workspace": me.workspace})"#,
             r#"emit(attempt_info().state)"#,
             r#"lifecycle = attempt_info()
 if lifecycle.controller_run_count == 1:
@@ -1177,7 +1178,7 @@ else:
     StoneHelpEntry {
         name: "attempt_join",
         signature: r#"attempt_join(attempt: attempt_handle | str | record, timeout_ms: int? = None) -> attempt_outcome"#,
-        use_when: "Gateway mode only. Wait for a child and return an immutable typed outcome; result.value is the child's compact returned summary.",
+        use_when: "Gateway mode only. Wait for a child and return an immutable typed outcome. outcome.ok and outcome.succeeded are true only when the controller joined and reported succeeded; result.value is the child's compact returned summary.",
         examples: &[r#"outcome = attempt_join(child, timeout_ms=30000)"#],
         avoid: &["Joining observes child completion; it does not accept, merge, publish, or discard the child workspace."],
         aliases: &[],
@@ -1248,6 +1249,37 @@ emit(attempt_scope_close(scope).clean)"#],
             "Do not assume a fork mutates the parent attempt; it returns a separate attempt and transaction.",
             "Do not treat a workspace checkpoint as a full tool-environment snapshot; forkable provider state is a separate checkpoint plane.",
             "A reconstructed child becomes conservatively non-joinable after it starts a mutable provider container until mutable tool-environment snapshot/join support exists.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "semantic_frontier",
+        signature: r#"semantic_frontier(checkpoint: workflow_checkpoint, owner: attempt_handle | attempt_outcome | record? = None) -> semantic_frontier"#,
+        use_when: "Gateway mode only. Turn a successfully sealed forkable or repairable workflow checkpoint into a nominal task-owned branch capability. Omit owner for a checkpoint owned by the current attempt; pass the joined failed owner for a retained repair checkpoint. The value carries cost guidance and hides raw checkpoint ownership and restoration ABI.",
+        examples: &[
+            r#"frontier = semantic_frontier(report.stages[0].checkpoint)"#,
+            r#"frontier = semantic_frontier(failed_report.stages[1].checkpoint, owner=failed_child)"#,
+            r#"if frontier.guidance.prefer_reuse:
+    emit(frontier.cost)"#,
+        ],
+        avoid: &[
+            "Do not pass only checkpoint.reference; the full checkpoint record carries policy, planes, and measured seal cost.",
+            "Do not serialize or reconstruct a semantic frontier; it is a task-owned authority value.",
+            "A frontier reported as unused in evaluation diagnostics paid seal cost without feeding attempt_branch during that evaluation.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "attempt_branch",
+        signature: r#"attempt_branch(frontier: semantic_frontier, task: str = "", input: Any = None, program: record? = None, entrypoint: str = "", start: bool = False, scope: attempt_scope? = None, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", resource_limits: record = {}, metadata: record = {}) -> attempt_handle"#,
+        use_when: "Gateway mode only. Create a child from a semantic frontier without deciding whether the checkpoint is owned by the current parent or retained by a failed owner. The runtime lowers to the authoritative fork or repair-restore operation and preserves the same supervision interface.",
+        examples: &[r#"frontier = semantic_frontier(report.stages[0].checkpoint)
+scope = attempt_scope()
+child = attempt_branch(frontier, input={"strategy": "alternate"}, program=current_program(), entrypoint="worker", start=True, scope=scope)"#],
+        avoid: &[
+            "Do not pass raw checkpoint ids or workspace_source records; construct a semantic_frontier once and reuse it.",
+            "Do not omit scope for started branches unless another bounded cleanup owner is explicit.",
+            "Branching does not select the result; join, evaluate evidence, then accept or discard it.",
         ],
         aliases: &[],
     },

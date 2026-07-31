@@ -61,6 +61,28 @@ const KEYWORD_SCHEMAS: &[(&str, &[&str])] = &[
     ),
     ("workflow", &[]),
     ("workflow_run", &[]),
+    ("semantic_frontier", &["checkpoint", "owner"]),
+    (
+        "attempt_branch",
+        &[
+            "frontier",
+            "task",
+            "input",
+            "task_input",
+            "program",
+            "entrypoint",
+            "start",
+            "scope",
+            "controller",
+            "capability_profile",
+            "container",
+            "workspace_mount",
+            "resource_limits",
+            "limits",
+            "metadata",
+            "meta",
+        ],
+    ),
 ];
 
 #[derive(Clone, Copy)]

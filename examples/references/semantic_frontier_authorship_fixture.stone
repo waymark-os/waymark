@@ -1,0 +1,181 @@
+# Fixed task and evidence support for semantic-frontier authorship comparison.
+# The author model supplies only main(input).
+
+
+def fixture_root_ready(step):
+    return workflow_evidence(
+        run(["test", "-s", "root.txt"]).ok,
+        "root frontier is ready",
+        ["authorship:root"],
+    )
+
+
+def fixture_prepare_root(step):
+    write_file("root.txt", "root\n")
+    return {"ok": True}
+
+
+def fixture_owner_ready(step):
+    return workflow_evidence(
+        run(["test", "-s", "owner.txt"]).ok,
+        "repair owner frontier is ready",
+        ["authorship:owner"],
+    )
+
+
+def fixture_prepare_owner(step):
+    write_file("owner.txt", "owner\n")
+    return {"ok": True}
+
+
+def fixture_prepare_checkpoint():
+    stage = workflow_stage(
+        "prepare-root",
+        evidence=fixture_root_ready,
+        action=fixture_prepare_root,
+        checkpoint="forkable",
+    )
+    report = workflow_run(workflow("authorship-frontier-root", stage))
+    if not report.ok or report.stages[0].checkpoint.status != "created":
+        fail(
+            "failed to seal authorship root frontier",
+            code="frontier_authorship_root_checkpoint_failed",
+            detail=report,
+        )
+    return report.stages[0].checkpoint
+
+
+def worker(input):
+    inherited = read_text(input.path).strip()
+    if inherited != input.expected:
+        fail(
+            "branch did not restore the expected semantic frontier",
+            code="frontier_authorship_restore_failed",
+            detail={"expected": input.expected, "actual": inherited},
+        )
+    write_file("branch.txt", input.label + "\n")
+    return {
+        "label": input.label,
+        "expected": input.expected,
+        "inherited": inherited,
+    }
+
+
+def setup_owner(input):
+    stage = workflow_stage(
+        "prepare-owner",
+        evidence=fixture_owner_ready,
+        action=fixture_prepare_owner,
+        checkpoint="repairable",
+    )
+    report = workflow_run(workflow("authorship-frontier-owner", stage))
+    if not report.ok or report.stages[0].checkpoint.status != "created":
+        fail(
+            "failed to seal authorship repair frontier",
+            code="frontier_authorship_owner_checkpoint_failed",
+            detail=report,
+        )
+    return {"checkpoint": report.stages[0].checkpoint}
+
+
+def fixture_checkpoint_cost(checkpoint):
+    return {
+        "create_duration_ms": checkpoint.create_duration_ms,
+        "storage_bytes": checkpoint.storage_bytes,
+        "copy_files": checkpoint.copy_files,
+        "copy_bytes": checkpoint.copy_bytes,
+        "reflink_attempts": checkpoint.reflink_attempts,
+        "reflink_successes": checkpoint.reflink_successes,
+        "remaining_budget_ms": None,
+    }
+
+
+def fixture_finalize(
+    interface,
+    parent_source,
+    retained_source,
+    parent_outcome,
+    repaired_outcome,
+    parent_child,
+    owner,
+    repaired,
+    cleanup,
+):
+    if (
+        not parent_outcome.joined
+        or parent_outcome.result.status != "succeeded"
+        or parent_outcome.result.value.inherited != "root"
+    ):
+        fail(
+            "parent branch evidence failed",
+            code="frontier_authorship_parent_evidence_failed",
+            detail=parent_outcome,
+        )
+    if (
+        not repaired_outcome.joined
+        or repaired_outcome.result.status != "succeeded"
+        or repaired_outcome.result.value.inherited != "owner"
+    ):
+        fail(
+            "retained branch evidence failed",
+            code="frontier_authorship_retained_evidence_failed",
+            detail=repaired_outcome,
+        )
+    if not cleanup.clean:
+        fail(
+            "authored attempt scope did not close cleanly",
+            code="frontier_authorship_cleanup_failed",
+            detail=cleanup,
+        )
+    if read_text("branch.txt").strip() != "retained-branch":
+        fail(
+            "authored control did not import the retained branch",
+            code="frontier_authorship_accept_failed",
+        )
+    owner_inspection = attempt_inspect(owner)
+    if not owner_inspection.resources_reclaimed:
+        fail(
+            "failed checkpoint owner retained live execution resources",
+            code="frontier_authorship_owner_resources_live",
+            detail=owner_inspection,
+        )
+
+    if interface == "typed":
+        parent_type = type(parent_source)
+        retained_type = type(retained_source)
+        parent_cost = parent_source.cost
+        retained_cost = retained_source.cost
+        parent_guidance = parent_source.guidance
+        retained_guidance = retained_source.guidance
+    else:
+        parent_type = "workflow_checkpoint"
+        retained_type = "workflow_checkpoint"
+        parent_cost = fixture_checkpoint_cost(parent_source)
+        retained_cost = fixture_checkpoint_cost(retained_source)
+        parent_guidance = parent_source.guidance
+        retained_guidance = retained_source.guidance
+
+    return {
+        "parent": {
+            "type": parent_type,
+            "availability": "parent",
+            "guidance": parent_guidance,
+            "cost": parent_cost,
+            "result": parent_outcome.result.value,
+        },
+        "retained": {
+            "type": retained_type,
+            "availability": "retained",
+            "guidance": retained_guidance,
+            "cost": retained_cost,
+            "result": repaired_outcome.result.value,
+        },
+        "attempts": {
+            "parent": parent_child.attempt,
+            "owner": owner.attempt,
+            "retained": repaired.attempt,
+        },
+        "accepted": read_text("branch.txt").strip(),
+        "owner_resource_state": owner_inspection.resource_state,
+        "clean": cleanup.clean,
+    }

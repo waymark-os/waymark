@@ -45,7 +45,9 @@ use crate::stone_ast::{
     FormattedStringPart, FunctionDef, Program, StageDecorator, Stmt, StoneFormatSpec, StoneType,
 };
 use crate::stone_attempt_scope::AttemptScopeValue;
-use crate::stone_attempt_value::{AttemptHandleValue, AttemptOutcomeValue};
+use crate::stone_attempt_value::{
+    AttemptHandleValue, AttemptOutcomeValue, SemanticFrontierMode, SemanticFrontierValue,
+};
 use crate::stone_builtins::{
     add_values, bitwise_int_values, compare_values, div_values, enumerate_builtin,
     find_method_builtin, first_builtin, float_builtin, floor_div_values, format_builtin,
@@ -122,6 +124,7 @@ use stone_runtime_value::{FileHandle, RuntimeValue, TextLines};
 use stone_state::runtime_state_record;
 
 const STONE_LAST_RESULT_ENV: &str = "WAYMARK_LAST_RESULT_JSON";
+const MAX_SEMANTIC_FRONTIER_DIAGNOSTICS: usize = 256;
 
 #[derive(Default)]
 pub struct EvalState {
@@ -135,6 +138,9 @@ pub struct EvalState {
     active_workflow_run: bool,
     transition_events: Vec<JsonValue>,
     attempt_scopes: Vec<AttemptScopeValue>,
+    semantic_frontiers: Vec<SemanticFrontierValue>,
+    semantic_frontier_diagnostics_dropped: u64,
+    next_semantic_frontier_id: u64,
     current_program_source: Option<String>,
     current_program_entrypoint: Option<String>,
     context: ContextState,
@@ -623,6 +629,9 @@ fn eval_program_with_source_options(
             active_workflow_run: false,
             transition_events: Vec::new(),
             attempt_scopes: Vec::new(),
+            semantic_frontiers: Vec::new(),
+            semantic_frontier_diagnostics_dropped: 0,
+            next_semantic_frontier_id: 0,
             current_program_source: source.map(str::to_string),
             current_program_entrypoint: entrypoint.map(str::to_string),
             context: options
@@ -682,6 +691,29 @@ fn eval_program_with_source_options(
     }
     if !evaluator.state.transition_events.is_empty() {
         diagnostics["transitions"] = JsonValue::Array(evaluator.state.transition_events.clone());
+    }
+    if !evaluator.state.semantic_frontiers.is_empty() {
+        let frontiers = evaluator
+            .state
+            .semantic_frontiers
+            .iter()
+            .map(SemanticFrontierValue::diagnostic)
+            .collect::<Vec<_>>();
+        let unused = frontiers
+            .iter()
+            .filter(|frontier| frontier["unused"] == JsonValue::Bool(true))
+            .count();
+        let high_cost = frontiers
+            .iter()
+            .filter(|frontier| frontier["guidance_level"] == JsonValue::String("high".to_string()))
+            .count();
+        diagnostics["semantic_frontiers"] = json!({
+            "created": frontiers.len(),
+            "dropped": evaluator.state.semantic_frontier_diagnostics_dropped,
+            "unused": unused,
+            "high_cost": high_cost,
+            "frontiers": frontiers,
+        });
     }
     if let Some(root_scope) = evaluator.state.scopes.first() {
         let mut bound = evaluator
@@ -2237,6 +2269,8 @@ impl Evaluator<'_> {
             "attempts" | "attempt_list" => self.eval_attempts_call(call),
             "attempt_spawn" => self.eval_attempt_spawn_call(call),
             "attempt_fork" => self.eval_attempt_fork_call(call),
+            "semantic_frontier" => self.eval_semantic_frontier_call(call),
+            "attempt_branch" => self.eval_attempt_branch_call(call),
             "attempt_finish" => self.eval_attempt_finish_call(call),
             "attempt_report" => self.eval_attempt_report_call(call),
             "attempt_accept" => self.eval_attempt_accept_call(call),
@@ -2538,6 +2572,9 @@ impl Evaluator<'_> {
         }
         if let RuntimeValue::AttemptOutcome(outcome) = receiver {
             return outcome.attribute(attr).map(RuntimeValue::Nu);
+        }
+        if let RuntimeValue::SemanticFrontier(frontier) = receiver {
+            return frontier.attribute(attr).map(RuntimeValue::Nu);
         }
         let receiver = receiver.into_nu_value("attribute")?;
         let Value::Record { val, .. } = receiver else {
@@ -6560,6 +6597,408 @@ impl Evaluator<'_> {
         )))
     }
 
+    fn eval_semantic_frontier_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if call.positional.len() > 2 {
+            return Err(stone_error(
+                "semantic_frontier",
+                "semantic_frontier() accepts at most checkpoint and owner positional arguments",
+            ));
+        }
+
+        let mut checkpoint = call
+            .positional
+            .first()
+            .map(|expr| self.eval_expr_value(expr, PipelineData::empty()))
+            .transpose()?;
+        let mut owner = call
+            .positional
+            .get(1)
+            .map(|expr| self.eval_expr_value(expr, PipelineData::empty()))
+            .transpose()?;
+        for (name, expression) in &call.named {
+            let value = self.eval_expr_value(expression, PipelineData::empty())?;
+            match name.as_str() {
+                "checkpoint" if checkpoint.is_none() => checkpoint = Some(value),
+                "owner" if owner.is_none() => owner = Some(value),
+                "checkpoint" | "owner" => {
+                    return Err(stone_error(
+                        "semantic_frontier",
+                        format!("`{name}` was supplied more than once"),
+                    ));
+                }
+                _ => {
+                    return Err(stone_error(
+                        "semantic_frontier",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        let checkpoint = checkpoint.ok_or_else(|| {
+            stone_error(
+                "semantic_frontier",
+                "missing checkpoint; pass the typed stage checkpoint record, not only its reference",
+            )
+        })?;
+        let RuntimeValue::Nu(checkpoint) = checkpoint else {
+            return Err(stone_error(
+                "semantic_frontier",
+                "checkpoint must be a workflow stage checkpoint record",
+            ));
+        };
+        let checkpoint_record = value_record(&checkpoint, "semantic_frontier checkpoint")?;
+        let status =
+            record_string_field(checkpoint_record, "status", "semantic_frontier checkpoint")?;
+        if status != "created" {
+            return Err(stone_error(
+                "semantic_frontier",
+                format!(
+                    "checkpoint status is `{status}`; only a successfully created checkpoint is branchable"
+                ),
+            ));
+        }
+        let checkpoint_reference = record_string_field(
+            checkpoint_record,
+            "reference",
+            "semantic_frontier checkpoint",
+        )?;
+        if checkpoint_reference.is_empty() {
+            return Err(stone_error(
+                "semantic_frontier",
+                "checkpoint record has no opaque reference",
+            ));
+        }
+        let policy = record_string_field(
+            checkpoint_record,
+            "selected_policy",
+            "semantic_frontier checkpoint",
+        )?;
+        if !matches!(policy.as_str(), "forkable" | "repairable") {
+            return Err(stone_error(
+                "semantic_frontier",
+                format!(
+                    "checkpoint policy `{policy}` is not branchable; declare checkpoint=\"forkable\" or checkpoint=\"repairable\""
+                ),
+            ));
+        }
+
+        let current = gateway_env::attempt_info(String::new())?;
+        let current_record = value_record(&current, "semantic_frontier current attempt")?;
+        let current_attempt = required_record_string(
+            current_record,
+            "attempt",
+            "semantic_frontier current attempt",
+        )?;
+        let task =
+            required_record_string(current_record, "task", "semantic_frontier current attempt")?;
+        let workspace = required_record_string(
+            current_record,
+            "workspace",
+            "semantic_frontier current attempt",
+        )?;
+
+        let owner_attempt = match owner {
+            None | Some(RuntimeValue::Nu(Value::Nothing { .. })) => current_attempt.clone(),
+            Some(RuntimeValue::AttemptHandle(handle)) => handle.attempt,
+            Some(RuntimeValue::AttemptOutcome(outcome)) => outcome.attempt,
+            Some(RuntimeValue::Nu(value)) => {
+                attempt_id_from_value(&value, "semantic_frontier owner")?
+            }
+            Some(other) => {
+                return Err(stone_error(
+                    "semantic_frontier",
+                    format!(
+                        "owner must be an attempt_handle, attempt_outcome, or attempt record, got {}",
+                        runtime_type_name(&other)
+                    ),
+                ));
+            }
+        };
+        let owner_record_value = if owner_attempt == current_attempt {
+            current.clone()
+        } else {
+            gateway_env::attempt_info(owner_attempt.clone())?
+        };
+        let owner_record = value_record(&owner_record_value, "semantic_frontier owner attempt")?;
+        let source_workspace =
+            required_record_string(owner_record, "workspace", "semantic_frontier owner attempt")?;
+        let mode = if owner_attempt == current_attempt {
+            SemanticFrontierMode::Parent
+        } else {
+            if policy != "repairable" {
+                return Err(stone_error(
+                    "semantic_frontier",
+                    "a checkpoint retained by another attempt must use policy `repairable`",
+                ));
+            }
+            let state =
+                required_record_string(owner_record, "state", "semantic_frontier owner attempt")?;
+            if state == "active" {
+                return Err(stone_error(
+                    "semantic_frontier",
+                    "the foreign owner attempt is still active; join its failure before constructing a retained frontier",
+                ));
+            }
+            SemanticFrontierMode::RetainedRepair
+        };
+
+        let seal_duration_ms =
+            record_optional_u64(checkpoint_record, "create_duration_ms", "semantic_frontier")?
+                .unwrap_or_default();
+        let storage_bytes =
+            record_optional_u64(checkpoint_record, "storage_bytes", "semantic_frontier")?
+                .unwrap_or_default();
+        let now_ms = agent_session_now_ms(&current, &mut self.state.agent_time_anchor);
+        let remaining_ms = record_optional_u64_from_value(
+            &agent_time_budget_value(&current, now_ms, Span::unknown()),
+            "remaining_ms",
+        )?;
+        let (guidance_level, guidance_code, guidance_message, prefer_reuse) =
+            semantic_frontier_guidance(seal_duration_ms, storage_bytes, remaining_ms);
+
+        self.state.next_semantic_frontier_id =
+            self.state.next_semantic_frontier_id.saturating_add(1);
+        let frontier_id = self.state.next_semantic_frontier_id;
+        let span = Span::unknown();
+        let mut cost = Record::new();
+        for field in [
+            "create_duration_ms",
+            "storage_bytes",
+            "copy_files",
+            "copy_bytes",
+            "reflink_attempts",
+            "reflink_successes",
+        ] {
+            cost.push(
+                field,
+                checkpoint_record
+                    .get(field)
+                    .cloned()
+                    .unwrap_or_else(|| Value::nothing(span)),
+            );
+        }
+        cost.push(
+            "remaining_budget_ms",
+            remaining_ms
+                .map(|value| Value::int(time_u64_to_i64(value), span))
+                .unwrap_or_else(|| Value::nothing(span)),
+        );
+        let mut guidance = Record::new();
+        guidance.push("level", Value::string(guidance_level, span));
+        guidance.push("code", Value::string(guidance_code, span));
+        guidance.push("prefer_reuse", Value::bool(prefer_reuse, span));
+        guidance.push("message", Value::string(guidance_message, span));
+        let mut record = Record::new();
+        record.push("kind", Value::string("semantic_frontier", span));
+        record.push("id", Value::int(time_u64_to_i64(frontier_id), span));
+        record.push("status", Value::string("ready", span));
+        record.push("availability", Value::string(mode.as_str(), span));
+        record.push("policy", Value::string(policy, span));
+        record.push(
+            "planes",
+            checkpoint_record
+                .get("planes")
+                .cloned()
+                .unwrap_or_else(|| Value::list(Vec::new(), span)),
+        );
+        record.push("cost", Value::record(cost, span));
+        record.push("guidance", Value::record(guidance, span));
+
+        let frontier = SemanticFrontierValue::new(
+            frontier_id,
+            checkpoint_reference,
+            owner_attempt,
+            source_workspace,
+            task,
+            workspace,
+            mode,
+            seal_duration_ms,
+            storage_bytes,
+            guidance_level,
+            Value::record(record, span),
+        );
+        if self.state.semantic_frontiers.len() == MAX_SEMANTIC_FRONTIER_DIAGNOSTICS {
+            self.state.semantic_frontiers.remove(0);
+            self.state.semantic_frontier_diagnostics_dropped = self
+                .state
+                .semantic_frontier_diagnostics_dropped
+                .saturating_add(1);
+        }
+        self.state.semantic_frontiers.push(frontier.clone());
+        Ok(RuntimeValue::SemanticFrontier(frontier))
+    }
+
+    fn eval_attempt_branch_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if call.positional.len() > 1 {
+            return Err(stone_error(
+                "attempt_branch",
+                "attempt_branch() accepts exactly one semantic frontier",
+            ));
+        }
+        let mut frontier = call
+            .positional
+            .first()
+            .map(|expr| self.eval_expr_value(expr, PipelineData::empty()))
+            .transpose()?;
+        let mut scope = None;
+        let mut named = Vec::new();
+        for (name, expression) in &call.named {
+            let value = self.eval_expr_value(expression, PipelineData::empty())?;
+            match name.as_str() {
+                "frontier" if frontier.is_none() => frontier = Some(value),
+                "frontier" => {
+                    return Err(stone_error(
+                        "attempt_branch",
+                        "`frontier` was supplied more than once",
+                    ));
+                }
+                "scope" => {
+                    let RuntimeValue::AttemptScope(value) = value else {
+                        return Err(stone_error(
+                            "attempt_branch",
+                            format!(
+                                "scope must be an attempt_scope, got {}",
+                                runtime_type_name(&value)
+                            ),
+                        ));
+                    };
+                    if scope.replace(value).is_some() {
+                        return Err(stone_error(
+                            "attempt_branch",
+                            "scope may be supplied only once",
+                        ));
+                    }
+                }
+                _ => named.push((name.clone(), value.into_nu_value("attempt_branch")?)),
+            }
+        }
+        let Some(RuntimeValue::SemanticFrontier(frontier)) = frontier else {
+            return Err(stone_error(
+                "attempt_branch",
+                "frontier must be a semantic_frontier created by semantic_frontier()",
+            ));
+        };
+
+        let mut task = String::new();
+        let mut controller = String::new();
+        let mut capability_profile = String::new();
+        let mut container = String::new();
+        let mut workspace_mount = String::new();
+        let mut resource_limits = Vec::new();
+        let mut metadata = Vec::new();
+        let mut task_input_json = String::new();
+        let mut program = None;
+        let mut entrypoint = String::new();
+        let mut start = false;
+        for (name, value) in named {
+            match name.as_str() {
+                "task" => task = value_to_string(&value, "attempt_branch task")?,
+                "controller" => controller = value_to_string(&value, "attempt_branch controller")?,
+                "capability_profile" => {
+                    capability_profile =
+                        value_to_string(&value, "attempt_branch capability_profile")?
+                }
+                "container" => container = value_to_string(&value, "attempt_branch container")?,
+                "workspace_mount" => {
+                    workspace_mount = value_to_string(&value, "attempt_branch workspace_mount")?
+                }
+                "resource_limits" | "limits" => {
+                    resource_limits =
+                        value_to_string_pairs(&value, "attempt_branch resource_limits")?
+                }
+                "metadata" | "meta" => {
+                    metadata = value_to_string_pairs(&value, "attempt_branch metadata")?
+                }
+                "input" | "task_input" => {
+                    task_input_json =
+                        serde_json::to_string(&nu_to_json_value(&value)).map_err(|error| {
+                            stone_error(
+                                "attempt_branch",
+                                format!("failed to encode task input: {error}"),
+                            )
+                        })?
+                }
+                "program" => program = Some(program_from_value(&value, "attempt_branch program")?),
+                "entrypoint" => entrypoint = value_to_string(&value, "attempt_branch entrypoint")?,
+                "start" => start = value_to_bool(&value, "attempt_branch start")?,
+                _ => {
+                    return Err(stone_error(
+                        "attempt_branch",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        apply_stone_entrypoint(&mut program, &entrypoint, "attempt_branch entrypoint")?;
+        metadata.push((
+            "semantic_frontier_id".to_string(),
+            frontier.frontier_id.to_string(),
+        ));
+        metadata.push((
+            "semantic_frontier_availability".to_string(),
+            frontier.mode.as_str().to_string(),
+        ));
+
+        let child = match frontier.mode {
+            SemanticFrontierMode::Parent => gateway_env::attempt_fork(
+                frontier.owner_attempt.clone(),
+                frontier.checkpoint.clone(),
+                task,
+                controller,
+                capability_profile,
+                container,
+                workspace_mount,
+                resource_limits,
+                metadata,
+                None,
+                task_input_json,
+                program,
+                start,
+            )?,
+            SemanticFrontierMode::RetainedRepair => {
+                let mut spawn = gateway_env::AttemptSpawnV1 {
+                    task_input_json,
+                    program,
+                    workspace_source: Some(WorkspaceSource {
+                        kind: "repair-checkpoint".to_string(),
+                        workspace: frontier.source_workspace.clone(),
+                        generation: String::new(),
+                        attempt: frontier.owner_attempt.clone(),
+                        checkpoint: frontier.checkpoint.clone(),
+                    }),
+                    start,
+                    ..gateway_env::AttemptSpawnV1::default()
+                };
+                if task.is_empty() {
+                    task = frontier.task.clone();
+                }
+                // Repair-checkpoint restoration selects its own provider state. Leaving
+                // container empty prevents accidental reuse of the current container.
+                spawn.context_source = None;
+                gateway_env::attempt_spawn(
+                    task,
+                    frontier.workspace.clone(),
+                    controller,
+                    capability_profile,
+                    container,
+                    workspace_mount,
+                    String::new(),
+                    resource_limits,
+                    metadata,
+                    spawn,
+                )?
+            }
+        };
+        let attempt = attempt_id_from_value(&child, "attempt_branch result")?;
+        frontier.mark_branched();
+        if let Some(scope) = scope {
+            scope.register(attempt.clone())?;
+        }
+        Ok(RuntimeValue::AttemptHandle(AttemptHandleValue::new(
+            attempt, child,
+        )))
+    }
+
     fn eval_attempt_fork_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let (positional, named, scope) = self.eval_attempt_call_values(call)?;
         if positional.len() > 1 {
@@ -9200,6 +9639,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "edit_file",
     "echo",
     "emit",
+    "attempt_branch",
     "attempt_finish",
     "attempt_fork",
     "attempt_accept",
@@ -9210,6 +9650,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "attempt_report",
     "attempt_run_process",
     "attempt_spawn",
+    "semantic_frontier",
     "attempt_start",
     "attempt_state",
     "attempt_inspect",
@@ -10280,6 +10721,24 @@ fn workflow_checkpoint_result_value(checkpoint: &WorkflowCheckpointResult) -> Va
                 .unwrap_or_else(|| Value::nothing(span)),
         );
     }
+    record.push(
+        "guidance",
+        if checkpoint.status == "created" {
+            let (level, code, message, prefer_reuse) = semantic_frontier_guidance(
+                checkpoint.create_duration_ms.unwrap_or_default(),
+                checkpoint.storage_bytes.unwrap_or_default(),
+                None,
+            );
+            let mut guidance = Record::new();
+            guidance.push("level", Value::string(level, span));
+            guidance.push("code", Value::string(code, span));
+            guidance.push("prefer_reuse", Value::bool(prefer_reuse, span));
+            guidance.push("message", Value::string(message, span));
+            Value::record(guidance, span)
+        } else {
+            Value::nothing(span)
+        },
+    );
     Value::record(record, span)
 }
 
@@ -10361,6 +10820,7 @@ fn runtime_type_name(value: &RuntimeValue) -> &'static str {
         RuntimeValue::AttemptScope(_) => "attempt_scope",
         RuntimeValue::AttemptHandle(_) => "attempt_handle",
         RuntimeValue::AttemptOutcome(_) => "attempt_outcome",
+        RuntimeValue::SemanticFrontier(_) => "semantic_frontier",
     }
 }
 
@@ -10599,6 +11059,10 @@ fn value_to_iter_values(value: &RuntimeValue) -> Result<Vec<Value>, ShellError> 
         RuntimeValue::AttemptOutcome(outcome) => {
             value_to_iter_values(&RuntimeValue::Nu(outcome.materialize()))
         }
+        RuntimeValue::SemanticFrontier(_) => Err(stone_error(
+            "iteration",
+            "cannot iterate a semantic frontier; pass it to attempt_branch(frontier=...)",
+        )),
     }
 }
 
@@ -11511,6 +11975,8 @@ fn agent_session_value_at(
         names(&[
             "attempt_spawn",
             "attempt_fork",
+            "semantic_frontier",
+            "attempt_branch",
             "attempt_scope",
             "attempt_scope_close",
             "attempt_state",
@@ -11886,6 +12352,87 @@ fn record_string_field(record: &Record, field: &str, context: &str) -> Result<St
         .map(|value| value.unwrap_or_default())
 }
 
+fn required_record_string(
+    record: &Record,
+    field: &str,
+    context: &str,
+) -> Result<String, ShellError> {
+    let value = record_string_field(record, field, context)?;
+    if value.is_empty() {
+        Err(stone_error(
+            context,
+            format!("record field `{field}` must be a non-empty string"),
+        ))
+    } else {
+        Ok(value)
+    }
+}
+
+fn record_optional_u64(
+    record: &Record,
+    field: &str,
+    context: &str,
+) -> Result<Option<u64>, ShellError> {
+    let Some(value) = record.get(field) else {
+        return Ok(None);
+    };
+    match value {
+        Value::Int { val, .. } => u64::try_from(*val).map(Some).map_err(|_| {
+            stone_error(
+                context,
+                format!("record field `{field}` expects an unsigned integer"),
+            )
+        }),
+        Value::Nothing { .. } => Ok(None),
+        other => Err(stone_error(
+            context,
+            format!(
+                "record field `{field}` expected int, got {}",
+                other.get_type()
+            ),
+        )),
+    }
+}
+
+fn record_optional_u64_from_value(value: &Value, field: &str) -> Result<Option<u64>, ShellError> {
+    let Value::Record { val, .. } = value else {
+        return Ok(None);
+    };
+    record_optional_u64(val, field, "semantic_frontier budget")
+}
+
+fn semantic_frontier_guidance(
+    seal_duration_ms: u64,
+    storage_bytes: u64,
+    remaining_ms: Option<u64>,
+) -> (&'static str, &'static str, &'static str, bool) {
+    let budget_pressure = remaining_ms
+        .filter(|remaining| *remaining > 0)
+        .is_some_and(|remaining| seal_duration_ms.saturating_mul(20) >= remaining);
+    if seal_duration_ms >= 10_000 || budget_pressure {
+        (
+            "high",
+            "checkpoint_reuse_recommended",
+            "Checkpoint sealing consumed material wall time; branch repeatedly from this frontier and avoid sealing equivalent state.",
+            true,
+        )
+    } else if seal_duration_ms >= 1_000 || storage_bytes >= 256 * 1024 * 1024 {
+        (
+            "medium",
+            "checkpoint_cost_notable",
+            "Checkpoint cost is notable; place it only at a likely exploration or repair boundary.",
+            true,
+        )
+    } else {
+        (
+            "low",
+            "checkpoint_cost_low",
+            "Checkpoint cost is currently low; keep it only when a later branch or repair can consume it.",
+            false,
+        )
+    }
+}
+
 fn record_u32_field(record: &Record, field: &str, context: &str) -> Result<u32, ShellError> {
     let Some(value) = record.get(field) else {
         return Ok(0);
@@ -12063,8 +12610,9 @@ mod tests {
     use super::{
         agent_session_value_at, context_prompt_required_keys_from_value, eval_program,
         eval_program_with_options, eval_program_with_output, eval_program_with_output_and_session,
-        match_fused_map_update_if, transition_id_for_scope, EvalHotLoopDiagnostics, EvalOptions,
-        RuntimeValue, StoneSession, TextLines, STONE_BUILTIN_NAMES,
+        match_fused_map_update_if, semantic_frontier_guidance, transition_id_for_scope,
+        EvalHotLoopDiagnostics, EvalOptions, RuntimeValue, StoneSession, TextLines,
+        STONE_BUILTIN_NAMES,
     };
     use crate::{
         commands::{
@@ -12090,6 +12638,20 @@ mod tests {
     fn transition_ids_include_controller_run_when_attached() {
         assert_eq!(transition_id_for_scope(3, Some(2)), "run-2-transition-3");
         assert_eq!(transition_id_for_scope(3, None), "transition-3");
+    }
+
+    #[test]
+    fn semantic_frontier_guidance_marks_caffe_scale_seals_for_reuse() {
+        let (level, code, _, prefer_reuse) =
+            semantic_frontier_guidance(38_000, 2_590_000_000, Some(300_000));
+        assert_eq!(level, "high");
+        assert_eq!(code, "checkpoint_reuse_recommended");
+        assert!(prefer_reuse);
+
+        let (level, code, _, prefer_reuse) = semantic_frontier_guidance(20, 4096, None);
+        assert_eq!(level, "low");
+        assert_eq!(code, "checkpoint_cost_low");
+        assert!(!prefer_reuse);
     }
 
     #[test]

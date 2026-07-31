@@ -289,18 +289,47 @@ gives the child an opaque selector. The child receives a fresh provider
 instance with its own workspace branch; no process, socket, or provider
 instance identity is cloned.
 
-The implemented checkpoint-backed fork consumes the opaque reference directly:
+The preferred Stone interface keeps the opaque reference and its ownership
+mode inside a nominal task-owned capability:
 
 ```stone
 report = workflow_run(workflow("prepare", dependencies))
-checkpoint = report.stages[0].checkpoint.reference
-child = attempt_fork(checkpoint=checkpoint, input={"strategy": "alternate"})
+frontier = semantic_frontier(report.stages[0].checkpoint)
+child = attempt_branch(frontier, input={"strategy": "alternate"})
 ```
 
-Gateway accepts only an active attempt-owned checkpoint belonging to the
-selected parent. The child receives the checkpoint's workspace and bounded
-memory frontiers, so later parent files and memory cannot leak into the branch.
-The checkpoint is borrowed rather than consumed, allowing sibling explorations.
+For a retained checkpoint owned by a failed child, the author supplies the
+owner once:
+
+```stone
+frontier = semantic_frontier(checkpoint, owner=failed_child)
+child = attempt_branch(frontier, input={"strategy": "repaired"})
+```
+
+`attempt_branch` selects the authorized parent fork or repair restoration
+without exposing raw workspace-source records. Gateway still validates the
+checkpoint, owner, task tree, captured planes, and budget. The child receives
+the checkpoint's workspace and bounded memory frontiers, so later parent files
+and memory cannot leak into the branch.
+
+Every created stage checkpoint reports deterministic `guidance`; a frontier
+also exposes its measured `cost` and budget-aware guidance, not raw authority
+identifiers. Seal duration at or above ten seconds, five percent of remaining
+attempt time, or large retained storage recommends reuse. Evaluation
+diagnostics report branch counts and unused constructed frontiers. This is
+guidance rather than automatic placement: declare a frontier at a likely
+exploration or repair boundary, reuse it across bounded candidates, and avoid
+sealing equivalent state.
+
+In a frozen three-pair authorship comparison, raw and typed controllers both
+passed 3/3 after at most one repair and both emitted zero redundant seals. The
+typed programs averaged 42.7 lines versus 53.7 for raw control, but one typed
+draft required repair after replacing its child handle with the record
+returned by `attempt_accept`; all raw drafts passed initially. This does not
+establish an authorship-rate gain. It does identify the next typing seam:
+lifecycle reports should not be easy to confuse with the capabilities they
+transform.
+
 This initial backend is deliberately narrow. If setup has already changed a
 container root, `forkable` fails because immutable-image reconstruction would
 lose those changes. Likewise, accepting a child after it starts a mutable
@@ -387,8 +416,9 @@ See
 The next official cell lowered that search to the unchanged visible
 `bounded_attempt_explore.stone` library. It rejected the same lexical candidate,
 reused the post-build frontier for the inode candidate, and passed all six
-checks. This validates transfer of the library control, while exposing a
-frontier typing gap: ordinary parent-owned checkpoints and retained
-foreign-owner repair checkpoints currently require different attempt
-primitives. See
+checks. This validated transfer of the library control and exposed the
+frontier typing gap. The subsequent semantic-frontier canary closed that
+authoring gap: the same `attempt_branch` call passed for a parent-owned
+checkpoint and a retained failed-owner checkpoint, with authoritative cleanup
+and zero leaked transactions or checkpoints. See
 [Caffe Bounded-Explore Library Experiment](../../waymark-gateway/docs/CAFFE_BOUNDED_EXPLORE_LIBRARY_EXPERIMENT.md).

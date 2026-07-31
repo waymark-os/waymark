@@ -13,7 +13,7 @@ use super::stone_json_view::{
 };
 use crate::stone_agent_control::AgentControlValue;
 use crate::stone_attempt_scope::AttemptScopeValue;
-use crate::stone_attempt_value::{AttemptHandleValue, AttemptOutcomeValue};
+use crate::stone_attempt_value::{AttemptHandleValue, AttemptOutcomeValue, SemanticFrontierValue};
 
 #[derive(Clone)]
 pub(super) enum RuntimeValue {
@@ -33,6 +33,7 @@ pub(super) enum RuntimeValue {
     AttemptScope(AttemptScopeValue),
     AttemptHandle(AttemptHandleValue),
     AttemptOutcome(AttemptOutcomeValue),
+    SemanticFrontier(SemanticFrontierValue),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +54,7 @@ pub(super) enum RuntimeValueTag {
     AttemptScope,
     AttemptHandle,
     AttemptOutcome,
+    SemanticFrontier,
 }
 
 impl RuntimeValueTag {
@@ -75,6 +77,7 @@ impl RuntimeValueTag {
             RuntimeValueTag::WorkflowStage => 14,
             RuntimeValueTag::Workflow => 15,
             RuntimeValueTag::WorkflowEvidenceSource => 16,
+            RuntimeValueTag::SemanticFrontier => 17,
         }
     }
 }
@@ -109,6 +112,7 @@ impl RuntimeValue {
             RuntimeValue::AttemptScope(_) => false,
             RuntimeValue::AttemptHandle(_) => false,
             RuntimeValue::AttemptOutcome(_) => true,
+            RuntimeValue::SemanticFrontier(_) => false,
             RuntimeValue::File(_) => false,
         }
     }
@@ -132,6 +136,7 @@ impl RuntimeValue {
             RuntimeValue::AttemptScope(_) => RuntimeValueTag::AttemptScope,
             RuntimeValue::AttemptHandle(_) => RuntimeValueTag::AttemptHandle,
             RuntimeValue::AttemptOutcome(_) => RuntimeValueTag::AttemptOutcome,
+            RuntimeValue::SemanticFrontier(_) => RuntimeValueTag::SemanticFrontier,
         }
     }
 
@@ -200,6 +205,10 @@ impl RuntimeValue {
             )),
             RuntimeValue::AttemptHandle(handle) => Ok(handle.materialize()),
             RuntimeValue::AttemptOutcome(outcome) => Ok(outcome.materialize()),
+            RuntimeValue::SemanticFrontier(_) => Err(stone_error(
+                context,
+                "semantic frontiers are task-owned authority values and cannot cross this boundary",
+            )),
         }
     }
 }
@@ -231,6 +240,7 @@ mod tests {
         assert_eq!(RuntimeValueTag::WorkflowStage.id(), 14);
         assert_eq!(RuntimeValueTag::Workflow.id(), 15);
         assert_eq!(RuntimeValueTag::WorkflowEvidenceSource.id(), 16);
+        assert_eq!(RuntimeValueTag::SemanticFrontier.id(), 17);
     }
 
     #[test]
@@ -331,6 +341,8 @@ mod tests {
         .into_nu_value("test")
         .expect("attempt outcome should materialize");
         let record = value.as_record().expect("outcome record");
+        assert_eq!(record.get("ok").unwrap().as_bool().unwrap(), true);
+        assert_eq!(record.get("succeeded").unwrap().as_bool().unwrap(), true);
         for (phase, expected) in [
             ("execution", "exited"),
             ("result", "succeeded"),
