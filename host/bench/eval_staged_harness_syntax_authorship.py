@@ -72,7 +72,7 @@ Available evidence expressions for this syntax experiment:
 - artifact(path, format=None, arch=None)
 - command_succeeded(argv)
 - stdout_nonempty()
-- decision_recorded(fields=[])
+- decision_recorded(fields=[]) or decision_recorded(resolved=[])
 - file_valid(path, format=None, nonempty=True)
 - all_evidence(first, ...)
 
@@ -81,8 +81,10 @@ these builtins yourself. A standard visible Stone library supplies the
 one-decision agent_loop(step) callback; do not regenerate that library.
 When an inspection or planning stage is meant to produce a decision rather
 than a file, gate it with decision_recorded(). If downstream execution depends
-on concrete facts, name them with fields=["fact_name", ...]; the standard
-agent's decide action must then record a non-empty finding for every field.
+on concrete facts, name them with resolved=["fact_name", ...]; the standard
+agent's decide action must then record state, value, and an observation basis
+for every field. An unknown finding keeps the stage open. Use fields= only when
+a non-empty structural finding is sufficient.
 Existing task inputs and generic prose are not evidence that planning happened.
 
 Public task:
@@ -266,7 +268,10 @@ def source_features(arm: str, source: str) -> dict[str, Any]:
         ),
         "decision_evidence": "decision_recorded(" in source,
         "typed_decision_fields": bool(
-            re.search(r"decision_recorded\s*\([^)]*\bfields\s*=", source)
+            re.search(r"decision_recorded\s*\([^)]*\b(?:fields|resolved)\s*=", source)
+        ),
+        "resolved_decision_fields": bool(
+            re.search(r"decision_recorded\s*\([^)]*\bresolved\s*=", source)
         ),
         "decorator_count": source.count("@stage("),
         "workflow_call": "workflow(" in source and "workflow_run(" in source,
@@ -334,6 +339,8 @@ def semantic_gate(features: dict[str, Any]) -> list[str]:
         violations.append("inspection/planning stage lacks decision_recorded evidence")
     if features["decision_stage"] and not features["typed_decision_fields"]:
         violations.append("inspection/planning decision lacks typed finding fields")
+    if features["decision_stage"] and not features["resolved_decision_fields"]:
+        violations.append("inspection/planning findings do not require resolved state")
     return violations
 
 

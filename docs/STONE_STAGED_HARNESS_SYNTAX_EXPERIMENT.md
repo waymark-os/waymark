@@ -191,5 +191,34 @@ a repairable linker conflict only after consuming its ordinary build actions;
 stage repair reserve should be represented and accounted for separately rather
 than hidden by increasing one undifferentiated action limit.
 
+The first stateful refinement uses
+`decision_recorded(resolved=[...])`. Its controller schema requires a bounded
+`{state, value, basis}` record for every named finding. `unknown` is admitted as
+an honest intermediate state but fails the evidence gate; `resolved` advances
+only when value and basis are both present. The runtime exposes the resolved
+field names independently from legacy structural `fields=[...]`, and nested
+finding records survive compact workflow reports.
+
+A fresh low-reasoning authorship cohort learned this refinement in 3/3 first
+responses. Every generated inspection stage used `resolved=[...]` and selected
+concrete build, target, and runtime fields. An initial sandboxed cohort never
+reached the model because Codex could not initialize writable state; it is
+excluded as infrastructure failure. The valid cohort artifact is
+`target/runs/staged-harness-resolved-findings-v2-terra/aggregate.json`.
+
+The first task cell then failed safely at inspection rather than handing an
+unknown toolchain to the build stage. Its four actions were: shallow root read,
+partial finding publication, shallow source-directory read, and a final partial
+publication. `toolchain` and `frame_backend` remained explicitly `unknown`, no
+Linux effects ran, and cleanup left no open checkpoint or transaction. This
+validates the gate and exposes a distinct efficiency problem: publishing useful
+partial state currently consumes the same action budget as observation. The
+next control experiment should reduce that accounting friction—without
+reclassifying unknown as resolved or merely raising the undifferentiated stage
+limit.
+
+Artifact:
+`../../waymark-gateway/target/runs/staged-stone-doom-v13-resolved-findings-terra/cell/cell.json`
+
 Artifact:
 `../../waymark-gateway/target/runs/staged-stone-doom-v12-typed-decisions-terra/cell/cell.json`

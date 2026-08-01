@@ -10,7 +10,7 @@ workflow project:
         max_actions=4,
     ):
         agent_loop()
-        ensure decision_recorded(fields=[
+        ensure decision_recorded(resolved=[
             "source_layout",
             "toolchain",
             "frame_backend",

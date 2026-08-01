@@ -1546,6 +1546,22 @@ repairable linker failure after exhausting its normal build actions. Treat
 repair reserve as a separate control resource; merely raising an
 undifferentiated stage budget weakens the pressure to execute early.
 
+Stone is experimenting with that distinction as
+`decision_recorded(resolved=[...])`. Findings are bounded records with
+`state`, `value`, and `basis`. An `unknown` record is valid information but not
+sufficient transition evidence, so uncertainty remains visible without
+allowing the next stage to consume it as a resolved interface. The basis is
+semantic provenance for control and debugging, not a replacement for fresh
+artifact or verifier evidence.
+
+The first Doom cell with this interface stopped at inspection with two resolved
+and two unknown findings, zero Linux effects, and clean resource state. This is
+the desired failure direction: an incomplete semantic interface no longer
+silently advances. The trace also shows that partial state publication and
+observation compete for one flat action budget. A subsequent control primitive
+should make incremental finding state cheap to retain, or account for it
+separately, while preserving the model-call cost in observability.
+
 Verifier-populated outcomes and aggregate budget/event views remain necessary.
 See
 [Caffe Bounded-Explore Library Experiment](../../waymark-gateway/docs/CAFFE_BOUNDED_EXPLORE_LIBRARY_EXPERIMENT.md).

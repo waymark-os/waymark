@@ -88,6 +88,7 @@ pub(super) enum WorkflowEvidenceSourceValue {
     StdoutNonempty,
     DecisionRecorded {
         fields: Vec<String>,
+        resolved: bool,
     },
     All(Vec<WorkflowEvidenceSourceValue>),
 }

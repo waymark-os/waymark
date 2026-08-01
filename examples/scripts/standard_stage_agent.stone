@@ -13,18 +13,39 @@
 # Every replacement remains ordinary admitted Stone source.
 
 def stage_agent_schema_prompt():
-    return "Return {\"actions\":[A]} with exactly one A: read(path), write(path,content), run_linux(argv,cwd?,stdin?,timeout_ms?), run_complete(argv,cwd?,stdin?,timeout_ms?), decide(answer,findings?), finish(answer,findings?), or final(answer,findings?). read(path) returns bounded text for a file or a bounded shallow listing for a directory. decide records a stage-local inspection or planning decision; when decision_fields is non-empty, findings must contain one non-empty string for every named field. It does not finish the whole task. Encode tools as {\"tool\":name,\"input\":object}; encode final as {\"final\":{\"answer\":string}}. Use relative paths for task-workspace files; Linux commands see that same root at /app. Prefer run_complete for a bounded build or test that must finish. Do not invent outcomes or use unlisted fields."
+    return "Return {\"actions\":[A]} with exactly one A: read(path), write(path,content), run_linux(argv,cwd?,stdin?,timeout_ms?), run_complete(argv,cwd?,stdin?,timeout_ms?), decide(answer,findings?), finish(answer,findings?), or final(answer,findings?). read(path) returns bounded text for a file or a bounded shallow listing for a directory. decide records a stage-local inspection or planning decision. decision_fields require one non-empty string per name. resolved_decision_fields require one {state: resolved|unknown, value: string, basis: string} record per name; report unknown honestly until observation supports a resolved value. It does not finish the whole task. Encode tools as {\"tool\":name,\"input\":object}; encode final as {\"final\":{\"answer\":string}}. Use relative paths for task-workspace files; Linux commands see that same root at /app. Prefer run_complete for a bounded build or test that must finish. Do not invent outcomes or use unlisted fields."
 
 
 def stage_agent_action_schema(step):
     decision_fields = get(step, "decision_fields", [])
+    resolved_decision_fields = get(step, "resolved_decision_fields", [])
     answer = {
         "type": "object",
         "properties": {"answer": {"type": "string", "minLength": 1}},
         "required": ["answer"],
         "additionalProperties": False,
     }
-    if len(decision_fields) > 0:
+    if len(resolved_decision_fields) > 0:
+        finding_properties = {}
+        for field in resolved_decision_fields:
+            finding_properties[field] = {
+                "type": "object",
+                "properties": {
+                    "state": {"type": "string", "enum": ["resolved", "unknown"]},
+                    "value": {"type": "string", "minLength": 1, "maxLength": 2048},
+                    "basis": {"type": "string", "minLength": 1, "maxLength": 1024},
+                },
+                "required": ["state", "value", "basis"],
+                "additionalProperties": False,
+            }
+        answer["properties"]["findings"] = {
+            "type": "object",
+            "properties": finding_properties,
+            "required": resolved_decision_fields,
+            "additionalProperties": False,
+        }
+        answer["required"].append("findings")
+    elif len(decision_fields) > 0:
         finding_properties = {}
         for field in decision_fields:
             finding_properties[field] = {
@@ -227,6 +248,10 @@ def stage_agent_mode(step):
     previous_tool = ""
     if step.outcome is not None:
         previous_tool = get(step.outcome, "tool", "")
+        findings = get(step.outcome, "findings", {})
+        for field in get(step, "resolved_decision_fields", []):
+            if get(get(findings, field, {}), "state", "unknown") != "resolved":
+                return "resolve_findings"
     if previous_tool in ["write", "run_complete"]:
         return "diagnose_or_repair"
     return "execute_or_repair"
@@ -252,7 +277,9 @@ def stage_agent_messages(step):
                 "task workspace mounted at /app. When decision_recorded is "
                 "the remaining contract, inspect as needed and then use "
                 "decide(answer, findings) to retain the stage-local decision; "
-                "decision_fields lists every required non-empty finding. Treat "
+                "decision_fields lists every required non-empty finding. "
+                "resolved_decision_fields require state, value, and a compact "
+                "observation basis; unknown is valid but keeps the gate open. Treat "
                 "stage_history as the completed action ledger and do not "
                 "repeat a successful probe unless new evidence requires it. "
                 "In execute_or_repair mode, take a workspace-changing action "
@@ -282,6 +309,7 @@ def stage_agent_messages(step):
                 "mode": stage_agent_mode(step),
                 "contract_kinds": step.contracts,
                 "decision_fields": get(step, "decision_fields", []),
+                "resolved_decision_fields": get(step, "resolved_decision_fields", []),
                 "contracts": step.evidence,
                 "previous_outcome": stage_agent_outcome_summary(step.outcome),
                 "stage_history": stage_agent_history(step),

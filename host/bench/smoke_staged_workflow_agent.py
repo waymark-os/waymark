@@ -25,8 +25,16 @@ FIXTURES = [
                     "input": {
                         "answer": "Build both files, run the command, then verify the frame.",
                         "findings": {
-                            "source_layout": "fixture files live at the workspace root",
-                            "execution_gate": "run the exact observed shell command",
+                            "source_layout": {
+                                "state": "resolved",
+                                "value": "fixture files live at the workspace root",
+                                "basis": "workspace directory listing",
+                            },
+                            "execution_gate": {
+                                "state": "resolved",
+                                "value": "run the exact observed shell command",
+                                "basis": "stage contract names the command",
+                            },
                         },
                     },
                 }
@@ -101,7 +109,7 @@ HARNESS = r'''
 workflow fixture:
     stage inspect(goal="record a fixture execution decision", max_actions=1):
         agent_loop()
-        ensure decision_recorded(fields=["source_layout", "execution_gate"])
+        ensure decision_recorded(resolved=["source_layout", "execution_gate"])
 
     stage build(goal="produce first.txt and second.txt", max_actions=3):
         agent_loop()

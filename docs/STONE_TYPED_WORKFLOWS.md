@@ -397,9 +397,28 @@ still validate its consequences.
 
 A typed shape gate also does not imply that a finding is resolved. A task cell
 can satisfy a required non-empty field with an honest statement that the fact
-is still unknown. The next refinement should represent resolution explicitly
-and attach a compact observation basis, while keeping final correctness under
-fresh evidence gates.
+is still unknown. Resolution therefore needs explicit state and a compact
+observation basis, while final correctness remains under fresh evidence gates.
+
+The experimental stateful form is:
+
+```stone
+ensure decision_recorded(resolved=["source_layout", "toolchain"])
+```
+
+Each named finding is a bounded `{state, value, basis}` record. `state` is
+`resolved` or `unknown`; both are representable, but only `resolved` satisfies
+the contract. An honest unknown therefore keeps the stage open and its value
+and basis explain what remains missing. `basis` is compact semantic provenance,
+not authoritative proof; artifact, command, and verifier gates retain that
+role. The older `fields=[...]` form continues to accept structural strings.
+
+In the first task-shaped run, the model used `unknown` honestly and the runtime
+kept the inspection stage open. That prevents a bad handoff, but it also showed
+that a partial finding publication consumes a stage action just like a file
+observation. Finding state and budget accounting are therefore separate design
+axes: retain the strict state gate, then make incremental publication cheaper
+or give it an explicit budget class.
 
 ```stone
 def repair_output(step):

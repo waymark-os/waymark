@@ -4649,22 +4649,24 @@ impl Evaluator<'_> {
     fn eval_decision_recorded_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         if !call.positional.is_empty() {
             return Err(workflow_error(
-                "decision_recorded() accepts only the optional fields= keyword",
+                "decision_recorded() accepts only an optional fields= or resolved= keyword",
             ));
         }
         let mut fields = Vec::new();
+        let mut resolved = false;
         let mut seen_keyword = false;
         for (name, expression) in &call.named {
-            if name != "fields" || seen_keyword {
+            if seen_keyword || !matches!(name.as_str(), "fields" | "resolved") {
                 return Err(workflow_error(
-                    "decision_recorded() accepts fields= exactly once",
+                    "decision_recorded() accepts at most one of fields= or resolved=",
                 ));
             }
             seen_keyword = true;
+            resolved = name == "resolved";
             let value = self
                 .eval_expr_value(expression, PipelineData::empty())?
-                .into_nu_value("decision_recorded fields")?;
-            fields = value_to_string_list(&value, "decision_recorded fields")?;
+                .into_nu_value("decision_recorded finding names")?;
+            fields = value_to_string_list(&value, "decision_recorded finding names")?;
         }
         if fields.len() > 12 {
             return Err(workflow_error(
@@ -4690,7 +4692,7 @@ impl Evaluator<'_> {
             }
         }
         Ok(RuntimeValue::WorkflowEvidenceSource(
-            WorkflowEvidenceSource::DecisionRecorded { fields },
+            WorkflowEvidenceSource::DecisionRecorded { fields, resolved },
         ))
     }
 
@@ -5695,8 +5697,9 @@ impl Evaluator<'_> {
                 validate_workflow_evidence(satisfied, summary, references)
                     .map_err(|error| workflow_evidence_source_error(workflow, stage, phase, error))
             }
-            WorkflowEvidenceSource::DecisionRecorded { fields } => {
-                let (satisfied, summary, reference) = workflow_decision_evidence(&context, fields)?;
+            WorkflowEvidenceSource::DecisionRecorded { fields, resolved } => {
+                let (satisfied, summary, reference) =
+                    workflow_decision_evidence(&context, fields, *resolved)?;
                 validate_workflow_evidence(satisfied, summary, reference.into_iter().collect())
                     .map_err(|error| workflow_evidence_source_error(workflow, stage, phase, error))
             }
@@ -11595,6 +11598,7 @@ fn workflow_stdout_evidence(context: &Value) -> Result<(bool, String, usize), Sh
 fn workflow_decision_evidence(
     context: &Value,
     required_fields: &[String],
+    require_resolved: bool,
 ) -> Result<(bool, String, Option<String>), ShellError> {
     let Some(outcome) = workflow_context_outcome(context) else {
         return Ok((
@@ -11627,24 +11631,69 @@ fn workflow_decision_evidence(
         _ => None,
     });
     let mut missing = Vec::new();
+    let mut unresolved = Vec::new();
+    let mut invalid = Vec::new();
     for field in required_fields {
-        let present = findings
-            .and_then(|findings| findings.get(field))
-            .and_then(|value| match value {
-                Value::String { val, .. } | Value::Glob { val, .. } => Some(val.trim()),
+        let Some(finding) = findings.and_then(|findings| findings.get(field)) else {
+            missing.push(field.as_str());
+            continue;
+        };
+        if !require_resolved {
+            let present = match finding {
+                Value::String { val, .. } | Value::Glob { val, .. } => {
+                    !val.trim().is_empty() && val.chars().count() <= 2_048
+                }
+                _ => false,
+            };
+            if !present {
+                invalid.push(field.as_str());
+            }
+            continue;
+        }
+        let Value::Record { val: record, .. } = finding else {
+            invalid.push(field.as_str());
+            continue;
+        };
+        let bounded_string = |name: &str, limit: usize| {
+            record.get(name).and_then(|value| match value {
+                Value::String { val, .. } | Value::Glob { val, .. }
+                    if !val.trim().is_empty() && val.chars().count() <= limit =>
+                {
+                    Some(val.as_str())
+                }
                 _ => None,
             })
-            .is_some_and(|value| !value.is_empty() && value.chars().count() <= 2_048);
-        if !present {
-            missing.push(field.as_str());
+        };
+        let Some(state) = bounded_string("state", 16) else {
+            invalid.push(field.as_str());
+            continue;
+        };
+        if bounded_string("value", 2_048).is_none() || bounded_string("basis", 1_024).is_none() {
+            invalid.push(field.as_str());
+            continue;
+        }
+        match state {
+            "resolved" => {}
+            "unknown" => unresolved.push(field.as_str()),
+            _ => invalid.push(field.as_str()),
         }
     }
-    if !missing.is_empty() {
+    if !missing.is_empty() || !unresolved.is_empty() || !invalid.is_empty() {
+        let mut problems = Vec::new();
+        if !missing.is_empty() {
+            problems.push(format!("missing: {}", missing.join(", ")));
+        }
+        if !unresolved.is_empty() {
+            problems.push(format!("unresolved: {}", unresolved.join(", ")));
+        }
+        if !invalid.is_empty() {
+            problems.push(format!("invalid: {}", invalid.join(", ")));
+        }
         return Ok((
             false,
             format!(
-                "explicit stage decision is missing typed findings: {}",
-                missing.join(", ")
+                "explicit stage decision has typed finding problems; {}",
+                problems.join("; ")
             ),
             None,
         ));
@@ -11659,6 +11708,11 @@ fn workflow_decision_evidence(
         true,
         if required_fields.is_empty() {
             format!("explicit stage decision recorded ({bytes} bytes)")
+        } else if require_resolved {
+            format!(
+                "explicit stage decision recorded ({bytes} bytes) with resolved findings: {}",
+                required_fields.join(", ")
+            )
         } else {
             format!(
                 "explicit stage decision recorded ({bytes} bytes) with typed findings: {}",
@@ -11831,8 +11885,25 @@ fn compact_workflow_action_record(record: &Record) -> Value {
     if let Some(Value::Record { val: findings, .. }) = record.get("findings") {
         let mut bounded = Record::new();
         for (field, value) in findings.iter().take(12) {
-            if let Value::String { val, .. } | Value::Glob { val, .. } = value {
-                bounded.push(field, Value::string(bounded_text(val, 2_048), span));
+            match value {
+                Value::String { val, .. } | Value::Glob { val, .. } => {
+                    bounded.push(field, Value::string(bounded_text(val, 2_048), span));
+                }
+                Value::Record { val: finding, .. } => {
+                    let mut compact_finding = Record::new();
+                    for (name, limit) in [("state", 16), ("value", 2_048), ("basis", 1_024)] {
+                        if let Some(Value::String { val, .. } | Value::Glob { val, .. }) =
+                            finding.get(name)
+                        {
+                            compact_finding
+                                .push(name, Value::string(bounded_text(val, limit), span));
+                        }
+                    }
+                    if !compact_finding.is_empty() {
+                        bounded.push(field, Value::record(compact_finding, span));
+                    }
+                }
+                _ => {}
             }
         }
         if !bounded.is_empty() {
@@ -11960,6 +12031,18 @@ fn workflow_context_value(
             span,
         ),
     );
+    let mut resolved_decision_fields = Vec::new();
+    workflow_resolved_decision_fields(&stage.evidence, &mut resolved_decision_fields);
+    record.push(
+        "resolved_decision_fields",
+        Value::list(
+            resolved_decision_fields
+                .into_iter()
+                .map(|name| Value::string(name, span))
+                .collect(),
+            span,
+        ),
+    );
     record.push(
         "outcome",
         outcome.cloned().unwrap_or_else(|| Value::nothing(span)),
@@ -11986,12 +12069,28 @@ fn workflow_contract_names(source: &WorkflowEvidenceSource, names: &mut Vec<&'st
 
 fn workflow_decision_fields(source: &WorkflowEvidenceSource, fields: &mut Vec<String>) {
     match source {
-        WorkflowEvidenceSource::DecisionRecorded { fields: required } => {
-            fields.extend(required.iter().cloned())
-        }
+        WorkflowEvidenceSource::DecisionRecorded {
+            fields: required,
+            resolved: false,
+        } => fields.extend(required.iter().cloned()),
         WorkflowEvidenceSource::All(sources) => {
             for source in sources {
                 workflow_decision_fields(source, fields);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn workflow_resolved_decision_fields(source: &WorkflowEvidenceSource, fields: &mut Vec<String>) {
+    match source {
+        WorkflowEvidenceSource::DecisionRecorded {
+            fields: required,
+            resolved: true,
+        } => fields.extend(required.iter().cloned()),
+        WorkflowEvidenceSource::All(sources) => {
+            for source in sources {
+                workflow_resolved_decision_fields(source, fields);
             }
         }
         _ => {}
@@ -16502,6 +16601,36 @@ typed_decision = {
     "outcome": None,
 }
 typed_schema = stage_agent_action_schema(typed_decision)
+resolved_decision = {
+    "attempt": 2,
+    "max_actions": 4,
+    "contracts": ["decision_recorded"],
+    "decision_fields": [],
+    "resolved_decision_fields": ["source_layout", "toolchain"],
+    "outcome": {
+        "tool": "decide",
+        "findings": {
+            "source_layout": {
+                "state": "resolved",
+                "value": "sources found",
+                "basis": "directory listing",
+            },
+            "toolchain": {
+                "state": "unknown",
+                "value": "compiler not located",
+                "basis": "top-level Makefile is absent",
+            },
+        },
+    },
+}
+resolved_schema = stage_agent_action_schema({
+    "attempt": 4,
+    "max_actions": 4,
+    "contracts": ["decision_recorded"],
+    "decision_fields": [],
+    "resolved_decision_fields": ["source_layout", "toolchain"],
+    "outcome": resolved_decision.outcome,
+})
 emit({
     "summary_stdout": summary.stdout,
     "summary_stderr": summary.stderr,
@@ -16515,6 +16644,10 @@ emit({
     "decision_choices": len(stage_agent_action_schema(decision).properties.actions.items.oneOf),
     "typed_decision_required": typed_schema.properties.actions.items.oneOf[0].properties.input.required,
     "typed_finding_required": typed_schema.properties.actions.items.oneOf[0].properties.input.properties.findings.required,
+    "resolved_mode": stage_agent_mode(resolved_decision),
+    "resolved_choices": len(stage_agent_action_schema(resolved_decision).properties.actions.items.oneOf),
+    "resolved_finding_required": resolved_schema.properties.actions.items.oneOf[0].properties.input.properties.findings.properties.toolchain.required,
+    "resolved_state_enum": resolved_schema.properties.actions.items.oneOf[0].properties.input.properties.findings.properties.toolchain.properties.state.enum,
 })
 "#,
         );
@@ -16537,6 +16670,10 @@ emit({
                 "decision_choices": 3,
                 "typed_decision_required": ["answer", "findings"],
                 "typed_finding_required": ["source_layout", "toolchain"],
+                "resolved_mode": "resolve_findings",
+                "resolved_choices": 7,
+                "resolved_finding_required": ["state", "value", "basis"],
+                "resolved_state_enum": ["resolved", "unknown"],
             })
         );
         cleanup_dir(&root);
@@ -16632,6 +16769,90 @@ emit({
             .as_str()
             .expect("typed decision summary")
             .contains("source_layout, toolchain"));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn resolved_decision_contract_keeps_unknown_findings_open() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-resolved-decision")?;
+        let program = lower_source(
+            r#"def agent_loop(step):
+    if step.resolved_decision_fields != ["source_layout", "toolchain"]:
+        fail("resolved decision fields were not exposed to the stage agent")
+    if step.attempt == 1:
+        return {
+            "ok": True,
+            "kind": "decision_recorded",
+            "message": "The source layout is known; toolchain remains unknown.",
+            "findings": {
+                "source_layout": {
+                    "state": "resolved",
+                    "value": "sources are nested under doomgeneric",
+                    "basis": "directory listing contains doomgeneric/doomgeneric",
+                },
+                "toolchain": {
+                    "state": "unknown",
+                    "value": "cross compiler has not been identified",
+                    "basis": "top-level make reported that no Makefile exists",
+                },
+            },
+            "transition_id": "fixture-decision-unknown",
+        }
+    return {
+        "ok": True,
+        "kind": "decision_recorded",
+        "message": "The build inputs are resolved.",
+        "findings": {
+            "source_layout": {
+                "state": "resolved",
+                "value": "sources are nested under doomgeneric",
+                "basis": "directory listing contains doomgeneric/doomgeneric",
+            },
+            "toolchain": {
+                "state": "resolved",
+                "value": "use mipsel-linux-gnu-gcc",
+                "basis": "compiler probe returned /usr/bin/mipsel-linux-gnu-gcc",
+            },
+        },
+        "transition_id": "fixture-decision-resolved",
+    }
+
+workflow task:
+    stage inspect(goal="resolve build inputs", max_actions=2):
+        agent_loop()
+        ensure decision_recorded(resolved=["source_layout", "toolchain"])
+
+report = workflow_run(task)
+emit({
+    "ok": report.ok,
+    "attempts": report.stages[0].attempts,
+    "evidence": report.stages[0].evidence,
+    "findings": report.stages[0].last_action.findings,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(true));
+        assert_eq!(value["attempts"], json_value!(2));
+        assert_eq!(
+            value["evidence"]["evidence"],
+            json_value!(["transition:fixture-decision-resolved:decision"])
+        );
+        assert!(value["evidence"]["summary"]
+            .as_str()
+            .expect("resolved decision summary")
+            .contains("resolved findings: source_layout, toolchain"));
+        assert_eq!(
+            value["findings"]["toolchain"]["state"],
+            json_value!("resolved")
+        );
+        assert_eq!(
+            value["findings"]["toolchain"]["basis"],
+            json_value!("compiler probe returned /usr/bin/mipsel-linux-gnu-gcc")
+        );
         cleanup_dir(&root);
         Ok(())
     }

@@ -128,11 +128,12 @@ report = workflow_run(workflow("build", build_artifact))"#,
     },
     StoneHelpEntry {
         name: "decision_recorded",
-        signature: r#"decision_recorded(fields: list[str]? = []) -> workflow_evidence_spec"#,
-        use_when: "Gate an inspection, planning, or selection stage on an explicit non-empty stage decision. fields= additionally requires named, non-empty typed findings from decide(answer, findings); finish remains accepted for compatibility.",
+        signature: r#"decision_recorded(fields: list[str]? = [], resolved: list[str]? = []) -> workflow_evidence_spec"#,
+        use_when: "Gate an inspection, planning, or selection stage on an explicit non-empty stage decision. fields= requires named non-empty strings. resolved= instead requires state/value/basis records and advances only when every state is resolved. The two keywords are mutually exclusive.",
         examples: &[
             r#"ensure decision_recorded()"#,
             r#"ensure decision_recorded(fields=["source_layout", "toolchain"])"#,
+            r#"ensure decision_recorded(resolved=["source_layout", "toolchain"])"#,
         ],
         avoid: &[
             "Do not use the existence of task inputs as proof that inspection or planning produced a decision.",
