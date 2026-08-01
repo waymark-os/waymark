@@ -854,8 +854,8 @@ for key, value in items(counts):
         use_when: "Use for lightweight validation when checking task outputs or nominal control values. Attempt control reports attempt_handle, attempt_outcome, attempt_scope, semantic_frontier, and attempt_acceptance without flattening them to record.",
         examples: &[
             r#"ok = type(row["name"]) == "str""#,
-            r#"accepted = attempt_accept(root, child)
-ok = type(accepted) == "attempt_acceptance""#,
+            r#"scope = attempt_scope()
+ok = type(scope) == "attempt_scope""#,
         ],
         avoid: &["Prefer direct conversions like int()/float() when you need numeric values."],
         aliases: &[],
@@ -962,6 +962,9 @@ if starts_with(line, "ERROR"):
             r#"result = run(["printf", "ok"], timeout_ms=5000)"#,
             r#"result = run(["printf", "ok"], hooks={"pre": lambda step: {"argv": step.input.argv}})"#,
             r#"result = run(["printf", "not executed"], hooks={"pre": lambda step: {"allow": False, "reason": "command denied"}})"#,
+            r#"async def build():
+    return await run(["sh", "-c", "sleep 0.01; printf done"], timeout_ms=5000)
+result = build()"#,
             r#"def record_run(step):
     result = step.outcome.value
     return context_write("outcome.last_run", "outcome", {"ok": step.outcome.ok, "exit_code": result.exit_code, "stderr": result.stderr})
@@ -975,6 +978,7 @@ result = run(["sh", "-c", "printf failed >&2; exit 7"], hooks={"post": record_ru
             "Do not pass shell strings; pass argv lists.",
             "Do not use run for normal file/JSON/CSV work.",
             "Use run_complete for long task commands that must finish before the next Stone statement, such as builds, tests, installs, downloads, benchmarks, or data processing.",
+            "Inside async def, `await run(...)` is the explicit-effect spelling of run_complete and owns the command through terminal completion.",
             "Do not use shell backgrounding, nohup, or `&`; use background=True for long task commands, or start_daemon() for servers/services that must stay running while tests execute.",
             "For noisy commands, suppress or cap output explicitly instead of flooding stdout/stderr.",
             "Do not ignore result.ok; inspect stderr, exit_code, timed_out, and explanation before retrying.",
@@ -1217,15 +1221,13 @@ else:
         use_when: "Create a task-owned supervision scope before spawning child attempts. Use `with scope:` when every consumer fits naturally inside one block; otherwise call attempt_scope_close explicitly. `scope.branch(frontier, ...)`, `scope.wait_any(...)`, and `scope.wait_all(...)` are thin method forms of the existing lifecycle operations.",
         examples: &[r#"scope = attempt_scope(join_timeout_ms=2000)
 with scope:
-    child = scope.branch(frontier, program=current_program(), entrypoint="worker", start=True)
-    outcome = child.wait(timeout_ms=30000)
-    child.discard(reason="probe complete")
+    marker = "supervised"
 emit(scope.closed)"#,
             r#"async def explore():
     async with attempt_scope(join_timeout_ms=2000) as scope:
-        child = scope.branch(frontier, program=current_program(), entrypoint="worker", start=True)
-        outcome = await child.wait(timeout_ms=30000)
-    return {"outcome": outcome, "clean": scope.closed}"#,
+        marker = "supervised"
+    return {"marker": marker, "clean": scope.closed}
+result = explore()"#,
         ],
         avoid: &[
             "Do not persist an open attempt scope across Stone evaluations; it is closed automatically at the current evaluation boundary.",

@@ -204,7 +204,7 @@ def fixture_gate(summary: dict[str, Any] | None) -> tuple[bool, list[str]]:
                 f"controller_report.{key}={report.get(key)!r}, expected {value!r}"
             )
     control = report.get("_control")
-    if not isinstance(control, dict) or control.get("name") != "stone.standard_action_v11":
+    if not isinstance(control, dict) or control.get("name") != "stone.standard_action_v12":
         violations.append("standard control provenance is missing")
     if summary.get("rolled_back") is not True:
         violations.append("attempt did not roll back")

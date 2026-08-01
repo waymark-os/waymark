@@ -124,11 +124,17 @@ class StandardAttemptAgentTests(unittest.TestCase):
         self.assertIn('"run_cleanup_wait_attempts": 6', self.source)
         self.assertIn('"run_cleanup_pending"', self.source)
         self.assertIn('"tool": {"const": "run_start"}', self.source)
+        self.assertIn('"tool": {"const": "run_complete"}', self.source)
         self.assertIn('"tool": {"const": "run_status"}', self.source)
         self.assertIn('"tool": {"const": "run_wait"}', self.source)
         self.assertIn('"tool": {"const": "run_terminate"}', self.source)
         self.assertIn("background=True", self.source)
         self.assertIn('"run_wait_ms": 30000', self.source)
+        self.assertIn('"run_complete_timeout_ms": 900000', self.source)
+        self.assertIn('result = run_complete(', self.source)
+        self.assertIn('"run_completion_timeout"', self.source)
+        self.assertIn('"run_complete_calls":', self.source)
+        self.assertIn('"runtime_wait_observations":', self.source)
         self.assertIn('"max_active_runs": 4', self.source)
         self.assertIn('"progress.active_runs"', self.source)
         self.assertIn("def standard_reconcile_active_runs(", self.source)
@@ -163,7 +169,7 @@ class StandardAttemptAgentTests(unittest.TestCase):
             "state.model_calls + 1 + reserved_calls > options.max_model_calls",
             self.source,
         )
-        self.assertIn('"name": "stone.standard_action_v11"', self.source)
+        self.assertIn('"name": "stone.standard_action_v12"', self.source)
         self.assertIn('"stage": "budget_checkpoint"', self.source)
         self.assertIn('"kind": "budget_completion_checkpoint"', self.source)
         self.assertIn(

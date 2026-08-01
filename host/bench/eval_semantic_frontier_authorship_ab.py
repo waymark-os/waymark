@@ -476,7 +476,7 @@ def execute_source(
     if ok and arm == "async":
         async_diagnostics = (payload.get("frontiers") or {}).get("async") or {}
         ok = (
-            async_diagnostics.get("lowering") == "blocking_attempt_effects"
+            async_diagnostics.get("lowering") == "blocking_resource_effects"
             and async_diagnostics.get("functions_entered") == 1
             and async_diagnostics.get("awaits") == 4
         )

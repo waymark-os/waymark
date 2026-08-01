@@ -236,13 +236,20 @@ async def explore(frontier):
     return {"outcome": outcome, "clean": scope.closed}
 ```
 
-`await` is currently admitted only for an attempt handle, child/scope wait
-methods, root acceptance, and their functional `attempt_*` forms. `async with`
-is limited to attempt scopes and semantic frontiers. The interpreter lowers
-these effect boundaries onto the existing blocking Gateway operations; child
-attempts still execute concurrently, but Stone does not yet expose general
-coroutine values or a local async scheduler. Diagnostics report this as
-`lowering="blocking_attempt_effects"`.
+`await` is admitted only for owned resource effects: `run(...)`, an attempt
+handle, child/scope wait methods, root acceptance, and their functional
+`attempt_*` forms. `await run(...)` owns one bounded command through terminal
+completion and lowers to the same lifecycle as `run_complete(...)`, including
+internal observation slices and termination at the total timeout. Use ordinary
+`run(..., background=True)` when the program intentionally needs to interleave
+work or manage a service. `async with` remains limited to attempt scopes and
+semantic frontiers.
+
+The interpreter lowers these boundaries onto existing blocking Gateway
+operations; children and Gateway runs still execute outside the controller,
+but Stone does not expose general coroutine values or a local async scheduler.
+Diagnostics report `lowering="blocking_resource_effects"`, total `awaits`, and
+the `run_awaits` subset.
 
 In a frozen three-pair authorship comparison, async passed 3/3 first responses
 with no repairs, but did not beat corrected synchronous scoped syntax: both

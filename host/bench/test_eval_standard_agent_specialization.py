@@ -78,7 +78,7 @@ class StandardAgentSpecializationTests(unittest.TestCase):
                 "specialized": True,
                 "specialization_label": EXPERIMENT.EXPECTED_LABEL,
                 "verified_round": 1,
-                "_control": {"name": "stone.standard_action_v11"},
+                "_control": {"name": "stone.standard_action_v12"},
             },
         }
         self.assertEqual(EXPERIMENT.fixture_gate(summary), (True, []))

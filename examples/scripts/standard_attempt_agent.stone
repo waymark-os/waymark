@@ -1,4 +1,4 @@
-# Standard visible Stone action controller, V11.
+# Standard visible Stone action controller, V12.
 #
 # Everything below is ordinary admitted Stone source. The runtime contributes
 # model_infer and resource effects, but it does not hide this loop, dispatcher,
@@ -18,7 +18,7 @@
 # can replace adapters and pass reusable call-local policy through this control.
 
 def standard_schema_prompt_text():
-    return "Return {\"actions\":[A]} with exactly one A. A is exactly one of: {\"tool\":\"read\",\"input\":{\"path\":string}}; {\"tool\":\"write\",\"input\":{\"path\":string,\"content\":string}}; {\"tool\":\"run_linux\",\"input\":C}; {\"tool\":\"run_start\",\"input\":B}; {\"tool\":\"run_status\",\"input\":{\"run_id\":string}}; {\"tool\":\"run_wait\",\"input\":{\"run_id\":string,\"timeout_ms\"?:integer}}; {\"tool\":\"run_terminate\",\"input\":{\"run_id\":string}}; {\"tool\":\"finish\",\"input\":{\"answer\":nonempty string}}; {\"final\":{\"answer\":nonempty string}}. C={\"argv\":[string,...],\"cwd\"?:string,\"stdin\"?:string,\"timeout_ms\"?:integer,\"max_stdout_bytes\"?:integer,\"max_stderr_bytes\"?:integer}; B is C without timeout_ms. argv has 1..64 items; timeout 1..120000; stdout 1..65536; stderr 1..32768. Use run_start for long commands, then retain its run_id and manage it with status/wait/terminate. Never use shell &, nohup, or finish with active runs. No unlisted fields."
+    return "Return {\"actions\":[A]} with one A: read(path); write(path,content); run_linux(C); run_complete(L); run_start(B); run_status(run_id); run_wait(run_id,timeout_ms?); run_terminate(run_id); finish(answer); or final(answer). Encode each tool as {\"tool\":name,\"input\":object}, final as {\"final\":{\"answer\":string}}. C/L/B contain argv:[string,...], optional cwd,stdin,max_stdout_bytes,max_stderr_bytes; C/L may include timeout_ms, B may not. argv 1..64; C timeout <=120000; L timeout <=1800000; stdout <=65536; stderr <=32768. Prefer run_complete for a bounded command that must finish; use run_start only to interleave work or manage a service, then status/wait/terminate its run_id. Never use shell &, nohup, or finish with active runs. No unlisted fields."
 
 
 def standard_critique_schema_prompt_text():
@@ -54,6 +54,7 @@ def standard_agent_options(input):
         "max_stdout_bytes": 16384,
         "max_stderr_bytes": 8192,
         "tool_timeout_ms": 60000,
+        "run_complete_timeout_ms": 900000,
         "run_wait_ms": 30000,
         "max_active_runs": 4,
         "run_cleanup_wait_ms": 5000,
@@ -207,6 +208,15 @@ def standard_agent_options(input):
     options["tool_timeout_ms"] = standard_clamp(
         get(input, "tool_timeout_ms", options.tool_timeout_ms), 1000, 120000
     )
+    options["run_complete_timeout_ms"] = standard_clamp(
+        get(
+            input,
+            "run_complete_timeout_ms",
+            options.run_complete_timeout_ms,
+        ),
+        120000,
+        1800000,
+    )
     options["run_wait_ms"] = standard_clamp(
         get(input, "run_wait_ms", options.run_wait_ms), 100, 60000
     )
@@ -354,6 +364,36 @@ def standard_action_schema():
         "required": ["argv"],
         "additionalProperties": False,
     }
+    run_complete_input = {
+        "type": "object",
+        "properties": {
+            "argv": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 64,
+            },
+            "cwd": {"type": "string", "minLength": 1},
+            "stdin": {"type": "string"},
+            "timeout_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1800000,
+            },
+            "max_stdout_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65536,
+            },
+            "max_stderr_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 32768,
+            },
+        },
+        "required": ["argv"],
+        "additionalProperties": False,
+    }
     run_handle_input = {
         "type": "object",
         "properties": {
@@ -409,6 +449,15 @@ def standard_action_schema():
                 "properties": {
                     "tool": {"const": "run_start"},
                     "input": run_start_input,
+                },
+                "required": ["tool", "input"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "tool": {"const": "run_complete"},
+                    "input": run_complete_input,
                 },
                 "required": ["tool", "input"],
                 "additionalProperties": False,
@@ -618,7 +667,7 @@ def standard_initial_messages(session, options):
     return [
         {
             "role": "system",
-            "content": "Choose exactly one next action from visible evidence and wrap it as {\"actions\":[...]}. Never invent tool outcomes. Use run_start plus its returned run_id for commands that may take more than a few seconds; use run_status or bounded run_wait while doing other useful work, and run_terminate only when the run is stale or wrong. Never use shell backgrounding. Finish is rejected while an owned run remains active. A fresh completion critic will reject finish claims not supported by recorded evidence.",
+            "content": "Choose exactly one next action from visible evidence and wrap it as {\"actions\":[...]}. Never invent tool outcomes. Prefer run_complete for a bounded build, install, test, download, benchmark, or data-processing command that must finish. Use run_start only when work should overlap or a service must stay live; manage that run_id with status/wait/terminate. Never use shell backgrounding. Finish is rejected while an owned run remains active. A fresh completion critic rejects claims without recorded evidence.",
         },
         {
             "role": "user",
@@ -749,6 +798,45 @@ def standard_shell_dispatch(action, options):
             "timed_out": result.timed_out,
             "truncated": result.truncated,
         }
+    if tool == "run_complete":
+        result = run_complete(
+            args.argv,
+            cwd=get(args, "cwd", None),
+            stdin=get(args, "stdin", None),
+            timeout_ms=min(
+                get(
+                    args,
+                    "timeout_ms",
+                    options.run_complete_timeout_ms,
+                ),
+                options.run_complete_timeout_ms,
+            ),
+            max_stdout_bytes=min(
+                get(args, "max_stdout_bytes", options.max_stdout_bytes),
+                options.max_stdout_bytes,
+            ),
+            max_stderr_bytes=min(
+                get(args, "max_stderr_bytes", options.max_stderr_bytes),
+                options.max_stderr_bytes,
+            ),
+        )
+        outcome = standard_owned_run_outcome(
+            (
+                "run_completion_timeout"
+                if get(result, "timed_out", False)
+                else "run_completed"
+            ),
+            get(result, "run_id", ""),
+            result,
+        )
+        outcome["completion_waits"] = get(result, "completion_waits", 0)
+        outcome["requested_timeout_ms"] = get(
+            result,
+            "requested_timeout_ms",
+            options.run_complete_timeout_ms,
+        )
+        outcome["message"] = str(get(result, "explanation", ""))
+        return outcome
     if tool == "run_start":
         result = run(
             args.argv,
@@ -828,7 +916,7 @@ def standard_action_summary(action):
             "path": args.path,
             "content_characters": len(args.content),
         }
-    if tool in ["run_linux", "run_start"]:
+    if tool in ["run_linux", "run_complete", "run_start"]:
         return {"tool": tool, "argv": args.argv, "cwd": get(args, "cwd", None)}
     if tool in ["run_status", "run_wait", "run_terminate"]:
         return {
@@ -850,7 +938,7 @@ def standard_record_active_runs(state, options):
             "runs": state.active_runs,
         },
         status=status,
-        evidence=["control:stone.standard_action_v11"],
+        evidence=["control:stone.standard_action_v12"],
     )
 
 
@@ -887,6 +975,16 @@ def standard_reconcile_active_runs(state, options):
 
 def standard_track_owned_run(action, outcome, state, options):
     tool = action.tool
+    if tool == "run_complete":
+        state["run_complete_calls"] += 1
+        state["runtime_wait_observations"] += get(
+            outcome,
+            "completion_waits",
+            0,
+        )
+        if get(outcome, "done", False):
+            state["run_complete_completions"] += 1
+        return state
     if tool not in ["run_start", "run_status", "run_wait", "run_terminate"]:
         return state
     if tool == "run_start":
@@ -970,6 +1068,8 @@ def standard_outcome_evidence(action, outcome, state, options):
         "timed_out",
         "still_running",
         "done",
+        "completion_waits",
+        "requested_timeout_ms",
         "truncated",
         "path",
         "run_id",
@@ -1239,7 +1339,7 @@ def standard_verify_finish(candidate, session, state):
 
 
 def standard_record_progress(event):
-    evidence = ["control:stone.standard_action_v11"]
+    evidence = ["control:stone.standard_action_v12"]
     transition_id = get(event, "transition_id", "")
     if len(transition_id) > 0:
         evidence.append("transition:" + transition_id)
@@ -1256,7 +1356,7 @@ def standard_record_progress(event):
 def standard_result(candidate, state):
     result = candidate
     result["_control"] = {
-        "name": "stone.standard_action_v11",
+        "name": "stone.standard_action_v12",
         "rounds": state.rounds,
         "actions": state.actions,
         "model_calls": state.model_calls,
@@ -1266,6 +1366,9 @@ def standard_result(candidate, state):
         "run_observations": state.run_observations,
         "run_termination_calls": state.run_termination_calls,
         "run_completions": state.run_completions,
+        "run_complete_calls": state.run_complete_calls,
+        "run_complete_completions": state.run_complete_completions,
+        "runtime_wait_observations": state.runtime_wait_observations,
         "run_reconciliations": state.run_reconciliations,
         "recovered_active_runs": state.recovered_active_runs,
         "run_reconciliation_over_capacity": (
@@ -1339,6 +1442,9 @@ def standard_agent_control(
         "run_observations": 0,
         "run_termination_calls": 0,
         "run_completions": 0,
+        "run_complete_calls": 0,
+        "run_complete_completions": 0,
+        "runtime_wait_observations": 0,
         "run_reconciliations": 0,
         "recovered_active_runs": 0,
         "run_reconciliation_over_capacity": 0,
@@ -1473,7 +1579,7 @@ def standard_agent_control(
                 state,
                 reserved_calls,
             ),
-            repair_prompt="Correct only the response shape and arguments. Preserve the intended next action. Use the exact tool/input form in the schema prompt; run_start never accepts timeout_ms.",
+            repair_prompt="Correct only the response shape and arguments. Preserve the intended next action. Use the exact tool/input form in the schema prompt; prefer run_complete for bounded long commands, and remember run_start never accepts timeout_ms.",
             schema_prompt=standard_schema_prompt_text(),
             model_class="agent",
             max_output_tokens=options.max_output_tokens,

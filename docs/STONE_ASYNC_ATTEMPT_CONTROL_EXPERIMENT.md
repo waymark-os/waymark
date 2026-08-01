@@ -1,7 +1,7 @@
 # Stone Async Attempt Control Experiment
 
-Status: mechanism passed; async was learnable but showed no authorship advantage
-over corrected synchronous scoped syntax on 2026-07-31.
+Status: attempt-control mechanism passed; async was learnable but showed no
+authorship advantage over corrected synchronous scoped syntax on 2026-07-31.
 
 ## Question
 
@@ -64,6 +64,15 @@ but it is not the default yet: corrected synchronous scoped syntax is equally
 reliable and slightly smaller. Expand async only when Waymark needs an actual
 overlap/select capability—such as racing waits with model or tool operations—
 not merely to imitate a general-purpose language.
+
+## Runtime-owned Run Follow-up
+
+Stone now also admits `await run(...)`. Unlike the attempt-control comparison,
+this spelling has operational value: it lowers to `run_complete`, so the
+runtime—not the model—owns repeated Gateway observations until terminal
+completion or a bounded total timeout. `run(..., background=True)` remains the
+manual handle path for intentional overlap and services. This is still a
+restricted resource-effect model, not general Python async.
 
 Artifacts:
 

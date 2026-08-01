@@ -29,7 +29,7 @@ def synthetic_result() -> dict:
                     "agent_result": {
                         "answer": experiment.TARGET,
                         "_control": {
-                            "name": "stone.standard_action_v11",
+                            "name": "stone.standard_action_v12",
                             "model_calls": 1,
                             "actions": 1,
                             "initial_action_memory_required_keys": [

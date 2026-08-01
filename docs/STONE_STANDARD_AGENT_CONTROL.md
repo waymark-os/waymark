@@ -25,7 +25,7 @@ call-local decision hooks while preserving the bounded decision loop. Construct
 the latter with `transition_hooks(pre=..., post=...)`; the resulting value can
 be bound and passed through ordinary Stone functions.
 
-V11 provides the accumulated controls below. The combined controller provides:
+V12 provides the accumulated controls below. The combined controller provides:
 
 - exactly one schema-validated action per model transition;
 - a compact model-facing action contract with the complete schema retained as
@@ -55,6 +55,8 @@ V11 provides the accumulated controls below. The combined controller provides:
   request fails;
 - explicit `run_start`, `run_status`, `run_wait`, and `run_terminate` actions
   over the Gateway's existing attempt-owned operation lifecycle;
+- one runtime-owned `run_complete` action for bounded foreground commands,
+  lowering internal observations without spending a model decision per poll;
 - one bounded `progress.active_runs` memory item, terminal-handle removal, a
   configurable active-run cap, finish rejection while runs remain active, and
   bounded reaping on controller budget exhaustion;
@@ -84,16 +86,16 @@ contract; it is not an authoritative task verifier.
 
 ## Current Packaging
 
-Stone does not yet have a module import mechanism. Consequently V11 is a
+Stone does not yet have a module import mechanism. Consequently V12 is a
 checked-in source bundle containing the library functions and a small default
 adapter invocation. The complete source is included in the admitted program
 digest. This keeps policy visible while leaving module loading as a separate
 language-design decision.
 
 The default dispatcher supports `read`, `write`, short synchronous
-`run_linux`, the four owned-task lifecycle actions, and `finish`. Task-specific
-controls may replace it with another named function without changing
-`standard_agent_control`.
+`run_linux`, runtime-owned `run_complete`, the four manual owned-task lifecycle
+actions, and `finish`. Task-specific controls may replace it with another named
+function without changing `standard_agent_control`.
 
 ## Validation
 
@@ -242,6 +244,37 @@ through ordinary Stone functions. The standard controller accepts one such
 value as `decision_hooks`. Captured resources must remain session-persistable,
 and hook values still cannot be serialized into JSON/data records or cross the
 task authority boundary.
+
+V12 adds runtime-owned foreground completion. The model can choose one
+`run_complete` action for a bounded build, install, test, download, benchmark,
+or data-processing command. Stone performs the internal Gateway waits without
+spending another model decision per observation and reports
+`completion_waits`, the requested total timeout, and terminal output as one
+action outcome. Manual `run_start`/status/wait/terminate remains available for
+real overlap and services. At the language level, `await run(...)` lowers to
+the same owned lifecycle.
+
+The first Gateway fixture used one `run_complete` action to create an output,
+then one read and one finish action. It made no model-driven run observations,
+retained verified evidence and audit state, reported zero active handles, and
+rolled back cleanly. A separate Gateway canary forced a command beyond its
+first 100 ms observation and confirmed that `await run` performed and traced
+the required follow-up wait inside the runtime. See
+[Stone Runtime-owned Run Await](STONE_RUNTIME_OWNED_RUN_AWAIT.md).
+
+A low-reasoning Terra probe also selected `run_complete` on its first response
+from the generic V12 prompt, then read the exact output and finished in three
+model calls with no poll actions or schema repairs. This establishes basic
+learnability.
+
+A frozen one-cell comparison on untouched `mcmc-sampling-stan` then provided
+task-shaped evidence. V11 exhausted 31 model calls after 14 manual run
+observations and did not reach the verifier. V12 used 12 terminal
+`run_complete` actions, zero manual observations, and three internal Gateway
+waits; it finished in 14 model calls, cut total tokens from 132,395 to 68,497,
+and earned official reward `1.0`. This is one stochastic matched pair, not a
+broad task-level estimate. See
+[Stone Runtime-owned Run Await](STONE_RUNTIME_OWNED_RUN_AWAIT.md).
 
 The next PL slice is now available independently of this generic ReAct loop:
 typed Stone workflows encode deterministic stages with explicit evidence,

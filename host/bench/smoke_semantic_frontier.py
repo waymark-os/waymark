@@ -71,7 +71,7 @@ def assert_result(
         if expected_interface == "async":
             async_diagnostics = (payload.get("diagnostics") or {}).get("async") or {}
             if (
-                async_diagnostics.get("lowering") != "blocking_attempt_effects"
+                async_diagnostics.get("lowering") != "blocking_resource_effects"
                 or async_diagnostics.get("functions_entered") != 1
                 or async_diagnostics.get("awaits") != 1
             ):

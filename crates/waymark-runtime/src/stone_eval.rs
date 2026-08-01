@@ -140,6 +140,7 @@ pub struct EvalState {
     active_async_depth: usize,
     async_functions_entered: u64,
     async_await_count: u64,
+    async_run_await_count: u64,
     transition_events: Vec<JsonValue>,
     attempt_scopes: Vec<AttemptScopeValue>,
     semantic_frontiers: Vec<SemanticFrontierValue>,
@@ -634,6 +635,7 @@ fn eval_program_with_source_options(
             active_async_depth: 0,
             async_functions_entered: 0,
             async_await_count: 0,
+            async_run_await_count: 0,
             transition_events: Vec::new(),
             attempt_scopes: Vec::new(),
             semantic_frontiers: Vec::new(),
@@ -703,9 +705,10 @@ fn eval_program_with_source_options(
     }
     if evaluator.state.async_functions_entered > 0 || evaluator.state.async_await_count > 0 {
         diagnostics["async"] = json!({
-            "lowering": "blocking_attempt_effects",
+            "lowering": "blocking_resource_effects",
             "functions_entered": evaluator.state.async_functions_entered,
             "awaits": evaluator.state.async_await_count,
+            "run_awaits": evaluator.state.async_run_await_count,
         });
     }
     if !evaluator.state.semantic_frontiers.is_empty() {
@@ -2153,7 +2156,8 @@ impl Evaluator<'_> {
             }
             Expr::Call(call) => matches!(
                 call.name.as_str(),
-                "attempt_wait"
+                "run"
+                    | "attempt_wait"
                     | "attempt_join"
                     | "attempt_wait_any"
                     | "attempt_wait_all"
@@ -2164,10 +2168,17 @@ impl Evaluator<'_> {
         if !supported {
             return Err(stone_error(
                 "await",
-                "await currently supports an attempt handle, child.wait(), scope.wait_any(), scope.wait_all(), root.accept(), and their functional attempt_* forms",
+                "await currently supports run(), an attempt handle, child.wait(), scope.wait_any(), scope.wait_all(), root.accept(), and their functional attempt_* forms",
             ));
         }
         self.state.async_await_count = self.state.async_await_count.saturating_add(1);
+        if let Expr::Call(call) = expression {
+            if call.name == "run" {
+                self.state.async_run_await_count =
+                    self.state.async_run_await_count.saturating_add(1);
+                return self.eval_run_transition_call(call, "run_await", true);
+            }
+        }
         let value = self.eval_expr_value(expression, PipelineData::empty())?;
         match (expression, value) {
             (_, RuntimeValue::AttemptHandle(handle)) => {
@@ -13697,9 +13708,10 @@ main()
         assert_eq!(
             output.diagnostics["async"],
             json_value!({
-                "lowering": "blocking_attempt_effects",
+                "lowering": "blocking_resource_effects",
                 "functions_entered": 1,
                 "awaits": 0,
+                "run_awaits": 0,
             })
         );
         cleanup_dir(&root);
@@ -13725,6 +13737,41 @@ main()
             "{text}"
         );
         cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "hermit"))]
+    #[test]
+    fn await_run_lowers_to_owned_terminal_completion() -> Result<(), ShellError> {
+        let (engine_state, mut stack, _root) = test_engine("await-run-completion")?;
+        let program = lower_source(
+            r#"async def main():
+    return await run(["sh", "-c", "sleep 0.01; printf done"], timeout_ms=5000)
+
+main()
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(true));
+        assert_eq!(value["stdout"], json_value!("done"));
+        assert_eq!(value["still_running"], json_value!(false));
+        assert_eq!(value["done"], json_value!(true));
+        assert_eq!(value["requested_timeout_ms"], json_value!(5000));
+        assert_eq!(
+            output.diagnostics["async"],
+            json_value!({
+                "lowering": "blocking_resource_effects",
+                "functions_entered": 1,
+                "awaits": 1,
+                "run_awaits": 1,
+            })
+        );
+        assert_eq!(
+            output.diagnostics["transitions"][0]["kind"],
+            json_value!("run_await")
+        );
         Ok(())
     }
 

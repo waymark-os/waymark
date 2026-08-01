@@ -1481,6 +1481,18 @@ control as the block-shaped default, the functional forms as the explicit
 kernel surface, and async experimental until actual operation overlap requires
 it. See [Scoped Attempt Resources Experiment](STONE_SCOPED_ATTEMPT_RESOURCES_EXPERIMENT.md)
 and [Async Attempt Control Experiment](STONE_ASYNC_ATTEMPT_CONTROL_EXPERIMENT.md).
+
+A later run-control slice gives the marker concrete value without adding a
+general scheduler: `await run(...)` lowers to the existing runtime-owned
+`run_complete` lifecycle. The standard V12 controller exposes the same policy
+as one `run_complete` action, reserving manual run handles for intentional
+overlap or services. This removes model decisions whose only purpose was to
+repeat a bounded status/wait poll. In a matched `mcmc-sampling-stan` pair, V11
+spent 14 decisions observing runs and exhausted its 32-round budget before a
+required dependency-repair rerun. V12 made zero model-driven run observations,
+used three runtime wait events, preserved enough budget to repair and verify
+the task, and earned official reward `1.0`. One pair is not a broad estimate,
+but it validates the intended mechanism on a previously failing task.
 Verifier-populated outcomes and aggregate budget/event views remain necessary.
 See
 [Caffe Bounded-Explore Library Experiment](../../waymark-gateway/docs/CAFFE_BOUNDED_EXPLORE_LIBRARY_EXPERIMENT.md).

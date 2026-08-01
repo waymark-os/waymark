@@ -195,7 +195,8 @@ fn validate_expr(expr: &Expr, names: &AdmissionNames) -> Result<(), ShellError> 
                 }
                 Expr::Call(call) => matches!(
                     call.name.as_str(),
-                    "attempt_wait"
+                    "run"
+                        | "attempt_wait"
                         | "attempt_join"
                         | "attempt_wait_any"
                         | "attempt_wait_all"
@@ -205,7 +206,7 @@ fn validate_expr(expr: &Expr, names: &AdmissionNames) -> Result<(), ShellError> 
             };
             if !supported {
                 return Err(admission_error(
-                    "await currently supports an attempt handle, child.wait(), scope.wait_any(), scope.wait_all(), root.accept(), and their functional attempt_* forms",
+                    "await currently supports run(), an attempt handle, child.wait(), scope.wait_any(), scope.wait_all(), root.accept(), and their functional attempt_* forms",
                 ));
             }
             validate_expr(value, names)?;
@@ -560,20 +561,21 @@ mod tests {
     }
 
     #[test]
-    fn admits_only_narrow_async_attempt_effects() {
+    fn admits_only_narrow_async_resource_effects() {
         let valid = lower_source(
             r#"async def main():
     async with attempt_scope() as scope:
         outcome = await child.wait(timeout_ms=1000)
+        command = await run(["true"], timeout_ms=1000)
     return outcome
 "#,
         )
-        .expect("lower valid async control");
-        validate_program(&valid, &[]).expect("admit valid async control");
+        .expect("lower valid async resource control");
+        validate_program(&valid, &[]).expect("admit valid async resource control");
 
         let unsupported = lower_source(
             r#"async def main():
-    return await run(["true"])
+    return await print("not an owned resource effect")
 "#,
         )
         .expect("lower unsupported await target");

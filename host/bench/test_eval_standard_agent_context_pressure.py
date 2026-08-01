@@ -62,7 +62,7 @@ class StandardContextPressureTests(unittest.TestCase):
             "rolled_back": True,
             "controller_report": {
                 "_control": {
-                    "name": "stone.standard_action_v11",
+                    "name": "stone.standard_action_v12",
                     "actions": pressure.PROBE_COUNT + 1,
                     "tool_calls": pressure.PROBE_COUNT,
                     "model_calls": pressure.PROBE_COUNT + 1,

@@ -1,0 +1,28 @@
+# `await run(...)` owns one bounded task process through terminal completion.
+# Use ordinary `run(..., background=True)` only when the program intends to
+# interleave other work or manage a long-lived service through its run_id.
+
+async def build():
+    result = await run(
+        ["sh", "-c", "sleep 0.01; printf built"],
+        timeout_ms=5000,
+        max_stdout_bytes=4096,
+        max_stderr_bytes=4096,
+    )
+    if not result.ok:
+        fail(
+            "awaited build failed: " + result.explanation,
+            code="awaited_run_failed",
+            detail=result,
+        )
+    return result
+
+
+result = build()
+emit({
+    "ok": result.ok,
+    "stdout": result.stdout,
+    "done": result.done,
+    "still_running": result.still_running,
+    "completion_waits": result.completion_waits,
+})

@@ -408,7 +408,7 @@ def positive_gate(
         if not isinstance(report.get("verifier_transition_id"), str):
             violations.append("verifier transition id is missing")
         control = report.get("_control")
-        if not isinstance(control, dict) or control.get("name") != "stone.standard_action_v11":
+        if not isinstance(control, dict) or control.get("name") != "stone.standard_action_v12":
             violations.append("standard control provenance is missing")
     counts = metrics.get("operation_counts", {})
     model_calls = counts.get("attempt.rpc.model.call", 0)

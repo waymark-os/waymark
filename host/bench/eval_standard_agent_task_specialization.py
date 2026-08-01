@@ -308,7 +308,7 @@ def result_gate(
             )
     control = report.get("_control")
     expected_control = {
-        "name": "stone.standard_action_v11",
+        "name": "stone.standard_action_v12",
         "rounds": 4,
         "actions": 4,
         "tool_calls": 3,

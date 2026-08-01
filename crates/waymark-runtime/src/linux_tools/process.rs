@@ -252,7 +252,9 @@ pub(crate) fn run_call_values(
     if complete && background {
         return Err(stone_error(
             context,
-            "background=True conflicts with run_complete(); use run() when the caller will manage the run_id",
+            format!(
+                "background=True conflicts with {context}(); use run() without await when the caller will manage the run_id"
+            ),
         ));
     }
     let timeout = Duration::from_millis(timeout_ms as u64);
@@ -357,6 +359,7 @@ fn complete_gateway_run(
     for (field, value) in metadata {
         record.insert(field, value);
     }
+    record.insert("run_id", Value::string(run_id, Span::unknown()));
     apply_gateway_output_policy(&mut record, stdout_target, stderr_target);
     record.insert("completion_waits", Value::int(waits, Span::unknown()));
     record.insert(
