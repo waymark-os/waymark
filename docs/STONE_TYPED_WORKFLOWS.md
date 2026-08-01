@@ -54,6 +54,16 @@ The lowering boundary is intentional:
 New authoring constructs should lower into this kernel rather than duplicate
 retry, evidence, or report policy in a second runtime.
 
+A later task-shaped authorship experiment found that both the existing
+`@stage` form and a proposed `workflow`/`stage` block were syntactically easy:
+each passed 3/3 first responses. Moving evidence from nested declaration fields
+to body-level `ensure` contracts produced 3/3 syntax-valid sources that were
+28.5% smaller than the decorator form, and all three explicitly represented a
+public stdout obligation that both header-evidence arms omitted. This supports
+prototype lowering for code-like workflow blocks and re-checkable `ensure`
+postconditions, while retaining this typed kernel. See
+[Stone Staged Harness Syntax Experiment](STONE_STAGED_HARNESS_SYNTAX_EXPERIMENT.md).
+
 The explicit semantic-kernel form remains available:
 
 ```stone

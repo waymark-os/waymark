@@ -1493,6 +1493,28 @@ required dependency-repair rerun. V12 made zero model-driven run observations,
 used three runtime wait events, preserved enough budget to repair and verify
 the task, and earned official reward `1.0`. One pair is not a broad estimate,
 but it validates the intended mechanism on a previously failing task.
+
+The unchanged V12 controller then failed `make-doom-for-mips` without making a
+single polling decision. It spent 29 actions inspecting and deferred its first
+build until the last action, where two repairable linker errors appeared. This
+sharpens the architecture boundary: runtime-owned effects make execution
+cheaper, but do not define useful progress. A task harness needs typed stage
+obligations, per-stage action budgets, and early evidence gates so exploration
+must produce an executable build attempt while repair budget remains. Retained
+semantic frontiers become useful after such a stage succeeds; they cannot
+compensate for never attempting it.
+
+An authorship follow-up compared `@stage`, `workflow`/`stage` blocks with header
+evidence, and blocks with body-level `ensure` contracts. All three surfaces
+were authored correctly in 3/3 first responses and independently inferred a
+bounded early build stage, so constructing a graph is not required. The
+contract form was shortest and was the only arm to represent the public stdout
+obligation consistently. The remaining shared error was an incorrect workspace
+path caused by omitting generic path-resolution context from the authoring
+call. The preferred near-term spec is therefore executable Stone code with
+ordered stage blocks, optional stage-scoped `agent_loop()`, and re-checkable
+`ensure` contracts; graphs remain a derived runtime view. See
+[Stone Staged Harness Syntax Experiment](STONE_STAGED_HARNESS_SYNTAX_EXPERIMENT.md).
 Verifier-populated outcomes and aggregate budget/event views remain necessary.
 See
 [Caffe Bounded-Explore Library Experiment](../../waymark-gateway/docs/CAFFE_BOUNDED_EXPLORE_LIBRARY_EXPERIMENT.md).

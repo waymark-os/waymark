@@ -84,3 +84,18 @@ causal estimate. The artifacts are:
 
 - `../waymark-gateway/target/runs/standard-stone-tbv21-await-ab-mcmc-v11/cell/cell.json`
 - `../waymark-gateway/target/runs/standard-stone-tbv21-await-ab-mcmc-v12/cell/cell.json`
+
+## Boundary of the Improvement
+
+The unchanged committed V12 source did not solve `make-doom-for-mips`. It made
+zero model-driven polls and required zero internal follow-up waits, but spent
+29 actions inspecting the environment and attempted its first build only on
+the final action. That build reached two actionable linker errors with no
+repair budget remaining. The prior V11 cell had used only two polling actions,
+so waiting was never the dominant failure on this task.
+
+Runtime-owned waiting should remain as infrastructure, but Doom requires a
+higher control layer: bounded inspection, build, execute, and verify stages;
+evidence gates at each boundary; and retained repair frontiers after expensive
+successful stages. The result separates action-lifecycle efficiency from
+task-progress policy.
