@@ -84,8 +84,76 @@ report = workflow_run(workflow("build", build_artifact))"#,
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "all_evidence",
+        signature: r#"all_evidence(contract: workflow_evidence_spec, ...contracts) -> workflow_evidence_spec"#,
+        use_when: "Require every lazy stage contract and retain a bounded summary naming each contract that is still missing.",
+        examples: &[r#"proof = all_evidence(file_nonempty("binary"), file_nonempty("report.txt"))"#],
+        avoid: &[
+            "Do not flatten contracts into one boolean; separate typed contracts produce better repair feedback.",
+            "Use one to 16 contracts.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "artifact",
+        signature: r#"artifact(path: str, format: "elf"? = None, arch: "mips" | "x86_64" | "aarch64" | "riscv64"? = None) -> workflow_evidence_spec"#,
+        use_when: "Require a non-empty workspace artifact and optionally validate its executable format and architecture from the file header.",
+        examples: &[r#"ensure artifact("doomgeneric_mips", format="elf", arch="mips")"#],
+        avoid: &[
+            "Use a path relative to the task workspace unless the public task requires an absolute workspace path.",
+            "Do not infer architecture from the filename; the runtime checks the ELF machine field.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "command_succeeded",
+        signature: r#"command_succeeded(argv: list[str]) -> workflow_evidence_spec"#,
+        use_when: "Require the latest stage action to be the exact command and to have completed successfully.",
+        examples: &[r#"ensure command_succeeded(["node", "vm.js"])"#],
+        avoid: &[
+            "This is action-scoped evidence and is unsatisfied before a stage action runs.",
+            "Keep stdout_nonempty in a separate ensure when observable output is also required.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "stdout_nonempty",
+        signature: r#"stdout_nonempty() -> workflow_evidence_spec"#,
+        use_when: "Require the latest stage action to have produced at least one captured stdout byte.",
+        examples: &[r#"ensure stdout_nonempty()"#],
+        avoid: &[
+            "This contract checks the same latest stage action as adjacent outcome contracts; a prior stage's stdout does not satisfy it.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "decision_recorded",
+        signature: r#"decision_recorded(fields: list[str]? = []) -> workflow_evidence_spec"#,
+        use_when: "Gate an inspection, planning, or selection stage on an explicit non-empty stage decision. fields= additionally requires named, non-empty typed findings from decide(answer, findings); finish remains accepted for compatibility.",
+        examples: &[
+            r#"ensure decision_recorded()"#,
+            r#"ensure decision_recorded(fields=["source_layout", "toolchain"])"#,
+        ],
+        avoid: &[
+            "Do not use the existence of task inputs as proof that inspection or planning produced a decision.",
+            "Use fields= when downstream execution depends on concrete findings; a prose-only decision cannot satisfy those fields.",
+            "This is action-scoped evidence and remains unsatisfied until the stage agent explicitly records a non-empty decision and every required finding.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "file_valid",
+        signature: r#"file_valid(path: str, format: "bmp"? = None, nonempty: bool = True) -> workflow_evidence_spec"#,
+        use_when: "Require a regular file with optional non-empty and format checks. /tmp paths are checked in the retained Linux tool environment in Gateway mode.",
+        examples: &[r#"ensure file_valid("/tmp/frame.bmp", format="bmp", nonempty=True)"#],
+        avoid: &[
+            "Use artifact(...) for workspace build products whose executable format or architecture matters.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "stage",
-        signature: r#"@stage(evidence: workflow_evidence_spec | callable, repair: callable? = None, max_attempts: int = 1, checkpoint: str = "none")
+        signature: r#"@stage(evidence: workflow_evidence_spec | callable, name: str? = None, goal: str? = None, repair: callable? = None, max_attempts: int = 1, max_actions: int = 1, checkpoint: str = "none")
 def name(step): ... -> workflow_stage"#,
         use_when: "Declare a named evidence-gated workflow stage with its action body directly below the decorator. Use checkpoint=\"workspace\" for workspace plus memory, checkpoint=\"forkable\" for an attempt-scoped reconstructable tool environment, or checkpoint=\"repairable\" when a verified frontier must survive a late harness failure.",
         examples: &[
@@ -143,6 +211,17 @@ plan = workflow("build-and-check", build_stage, verify_stage)"#],
         avoid: &[
             "Do not place workflows inside ordinary JSON/data records; pass them as first-class function arguments.",
             "This initial primitive is sequential; parallel and cross-attempt stages are not implied.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "workflow_main",
+        signature: r#"workflow_main(plan: workflow) -> workflow_report"#,
+        use_when: "Execute the top-level workflow selected by `run name`. In an attached attempt, retain a typed requirement audit and report succeeded or failed from the evidence-gated workflow result; local evaluation simply returns the report.",
+        examples: &[r#"emit(workflow_main(plan))"#],
+        avoid: &[
+            "Use workflow_run(plan) for nested/library evaluation that must not finalize the current attempt's controller result.",
+            "A succeeded report does not bypass Gateway publication or official verifier authority.",
         ],
         aliases: &[],
     },
@@ -1568,6 +1647,18 @@ emit({"attempt": accepted.attempt, "changes": accepted.file_changes})"#,
 ];
 
 const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
+    StoneHelpTopic {
+        name: "staged_workflow",
+        summary: "Author a sequential evidence-gated task harness with optional one-decision agent control inside each bounded stage.",
+        bullets: &[
+            "Write `workflow name:` at top level, indent `stage name(goal=..., max_actions=..., checkpoint=...):` by four spaces, place direct `ensure <typed evidence>` contracts in the stage body, and execute with `run name` or workflow_run(name).",
+            "A deterministic stage may contain ordinary Stone effects. `agent_loop()` must be its only executable action and resolves to a visible `def agent_loop(step)` callback, such as examples/scripts/standard_stage_agent.stone.",
+            "The kernel calls that callback once per decision, checks every ensure contract after each returned action, and stops after max_actions; the callback receives goal, current missing evidence, previous outcome, and completed stages in step.",
+            "A finish claim is only another returned action. It cannot advance a stage while evidence remains missing.",
+            "A requested checkpoint is created only after fresh satisfied evidence. Later stages may therefore resume or branch from a verified semantic frontier.",
+            "Workflow blocks lower to the same typed workflow_stage/workflow/workflow_run kernel as @stage declarations; there is no second workflow engine or author-facing DAG.",
+        ],
+    },
     StoneHelpTopic {
         name: "agent_control",
         summary: "Write an ad-hoc or reusable agent as an ordinary Stone function over one structured session; optimized builtins follow the same control contract.",

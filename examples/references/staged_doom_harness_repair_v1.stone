@@ -1,0 +1,37 @@
+# Stage-scoped repair of the blind-authored make-doom-for-mips harness.
+# Public rollout evidence showed that build action 5 installed the toolchain
+# and action 6 exposed the first compiler failure, leaving no repair action.
+# Only the build decision budget changes; goals, evidence, and stage order are
+# retained from staged_doom_harness.stone.
+
+workflow project:
+    stage inspect(
+        goal="inspect the Doom source, target runtime, and build requirements",
+        max_actions=4,
+    ):
+        agent_loop()
+        ensure decision_recorded(fields=[
+            "source_layout",
+            "toolchain",
+            "frame_backend",
+            "runtime_contract",
+        ])
+
+    stage build(
+        goal="build the doomgeneric_mips ELF using the supplied frame writer",
+        max_actions=12,
+        checkpoint="repairable",
+    ):
+        agent_loop()
+        ensure artifact("doomgeneric_mips", format="elf", arch="mips")
+
+    stage run(
+        goal="run the supplied VM and confirm its observable output",
+        max_actions=3,
+    ):
+        agent_loop()
+        ensure command_succeeded(["node", "vm.js"])
+        ensure stdout_nonempty()
+        ensure file_valid("/tmp/frame.bmp", format="bmp", nonempty=True)
+
+run project

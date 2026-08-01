@@ -1515,6 +1515,37 @@ call. The preferred near-term spec is therefore executable Stone code with
 ordered stage blocks, optional stage-scoped `agent_loop()`, and re-checkable
 `ensure` contracts; graphs remain a derived runtime view. See
 [Stone Staged Harness Syntax Experiment](STONE_STAGED_HARNESS_SYNTAX_EXPERIMENT.md).
+
+The first staged Doom rollout sharpens what “typed” must mean. Stage names,
+budgets, and artifact gates successfully forced real execution, while bounded
+diagnostic-tail memory enabled a model to repair a missing-header build and
+reach the VM stage. But a prose-only inspection decision could still advance
+without discovering the toolchain or backend. Stone now permits
+`decision_recorded(fields=[...])`: the spec names downstream-required findings,
+the visible controller must produce them, and the runtime gates transition on
+their presence. A stage contract should constrain the semantic interface to
+the next stage, not merely certify that an action occurred.
+
+The same rollout argues for an explicit action-state controller in the standard
+library: explore, execute/repair, and a bounded diagnose-after-gate-failure
+transition. Tool names continue to describe execution mechanics. They should
+not silently double as policy types; doing so rejected valid package-install
+commands and consumed repair budget.
+
+The typed-decision surface also passed a fresh 3/3 blind-authorship canary at
+low reasoning. All drafts named concrete Doom inspection findings and passed
+the tightened semantic gate without repair. This supports interface
+learnability; it does not show that the inner agent's findings are correct or
+that the task completes.
+
+The first task execution with that surface made the distinction concrete: a
+required, non-empty `toolchain` finding could still report that the answer was
+unknown. Typed shape is useful, but a stage boundary also needs explicit
+resolution state and a bounded observation basis. The run later reached a
+repairable linker failure after exhausting its normal build actions. Treat
+repair reserve as a separate control resource; merely raising an
+undifferentiated stage budget weakens the pressure to execute early.
+
 Verifier-populated outcomes and aggregate budget/event views remain necessary.
 See
 [Caffe Bounded-Explore Library Experiment](../../waymark-gateway/docs/CAFFE_BOUNDED_EXPLORE_LIBRARY_EXPERIMENT.md).

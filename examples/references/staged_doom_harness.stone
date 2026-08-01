@@ -1,0 +1,36 @@
+# Blind-authored staged harness for the public make-doom-for-mips task.
+# Prepend examples/scripts/standard_stage_agent.stone until Stone has imports.
+# `run project` executes the typed workflow and reports the evidence-gated
+# result when attached to a Waymark attempt.
+
+workflow project:
+    stage inspect(
+        goal="inspect the Doom source, target runtime, and build requirements",
+        max_actions=4,
+    ):
+        agent_loop()
+        ensure decision_recorded(fields=[
+            "source_layout",
+            "toolchain",
+            "frame_backend",
+            "runtime_contract",
+        ])
+
+    stage build(
+        goal="build the doomgeneric_mips ELF using the supplied frame writer",
+        max_actions=6,
+        checkpoint="repairable",
+    ):
+        agent_loop()
+        ensure artifact("doomgeneric_mips", format="elf", arch="mips")
+
+    stage run(
+        goal="run the supplied VM and confirm its observable output",
+        max_actions=3,
+    ):
+        agent_loop()
+        ensure command_succeeded(["node", "vm.js"])
+        ensure stdout_nonempty()
+        ensure file_valid("/tmp/frame.bmp", format="bmp", nonempty=True)
+
+run project

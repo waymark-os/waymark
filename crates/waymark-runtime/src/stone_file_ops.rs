@@ -117,10 +117,14 @@ pub(crate) fn stat_record(path: &Path, follow_symlinks: bool) -> Result<Value, S
 }
 
 pub(crate) fn file_nonempty_probe(path: &Path) -> Result<Option<u64>, ShellError> {
+    Ok(file_regular_probe(path)?.filter(|size| *size > 0))
+}
+
+pub(crate) fn file_regular_probe(path: &Path) -> Result<Option<u64>, ShellError> {
     let Some(stat) = stone_file_adapter().stat_optional(path, false)? else {
         return Ok(None);
     };
-    Ok((stat.is_file && stat.size > 0).then_some(stat.size))
+    Ok(stat.is_file.then_some(stat.size))
 }
 
 pub(crate) fn list_dir_records(path: &Path) -> Result<Vec<Value>, ShellError> {
@@ -255,10 +259,20 @@ pub(crate) fn write_jsonl_file(path: &Path, rows: Vec<Value>) -> Result<Value, S
 }
 
 pub(crate) fn read_bytes_for_jsonl(path: &Path, context: &str) -> Result<Vec<u8>, ShellError> {
+    read_bytes(path, usize::MAX, context)
+}
+
+pub(crate) fn read_bytes(
+    path: &Path,
+    max_bytes: usize,
+    context: &str,
+) -> Result<Vec<u8>, ShellError> {
     if gateway_runtime::enabled() {
-        return gateway_runtime::read_bytes(path, usize::MAX);
+        return gateway_runtime::read_bytes(path, max_bytes);
     }
-    fs::read(path).map_err(|err| io_read_stone_error(context, err, path))
+    let mut bytes = fs::read(path).map_err(|err| io_read_stone_error(context, err, path))?;
+    bytes.truncate(max_bytes);
+    Ok(bytes)
 }
 
 pub(crate) fn create_dir_all(path: &Path) -> Result<(), ShellError> {

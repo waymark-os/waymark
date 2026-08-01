@@ -1,0 +1,419 @@
+# Standard visible one-decision controller for staged workflows.
+#
+# A workflow block lowers `agent_loop()` to repeated calls to this function.
+# The workflow kernel, not this function, owns the loop: it checks every
+# `ensure` contract before the first decision and after each returned action,
+# passes the current missing-contract summary in `step.evidence`, and stops at
+# the stage's `max_actions` budget.
+#
+# Extension seams:
+# - replace stage_agent_messages to change context selection or prompting;
+# - replace stage_agent_dispatch to add task-specific tools;
+# - replace agent_loop itself to add hooks, critics, or a different policy.
+# Every replacement remains ordinary admitted Stone source.
+
+def stage_agent_schema_prompt():
+    return "Return {\"actions\":[A]} with exactly one A: read(path), write(path,content), run_linux(argv,cwd?,stdin?,timeout_ms?), run_complete(argv,cwd?,stdin?,timeout_ms?), decide(answer,findings?), finish(answer,findings?), or final(answer,findings?). read(path) returns bounded text for a file or a bounded shallow listing for a directory. decide records a stage-local inspection or planning decision; when decision_fields is non-empty, findings must contain one non-empty string for every named field. It does not finish the whole task. Encode tools as {\"tool\":name,\"input\":object}; encode final as {\"final\":{\"answer\":string}}. Use relative paths for task-workspace files; Linux commands see that same root at /app. Prefer run_complete for a bounded build or test that must finish. Do not invent outcomes or use unlisted fields."
+
+
+def stage_agent_action_schema(step):
+    decision_fields = get(step, "decision_fields", [])
+    answer = {
+        "type": "object",
+        "properties": {"answer": {"type": "string", "minLength": 1}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+    if len(decision_fields) > 0:
+        finding_properties = {}
+        for field in decision_fields:
+            finding_properties[field] = {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2048,
+            }
+        answer["properties"]["findings"] = {
+            "type": "object",
+            "properties": finding_properties,
+            "required": decision_fields,
+            "additionalProperties": False,
+        }
+        answer["required"].append("findings")
+    path = {
+        "type": "object",
+        "properties": {"path": {"type": "string", "minLength": 1}},
+        "required": ["path"],
+        "additionalProperties": False,
+    }
+    write = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "minLength": 1},
+            "content": {"type": "string"},
+        },
+        "required": ["path", "content"],
+        "additionalProperties": False,
+    }
+    command = {
+        "type": "object",
+        "properties": {
+            "argv": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 64,
+            },
+            "cwd": {"type": "string", "minLength": 1},
+            "stdin": {"type": "string"},
+            "timeout_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1800000,
+            },
+        },
+        "required": ["argv"],
+        "additionalProperties": False,
+    }
+    read_action = {
+        "type": "object",
+        "properties": {"tool": {"const": "read"}, "input": path},
+        "required": ["tool", "input"],
+        "additionalProperties": False,
+    }
+    write_action = {
+        "type": "object",
+        "properties": {"tool": {"const": "write"}, "input": write},
+        "required": ["tool", "input"],
+        "additionalProperties": False,
+    }
+    run_action = {
+        "type": "object",
+        "properties": {"tool": {"const": "run_linux"}, "input": command},
+        "required": ["tool", "input"],
+        "additionalProperties": False,
+    }
+    complete_action = {
+        "type": "object",
+        "properties": {"tool": {"const": "run_complete"}, "input": command},
+        "required": ["tool", "input"],
+        "additionalProperties": False,
+    }
+    decide_action = {
+        "type": "object",
+        "properties": {"tool": {"const": "decide"}, "input": answer},
+        "required": ["tool", "input"],
+        "additionalProperties": False,
+    }
+    finish_action = {
+        "type": "object",
+        "properties": {"tool": {"const": "finish"}, "input": answer},
+        "required": ["tool", "input"],
+        "additionalProperties": False,
+    }
+    final_action = {
+        "type": "object",
+        "properties": {"final": answer},
+        "required": ["final"],
+        "additionalProperties": False,
+    }
+    choices = [read_action, write_action, run_action, complete_action]
+    remaining = step.max_actions - step.attempt + 1
+    decision_stage = "decision_recorded" in step.contracts
+    mode = stage_agent_mode(step)
+    if decision_stage and remaining == 1:
+        choices = [decide_action, finish_action, final_action]
+    elif decision_stage and mode == "execute_or_repair":
+        choices = [write_action, complete_action, decide_action, finish_action, final_action]
+    elif decision_stage:
+        choices = [
+            read_action,
+            write_action,
+            run_action,
+            complete_action,
+            decide_action,
+            finish_action,
+            final_action,
+        ]
+    elif remaining == 1 or mode == "execute_or_repair":
+        # run_linux/run_complete differ in completion mechanics, not effect
+        # intent. Either can perform the required mutation or gate command.
+        choices = [write_action, run_action, complete_action]
+    action = {"oneOf": choices}
+    return {
+        "type": "object",
+        "properties": {
+            "actions": {
+                "type": "array",
+                "items": action,
+                "minItems": 1,
+                "maxItems": 1,
+            },
+        },
+        "required": ["actions"],
+        "additionalProperties": False,
+    }
+
+
+def stage_agent_diagnostic_stream(outcome, field, tail_field, limit):
+    # Process adapters expose a bounded tail specifically so long build logs do
+    # not hide the final compiler/test diagnostic. Prefer it whenever present;
+    # file/read outcomes have no tail and naturally fall back to their content.
+    diagnostic_tail = get(outcome, tail_field, "")
+    if diagnostic_tail != "":
+        return slice(diagnostic_tail, 0, limit)
+    return slice(get(outcome, field, ""), 0, limit)
+
+
+def stage_agent_outcome_summary(outcome):
+    if outcome is None:
+        return None
+    return {
+        "ok": get(outcome, "ok", False),
+        "kind": get(outcome, "kind", "unknown"),
+        "path": get(outcome, "path", None),
+        "argv": get(outcome, "argv", []),
+        "cwd": get(outcome, "cwd", None),
+        "exit_code": get(outcome, "exit_code", None),
+        "stdout": stage_agent_diagnostic_stream(
+            outcome, "stdout", "stdout_tail", 4096
+        ),
+        "stderr": stage_agent_diagnostic_stream(
+            outcome, "stderr", "stderr_tail", 2048
+        ),
+        "content": slice(get(outcome, "content", ""), 0, 4096),
+        "message": slice(get(outcome, "message", ""), 0, 2048),
+    }
+
+
+def stage_agent_history_key(step):
+    return "workflow." + step.workflow + "." + step.stage + ".history"
+
+
+def stage_agent_history(step):
+    items = context_read(keys=[stage_agent_history_key(step)], limit=1)
+    if len(items) == 0:
+        return []
+    return get(items[0].content, "actions", [])
+
+
+def stage_agent_history_item(step, action, outcome):
+    return {
+        "decision": step.attempt,
+        "tool": get(action, "tool", "final"),
+        "input": slice(json_dumps(get(action, "input", {})), 0, 768),
+        "ok": get(outcome, "ok", False),
+        "kind": get(outcome, "kind", "unknown"),
+        "exit_code": get(outcome, "exit_code", None),
+        "stdout": stage_agent_diagnostic_stream(
+            outcome, "stdout", "stdout_tail", 1024
+        ),
+        "stderr": stage_agent_diagnostic_stream(
+            outcome, "stderr", "stderr_tail", 512
+        ),
+        "content": slice(get(outcome, "content", ""), 0, 1024),
+        "message": slice(get(outcome, "message", ""), 0, 512),
+        "findings": get(outcome, "findings", {}),
+    }
+
+
+def stage_agent_mode(step):
+    remaining = step.max_actions - step.attempt + 1
+    if "decision_recorded" in step.contracts and remaining == 1:
+        return "decision_required"
+    if step.attempt * 3 <= step.max_actions:
+        return "explore"
+    if remaining == 1:
+        return "execute_or_repair"
+    previous_tool = ""
+    if step.outcome is not None:
+        previous_tool = get(step.outcome, "tool", "")
+    if previous_tool in ["write", "run_complete"]:
+        return "diagnose_or_repair"
+    return "execute_or_repair"
+
+
+def stage_agent_messages(step):
+    session = agent_session()
+    memory = context_project(
+        focus=(
+            "current workflow stage, prior stage actions, concrete tool "
+            "outcomes, blockers, and evidence still required"
+        ),
+        max_tokens=512,
+    )
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Choose exactly one next action for the current stage. "
+                "The workflow runtime independently checks the listed "
+                "contracts after this action; a finish claim cannot advance "
+                "the stage while evidence is missing. Commands run in the "
+                "task workspace mounted at /app. When decision_recorded is "
+                "the remaining contract, inspect as needed and then use "
+                "decide(answer, findings) to retain the stage-local decision; "
+                "decision_fields lists every required non-empty finding. Treat "
+                "stage_history as the completed action ledger and do not "
+                "repeat a successful probe unless new evidence requires it. "
+                "In execute_or_repair mode, take a workspace-changing action "
+                "or run the actual gate-producing build/test; read is "
+                "intentionally unavailable, and run_linux is permitted only "
+                "when its command changes the workspace or exercises the gate. "
+                "In diagnose_or_repair mode, "
+                "a failed gate has reopened bounded observation: use read or "
+                "run_linux for one focused diagnostic, write for a repair, or "
+                "run_complete only for the actual gate. A diagnostic action "
+                "is followed by execute_or_repair mode. In decision_required mode, "
+                "record the stage decision now. Return one schema-valid "
+                "JSON object and never invent a tool outcome."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json_dumps({
+                "task": session.task,
+                "input": session.input,
+                "workflow": step.workflow,
+                "stage": step.stage,
+                "stage_goal": step.goal,
+                "decision": step.attempt,
+                "max_actions": step.max_actions,
+                "remaining_actions": step.max_actions - step.attempt + 1,
+                "mode": stage_agent_mode(step),
+                "contract_kinds": step.contracts,
+                "decision_fields": get(step, "decision_fields", []),
+                "contracts": step.evidence,
+                "previous_outcome": stage_agent_outcome_summary(step.outcome),
+                "stage_history": stage_agent_history(step),
+                "attempt_memory": memory.text,
+            }),
+        },
+    ]
+
+
+def stage_agent_dispatch(action):
+    tool = action.tool
+    args = action.input
+    try:
+        if tool == "read":
+            info = stat(args.path)
+            if info.is_dir:
+                return {
+                    "ok": True,
+                    "kind": "list",
+                    "path": args.path,
+                    "content": slice(json_dumps(ls(args.path)), 0, 8192),
+                }
+            return {
+                "ok": True,
+                "kind": "read",
+                "path": args.path,
+                "content": read_file(args.path, max_bytes=8192),
+            }
+        if tool == "write":
+            write_text(args.path, args.content)
+            return {"ok": True, "kind": "write", "path": args.path}
+        if tool == "run_linux":
+            return run(
+                args.argv,
+                cwd=get(args, "cwd", None),
+                stdin=get(args, "stdin", None),
+                timeout_ms=min(get(args, "timeout_ms", 60000), 120000),
+                max_stdout_bytes=16384,
+                max_stderr_bytes=8192,
+            )
+        if tool == "run_complete":
+            return run_complete(
+                args.argv,
+                cwd=get(args, "cwd", None),
+                stdin=get(args, "stdin", None),
+                timeout_ms=min(get(args, "timeout_ms", 900000), 1800000),
+                max_stdout_bytes=16384,
+                max_stderr_bytes=8192,
+            )
+        fail("unknown stage agent tool: " + tool, code="stage_agent_unknown_tool")
+    except Exception as error:
+        return {
+            "ok": False,
+            "kind": "tool_error",
+            "tool": tool,
+            "message": slice(str(error), 0, 2048),
+        }
+
+
+def stage_agent_remember(step, action, outcome, evidence):
+    history = stage_agent_history(step)
+    history.append(stage_agent_history_item(step, action, outcome))
+    history = tail(history, 8)
+    context_write(
+        stage_agent_history_key(step),
+        "outcome",
+        {"actions": history},
+        status=("verified" if get(outcome, "ok", False) else "contradicted"),
+        evidence=evidence,
+    )
+    return outcome
+
+
+def agent_loop(step):
+    try:
+        inference = model_infer(
+            stage_agent_messages(step),
+            stage_agent_action_schema(step),
+            retries=1,
+            repair_prompt=(
+                "Correct only the response shape and arguments. Preserve the "
+                "intended next stage action."
+            ),
+            schema_prompt=stage_agent_schema_prompt(),
+            model_class="agent",
+            max_output_tokens=768,
+        )
+    except Exception as error:
+        action = {"tool": "model_infer", "input": {}}
+        error_text = str(error)
+        outcome = {
+            "ok": False,
+            "kind": "model_schema_error",
+            "tool": "model_infer",
+            "message": (
+                slice(error_text, 0, 384)
+                + "\n... validation detail tail ...\n"
+                + error_text[-1536:]
+            ),
+        }
+        return stage_agent_remember(
+            step, action, outcome, ["runtime:model_infer_validation"]
+        )
+    action = inference.value.actions[0]
+    decision = None
+    if get(action, "tool", "") == "decide":
+        decision = action.input
+    final = get(action, "final", None)
+    if final is None and get(action, "tool", "") == "finish":
+        final = action.input
+    if decision is not None:
+        outcome = {
+            "ok": True,
+            "kind": "decision_recorded",
+            "message": decision.answer,
+            "findings": get(decision, "findings", {}),
+            "transition_id": inference.response.transition_id,
+        }
+    elif final is not None:
+        outcome = {
+            "ok": True,
+            "kind": "finish_requested",
+            "message": final.answer,
+            "findings": get(final, "findings", {}),
+            "transition_id": inference.response.transition_id,
+        }
+    else:
+        outcome = stage_agent_dispatch(action)
+    outcome["tool"] = get(action, "tool", "final")
+    return stage_agent_remember(
+        step,
+        action,
+        outcome,
+        ["transition:" + inference.response.transition_id],
+    )

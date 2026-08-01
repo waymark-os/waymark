@@ -130,3 +130,66 @@ Artifacts:
 
 - `target/runs/staged-harness-syntax-authorship-v1-terra/aggregate.json`
 - `target/runs/staged-harness-contract-authorship-v1-terra/aggregate.json`
+
+## Implemented Rollout Findings
+
+The block surface now lowers to the typed workflow runtime, including visible
+stage-scoped `agent_loop()`, rechecked `ensure` contracts, bounded action
+budgets, compiler-hygienic private stage symbols, and automatic publication
+audits. An attached fixture passes with one model decision per action.
+
+The staged Doom rollout identified four control requirements that syntax alone
+does not provide:
+
+- bounded stage memory must retain a ledger, not only the latest outcome;
+- process feedback must prefer diagnostic stdout/stderr tails so long build
+  logs do not erase the final compiler error;
+- exploration and exploitation are explicit action-state modes, with one
+  focused diagnostic reopened after a failed gate;
+- command completion mechanics (`run_linux` versus `run_complete`) must not be
+  mistaken for semantic intent.
+
+These changes moved one frozen harness from passive inspection to a real MIPS
+cross-build and, in one cell, through the build frontier into VM execution. A
+later cell exposed the next evidence gap: `decision_recorded()` accepted a
+generic inspection summary that omitted facts needed by the build stage. The
+selected refinement is a typed decision contract:
+
+```stone
+stage inspect(goal="inspect build requirements", max_actions=4):
+    agent_loop()
+    ensure decision_recorded(fields=[
+        "source_layout",
+        "toolchain",
+        "frame_backend",
+        "runtime_contract",
+    ])
+```
+
+The runtime exposes these field names to the visible controller; its decision
+schema requires one non-empty string per field, and the evidence gate checks
+them independently. This remains structural semantic evidence, not proof that
+the findings are true. Later stages and external verification still test the
+consequences.
+
+A fresh three-draft, low-reasoning Terra authorship cohort learned this form
+from generic guidance: 3/3 sources parsed on the first response and 3/3 passed
+the tightened public-requirement gate. The independently chosen field sets
+covered build method/system, MIPS target requirements, frame integration, and
+VM invocation. Mean source size was 1,009 bytes and 31.7 lines. This is a
+learnability canary, not task-success evidence.
+
+Artifact: `target/runs/staged-harness-typed-decisions-v1-terra/aggregate.json`
+
+The first typed-decision Doom cell confirmed the remaining boundary. The
+inspection stage supplied every required field, but the non-empty `toolchain`
+finding still said that the compiler and target were unknown. The structural
+contract passed even though the finding was not actionable. The next evidence
+form should therefore distinguish `resolved` from `unknown` and retain a
+compact observation basis that later stages can inspect. The same cell reached
+a repairable linker conflict only after consuming its ordinary build actions;
+stage repair reserve should be represented and accounted for separately rather
+than hidden by increasing one undifferentiated action limit.
+
+Artifact:
+`../../waymark-gateway/target/runs/staged-stone-doom-v12-typed-decisions-terra/cell/cell.json`

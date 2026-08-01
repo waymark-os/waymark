@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::borrow::Cow;
+
 use nu_protocol::{shell_error::generic::GenericError, ShellError};
 use ruff_python_ast as py;
 
@@ -64,8 +66,12 @@ pub struct FunctionDef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StageDecorator {
     pub evidence: Expr,
+    pub name: Option<Expr>,
+    pub goal: Option<Expr>,
+    pub agent_loop: Option<Expr>,
     pub repair: Option<Expr>,
     pub max_attempts: Option<Expr>,
+    pub max_actions: Option<Expr>,
     pub checkpoint: Option<Expr>,
 }
 
@@ -284,7 +290,8 @@ pub struct ComprehensionClause {
 }
 
 pub fn lower_source(source: &str) -> Result<Program, ShellError> {
-    let parsed = ruff_python_parser::parse_module(source).map_err(|err| {
+    let expanded = expand_workflow_block_syntax(source)?;
+    let parsed = ruff_python_parser::parse_module(&expanded).map_err(|err| {
         let mut error = GenericError::new_internal("python parse error", err.to_string())
             .with_code("stone_parse_error");
         if source
@@ -299,6 +306,379 @@ pub fn lower_source(source: &str) -> Result<Program, ShellError> {
     })?;
 
     lower_module(parsed.into_syntax())
+}
+
+fn expand_workflow_block_syntax(source: &str) -> Result<Cow<'_, str>, ShellError> {
+    if !source
+        .lines()
+        .any(|line| line.starts_with("workflow ") || line.starts_with("run "))
+    {
+        return Ok(Cow::Borrowed(source));
+    }
+
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut output = Vec::with_capacity(lines.len());
+    let mut workflows = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        if let Some(name) = workflow_block_name(line)? {
+            if workflows.iter().any(|known| known == &name) {
+                return Err(workflow_syntax_error(format!(
+                    "duplicate workflow block `{name}`"
+                )));
+            }
+            workflows.push(name.clone());
+            let workflow_index = workflows.len() - 1;
+            index += 1;
+            let mut stages = Vec::new();
+            let mut stage_bindings = Vec::new();
+            while index < lines.len() {
+                let current = lines[index];
+                if current.trim().is_empty() || current.trim_start().starts_with('#') {
+                    index += 1;
+                    continue;
+                }
+                let indent = leading_spaces(current)?;
+                if indent == 0 {
+                    break;
+                }
+                if indent != 4 || !current.trim_start().starts_with("stage ") {
+                    return Err(workflow_syntax_error(format!(
+                        "workflow `{name}` accepts stage blocks indented by four spaces; found `{}`",
+                        current.trim()
+                    )));
+                }
+
+                let header_start = index;
+                let mut header = current.trim().to_string();
+                while !stage_header_complete(&header) {
+                    index += 1;
+                    if index >= lines.len() {
+                        return Err(workflow_syntax_error(format!(
+                            "unterminated stage header in workflow `{name}`"
+                        )));
+                    }
+                    let continuation = lines[index];
+                    if leading_spaces(continuation)? < 4 {
+                        return Err(workflow_syntax_error(format!(
+                            "unterminated stage header beginning on line {}",
+                            header_start + 1
+                        )));
+                    }
+                    header.push(' ');
+                    header.push_str(continuation.trim());
+                }
+                let (stage_name, arguments) = parse_stage_header(&header)?;
+                if stages.iter().any(|known| known == &stage_name) {
+                    return Err(workflow_syntax_error(format!(
+                        "workflow `{name}` has duplicate stage `{stage_name}`"
+                    )));
+                }
+                stages.push(stage_name.clone());
+                let stage_binding = format!(
+                    "__stone_workflow_{workflow_index}_stage_{}",
+                    stage_bindings.len()
+                );
+                stage_bindings.push(stage_binding.clone());
+                index += 1;
+
+                let body_start = index;
+                while index < lines.len() {
+                    let body_line = lines[index];
+                    if body_line.trim().is_empty() {
+                        index += 1;
+                        continue;
+                    }
+                    let indent = leading_spaces(body_line)?;
+                    if indent <= 4 {
+                        break;
+                    }
+                    index += 1;
+                }
+                let (actions, contracts, has_agent_loop) =
+                    parse_stage_body(&name, &stage_name, &lines[body_start..index])?;
+                if contracts.is_empty() {
+                    return Err(workflow_syntax_error(format!(
+                        "workflow `{name}` stage `{stage_name}` requires at least one direct `ensure <typed evidence>` contract"
+                    )));
+                }
+
+                let evidence = format!("all_evidence({})", contracts.join(", "));
+                let generated = if has_agent_loop {
+                    "agent_loop=True"
+                } else {
+                    "agent_loop=False"
+                };
+                let decorator = if arguments.trim().is_empty() {
+                    format!("@stage(evidence={evidence}, name={stage_name:?}, {generated})")
+                } else {
+                    format!(
+                        "@stage(evidence={evidence}, name={stage_name:?}, {generated}, {arguments})"
+                    )
+                };
+                output.push(decorator);
+                output.push(format!("def {stage_binding}(__stone_step):"));
+                if has_agent_loop {
+                    output.push("    return agent_loop(__stone_step)".to_string());
+                } else {
+                    let mut emitted_action = false;
+                    for action in actions {
+                        if action.trim().is_empty() {
+                            output.push(String::new());
+                        } else {
+                            output.push(action);
+                            emitted_action = true;
+                        }
+                    }
+                    if !emitted_action {
+                        output.push("    pass".to_string());
+                    }
+                    output
+                        .push("    return {\"ok\": True, \"kind\": \"stage_action\"}".to_string());
+                }
+                output.push(String::new());
+            }
+            if stages.is_empty() {
+                return Err(workflow_syntax_error(format!(
+                    "workflow `{name}` requires at least one stage"
+                )));
+            }
+            output.push(format!(
+                "{name} = workflow(\"{name}\", {})",
+                stage_bindings.join(", ")
+            ));
+            output.push(String::new());
+            continue;
+        }
+
+        if let Some(name) = run_workflow_name(line)? {
+            if !workflows.iter().any(|known| known == &name) {
+                return Err(workflow_syntax_error(format!(
+                    "`run {name}` does not name a preceding workflow block"
+                )));
+            }
+            output.push(format!("emit(workflow_main({name}))"));
+        } else {
+            output.push(line.to_string());
+        }
+        index += 1;
+    }
+
+    let mut expanded = output.join("\n");
+    if source.ends_with('\n') {
+        expanded.push('\n');
+    }
+    Ok(Cow::Owned(expanded))
+}
+
+fn workflow_block_name(line: &str) -> Result<Option<String>, ShellError> {
+    if !line.starts_with("workflow ") {
+        return Ok(None);
+    }
+    let Some(name) = line
+        .strip_prefix("workflow ")
+        .and_then(|rest| rest.strip_suffix(':'))
+        .map(str::trim)
+    else {
+        return Err(workflow_syntax_error(
+            "workflow block header must be `workflow <name>:`",
+        ));
+    };
+    validate_workflow_syntax_identifier(name, "workflow")?;
+    Ok(Some(name.to_string()))
+}
+
+fn run_workflow_name(line: &str) -> Result<Option<String>, ShellError> {
+    if !line.starts_with("run ") || line.contains('(') {
+        return Ok(None);
+    }
+    let name = line
+        .strip_prefix("run ")
+        .expect("run prefix checked")
+        .trim();
+    validate_workflow_syntax_identifier(name, "run target")?;
+    Ok(Some(name.to_string()))
+}
+
+fn stage_header_complete(header: &str) -> bool {
+    header.ends_with(':') && delimiter_balance(header.trim_end_matches(':')) == Some(0)
+}
+
+fn parse_stage_header(header: &str) -> Result<(String, String), ShellError> {
+    let Some(rest) = header
+        .strip_prefix("stage ")
+        .and_then(|value| value.strip_suffix(':'))
+        .map(str::trim)
+    else {
+        return Err(workflow_syntax_error(
+            "stage header must be `stage <name>(...):`",
+        ));
+    };
+    let (name, arguments) = match rest.find('(') {
+        Some(open) => {
+            if !rest.ends_with(')') {
+                return Err(workflow_syntax_error("stage arguments must end with `):`"));
+            }
+            (rest[..open].trim(), rest[open + 1..rest.len() - 1].trim())
+        }
+        None => (rest, ""),
+    };
+    validate_workflow_syntax_identifier(name, "stage")?;
+    Ok((name.to_string(), arguments.to_string()))
+}
+
+fn parse_stage_body(
+    workflow: &str,
+    stage: &str,
+    lines: &[&str],
+) -> Result<(Vec<String>, Vec<String>, bool), ShellError> {
+    let mut actions = Vec::new();
+    let mut contracts = Vec::new();
+    let mut agent_loop = false;
+    let mut other_action = false;
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        if line.trim().is_empty() {
+            actions.push(String::new());
+            index += 1;
+            continue;
+        }
+        let indent = leading_spaces(line)?;
+        if indent < 8 {
+            return Err(workflow_syntax_error(format!(
+                "workflow `{workflow}` stage `{stage}` body must be indented by eight spaces"
+            )));
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("ensure ") {
+            if indent != 8 {
+                return Err(workflow_syntax_error(format!(
+                    "workflow `{workflow}` stage `{stage}` contracts must use direct stage indentation"
+                )));
+            }
+            let contract = trimmed
+                .strip_prefix("ensure ")
+                .expect("ensure prefix checked")
+                .trim();
+            if contract.is_empty() {
+                return Err(workflow_syntax_error(format!(
+                    "workflow `{workflow}` stage `{stage}` ensure requires a typed evidence expression"
+                )));
+            }
+            let mut contract = contract.to_string();
+            while delimiter_balance(&contract).is_some_and(|balance| balance > 0) {
+                index += 1;
+                if index >= lines.len() {
+                    return Err(workflow_syntax_error(format!(
+                        "workflow `{workflow}` stage `{stage}` has an unterminated ensure expression"
+                    )));
+                }
+                let continuation = lines[index];
+                if continuation.trim().is_empty() || leading_spaces(continuation)? < 8 {
+                    return Err(workflow_syntax_error(format!(
+                        "workflow `{workflow}` stage `{stage}` multiline ensure continuation must remain inside the stage body"
+                    )));
+                }
+                contract.push(' ');
+                contract.push_str(continuation.trim());
+            }
+            if delimiter_balance(&contract) != Some(0) {
+                return Err(workflow_syntax_error(format!(
+                    "workflow `{workflow}` stage `{stage}` ensure contract has unbalanced delimiters"
+                )));
+            }
+            contracts.push(contract);
+            index += 1;
+            continue;
+        }
+        if indent == 8 && trimmed == "agent_loop()" {
+            if agent_loop {
+                return Err(workflow_syntax_error(format!(
+                    "workflow `{workflow}` stage `{stage}` may contain at most one agent_loop()"
+                )));
+            }
+            agent_loop = true;
+            index += 1;
+            continue;
+        }
+        if !trimmed.starts_with('#') {
+            other_action = true;
+        }
+        actions.push(line[4..].to_string());
+        index += 1;
+    }
+    if agent_loop && other_action {
+        return Err(workflow_syntax_error(format!(
+            "workflow `{workflow}` stage `{stage}` agent_loop() must be the only executable stage action; move setup into another stage or an agent-loop adapter"
+        )));
+    }
+    Ok((actions, contracts, agent_loop))
+}
+
+fn leading_spaces(line: &str) -> Result<usize, ShellError> {
+    if line.as_bytes().contains(&b'\t') {
+        return Err(workflow_syntax_error(
+            "workflow block syntax requires spaces, not tabs",
+        ));
+    }
+    Ok(line.len() - line.trim_start_matches(' ').len())
+}
+
+fn delimiter_balance(source: &str) -> Option<i32> {
+    let mut balance = 0_i32;
+    let mut quote = None;
+    let mut escaped = false;
+    for character in source.chars() {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' | '[' | '{' => balance += 1,
+            ')' | ']' | '}' => {
+                balance -= 1;
+                if balance < 0 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    (quote.is_none()).then_some(balance)
+}
+
+fn validate_workflow_syntax_identifier(name: &str, kind: &str) -> Result<(), ShellError> {
+    let mut characters = name.chars();
+    let valid = characters
+        .next()
+        .map(|character| character == '_' || character.is_ascii_alphabetic())
+        .unwrap_or(false)
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric());
+    if !valid {
+        return Err(workflow_syntax_error(format!(
+            "{kind} name `{name}` must be a Stone identifier"
+        )));
+    }
+    Ok(())
+}
+
+fn workflow_syntax_error(message: impl Into<String>) -> ShellError {
+    ShellError::Generic(
+        GenericError::new_internal("Stone workflow syntax error", message.into())
+            .with_code("stone_workflow_syntax_error")
+            .with_help(
+                "Use `workflow name:`, four-space `stage name(...):` blocks, direct `ensure evidence(...)` contracts, and `run name`.",
+            ),
+    )
 }
 
 fn lower_module(module: py::ModModule) -> Result<Program, ShellError> {
@@ -425,12 +805,16 @@ fn lower_function_stage_decorator(
         if !call.arguments.args.is_empty() {
             return Err(unsupported_message(
                 "stage declaration",
-                "@stage(...) accepts only evidence=, repair=, max_attempts=, and checkpoint= keyword arguments",
+                "@stage(...) accepts only evidence=, name=, goal=, agent_loop=, repair=, max_attempts=, max_actions=, and checkpoint= keyword arguments",
             ));
         }
         let mut evidence = None;
+        let mut stage_name = None;
+        let mut goal = None;
+        let mut agent_loop = None;
         let mut repair = None;
         let mut max_attempts = None;
+        let mut max_actions = None;
         let mut checkpoint = None;
         for keyword in call.arguments.keywords {
             let Some(name) = keyword.arg else {
@@ -441,14 +825,18 @@ fn lower_function_stage_decorator(
             };
             let slot = match name.as_str() {
                 "evidence" => &mut evidence,
+                "name" => &mut stage_name,
+                "goal" => &mut goal,
+                "agent_loop" => &mut agent_loop,
                 "repair" => &mut repair,
                 "max_attempts" => &mut max_attempts,
+                "max_actions" => &mut max_actions,
                 "checkpoint" => &mut checkpoint,
                 other => {
                     return Err(unsupported_message(
                         "stage declaration",
                         format!(
-                            "unsupported @stage field `{other}`; expected evidence, repair, max_attempts, or checkpoint"
+                            "unsupported @stage field `{other}`; expected evidence, name, goal, agent_loop, repair, max_attempts, max_actions, or checkpoint"
                         ),
                     ));
                 }
@@ -469,8 +857,12 @@ fn lower_function_stage_decorator(
         })?;
         return Ok(Some(StageDecorator {
             evidence,
+            name: stage_name,
+            goal,
+            agent_loop,
             repair,
             max_attempts,
+            max_actions,
             checkpoint,
         }));
     };
@@ -1888,7 +2280,7 @@ values = sorted([3, 1, 2])
     #[test]
     fn lowers_stage_decorator_to_typed_function_metadata() {
         let program = lower_source(
-            r#"@stage(evidence=file_nonempty("artifact.txt"), repair=repair_artifact, max_attempts=2, checkpoint="workspace")
+            r#"@stage(evidence=file_nonempty("artifact.txt"), goal="build the artifact", repair=repair_artifact, max_attempts=2, max_actions=6, checkpoint="workspace")
 def artifact(step):
     return run(["make", "artifact"])
 "#,
@@ -1902,9 +2294,191 @@ def artifact(step):
             stage.evidence,
             Expr::Call(ref call) if call.name == "file_nonempty"
         ));
+        assert!(
+            matches!(stage.goal, Some(Expr::String(ref value)) if value == "build the artifact")
+        );
         assert!(matches!(stage.repair, Some(Expr::Name(ref name)) if name == "repair_artifact"));
         assert!(matches!(stage.max_attempts, Some(Expr::Int(ref value)) if value == "2"));
+        assert!(matches!(stage.max_actions, Some(Expr::Int(ref value)) if value == "6"));
         assert!(matches!(stage.checkpoint, Some(Expr::String(ref value)) if value == "workspace"));
+    }
+
+    #[test]
+    fn lowers_workflow_blocks_and_ensure_contracts_to_typed_kernel() {
+        let program = lower_source(
+            r#"workflow task:
+    stage build(
+        goal="produce the artifact",
+        max_actions=8,
+        checkpoint="repairable",
+    ):
+        run(["sh", "-c", "printf ready > artifact.txt"])
+        ensure file_nonempty("artifact.txt")
+
+    stage verify(goal="verify output", max_actions=2):
+        ensure all_evidence(
+            file_nonempty("artifact.txt"),
+            file_nonempty("artifact.txt"),
+        )
+
+run task
+"#,
+        )
+        .expect("lower workflow block");
+
+        assert_eq!(program.statements.len(), 4);
+        let Stmt::FunctionDef(build) = &program.statements[0] else {
+            panic!("expected build stage function");
+        };
+        let build_stage = build.stage.as_ref().expect("build stage metadata");
+        assert_eq!(build.name, "__stone_workflow_0_stage_0");
+        assert!(matches!(
+            build_stage.name,
+            Some(Expr::String(ref value)) if value == "build"
+        ));
+        assert!(matches!(
+            build_stage.evidence,
+            Expr::Call(ref call) if call.name == "all_evidence" && call.positional.len() == 1
+        ));
+        assert!(matches!(
+            build_stage.max_actions,
+            Some(Expr::Int(ref value)) if value == "8"
+        ));
+        assert!(matches!(build.body.last(), Some(Stmt::Return(Some(_)))));
+
+        let Stmt::Assign { value, .. } = &program.statements[2] else {
+            panic!("expected workflow construction");
+        };
+        assert!(
+            matches!(value, Expr::Call(call) if call.name == "workflow" && call.positional.len() == 3)
+        );
+        assert!(matches!(
+            program.statements[3],
+            Stmt::Expr(Expr::Call(ref emit))
+                if emit.name == "emit"
+                    && matches!(emit.positional[0], Expr::Call(ref run) if run.name == "workflow_main")
+        ));
+    }
+
+    #[test]
+    fn workflow_block_agent_loop_lowers_to_stage_context_call() {
+        let program = lower_source(
+            r#"workflow task:
+    stage build(goal="build", max_actions=4):
+        agent_loop()
+        ensure file_nonempty("artifact.txt")
+
+run task
+"#,
+        )
+        .expect("lower workflow agent loop");
+        let Stmt::FunctionDef(function) = &program.statements[0] else {
+            panic!("expected stage function");
+        };
+        assert!(matches!(
+            function.body.as_slice(),
+            [Stmt::Return(Some(Expr::Call(call)))]
+                if call.name == "agent_loop"
+                    && matches!(call.positional.as_slice(), [Expr::Name(name)] if name == "__stone_step")
+        ));
+    }
+
+    #[test]
+    fn workflow_stage_names_do_not_shadow_builtin_calls() {
+        let program = lower_source(
+            r#"workflow task:
+    stage run(goal="execute command", max_actions=1):
+        run(["true"])
+        ensure command_succeeded(["true"])
+
+run task
+"#,
+        )
+        .expect("lower stage named after builtin");
+        let Stmt::FunctionDef(function) = &program.statements[0] else {
+            panic!("expected stage function");
+        };
+        assert_eq!(function.name, "__stone_workflow_0_stage_0");
+        assert!(function.body.iter().any(|statement| matches!(
+            statement,
+            Stmt::Expr(Expr::Call(call)) if call.name == "run"
+        )));
+    }
+
+    #[test]
+    fn workflow_block_rejects_missing_or_nested_contracts() {
+        let missing = lower_source(
+            r#"workflow task:
+    stage build(goal="build"):
+        pass
+"#,
+        )
+        .expect_err("missing ensure");
+        assert!(format!("{missing:?}").contains("requires at least one direct `ensure"));
+
+        let nested = lower_source(
+            r#"workflow task:
+    stage build(goal="build"):
+        if True:
+            ensure file_nonempty("artifact.txt")
+"#,
+        )
+        .expect_err("nested ensure");
+        assert!(format!("{nested:?}").contains("direct stage indentation"));
+    }
+
+    #[test]
+    fn standard_stage_agent_library_is_valid_visible_stone() {
+        let source = include_str!("../../../examples/scripts/standard_stage_agent.stone");
+        let program = lower_source(source).expect("lower standard stage agent library");
+        let names = program
+            .statements
+            .iter()
+            .filter_map(|statement| match statement {
+                Stmt::FunctionDef(function) => Some(function.name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"stage_agent_messages"));
+        assert!(names.contains(&"stage_agent_dispatch"));
+        assert!(names.contains(&"agent_loop"));
+        assert_eq!(
+            source.matches("model_infer(").count(),
+            1,
+            "one stage callback must make one visible model decision"
+        );
+        assert!(!source.contains("react_control("));
+    }
+
+    #[test]
+    fn blind_authored_staged_doom_reference_is_admitted() {
+        let library = include_str!("../../../examples/scripts/standard_stage_agent.stone");
+        let harness = include_str!("../../../examples/references/staged_doom_harness.stone");
+        let program = lower_source(&format!("{library}\n{harness}"))
+            .expect("lower staged Doom reference with visible control library");
+        assert!(program.statements.iter().any(|statement| matches!(
+            statement,
+            Stmt::Expr(Expr::Call(call))
+                if call.name == "emit"
+                    && matches!(call.positional.as_slice(), [Expr::Call(run)] if run.name == "workflow_main")
+        )));
+    }
+
+    #[test]
+    fn stage_scoped_doom_repair_is_admitted_with_larger_budget() {
+        let library = include_str!("../../../examples/scripts/standard_stage_agent.stone");
+        let harness =
+            include_str!("../../../examples/references/staged_doom_harness_repair_v1.stone");
+        let program = lower_source(&format!("{library}\n{harness}"))
+            .expect("lower staged Doom repair with visible control library");
+        assert!(program.statements.iter().any(|statement| matches!(
+            statement,
+            Stmt::FunctionDef(function)
+                if function.stage.as_ref().is_some_and(|stage| {
+                    matches!(stage.name, Some(Expr::String(ref name)) if name == "build")
+                        && matches!(stage.max_actions, Some(Expr::Int(ref value)) if value == "12")
+                })
+        )));
     }
 
     #[test]

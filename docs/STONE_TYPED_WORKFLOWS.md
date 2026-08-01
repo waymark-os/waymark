@@ -375,6 +375,32 @@ Mutable Docker/VM generation snapshot and join are the next provider slice.
 
 ## Example
 
+An inspection stage can declare the semantic inputs required downstream:
+
+```stone
+workflow project:
+    stage inspect(goal="resolve build requirements", max_actions=4):
+        agent_loop()
+        ensure decision_recorded(fields=[
+            "source_layout",
+            "toolchain",
+            "frame_backend",
+            "runtime_contract",
+        ])
+```
+
+The standard stage agent's `decide` action must provide an answer plus a
+non-empty finding for each field. The runtime rechecks those fields before the
+stage advances and reports the missing names. This proves that the typed
+decision record exists; artifact, command, and external verifier evidence must
+still validate its consequences.
+
+A typed shape gate also does not imply that a finding is resolved. A task cell
+can satisfy a required non-empty field with an honest statement that the fact
+is still unknown. The next refinement should represent resolution explicitly
+and attach a compact observation basis, while keeping final correctness under
+fresh evidence gates.
+
 ```stone
 def repair_output(step):
     return run(["sh", "-c", "printf ready > artifact.txt"])

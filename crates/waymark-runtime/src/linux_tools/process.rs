@@ -297,6 +297,23 @@ pub(crate) fn run_call_values(
             Value::int(timeout_ms, Span::unknown()),
         );
     }
+    if record.get("argv").is_none() {
+        record.insert(
+            "argv",
+            Value::list(
+                argv.iter()
+                    .map(|argument| Value::string(argument, Span::unknown()))
+                    .collect(),
+                Span::unknown(),
+            ),
+        );
+    }
+    if record.get("cwd").is_none() {
+        record.insert(
+            "cwd",
+            Value::string(cwd.display().to_string(), Span::unknown()),
+        );
+    }
     Ok(StoneRunInvocation {
         record,
         argv,

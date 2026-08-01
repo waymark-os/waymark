@@ -65,10 +65,10 @@ use crate::stone_builtins::{
 use crate::stone_correction;
 use crate::stone_file_ops::{
     cat_text, create_dir_all, diff_record_for_paths, edit_text_file, file_nonempty_probe,
-    find_records, io_stone_error, list_dir_records, open_runtime_file, read_bytes_for_jsonl,
-    read_csv_file, read_json_file, read_text as stone_read_text, remove_path, save_value_file,
-    search_records, stat_record, write_json_file, write_jsonl_file, write_text as stone_write_text,
-    RuntimeFile, StoneFindOptions,
+    file_regular_probe, find_records, io_stone_error, list_dir_records, open_runtime_file,
+    read_bytes, read_bytes_for_jsonl, read_csv_file, read_json_file, read_text as stone_read_text,
+    remove_path, save_value_file, search_records, stat_record, write_json_file, write_jsonl_file,
+    write_text as stone_write_text, RuntimeFile, StoneFindOptions,
 };
 use crate::stone_hash::hash_builtin;
 #[cfg(not(target_os = "hermit"))]
@@ -2313,11 +2313,18 @@ impl Evaluator<'_> {
             "transition_hooks" => self.eval_transition_hooks_call(call),
             "workflow_evidence" => self.eval_workflow_evidence_call(call),
             "file_nonempty" => self.eval_file_nonempty_call(call),
+            "artifact" => self.eval_artifact_call(call),
+            "file_valid" => self.eval_file_valid_call(call),
+            "command_succeeded" => self.eval_command_succeeded_call(call),
+            "stdout_nonempty" => self.eval_stdout_nonempty_call(call),
+            "decision_recorded" => self.eval_decision_recorded_call(call),
+            "all_evidence" => self.eval_all_evidence_call(call),
             "stage" => self.eval_stage_marker_call(call),
             "workflow_stage" => self.eval_workflow_stage_call(call),
             "workflow" => self.eval_workflow_call(call),
             "workflow_patch" => self.eval_workflow_patch_call(call),
             "workflow_run" => self.eval_workflow_run_call(call),
+            "workflow_main" => self.eval_workflow_main_call(call),
             "model_call" => self.eval_model_call_call(call),
             "model_infer" => self.eval_model_infer_call(call),
             "context_write" => self.eval_context_write_call(call),
@@ -4513,6 +4520,218 @@ impl Evaluator<'_> {
         ))
     }
 
+    fn eval_artifact_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let [path] = call.positional.as_slice() else {
+            return Err(workflow_error(
+                "artifact() requires exactly one positional workspace path",
+            ));
+        };
+        let path = self.eval_workflow_evidence_path(path, "artifact")?;
+        let mut format = None;
+        let mut arch = None;
+        let mut seen = HashSet::new();
+        for (name, expression) in &call.named {
+            if !seen.insert(name.as_str()) {
+                return Err(workflow_error(format!(
+                    "artifact() field `{name}` may be supplied only once"
+                )));
+            }
+            let value = self
+                .eval_expr_value(expression, PipelineData::empty())?
+                .into_nu_value("artifact")?;
+            match name.as_str() {
+                "format" => format = Some(value_to_string(&value, "artifact format")?),
+                "arch" => arch = Some(value_to_string(&value, "artifact arch")?),
+                other => {
+                    return Err(workflow_error(format!(
+                        "unsupported artifact() field `{other}`; expected format or arch"
+                    )))
+                }
+            }
+        }
+        if let Some(format) = format.as_deref() {
+            if format != "elf" {
+                return Err(workflow_error(format!(
+                    "artifact() currently supports format=\"elf\"; got `{format}`"
+                )));
+            }
+        }
+        if arch.is_some() && format.as_deref() != Some("elf") {
+            return Err(workflow_error("artifact() arch= requires format=\"elf\""));
+        }
+        if let Some(arch) = arch.as_deref() {
+            workflow_elf_machine(arch)?;
+        }
+        Ok(RuntimeValue::WorkflowEvidenceSource(
+            WorkflowEvidenceSource::Artifact { path, format, arch },
+        ))
+    }
+
+    fn eval_file_valid_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let [path] = call.positional.as_slice() else {
+            return Err(workflow_error(
+                "file_valid() requires exactly one positional path",
+            ));
+        };
+        let path = self.eval_workflow_evidence_path(path, "file_valid")?;
+        let mut format = None;
+        let mut nonempty = true;
+        let mut seen = HashSet::new();
+        for (name, expression) in &call.named {
+            if !seen.insert(name.as_str()) {
+                return Err(workflow_error(format!(
+                    "file_valid() field `{name}` may be supplied only once"
+                )));
+            }
+            let value = self
+                .eval_expr_value(expression, PipelineData::empty())?
+                .into_nu_value("file_valid")?;
+            match name.as_str() {
+                "format" => format = Some(value_to_string(&value, "file_valid format")?),
+                "nonempty" => nonempty = value_to_bool(&value, "file_valid nonempty")?,
+                other => {
+                    return Err(workflow_error(format!(
+                        "unsupported file_valid() field `{other}`; expected format or nonempty"
+                    )))
+                }
+            }
+        }
+        if let Some(format) = format.as_deref() {
+            if format != "bmp" {
+                return Err(workflow_error(format!(
+                    "file_valid() currently supports format=\"bmp\"; got `{format}`"
+                )));
+            }
+        }
+        Ok(RuntimeValue::WorkflowEvidenceSource(
+            WorkflowEvidenceSource::FileValid {
+                path,
+                format,
+                nonempty,
+            },
+        ))
+    }
+
+    fn eval_command_succeeded_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let [argv] = call.positional.as_slice() else {
+            return Err(workflow_error(
+                "command_succeeded() requires exactly one positional argv list",
+            ));
+        };
+        if !call.named.is_empty() {
+            return Err(workflow_error(
+                "command_succeeded() does not accept keyword arguments",
+            ));
+        }
+        let value = self
+            .eval_expr_value(argv, PipelineData::empty())?
+            .into_nu_value("command_succeeded")?;
+        let argv = value_to_string_list(&value, "command_succeeded argv")?;
+        if argv.is_empty() || argv.len() > 64 {
+            return Err(workflow_error(
+                "command_succeeded() argv must contain between one and 64 strings",
+            ));
+        }
+        Ok(RuntimeValue::WorkflowEvidenceSource(
+            WorkflowEvidenceSource::CommandSucceeded { argv },
+        ))
+    }
+
+    fn eval_stdout_nonempty_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.positional.is_empty() || !call.named.is_empty() {
+            return Err(workflow_error("stdout_nonempty() accepts no arguments"));
+        }
+        Ok(RuntimeValue::WorkflowEvidenceSource(
+            WorkflowEvidenceSource::StdoutNonempty,
+        ))
+    }
+
+    fn eval_decision_recorded_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.positional.is_empty() {
+            return Err(workflow_error(
+                "decision_recorded() accepts only the optional fields= keyword",
+            ));
+        }
+        let mut fields = Vec::new();
+        let mut seen_keyword = false;
+        for (name, expression) in &call.named {
+            if name != "fields" || seen_keyword {
+                return Err(workflow_error(
+                    "decision_recorded() accepts fields= exactly once",
+                ));
+            }
+            seen_keyword = true;
+            let value = self
+                .eval_expr_value(expression, PipelineData::empty())?
+                .into_nu_value("decision_recorded fields")?;
+            fields = value_to_string_list(&value, "decision_recorded fields")?;
+        }
+        if fields.len() > 12 {
+            return Err(workflow_error(
+                "decision_recorded() accepts at most 12 required finding fields",
+            ));
+        }
+        let mut unique = HashSet::new();
+        for field in &fields {
+            if field.is_empty()
+                || field.len() > 64
+                || !field
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            {
+                return Err(workflow_error(format!(
+                    "decision_recorded() field `{field}` must be a 1..64 character ASCII identifier"
+                )));
+            }
+            if !unique.insert(field.clone()) {
+                return Err(workflow_error(format!(
+                    "decision_recorded() field `{field}` is duplicated"
+                )));
+            }
+        }
+        Ok(RuntimeValue::WorkflowEvidenceSource(
+            WorkflowEvidenceSource::DecisionRecorded { fields },
+        ))
+    }
+
+    fn eval_workflow_evidence_path(
+        &mut self,
+        expression: &Expr,
+        context: &str,
+    ) -> Result<String, ShellError> {
+        let path = self
+            .eval_expr_value(expression, PipelineData::empty())?
+            .into_nu_value(context)
+            .and_then(|value| value_to_path_string(&value, &format!("{context} path")))?;
+        let length = path.chars().count();
+        if path.trim().is_empty() || length > 200 {
+            return Err(workflow_error(format!(
+                "{context} path must contain between 1 and 200 characters"
+            )));
+        }
+        Ok(path)
+    }
+
+    fn eval_all_evidence_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.named.is_empty() {
+            return Err(workflow_error(
+                "all_evidence() accepts typed evidence specifications as positional arguments only",
+            ));
+        }
+        if call.positional.is_empty() || call.positional.len() > 16 {
+            return Err(workflow_error(
+                "all_evidence() requires between one and 16 typed evidence specifications",
+            ));
+        }
+        let mut sources = Vec::with_capacity(call.positional.len());
+        for expression in &call.positional {
+            sources.push(self.eval_workflow_evidence_source(expression)?);
+        }
+        Ok(RuntimeValue::WorkflowEvidenceSource(
+            WorkflowEvidenceSource::All(sources),
+        ))
+    }
+
     fn eval_stage_marker_call(&mut self, _call: &Call) -> Result<RuntimeValue, ShellError> {
         Err(workflow_error(
             "stage(...) is declaration syntax and must be written as @stage(...) immediately above a def",
@@ -4524,7 +4743,13 @@ impl Evaluator<'_> {
         function: &FunctionDef,
         decorator: &StageDecorator,
     ) -> Result<WorkflowStage, ShellError> {
-        validate_workflow_name(&function.name, "stage")?;
+        let name = decorator
+            .name
+            .as_ref()
+            .map(|expression| self.eval_workflow_goal(expression, "@stage name"))
+            .transpose()?
+            .unwrap_or_else(|| function.name.clone());
+        validate_workflow_name(&name, "stage")?;
         if !function_accepts_arity(function, 1) {
             return Err(workflow_error(format!(
                 "@stage action `{}` must accept one workflow context argument",
@@ -4532,18 +4757,50 @@ impl Evaluator<'_> {
             )));
         }
         let evidence = self.eval_workflow_evidence_source(&decorator.evidence)?;
+        let goal = decorator
+            .goal
+            .as_ref()
+            .map(|expression| self.eval_workflow_goal(expression, "@stage"))
+            .transpose()?
+            .unwrap_or_else(|| name.clone());
+        let agent_loop = decorator
+            .agent_loop
+            .as_ref()
+            .map(|expression| self.eval_workflow_bool(expression, "@stage agent_loop"))
+            .transpose()?
+            .unwrap_or(false);
         let repair = decorator
             .repair
             .as_ref()
             .filter(|expression| !matches!(expression, Expr::None))
             .map(|expression| self.eval_workflow_handler("repair", expression))
             .transpose()?;
-        let max_attempts = decorator
+        let explicit_max_attempts = decorator
             .max_attempts
             .as_ref()
             .map(|expression| self.eval_workflow_max_attempts(expression, "@stage"))
+            .transpose()?;
+        let max_actions = decorator
+            .max_actions
+            .as_ref()
+            .map(|expression| self.eval_workflow_max_actions(expression, "@stage"))
             .transpose()?
             .unwrap_or(1);
+        if agent_loop && decorator.max_actions.is_none() {
+            return Err(workflow_error(
+                "@stage agent_loop=True requires an explicit max_actions budget",
+            ));
+        }
+        if agent_loop && explicit_max_attempts.is_some() {
+            return Err(workflow_error(
+                "@stage agent_loop=True uses max_actions as its sole decision budget; do not also provide max_attempts",
+            ));
+        }
+        let max_attempts = if agent_loop {
+            max_actions
+        } else {
+            explicit_max_attempts.unwrap_or(1)
+        };
         let checkpoint = decorator
             .checkpoint
             .as_ref()
@@ -4551,11 +4808,14 @@ impl Evaluator<'_> {
             .transpose()?
             .unwrap_or(WorkflowCheckpointPolicy::None);
         Ok(WorkflowStage {
-            name: function.name.clone(),
+            name,
+            goal,
+            agent_loop,
             evidence,
             action: WorkflowHandler::NamedFunction(function.name.clone()),
             repair,
             max_attempts,
+            max_actions,
             checkpoint,
         })
     }
@@ -4573,9 +4833,14 @@ impl Evaluator<'_> {
         validate_workflow_name(&name, "stage")?;
 
         let mut evidence = None;
+        let mut goal = name.clone();
+        let mut agent_loop = false;
         let mut action = None;
         let mut repair = None;
         let mut max_attempts = 1_u32;
+        let mut max_actions = 1_u32;
+        let mut explicit_max_attempts = false;
+        let mut explicit_max_actions = false;
         let mut checkpoint = WorkflowCheckpointPolicy::None;
         let mut seen = HashSet::new();
         for (field, expression) in &call.named {
@@ -4588,6 +4853,13 @@ impl Evaluator<'_> {
                 "evidence" => {
                     evidence = Some(self.eval_workflow_evidence_source(expression)?);
                 }
+                "goal" => {
+                    goal = self.eval_workflow_goal(expression, "workflow_stage")?;
+                }
+                "agent_loop" => {
+                    agent_loop =
+                        self.eval_workflow_bool(expression, "workflow_stage agent_loop")?;
+                }
                 "action" => {
                     action = Some(self.eval_workflow_handler("action", expression)?);
                 }
@@ -4596,7 +4868,12 @@ impl Evaluator<'_> {
                     repair = Some(self.eval_workflow_handler("repair", expression)?);
                 }
                 "max_attempts" => {
+                    explicit_max_attempts = true;
                     max_attempts = self.eval_workflow_max_attempts(expression, "workflow_stage")?;
+                }
+                "max_actions" => {
+                    explicit_max_actions = true;
+                    max_actions = self.eval_workflow_max_actions(expression, "workflow_stage")?;
                 }
                 "checkpoint" => {
                     checkpoint =
@@ -4604,7 +4881,7 @@ impl Evaluator<'_> {
                 }
                 other => {
                     return Err(workflow_error(format!(
-                        "unsupported workflow_stage() field `{other}`; expected evidence, action, repair, max_attempts, or checkpoint"
+                        "unsupported workflow_stage() field `{other}`; expected evidence, goal, agent_loop, action, repair, max_attempts, max_actions, or checkpoint"
                     )));
                 }
             }
@@ -4612,12 +4889,28 @@ impl Evaluator<'_> {
         let evidence =
             evidence.ok_or_else(|| workflow_error("workflow_stage() requires evidence="))?;
         let action = action.ok_or_else(|| workflow_error("workflow_stage() requires action="))?;
+        if agent_loop {
+            if !explicit_max_actions {
+                return Err(workflow_error(
+                    "workflow_stage(agent_loop=True) requires an explicit max_actions budget",
+                ));
+            }
+            if explicit_max_attempts {
+                return Err(workflow_error(
+                    "workflow_stage(agent_loop=True) uses max_actions as its sole decision budget; do not also provide max_attempts",
+                ));
+            }
+            max_attempts = max_actions;
+        }
         Ok(RuntimeValue::WorkflowStage(WorkflowStage {
             name,
+            goal,
+            agent_loop,
             evidence,
             action,
             repair,
             max_attempts,
+            max_actions,
             checkpoint,
         }))
     }
@@ -4673,6 +4966,50 @@ impl Evaluator<'_> {
             )));
         }
         Ok(attempts)
+    }
+
+    fn eval_workflow_goal(
+        &mut self,
+        expression: &Expr,
+        context: &str,
+    ) -> Result<String, ShellError> {
+        let value = self
+            .eval_expr_value(expression, PipelineData::empty())?
+            .into_nu_value(&format!("{context} goal"))?;
+        let goal = value_to_string(&value, &format!("{context} goal"))?;
+        let length = goal.chars().count();
+        if goal.trim().is_empty() || length > 2_048 {
+            return Err(workflow_error(format!(
+                "{context} goal must contain between 1 and 2048 characters"
+            )));
+        }
+        Ok(goal)
+    }
+
+    fn eval_workflow_bool(&mut self, expression: &Expr, context: &str) -> Result<bool, ShellError> {
+        let value = self
+            .eval_expr_value(expression, PipelineData::empty())?
+            .into_nu_value(context)?;
+        value_to_bool(&value, context).map_err(|error| workflow_error(format!("{error:?}")))
+    }
+
+    fn eval_workflow_max_actions(
+        &mut self,
+        expression: &Expr,
+        context: &str,
+    ) -> Result<u32, ShellError> {
+        let value = self
+            .eval_expr_value(expression, PipelineData::empty())?
+            .into_nu_value(&format!("{context} max_actions"))?;
+        let actions = value_to_limit(&value, &format!("{context} max_actions"))?;
+        let actions =
+            u32::try_from(actions).map_err(|_| workflow_error("max_actions is too large"))?;
+        if !(1..=64).contains(&actions) {
+            return Err(workflow_error(format!(
+                "{context} max_actions must be between 1 and 64"
+            )));
+        }
+        Ok(actions)
     }
 
     fn eval_workflow_checkpoint_policy(
@@ -4927,6 +5264,57 @@ impl Evaluator<'_> {
         let result = self.run_workflow(&workflow);
         self.state.active_workflow_run = false;
         result.map(RuntimeValue::Nu)
+    }
+
+    fn eval_workflow_main_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let result = self.eval_workflow_run_call(call)?;
+        let RuntimeValue::Nu(report) = result else {
+            unreachable!("workflow_run returns a report value")
+        };
+        if gateway_env::enabled() {
+            let report_json = nu_to_json_value(&report);
+            let complete = report
+                .get_data_by_key("ok")
+                .and_then(|value| value.as_bool().ok())
+                .unwrap_or(false);
+            let failed_stage = report
+                .get_data_by_key("failed_stage")
+                .and_then(|value| value.as_str().ok().map(str::to_string))
+                .unwrap_or_default();
+            let reason = if complete {
+                "staged workflow evidence satisfied".to_string()
+            } else if failed_stage.is_empty() {
+                "staged workflow evidence remained unsatisfied".to_string()
+            } else {
+                format!("staged workflow failed at `{failed_stage}`")
+            };
+            let audit = workflow_publication_audit(&report_json, complete, &reason);
+            gateway_runtime::context_write(
+                "requirement.audit".to_string(),
+                "requirement".to_string(),
+                audit,
+                if complete { "verified" } else { "contradicted" }.to_string(),
+                vec![json!("runtime:typed_workflow")],
+            )
+            .map_err(|error| {
+                workflow_error(format!(
+                    "could not retain typed workflow publication audit: {}",
+                    gateway_runtime::shell_error_detail(&error)
+                ))
+            })?;
+            gateway_env::attempt_report(
+                String::new(),
+                if complete { "succeeded" } else { "failed" }.to_string(),
+                report_json.to_string(),
+                String::new(),
+                reason,
+                vec![(
+                    "control".to_string(),
+                    "stone.staged_workflow.v0".to_string(),
+                )],
+            )?;
+        }
+        Ok(RuntimeValue::Nu(report))
     }
 
     fn run_workflow(&mut self, workflow: &Workflow) -> Result<Value, ShellError> {
@@ -5205,7 +5593,18 @@ impl Evaluator<'_> {
         phase: &str,
         context: Value,
     ) -> Result<WorkflowEvidence, ShellError> {
-        match &stage.evidence {
+        self.invoke_workflow_evidence_source(workflow, stage, phase, &stage.evidence, context)
+    }
+
+    fn invoke_workflow_evidence_source(
+        &mut self,
+        workflow: &Workflow,
+        stage: &WorkflowStage,
+        phase: &str,
+        source: &WorkflowEvidenceSource,
+        context: Value,
+    ) -> Result<WorkflowEvidence, ShellError> {
+        match source {
             WorkflowEvidenceSource::Handler(handler) => {
                 let value = self
                     .invoke_workflow_handler(handler, context)
@@ -5230,6 +5629,89 @@ impl Evaluator<'_> {
                     .map(|size| vec![format!("file:{path}:size={size}")])
                     .unwrap_or_default();
                 validate_workflow_evidence(satisfied, summary, references)
+                    .map_err(|error| workflow_evidence_source_error(workflow, stage, phase, error))
+            }
+            WorkflowEvidenceSource::Artifact { path, format, arch } => {
+                let target = self.resolve_script_path(path).map_err(|error| {
+                    workflow_evidence_source_error(workflow, stage, phase, error)
+                })?;
+                let probe = workflow_artifact_probe(&target, format.as_deref(), arch.as_deref())
+                    .map_err(|error| {
+                        workflow_evidence_source_error(workflow, stage, phase, error)
+                    })?;
+                let summary = if probe.satisfied {
+                    format!("artifact `{path}` is valid ({})", probe.detail)
+                } else {
+                    format!("artifact `{path}` is not valid: {}", probe.detail)
+                };
+                let references = probe
+                    .satisfied
+                    .then(|| vec![format!("artifact:{path}:{}", probe.reference)])
+                    .unwrap_or_default();
+                validate_workflow_evidence(probe.satisfied, summary, references)
+                    .map_err(|error| workflow_evidence_source_error(workflow, stage, phase, error))
+            }
+            WorkflowEvidenceSource::FileValid {
+                path,
+                format,
+                nonempty,
+            } => {
+                let target = self.resolve_script_path(path).map_err(|error| {
+                    workflow_evidence_source_error(workflow, stage, phase, error)
+                })?;
+                let probe = workflow_file_valid_probe(
+                    &target,
+                    format.as_deref(),
+                    *nonempty,
+                    gateway_runtime::enabled() && path.starts_with("/tmp/"),
+                )
+                .map_err(|error| workflow_evidence_source_error(workflow, stage, phase, error))?;
+                let summary = if probe.satisfied {
+                    format!("file `{path}` is valid ({})", probe.detail)
+                } else {
+                    format!("file `{path}` is not valid: {}", probe.detail)
+                };
+                let references = probe
+                    .satisfied
+                    .then(|| vec![format!("file:{path}:{}", probe.reference)])
+                    .unwrap_or_default();
+                validate_workflow_evidence(probe.satisfied, summary, references)
+                    .map_err(|error| workflow_evidence_source_error(workflow, stage, phase, error))
+            }
+            WorkflowEvidenceSource::CommandSucceeded { argv } => {
+                let (satisfied, summary) = workflow_command_evidence(&context, argv)?;
+                let encoded = serde_json::to_string(argv).unwrap_or_else(|_| "[]".to_string());
+                let references = satisfied
+                    .then(|| vec![format!("command:{encoded}:exit=0")])
+                    .unwrap_or_default();
+                validate_workflow_evidence(satisfied, summary, references)
+                    .map_err(|error| workflow_evidence_source_error(workflow, stage, phase, error))
+            }
+            WorkflowEvidenceSource::StdoutNonempty => {
+                let (satisfied, summary, bytes) = workflow_stdout_evidence(&context)?;
+                let references = satisfied
+                    .then(|| vec![format!("stdout:bytes={bytes}")])
+                    .unwrap_or_default();
+                validate_workflow_evidence(satisfied, summary, references)
+                    .map_err(|error| workflow_evidence_source_error(workflow, stage, phase, error))
+            }
+            WorkflowEvidenceSource::DecisionRecorded { fields } => {
+                let (satisfied, summary, reference) = workflow_decision_evidence(&context, fields)?;
+                validate_workflow_evidence(satisfied, summary, reference.into_iter().collect())
+                    .map_err(|error| workflow_evidence_source_error(workflow, stage, phase, error))
+            }
+            WorkflowEvidenceSource::All(sources) => {
+                let mut evidence = Vec::with_capacity(sources.len());
+                for source in sources {
+                    evidence.push(self.invoke_workflow_evidence_source(
+                        workflow,
+                        stage,
+                        phase,
+                        source,
+                        context.clone(),
+                    )?);
+                }
+                combine_workflow_evidence(evidence)
                     .map_err(|error| workflow_evidence_source_error(workflow, stage, phase, error))
             }
         }
@@ -5816,6 +6298,7 @@ impl Evaluator<'_> {
             failures.push(json!({
                 "attempt": attempt + 1,
                 "errors": issue_values,
+                "response_excerpt": bounded_text(&content, 2_048),
                 "repair_prompt": repair_message,
             }));
             if attempt == retries {
@@ -9344,6 +9827,14 @@ impl Evaluator<'_> {
         if path.is_absolute() {
             return Ok(path.to_path_buf());
         }
+        // An attached Stone program addresses the transactional workspace, not
+        // the LibOS guest's private cwd (currently /work). Keep the path
+        // relative so the Gateway file adapter resolves it from the abstract
+        // workspace root and provider-specific /app remains an implementation
+        // detail.
+        if gateway_runtime::enabled() {
+            return Ok(path.to_path_buf());
+        }
         let cwd = self
             .engine_state
             .cwd_as_string(Some(self.stack))
@@ -10070,11 +10561,18 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "transition_hooks",
     "workflow_evidence",
     "file_nonempty",
+    "artifact",
+    "file_valid",
+    "command_succeeded",
+    "stdout_nonempty",
+    "decision_recorded",
+    "all_evidence",
     "stage",
     "workflow_stage",
     "workflow",
     "workflow_patch",
     "workflow_run",
+    "workflow_main",
     "mkdir",
     "must_run",
     "open",
@@ -10792,6 +11290,424 @@ fn validate_workflow_evidence(
     })
 }
 
+struct WorkflowFileProbe {
+    satisfied: bool,
+    detail: String,
+    reference: String,
+}
+
+fn workflow_artifact_probe(
+    path: &Path,
+    format: Option<&str>,
+    arch: Option<&str>,
+) -> Result<WorkflowFileProbe, ShellError> {
+    let Some(size) = file_regular_probe(path)? else {
+        return Ok(WorkflowFileProbe {
+            satisfied: false,
+            detail: "missing or not a regular file".to_string(),
+            reference: String::new(),
+        });
+    };
+    if size == 0 {
+        return Ok(WorkflowFileProbe {
+            satisfied: false,
+            detail: "file is empty".to_string(),
+            reference: String::new(),
+        });
+    }
+    if format != Some("elf") {
+        return Ok(WorkflowFileProbe {
+            satisfied: true,
+            detail: format!("regular non-empty file, {size} bytes"),
+            reference: format!("size={size}"),
+        });
+    }
+    let bytes = read_bytes(path, 64, "artifact ELF header")?;
+    if bytes.len() < 20 || bytes.get(..4) != Some(b"\x7fELF") {
+        return Ok(WorkflowFileProbe {
+            satisfied: false,
+            detail: "expected an ELF header".to_string(),
+            reference: String::new(),
+        });
+    }
+    let machine = match bytes[5] {
+        1 => u16::from_le_bytes([bytes[18], bytes[19]]),
+        2 => u16::from_be_bytes([bytes[18], bytes[19]]),
+        other => {
+            return Ok(WorkflowFileProbe {
+                satisfied: false,
+                detail: format!("ELF header has unsupported data encoding {other}"),
+                reference: String::new(),
+            })
+        }
+    };
+    if let Some(arch) = arch {
+        let expected = workflow_elf_machine(arch)?;
+        if machine != expected {
+            return Ok(WorkflowFileProbe {
+                satisfied: false,
+                detail: format!(
+                    "ELF machine {machine} does not match requested architecture `{arch}`"
+                ),
+                reference: String::new(),
+            });
+        }
+    }
+    let arch_detail = arch
+        .map(|arch| format!(", architecture {arch}"))
+        .unwrap_or_default();
+    Ok(WorkflowFileProbe {
+        satisfied: true,
+        detail: format!("ELF{arch_detail}, {size} bytes"),
+        reference: format!(
+            "size={size};format=elf;machine={machine}{}",
+            arch.map(|arch| format!(";arch={arch}")).unwrap_or_default()
+        ),
+    })
+}
+
+fn workflow_elf_machine(arch: &str) -> Result<u16, ShellError> {
+    match arch {
+        "mips" => Ok(8),
+        "x86_64" => Ok(62),
+        "aarch64" => Ok(183),
+        "riscv64" => Ok(243),
+        other => Err(workflow_error(format!(
+            "unsupported ELF architecture `{other}`; expected mips, x86_64, aarch64, or riscv64"
+        ))),
+    }
+}
+
+fn workflow_file_valid_probe(
+    path: &Path,
+    format: Option<&str>,
+    nonempty: bool,
+    tool_environment_path: bool,
+) -> Result<WorkflowFileProbe, ShellError> {
+    if tool_environment_path {
+        return workflow_tool_environment_file_probe(path, format, nonempty);
+    }
+    let Some(size) = file_regular_probe(path)? else {
+        return Ok(WorkflowFileProbe {
+            satisfied: false,
+            detail: "missing or not a regular file".to_string(),
+            reference: String::new(),
+        });
+    };
+    if nonempty && size == 0 {
+        return Ok(WorkflowFileProbe {
+            satisfied: false,
+            detail: "file is empty".to_string(),
+            reference: String::new(),
+        });
+    }
+    if format == Some("bmp") {
+        let bytes = read_bytes(path, 2, "file_valid BMP header")?;
+        if bytes.as_slice() != b"BM" {
+            return Ok(WorkflowFileProbe {
+                satisfied: false,
+                detail: "expected a BMP header beginning with `BM`".to_string(),
+                reference: String::new(),
+            });
+        }
+    }
+    let format_detail = format
+        .map(|format| format!("format {format}, "))
+        .unwrap_or_default();
+    Ok(WorkflowFileProbe {
+        satisfied: true,
+        detail: format!("{format_detail}{size} bytes"),
+        reference: format!(
+            "size={size}{}",
+            format
+                .map(|format| format!(";format={format}"))
+                .unwrap_or_default()
+        ),
+    })
+}
+
+fn workflow_tool_environment_file_probe(
+    path: &Path,
+    format: Option<&str>,
+    nonempty: bool,
+) -> Result<WorkflowFileProbe, ShellError> {
+    let script = r#"path=$1
+require_nonempty=$2
+format=$3
+if [ ! -f "$path" ]; then
+  printf 'missing or not a regular file' >&2
+  exit 3
+fi
+size=$(wc -c < "$path") || exit 4
+if [ "$require_nonempty" = 1 ] && [ "$size" -eq 0 ]; then
+  printf 'file is empty' >&2
+  exit 5
+fi
+if [ "$format" = bmp ]; then
+  magic=$(dd if="$path" bs=1 count=2 2>/dev/null)
+  if [ "$magic" != BM ]; then
+    printf 'expected a BMP header beginning with BM' >&2
+    exit 6
+  fi
+fi
+printf '%s' "$size"
+"#;
+    let argv = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        script.to_string(),
+        "waymark-file-valid".to_string(),
+        path.display().to_string(),
+        if nonempty { "1" } else { "0" }.to_string(),
+        format.unwrap_or("").to_string(),
+    ];
+    let record = gateway_runtime::run_command(
+        &argv,
+        Path::new("/app"),
+        &[],
+        None,
+        Duration::from_secs(10),
+        false,
+        256,
+        512,
+    )?;
+    let satisfied = record
+        .get("ok")
+        .and_then(|value| value_to_bool(value, "file_valid tool probe").ok())
+        .unwrap_or(false);
+    if !satisfied {
+        let detail = record
+            .get("stderr")
+            .and_then(|value| value.as_str().ok())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("tool-environment file probe failed")
+            .to_string();
+        return Ok(WorkflowFileProbe {
+            satisfied: false,
+            detail,
+            reference: String::new(),
+        });
+    }
+    let size = record
+        .get("stdout")
+        .and_then(|value| value.as_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let format_detail = format
+        .map(|format| format!("format {format}, "))
+        .unwrap_or_default();
+    Ok(WorkflowFileProbe {
+        satisfied: true,
+        detail: format!("tool environment {format_detail}{size} bytes"),
+        reference: format!(
+            "plane=tool_environment;size={size}{}",
+            format
+                .map(|format| format!(";format={format}"))
+                .unwrap_or_default()
+        ),
+    })
+}
+
+fn workflow_context_outcome(context: &Value) -> Option<&Record> {
+    let Value::Record { val: context, .. } = context else {
+        return None;
+    };
+    let Value::Record { val: outcome, .. } = context.get("outcome")? else {
+        return None;
+    };
+    Some(outcome)
+}
+
+fn workflow_command_evidence(
+    context: &Value,
+    expected: &[String],
+) -> Result<(bool, String), ShellError> {
+    let expected_text = serde_json::to_string(expected).unwrap_or_else(|_| "[]".to_string());
+    let Some(outcome) = workflow_context_outcome(context) else {
+        return Ok((
+            false,
+            format!("command {expected_text} has no stage action outcome yet"),
+        ));
+    };
+    let Some(argv) = outcome.get("argv") else {
+        return Ok((
+            false,
+            format!("latest stage action does not identify command {expected_text}"),
+        ));
+    };
+    let observed = value_to_string_list(argv, "command_succeeded outcome argv")?;
+    let observed_text = serde_json::to_string(&observed).unwrap_or_else(|_| "[]".to_string());
+    if observed != expected {
+        return Ok((
+            false,
+            format!("expected command {expected_text}, observed {observed_text}"),
+        ));
+    }
+    let ok = outcome
+        .get("ok")
+        .map(|value| value_to_bool(value, "command_succeeded outcome ok"))
+        .transpose()?
+        .unwrap_or(false);
+    let exit_code = outcome.get("exit_code").and_then(|value| match value {
+        Value::Int { val, .. } => Some(*val),
+        _ => None,
+    });
+    if ok && exit_code.unwrap_or(0) == 0 {
+        Ok((true, format!("command {expected_text} succeeded")))
+    } else {
+        Ok((
+            false,
+            format!(
+                "command {expected_text} failed{}",
+                exit_code
+                    .map(|code| format!(" with exit code {code}"))
+                    .unwrap_or_default()
+            ),
+        ))
+    }
+}
+
+fn workflow_stdout_evidence(context: &Value) -> Result<(bool, String, usize), ShellError> {
+    let Some(outcome) = workflow_context_outcome(context) else {
+        return Ok((
+            false,
+            "no stage action stdout is available yet".to_string(),
+            0,
+        ));
+    };
+    let stdout = outcome
+        .get("stdout")
+        .map(|value| value_to_string(value, "stdout_nonempty outcome stdout"))
+        .transpose()?
+        .unwrap_or_default();
+    let bytes = stdout.len();
+    Ok(if bytes > 0 {
+        (
+            true,
+            format!("latest stage action produced {bytes} stdout bytes"),
+            bytes,
+        )
+    } else {
+        (false, "latest stage action stdout is empty".to_string(), 0)
+    })
+}
+
+fn workflow_decision_evidence(
+    context: &Value,
+    required_fields: &[String],
+) -> Result<(bool, String, Option<String>), ShellError> {
+    let Some(outcome) = workflow_context_outcome(context) else {
+        return Ok((
+            false,
+            "no explicit stage decision is available yet".to_string(),
+            None,
+        ));
+    };
+    let kind = outcome
+        .get("kind")
+        .map(|value| value_to_string(value, "decision_recorded outcome kind"))
+        .transpose()?
+        .unwrap_or_default();
+    let message = outcome
+        .get("message")
+        .map(|value| value_to_string(value, "decision_recorded outcome message"))
+        .transpose()?
+        .unwrap_or_default();
+    if !matches!(kind.as_str(), "decision_recorded" | "finish_requested")
+        || message.trim().is_empty()
+    {
+        return Ok((
+            false,
+            "latest stage action has not recorded an explicit non-empty decision".to_string(),
+            None,
+        ));
+    }
+    let findings = outcome.get("findings").and_then(|value| match value {
+        Value::Record { val, .. } => Some(val.as_ref()),
+        _ => None,
+    });
+    let mut missing = Vec::new();
+    for field in required_fields {
+        let present = findings
+            .and_then(|findings| findings.get(field))
+            .and_then(|value| match value {
+                Value::String { val, .. } | Value::Glob { val, .. } => Some(val.trim()),
+                _ => None,
+            })
+            .is_some_and(|value| !value.is_empty() && value.chars().count() <= 2_048);
+        if !present {
+            missing.push(field.as_str());
+        }
+    }
+    if !missing.is_empty() {
+        return Ok((
+            false,
+            format!(
+                "explicit stage decision is missing typed findings: {}",
+                missing.join(", ")
+            ),
+            None,
+        ));
+    }
+    let bytes = message.len();
+    let transition = outcome
+        .get("transition_id")
+        .map(|value| value_to_string(value, "decision_recorded transition_id"))
+        .transpose()?
+        .filter(|value| !value.is_empty());
+    Ok((
+        true,
+        if required_fields.is_empty() {
+            format!("explicit stage decision recorded ({bytes} bytes)")
+        } else {
+            format!(
+                "explicit stage decision recorded ({bytes} bytes) with typed findings: {}",
+                required_fields.join(", ")
+            )
+        },
+        Some(
+            transition
+                .map(|transition| format!("transition:{transition}:decision"))
+                .unwrap_or_else(|| format!("decision:bytes={bytes}")),
+        ),
+    ))
+}
+
+fn combine_workflow_evidence(
+    evidence: Vec<WorkflowEvidence>,
+) -> Result<WorkflowEvidence, ShellError> {
+    if evidence.is_empty() {
+        return Err(workflow_error(
+            "composite workflow evidence requires at least one contract",
+        ));
+    }
+    let satisfied_count = evidence.iter().filter(|item| item.satisfied).count();
+    let total = evidence.len();
+    let satisfied = satisfied_count == total;
+    let selected = evidence
+        .iter()
+        .filter(|item| satisfied || !item.satisfied)
+        .map(|item| item.summary.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let label = if satisfied {
+        format!("all {total} stage contracts satisfied")
+    } else {
+        format!("stage contracts satisfied {satisfied_count}/{total}; missing")
+    };
+    let summary = bounded_text(&format!("{label}: {selected}"), 1_024);
+    let references = if satisfied {
+        evidence
+            .into_iter()
+            .flat_map(|item| item.references)
+            .take(16)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    validate_workflow_evidence(satisfied, summary, references)
+}
+
 fn workflow_evidence_value(evidence: &WorkflowEvidence) -> Value {
     let span = Span::unknown();
     let mut record = Record::new();
@@ -10890,6 +11806,7 @@ fn compact_workflow_action_record(record: &Record) -> Value {
         "code",
         "completion_waits",
         "requested_timeout_ms",
+        "tool",
     ];
     let span = Span::unknown();
     let mut compact = Record::new();
@@ -10909,6 +11826,17 @@ fn compact_workflow_action_record(record: &Record) -> Value {
         };
         if let Some(value) = bounded {
             compact.push(*field, value);
+        }
+    }
+    if let Some(Value::Record { val: findings, .. }) = record.get("findings") {
+        let mut bounded = Record::new();
+        for (field, value) in findings.iter().take(12) {
+            if let Value::String { val, .. } | Value::Glob { val, .. } = value {
+                bounded.push(field, Value::string(bounded_text(val, 2_048), span));
+            }
+        }
+        if !bounded.is_empty() {
+            compact.push("findings", Value::record(bounded, span));
         }
     }
     for (field, fallback, limit) in [
@@ -10967,6 +11895,18 @@ fn workflow_context_value(
     record.push("schema", Value::string("waymark.workflow-context.v1", span));
     record.push("workflow", Value::string(workflow.name.clone(), span));
     record.push("stage", Value::string(stage.name.clone(), span));
+    record.push("goal", Value::string(stage.goal.clone(), span));
+    record.push(
+        "control",
+        Value::string(
+            if stage.agent_loop {
+                "agent_loop"
+            } else {
+                "deterministic"
+            },
+            span,
+        ),
+    );
     record.push("stage_index", Value::int(stage_index as i64, span));
     record.push(
         "stage_count",
@@ -10975,6 +11915,7 @@ fn workflow_context_value(
     record.push("phase", Value::string(phase, span));
     record.push("attempt", Value::int(attempt as i64, span));
     record.push("max_attempts", Value::int(stage.max_attempts as i64, span));
+    record.push("max_actions", Value::int(stage.max_actions as i64, span));
     record.push(
         "checkpoint_policy",
         Value::string(stage.checkpoint.as_str(), span),
@@ -10995,11 +11936,66 @@ fn workflow_context_value(
             .map(workflow_evidence_value)
             .unwrap_or_else(|| Value::nothing(span)),
     );
+    let mut contracts = Vec::new();
+    workflow_contract_names(&stage.evidence, &mut contracts);
+    record.push(
+        "contracts",
+        Value::list(
+            contracts
+                .into_iter()
+                .map(|name| Value::string(name, span))
+                .collect(),
+            span,
+        ),
+    );
+    let mut decision_fields = Vec::new();
+    workflow_decision_fields(&stage.evidence, &mut decision_fields);
+    record.push(
+        "decision_fields",
+        Value::list(
+            decision_fields
+                .into_iter()
+                .map(|name| Value::string(name, span))
+                .collect(),
+            span,
+        ),
+    );
     record.push(
         "outcome",
         outcome.cloned().unwrap_or_else(|| Value::nothing(span)),
     );
     Value::record(record, span)
+}
+
+fn workflow_contract_names(source: &WorkflowEvidenceSource, names: &mut Vec<&'static str>) {
+    match source {
+        WorkflowEvidenceSource::Handler(_) => names.push("custom"),
+        WorkflowEvidenceSource::FileNonempty { .. } => names.push("file_nonempty"),
+        WorkflowEvidenceSource::Artifact { .. } => names.push("artifact"),
+        WorkflowEvidenceSource::FileValid { .. } => names.push("file_valid"),
+        WorkflowEvidenceSource::CommandSucceeded { .. } => names.push("command_succeeded"),
+        WorkflowEvidenceSource::StdoutNonempty => names.push("stdout_nonempty"),
+        WorkflowEvidenceSource::DecisionRecorded { .. } => names.push("decision_recorded"),
+        WorkflowEvidenceSource::All(sources) => {
+            for source in sources {
+                workflow_contract_names(source, names);
+            }
+        }
+    }
+}
+
+fn workflow_decision_fields(source: &WorkflowEvidenceSource, fields: &mut Vec<String>) {
+    match source {
+        WorkflowEvidenceSource::DecisionRecorded { fields: required } => {
+            fields.extend(required.iter().cloned())
+        }
+        WorkflowEvidenceSource::All(sources) => {
+            for source in sources {
+                workflow_decision_fields(source, fields);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11017,6 +12013,19 @@ fn workflow_stage_report(
     let span = Span::unknown();
     let mut record = Record::new();
     record.push("name", Value::string(stage.name.clone(), span));
+    record.push("goal", Value::string(stage.goal.clone(), span));
+    record.push(
+        "control",
+        Value::string(
+            if stage.agent_loop {
+                "agent_loop"
+            } else {
+                "deterministic"
+            },
+            span,
+        ),
+    );
+    record.push("max_actions", Value::int(stage.max_actions as i64, span));
     record.push("status", Value::string(status, span));
     record.push("attempts", Value::int(attempts as i64, span));
     record.push("repairs", Value::int(repairs as i64, span));
@@ -11182,6 +12191,71 @@ fn workflow_report_value(
     );
     record.push("stages", Value::list(stages, span));
     Value::record(record, span)
+}
+
+fn workflow_publication_audit(
+    report: &serde_json::Value,
+    complete: bool,
+    summary: &str,
+) -> serde_json::Value {
+    let workflow = report
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("workflow");
+    let requirements = report
+        .get("stages")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|stage| {
+            let name = stage
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("stage");
+            let status = stage
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("missing");
+            let satisfied = matches!(status, "completed" | "already_satisfied");
+            let evidence = stage
+                .get("evidence")
+                .and_then(|value| value.get("evidence"))
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            let evidence_summary = stage
+                .get("evidence")
+                .and_then(|value| value.get("summary"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("stage evidence was not reported");
+            let goal = stage
+                .get("goal")
+                .and_then(serde_json::Value::as_str)
+                .filter(|goal| !goal.is_empty())
+                .unwrap_or(name);
+            json!({
+                "id": format!("workflow.{workflow}.{name}"),
+                "requirement": goal,
+                "status": if satisfied { "satisfied" } else { "missing" },
+                "evidence": evidence,
+                "reason": evidence_summary,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "audit_mode": "typed_workflow",
+        "approved": complete,
+        "claimed_approved": complete,
+        "summary": summary,
+        "repair_objective": if complete {
+            serde_json::Value::String(String::new())
+        } else {
+            serde_json::Value::String(
+                "Repair the first unsatisfied typed stage contract and resume from the latest semantic frontier."
+                    .to_string(),
+            )
+        },
+        "requirements": requirements,
+    })
 }
 
 fn stone_const_string(function: &StoneIrFunction, id: ConstId) -> Result<&str, ShellError> {
@@ -13022,8 +14096,9 @@ mod tests {
         agent_session_value_at, context_prompt_required_keys_from_value, ensure_runtime_type,
         eval_program, eval_program_with_options, eval_program_with_output,
         eval_program_with_output_and_session, match_fused_map_update_if,
-        semantic_frontier_guidance, transition_id_for_scope, EvalHotLoopDiagnostics, EvalOptions,
-        RuntimeValue, StoneSession, TextLines, STONE_BUILTIN_NAMES,
+        semantic_frontier_guidance, transition_id_for_scope, workflow_publication_audit,
+        EvalHotLoopDiagnostics, EvalOptions, RuntimeValue, StoneSession, TextLines,
+        STONE_BUILTIN_NAMES,
     };
     use crate::{
         commands::{
@@ -15299,6 +16374,385 @@ emit({
                 "artifact": "ready",
             })
         );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_block_executes_contract_gated_stages() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-block-contracts")?;
+        let program = lower_source(
+            r#"workflow task:
+    stage build(goal="produce artifact", max_actions=4):
+        run(["sh", "-c", "printf ready > artifact.txt"])
+        ensure file_nonempty("artifact.txt")
+
+    stage verify(goal="verify artifact", max_actions=1):
+        ensure file_nonempty("artifact.txt")
+
+report = workflow_run(task)
+emit({
+    "ok": report.ok,
+    "completed": report.completed_stages,
+    "build": report.stages[0],
+    "verify": report.stages[1],
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(true));
+        assert_eq!(value["completed"], json_value!(["build", "verify"]));
+        assert_eq!(value["build"]["goal"], json_value!("produce artifact"));
+        assert_eq!(value["build"]["max_actions"], json_value!(4));
+        assert_eq!(value["build"]["status"], json_value!("completed"));
+        assert_eq!(value["build"]["attempts"], json_value!(1));
+        assert_eq!(value["build"]["checks"], json_value!(2));
+        assert_eq!(value["verify"]["status"], json_value!("already_satisfied"));
+        assert_eq!(value["verify"]["attempts"], json_value!(0));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_agent_loop_rechecks_contracts_after_each_visible_step() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-agent-loop-steps")?;
+        let program = lower_source(
+            r#"def agent_loop(step):
+    if step.contracts != ["file_nonempty", "file_nonempty"]:
+        fail("typed contract kinds were not exposed to the stage agent")
+    if step.attempt == 1:
+        if "first.txt" not in step.evidence.summary or "second.txt" not in step.evidence.summary:
+            fail("initial decision did not receive both missing contracts")
+        return run(["sh", "-c", "printf first > first.txt"])
+    if "second.txt" not in step.evidence.summary or "first.txt" in step.evidence.summary:
+        fail("second decision did not receive the updated semantic frontier")
+    return run(["sh", "-c", "printf second > second.txt"])
+
+workflow task:
+    stage build(goal="produce both artifacts", max_actions=3):
+        agent_loop()
+        ensure file_nonempty("first.txt")
+        ensure file_nonempty("second.txt")
+
+report = workflow_run(task)
+emit({
+    "ok": report.ok,
+    "stage": report.stages[0],
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(true));
+        assert_eq!(value["stage"]["control"], json_value!("agent_loop"));
+        assert_eq!(value["stage"]["attempts"], json_value!(2));
+        assert_eq!(value["stage"]["checks"], json_value!(3));
+        assert_eq!(value["stage"]["max_actions"], json_value!(3));
+        assert_eq!(value["stage"]["evidence"]["satisfied"], json_value!(true));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn standard_stage_agent_preserves_process_tail_diagnostics() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("stage-agent-diagnostic-tail")?;
+        let source = format!(
+            "{}\n{}",
+            include_str!("../../../examples/scripts/standard_stage_agent.stone"),
+            r#"
+outcome = {
+    "ok": False,
+    "kind": "exec_failed",
+    "stdout": "build started and emitted a very long log",
+    "stdout_tail": "fatal error: required_header.h: No such file",
+    "stderr": "warning at the beginning",
+    "stderr_tail": "collect2: error: ld returned 1 exit status",
+}
+step = {"attempt": 3}
+action = {"tool": "run_complete", "input": {"argv": ["make"]}}
+summary = stage_agent_outcome_summary(outcome)
+history = stage_agent_history_item(step, action, outcome)
+failed_gate = {
+    "attempt": 2,
+    "max_actions": 3,
+    "contracts": ["file_valid"],
+    "outcome": {"tool": "run_complete"},
+}
+diagnostic = {
+    "attempt": 2,
+    "max_actions": 3,
+    "contracts": ["file_valid"],
+    "outcome": {"tool": "read"},
+}
+decision = {
+    "attempt": 4,
+    "max_actions": 4,
+    "contracts": ["decision_recorded"],
+    "decision_fields": [],
+    "outcome": None,
+}
+typed_decision = {
+    "attempt": 4,
+    "max_actions": 4,
+    "contracts": ["decision_recorded"],
+    "decision_fields": ["source_layout", "toolchain"],
+    "outcome": None,
+}
+typed_schema = stage_agent_action_schema(typed_decision)
+emit({
+    "summary_stdout": summary.stdout,
+    "summary_stderr": summary.stderr,
+    "history_stdout": history.stdout,
+    "history_stderr": history.stderr,
+    "failed_gate_mode": stage_agent_mode(failed_gate),
+    "failed_gate_choices": len(stage_agent_action_schema(failed_gate).properties.actions.items.oneOf),
+    "diagnostic_mode": stage_agent_mode(diagnostic),
+    "diagnostic_choices": len(stage_agent_action_schema(diagnostic).properties.actions.items.oneOf),
+    "decision_mode": stage_agent_mode(decision),
+    "decision_choices": len(stage_agent_action_schema(decision).properties.actions.items.oneOf),
+    "typed_decision_required": typed_schema.properties.actions.items.oneOf[0].properties.input.required,
+    "typed_finding_required": typed_schema.properties.actions.items.oneOf[0].properties.input.properties.findings.required,
+})
+"#,
+        );
+        let program = lower_source(&source)?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(
+            value,
+            json_value!({
+                "summary_stdout": "fatal error: required_header.h: No such file",
+                "summary_stderr": "collect2: error: ld returned 1 exit status",
+                "history_stdout": "fatal error: required_header.h: No such file",
+                "history_stderr": "collect2: error: ld returned 1 exit status",
+                "failed_gate_mode": "diagnose_or_repair",
+                "failed_gate_choices": 4,
+                "diagnostic_mode": "execute_or_repair",
+                "diagnostic_choices": 3,
+                "decision_mode": "decision_required",
+                "decision_choices": 3,
+                "typed_decision_required": ["answer", "findings"],
+                "typed_finding_required": ["source_layout", "toolchain"],
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_agent_loop_supports_task_scaled_bounded_action_budget() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-agent-loop-budget")?;
+        let program = lower_source(
+            r#"def agent_loop(step):
+    return {"ok": True, "kind": "decision", "message": "no progress"}
+
+workflow task:
+    stage build(goal="produce artifact", max_actions=12):
+        agent_loop()
+        ensure file_nonempty("missing.txt")
+
+report = workflow_run(task)
+emit({
+    "ok": report.ok,
+    "failed_stage": report.failed_stage,
+    "attempts": report.stages[0].attempts,
+    "summary": report.stages[0].evidence.summary,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(false));
+        assert_eq!(value["failed_stage"], json_value!("build"));
+        assert_eq!(value["attempts"], json_value!(12));
+        assert!(value["summary"]
+            .as_str()
+            .expect("summary")
+            .contains("missing.txt"));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn decision_contract_requires_explicit_nonempty_stage_decision() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-decision-evidence")?;
+        let program = lower_source(
+            r#"def agent_loop(step):
+    if step.contracts != ["decision_recorded"]:
+        fail("decision contract kind was not exposed to the stage agent")
+    if step.decision_fields != ["source_layout", "toolchain"]:
+        fail("typed decision fields were not exposed to the stage agent")
+    if step.attempt == 1:
+        return {
+            "ok": True,
+            "kind": "decision_recorded",
+            "message": "Source layout inspected, but toolchain is still unknown.",
+            "findings": {"source_layout": "sources are nested under doomgeneric"},
+            "transition_id": "fixture-decision-incomplete",
+        }
+    return {
+        "ok": True,
+        "kind": "decision_recorded",
+        "message": "Use the supplied frame writer and the MIPS target.",
+        "findings": {
+            "source_layout": "sources are nested under doomgeneric",
+            "toolchain": "use the available MIPS cross compiler",
+        },
+        "transition_id": "fixture-decision-1",
+    }
+
+workflow task:
+    stage inspect(goal="produce a build decision", max_actions=2):
+        agent_loop()
+        ensure decision_recorded(fields=["source_layout", "toolchain"])
+
+report = workflow_run(task)
+emit({
+    "ok": report.ok,
+    "attempts": report.stages[0].attempts,
+    "evidence": report.stages[0].evidence,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(true));
+        assert_eq!(value["attempts"], json_value!(2));
+        assert_eq!(
+            value["evidence"]["evidence"],
+            json_value!(["transition:fixture-decision-1:decision"])
+        );
+        assert!(value["evidence"]["summary"]
+            .as_str()
+            .expect("typed decision summary")
+            .contains("source_layout, toolchain"));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn composite_evidence_reports_each_missing_contract() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-composite-missing")?;
+        let program = lower_source(
+            r#"stage = workflow_stage(
+    "outputs",
+    evidence=all_evidence(
+        file_nonempty("first.txt"),
+        file_nonempty("second.txt"),
+    ),
+    action=lambda step: {"ok": True},
+)
+report = workflow_run(workflow("check-outputs", stage))
+emit(report.stages[0].evidence)
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["satisfied"], json_value!(false));
+        assert_eq!(value["evidence"], json_value!([]));
+        let summary = value["summary"].as_str().expect("evidence summary");
+        assert!(summary.contains("satisfied 0/2"), "{summary}");
+        assert!(summary.contains("first.txt"), "{summary}");
+        assert!(summary.contains("second.txt"), "{summary}");
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_artifact_and_file_contracts_validate_headers() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-file-formats")?;
+        let mut elf = vec![0_u8; 64];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 1;
+        elf[5] = 1;
+        elf[18..20].copy_from_slice(&8_u16.to_le_bytes());
+        fs::write(root.join("program"), elf).expect("write fixture ELF");
+        fs::write(root.join("frame.bmp"), b"BMfixture").expect("write fixture BMP");
+        let program = lower_source(
+            r#"stage = workflow_stage(
+    "files",
+    evidence=all_evidence(
+        artifact("program", format="elf", arch="mips"),
+        file_valid("frame.bmp", format="bmp", nonempty=True),
+    ),
+    action=lambda step: {"ok": False},
+)
+report = workflow_run(workflow("validate-files", stage))
+emit({
+    "ok": report.ok,
+    "status": report.stages[0].status,
+    "summary": report.stages[0].evidence.summary,
+    "references": report.stages[0].evidence.evidence,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(true));
+        assert_eq!(value["status"], json_value!("already_satisfied"));
+        assert!(value["summary"]
+            .as_str()
+            .expect("summary")
+            .contains("all 2 stage contracts satisfied"));
+        let references = value["references"].as_array().expect("references");
+        assert!(references.iter().any(|value| {
+            value
+                .as_str()
+                .is_some_and(|value| value.contains("format=elf") && value.contains("arch=mips"))
+        }));
+        assert!(references.iter().any(|value| {
+            value
+                .as_str()
+                .is_some_and(|value| value.contains("format=bmp"))
+        }));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn command_and_stdout_contracts_gate_on_the_same_latest_action() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-command-evidence")?;
+        let program = lower_source(
+            r#"def execute(step):
+    return run(["sh", "-c", "printf ready"])
+
+stage = workflow_stage(
+    "execute",
+    evidence=all_evidence(
+        command_succeeded(["sh", "-c", "printf ready"]),
+        stdout_nonempty(),
+    ),
+    action=execute,
+)
+report = workflow_run(workflow("run-and-observe", stage))
+emit({
+    "ok": report.ok,
+    "attempts": report.stages[0].attempts,
+    "checks": report.stages[0].checks,
+    "summary": report.stages[0].evidence.summary,
+    "references": report.stages[0].evidence.evidence,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(true));
+        assert_eq!(value["attempts"], json_value!(1));
+        assert_eq!(value["checks"], json_value!(2));
+        assert!(value["summary"]
+            .as_str()
+            .expect("summary")
+            .contains("all 2 stage contracts satisfied"));
+        assert_eq!(value["references"].as_array().expect("references").len(), 2);
         cleanup_dir(&root);
         Ok(())
     }
@@ -19320,6 +20774,42 @@ emit({
             .collect::<Vec<_>>()
             .join(", ");
         format!("[{values}]")
+    }
+
+    #[test]
+    fn typed_workflow_report_lowers_to_publication_audit() {
+        let report = json_value!({
+            "name": "project",
+            "stages": [
+                {
+                    "name": "build",
+                    "goal": "build the target artifact",
+                    "status": "completed",
+                    "evidence": {
+                        "summary": "artifact is a MIPS ELF",
+                        "evidence": ["workspace:doomgeneric_mips"]
+                    }
+                },
+                {
+                    "name": "run",
+                    "goal": "run the target",
+                    "status": "failed",
+                    "evidence": {
+                        "summary": "command did not succeed",
+                        "evidence": []
+                    }
+                }
+            ]
+        });
+        let audit = workflow_publication_audit(&report, false, "workflow failed");
+        assert_eq!(audit["audit_mode"], json_value!("typed_workflow"));
+        assert_eq!(audit["approved"], json_value!(false));
+        assert_eq!(audit["requirements"][0]["status"], json_value!("satisfied"));
+        assert_eq!(audit["requirements"][1]["status"], json_value!("missing"));
+        assert_eq!(
+            audit["requirements"][0]["evidence"],
+            json_value!(["workspace:doomgeneric_mips"])
+        );
     }
 
     fn stone_str_list_literal(values: &[&str]) -> String {

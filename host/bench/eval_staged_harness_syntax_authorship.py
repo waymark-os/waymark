@@ -61,15 +61,29 @@ stage should be reusable during later repair. Every public task obligation must
 be covered by some stage evidence. Prefer three to six purposeful stages and
 leave repair budget after the first real execution attempt.
 
+The admitted task workspace root is the Stone program's current directory and
+is mounted at /app for Linux commands. A relative path such as
+"doomgeneric_mips" therefore names /app/doomgeneric_mips. Do not place a
+requested root output under a source subdirectory merely because inputs live
+there. /tmp paths name the retained Linux tool environment rather than the
+transactional workspace.
+
 Available evidence expressions for this syntax experiment:
 - artifact(path, format=None, arch=None)
-- command_succeeded(argv, stdout=None)
+- command_succeeded(argv)
 - stdout_nonempty()
+- decision_recorded(fields=[])
 - file_valid(path, format=None, nonempty=True)
 - all_evidence(first, ...)
 
-This is an authorship experiment; the surface will later lower to Stone's
-existing typed workflow/stage IR. Do not define these builtins yourself.
+The surface lowers to Stone's existing typed workflow/stage IR. Do not define
+these builtins yourself. A standard visible Stone library supplies the
+one-decision agent_loop(step) callback; do not regenerate that library.
+When an inspection or planning stage is meant to produce a decision rather
+than a file, gate it with decision_recorded(). If downstream execution depends
+on concrete facts, name them with fields=["fact_name", ...]; the standard
+agent's decide action must then record a non-empty finding for every field.
+Existing task inputs and generic prose are not evidence that planning happened.
 
 Public task:
 {TASK}
@@ -213,7 +227,12 @@ def source_features(arm: str, source: str) -> dict[str, Any]:
         "ensure_count": len(re.findall(r"(?m)^\s+ensure\s+", source)),
         "repairable_checkpoint": 'checkpoint="repairable"' in source
         or "checkpoint='repairable'" in source,
-        "artifact_path": "/app/doomgeneric_mips" in source,
+        "artifact_path": bool(
+            re.search(
+                r"\bartifact\(\s*(['\"])(?:/app/)?doomgeneric_mips\1",
+                source,
+            )
+        ),
         "vm_command": bool(
             re.search(
                 r"(?:['\"]node['\"]\s*,\s*['\"](?:/app/)?vm\.js['\"]|node\s+(?:\.\./|/app/)?vm\.js)",
@@ -239,6 +258,15 @@ def source_features(arm: str, source: str) -> dict[str, Any]:
             token in name.lower()
             for name in names
             for token in ("verify", "validate", "check")
+        ),
+        "decision_stage": any(
+            token in name.lower()
+            for name in names
+            for token in ("inspect", "plan", "select", "decide")
+        ),
+        "decision_evidence": "decision_recorded(" in source,
+        "typed_decision_fields": bool(
+            re.search(r"decision_recorded\s*\([^)]*\bfields\s*=", source)
         ),
         "decorator_count": source.count("@stage("),
         "workflow_call": "workflow(" in source and "workflow_run(" in source,
@@ -302,6 +330,10 @@ def semantic_gate(features: dict[str, Any]) -> list[str]:
         violations.append(
             f"build stage index={build_index}, expected first or second stage"
         )
+    if features["decision_stage"] and not features["decision_evidence"]:
+        violations.append("inspection/planning stage lacks decision_recorded evidence")
+    if features["decision_stage"] and not features["typed_decision_fields"]:
+        violations.append("inspection/planning decision lacks typed finding fields")
     return violations
 
 

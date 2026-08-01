@@ -69,14 +69,40 @@ impl WorkflowHandlerValue {
 #[derive(Clone)]
 pub(super) enum WorkflowEvidenceSourceValue {
     Handler(WorkflowHandlerValue),
-    FileNonempty { path: String },
+    FileNonempty {
+        path: String,
+    },
+    Artifact {
+        path: String,
+        format: Option<String>,
+        arch: Option<String>,
+    },
+    FileValid {
+        path: String,
+        format: Option<String>,
+        nonempty: bool,
+    },
+    CommandSucceeded {
+        argv: Vec<String>,
+    },
+    StdoutNonempty,
+    DecisionRecorded {
+        fields: Vec<String>,
+    },
+    All(Vec<WorkflowEvidenceSourceValue>),
 }
 
 impl WorkflowEvidenceSourceValue {
     pub(super) fn is_session_persistable(&self) -> bool {
         match self {
             Self::Handler(handler) => handler.is_session_persistable(),
-            Self::FileNonempty { .. } => true,
+            Self::FileNonempty { .. }
+            | Self::Artifact { .. }
+            | Self::FileValid { .. }
+            | Self::CommandSucceeded { .. }
+            | Self::StdoutNonempty
+            | Self::DecisionRecorded { .. } => true,
+            Self::All(sources) => sources.iter().all(Self::is_session_persistable),
         }
     }
 }
@@ -116,10 +142,13 @@ impl WorkflowCheckpointPolicyValue {
 #[derive(Clone)]
 pub(super) struct WorkflowStageValue {
     pub(super) name: String,
+    pub(super) goal: String,
+    pub(super) agent_loop: bool,
     pub(super) evidence: WorkflowEvidenceSourceValue,
     pub(super) action: WorkflowHandlerValue,
     pub(super) repair: Option<WorkflowHandlerValue>,
     pub(super) max_attempts: u32,
+    pub(super) max_actions: u32,
     pub(super) checkpoint: WorkflowCheckpointPolicyValue,
 }
 

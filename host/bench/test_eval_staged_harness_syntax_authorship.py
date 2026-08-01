@@ -15,7 +15,7 @@ SPEC.loader.exec_module(EXPERIMENT)
 
 
 DECORATOR_SOURCE = r'''
-@stage(goal="inspect", evidence=artifact("plan"), max_actions=4)
+@stage(goal="inspect", evidence=decision_recorded(fields=["source_layout", "toolchain"]), max_actions=4)
 def inspect(step):
     return agent_loop(step)
 
@@ -37,7 +37,7 @@ emit(workflow_run(workflow("doom", inspect, build, execute, verify)))
 
 BLOCK_SOURCE = r'''
 workflow doom:
-    stage inspect(goal="inspect", evidence=artifact("plan"), max_actions=4):
+    stage inspect(goal="inspect", evidence=decision_recorded(fields=["source_layout", "toolchain"]), max_actions=4):
         agent_loop()
 
     stage build(goal="build", evidence=artifact("/app/doomgeneric_mips", format="elf", arch="mips"), max_actions=8, checkpoint="repairable"):
@@ -57,7 +57,7 @@ CONTRACT_SOURCE = r'''
 workflow doom:
     stage inspect(goal="inspect", max_actions=4):
         agent_loop()
-        ensure artifact("plan")
+        ensure decision_recorded(fields=["source_layout", "toolchain"])
 
     stage build(goal="build", max_actions=8, checkpoint="repairable"):
         agent_loop()
@@ -83,6 +83,8 @@ class StagedHarnessSyntaxAuthorshipTests(unittest.TestCase):
         for prompt in (decorator, block):
             self.assertIn("doomgeneric_mips", prompt)
             self.assertIn("Every public task obligation", prompt)
+            self.assertIn("mounted at /app", prompt)
+            self.assertIn("requested root output under a source subdirectory", prompt)
             self.assertNotIn("stage inspect", prompt)
         self.assertIn("@stage(", decorator)
         self.assertIn("workflow project:", block)
