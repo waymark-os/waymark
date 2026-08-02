@@ -68,6 +68,7 @@ pub struct StageDecorator {
     pub evidence: Expr,
     pub name: Option<Expr>,
     pub goal: Option<Expr>,
+    pub inputs: Option<Expr>,
     pub agent_loop: Option<Expr>,
     pub repair: Option<Expr>,
     pub max_attempts: Option<Expr>,
@@ -805,12 +806,13 @@ fn lower_function_stage_decorator(
         if !call.arguments.args.is_empty() {
             return Err(unsupported_message(
                 "stage declaration",
-                "@stage(...) accepts only evidence=, name=, goal=, agent_loop=, repair=, max_attempts=, max_actions=, and checkpoint= keyword arguments",
+                "@stage(...) accepts only evidence=, name=, goal=, inputs=, agent_loop=, repair=, max_attempts=, max_actions=, and checkpoint= keyword arguments",
             ));
         }
         let mut evidence = None;
         let mut stage_name = None;
         let mut goal = None;
+        let mut inputs = None;
         let mut agent_loop = None;
         let mut repair = None;
         let mut max_attempts = None;
@@ -827,6 +829,7 @@ fn lower_function_stage_decorator(
                 "evidence" => &mut evidence,
                 "name" => &mut stage_name,
                 "goal" => &mut goal,
+                "inputs" => &mut inputs,
                 "agent_loop" => &mut agent_loop,
                 "repair" => &mut repair,
                 "max_attempts" => &mut max_attempts,
@@ -836,7 +839,7 @@ fn lower_function_stage_decorator(
                     return Err(unsupported_message(
                         "stage declaration",
                         format!(
-                            "unsupported @stage field `{other}`; expected evidence, name, goal, agent_loop, repair, max_attempts, max_actions, or checkpoint"
+                            "unsupported @stage field `{other}`; expected evidence, name, goal, inputs, agent_loop, repair, max_attempts, max_actions, or checkpoint"
                         ),
                     ));
                 }
@@ -859,6 +862,7 @@ fn lower_function_stage_decorator(
             evidence,
             name: stage_name,
             goal,
+            inputs,
             agent_loop,
             repair,
             max_attempts,
@@ -2280,7 +2284,7 @@ values = sorted([3, 1, 2])
     #[test]
     fn lowers_stage_decorator_to_typed_function_metadata() {
         let program = lower_source(
-            r#"@stage(evidence=file_nonempty("artifact.txt"), goal="build the artifact", repair=repair_artifact, max_attempts=2, max_actions=6, checkpoint="workspace")
+            r#"@stage(evidence=file_nonempty("artifact.txt"), goal="build the artifact", inputs=["inspect"], repair=repair_artifact, max_attempts=2, max_actions=6, checkpoint="workspace")
 def artifact(step):
     return run(["make", "artifact"])
 "#,
@@ -2297,6 +2301,11 @@ def artifact(step):
         assert!(
             matches!(stage.goal, Some(Expr::String(ref value)) if value == "build the artifact")
         );
+        assert!(matches!(
+            stage.inputs,
+            Some(Expr::List(ref values))
+                if matches!(values.as_slice(), [Expr::String(value)] if value == "inspect")
+        ));
         assert!(matches!(stage.repair, Some(Expr::Name(ref name)) if name == "repair_artifact"));
         assert!(matches!(stage.max_attempts, Some(Expr::Int(ref value)) if value == "2"));
         assert!(matches!(stage.max_actions, Some(Expr::Int(ref value)) if value == "6"));
@@ -2315,7 +2324,7 @@ def artifact(step):
         run(["sh", "-c", "printf ready > artifact.txt"])
         ensure file_nonempty("artifact.txt")
 
-    stage verify(goal="verify output", max_actions=2):
+    stage verify(goal="verify output", inputs=["build"], max_actions=2):
         ensure all_evidence(
             file_nonempty("artifact.txt"),
             file_nonempty("artifact.txt"),
@@ -2345,6 +2354,15 @@ run task
             Some(Expr::Int(ref value)) if value == "8"
         ));
         assert!(matches!(build.body.last(), Some(Stmt::Return(Some(_)))));
+
+        let Stmt::FunctionDef(verify) = &program.statements[1] else {
+            panic!("expected verify stage function");
+        };
+        assert!(matches!(
+            verify.stage.as_ref().and_then(|stage| stage.inputs.as_ref()),
+            Some(Expr::List(values))
+                if matches!(values.as_slice(), [Expr::String(value)] if value == "build")
+        ));
 
         let Stmt::Assign { value, .. } = &program.statements[2] else {
             panic!("expected workflow construction");

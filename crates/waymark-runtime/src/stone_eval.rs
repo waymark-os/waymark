@@ -4897,6 +4897,12 @@ impl Evaluator<'_> {
             .map(|expression| self.eval_workflow_goal(expression, "@stage"))
             .transpose()?
             .unwrap_or_else(|| name.clone());
+        let inputs = decorator
+            .inputs
+            .as_ref()
+            .map(|expression| self.eval_workflow_stage_inputs(expression, "@stage"))
+            .transpose()?
+            .unwrap_or_default();
         let agent_loop = decorator
             .agent_loop
             .as_ref()
@@ -4943,7 +4949,7 @@ impl Evaluator<'_> {
             .unwrap_or(WorkflowCheckpointPolicy::None);
         Ok(WorkflowStage {
             name,
-            goal,
+            metadata: WorkflowStage::new_metadata(goal, inputs),
             agent_loop,
             evidence,
             action: WorkflowHandler::NamedFunction(function.name.clone()),
@@ -4968,6 +4974,7 @@ impl Evaluator<'_> {
 
         let mut evidence = None;
         let mut goal = name.clone();
+        let mut inputs = Vec::new();
         let mut agent_loop = false;
         let mut action = None;
         let mut repair = None;
@@ -4989,6 +4996,9 @@ impl Evaluator<'_> {
                 }
                 "goal" => {
                     goal = self.eval_workflow_goal(expression, "workflow_stage")?;
+                }
+                "inputs" => {
+                    inputs = self.eval_workflow_stage_inputs(expression, "workflow_stage")?;
                 }
                 "agent_loop" => {
                     agent_loop =
@@ -5015,7 +5025,7 @@ impl Evaluator<'_> {
                 }
                 other => {
                     return Err(workflow_error(format!(
-                        "unsupported workflow_stage() field `{other}`; expected evidence, goal, agent_loop, action, repair, max_attempts, max_actions, or checkpoint"
+                        "unsupported workflow_stage() field `{other}`; expected evidence, goal, inputs, agent_loop, action, repair, max_attempts, max_actions, or checkpoint"
                     )));
                 }
             }
@@ -5038,7 +5048,7 @@ impl Evaluator<'_> {
         }
         Ok(RuntimeValue::WorkflowStage(WorkflowStage {
             name,
-            goal,
+            metadata: WorkflowStage::new_metadata(goal, inputs),
             agent_loop,
             evidence,
             action,
@@ -5125,6 +5135,32 @@ impl Evaluator<'_> {
             .eval_expr_value(expression, PipelineData::empty())?
             .into_nu_value(context)?;
         value_to_bool(&value, context).map_err(|error| workflow_error(format!("{error:?}")))
+    }
+
+    fn eval_workflow_stage_inputs(
+        &mut self,
+        expression: &Expr,
+        context: &str,
+    ) -> Result<Vec<String>, ShellError> {
+        let value = self
+            .eval_expr_value(expression, PipelineData::empty())?
+            .into_nu_value(&format!("{context} inputs"))?;
+        let inputs = value_to_string_list(&value, &format!("{context} inputs"))?;
+        if inputs.len() > 8 {
+            return Err(workflow_error(format!(
+                "{context} inputs accepts at most eight completed stage names"
+            )));
+        }
+        let mut seen = HashSet::new();
+        for input in &inputs {
+            validate_workflow_name(input, "stage input")?;
+            if !seen.insert(input.as_str()) {
+                return Err(workflow_error(format!(
+                    "{context} inputs contains duplicate stage `{input}`"
+                )));
+            }
+        }
+        Ok(inputs)
     }
 
     fn eval_workflow_max_actions(
@@ -5218,6 +5254,14 @@ impl Evaluator<'_> {
                     runtime_type_name(&value)
                 )));
             };
+            for input in stage.inputs() {
+                if !names.contains(input) {
+                    return Err(workflow_error(format!(
+                        "workflow `{name}` stage `{}` input `{input}` must name an earlier stage in the same workflow",
+                        stage.name
+                    )));
+                }
+            }
             if !names.insert(stage.name.clone()) {
                 return Err(workflow_error(format!(
                     "workflow `{name}` has duplicate stage `{}`",
@@ -5453,6 +5497,7 @@ impl Evaluator<'_> {
 
     fn run_workflow(&mut self, workflow: &Workflow) -> Result<Value, ShellError> {
         let mut completed = Vec::with_capacity(workflow.stages.len());
+        let mut stage_outputs = Record::new();
         let mut reports = Vec::with_capacity(workflow.stages.len());
 
         for (stage_index, stage) in workflow.stages.iter().enumerate() {
@@ -5478,6 +5523,7 @@ impl Evaluator<'_> {
                 "evidence_pre",
                 0,
                 &completed,
+                &stage_outputs,
                 None,
                 &finding_state,
                 &probe_state,
@@ -5487,6 +5533,10 @@ impl Evaluator<'_> {
                 self.invoke_workflow_evidence_handler(workflow, stage, "evidence_pre", context)?;
             checks += 1;
             if evidence.satisfied {
+                stage_outputs.insert(
+                    stage.name.clone(),
+                    workflow_stage_output(stage, &finding_state),
+                );
                 completed.push(stage.name.clone());
                 let checkpoint = WorkflowCheckpointResult::skipped(
                     stage.checkpoint,
@@ -5518,6 +5568,7 @@ impl Evaluator<'_> {
                     "action",
                     attempt,
                     &completed,
+                    &stage_outputs,
                     Some(&evidence),
                     &finding_state,
                     &probe_state,
@@ -5549,6 +5600,7 @@ impl Evaluator<'_> {
                     "evidence_post_action",
                     attempt,
                     &completed,
+                    &stage_outputs,
                     Some(&evidence),
                     &finding_state,
                     &probe_state,
@@ -5575,6 +5627,7 @@ impl Evaluator<'_> {
                         "repair",
                         attempt,
                         &completed,
+                        &stage_outputs,
                         Some(&evidence),
                         &finding_state,
                         &probe_state,
@@ -5606,6 +5659,7 @@ impl Evaluator<'_> {
                         "evidence_post_repair",
                         attempt,
                         &completed,
+                        &stage_outputs,
                         Some(&evidence),
                         &finding_state,
                         &probe_state,
@@ -5649,6 +5703,10 @@ impl Evaluator<'_> {
                         reports,
                     ));
                 }
+                stage_outputs.insert(
+                    stage.name.clone(),
+                    workflow_stage_output(stage, &finding_state),
+                );
                 completed.push(stage.name.clone());
                 reports.push(workflow_stage_report(
                     stage,
@@ -12717,6 +12775,7 @@ fn workflow_context_value(
     phase: &str,
     attempt: u32,
     completed_stages: &[String],
+    completed_stage_outputs: &Record,
     evidence: Option<&WorkflowEvidence>,
     finding_state: &Record,
     probe_state: &Record,
@@ -12727,7 +12786,7 @@ fn workflow_context_value(
     record.push("schema", Value::string("waymark.workflow-context.v1", span));
     record.push("workflow", Value::string(workflow.name.clone(), span));
     record.push("stage", Value::string(stage.name.clone(), span));
-    record.push("goal", Value::string(stage.goal.clone(), span));
+    record.push("goal", Value::string(stage.goal(), span));
     record.push(
         "control",
         Value::string(
@@ -12762,6 +12821,24 @@ fn workflow_context_value(
             span,
         ),
     );
+    record.push(
+        "stage_inputs",
+        Value::list(
+            stage
+                .inputs()
+                .iter()
+                .map(|name| Value::string(name.clone(), span))
+                .collect(),
+            span,
+        ),
+    );
+    let mut stage_outputs = Record::with_capacity(stage.inputs().len());
+    for input in stage.inputs() {
+        if let Some(output) = completed_stage_outputs.get(input) {
+            stage_outputs.push(input, output.clone());
+        }
+    }
+    record.push("stage_outputs", Value::record(stage_outputs, span));
     record.push(
         "evidence",
         evidence
@@ -12846,6 +12923,34 @@ fn workflow_context_value(
     Value::record(record, span)
 }
 
+fn workflow_stage_output(stage: &WorkflowStage, finding_state: &Record) -> Value {
+    let span = Span::unknown();
+    let mut specs = Vec::new();
+    workflow_resolved_decision_specs(&stage.evidence, &mut specs);
+    let mut findings = Record::with_capacity(specs.len());
+    for spec in specs {
+        let Some(Value::Record { val: finding, .. }) = finding_state.get(&spec.name) else {
+            continue;
+        };
+        let mut typed = Record::new();
+        typed.push("kind", Value::string(spec.kind.clone(), span));
+        for name in ["state", "value", "basis"] {
+            if let Some(value) = finding.get(name) {
+                typed.push(name, value.clone());
+            }
+        }
+        findings.push(&spec.name, Value::record(typed, span));
+    }
+    let mut output = Record::new();
+    output.push(
+        "schema",
+        Value::string("waymark.workflow-stage-output.v1", span),
+    );
+    output.push("stage", Value::string(stage.name.clone(), span));
+    output.push("findings", Value::record(findings, span));
+    Value::record(output, span)
+}
+
 fn workflow_contract_names(source: &WorkflowEvidenceSource, names: &mut Vec<&'static str>) {
     match source {
         WorkflowEvidenceSource::Handler(_) => names.push("custom"),
@@ -12928,7 +13033,7 @@ fn workflow_stage_report(
     let span = Span::unknown();
     let mut record = Record::new();
     record.push("name", Value::string(stage.name.clone(), span));
-    record.push("goal", Value::string(stage.goal.clone(), span));
+    record.push("goal", Value::string(stage.goal(), span));
     record.push(
         "control",
         Value::string(
@@ -12941,6 +13046,17 @@ fn workflow_stage_report(
         ),
     );
     record.push("max_actions", Value::int(stage.max_actions as i64, span));
+    record.push(
+        "inputs",
+        Value::list(
+            stage
+                .inputs()
+                .iter()
+                .map(|name| Value::string(name.clone(), span))
+                .collect(),
+            span,
+        ),
+    );
     record.push("status", Value::string(status, span));
     record.push("attempts", Value::int(attempts as i64, span));
     record.push("repairs", Value::int(repairs as i64, span));
@@ -17328,6 +17444,98 @@ emit({
         assert_eq!(value["build"]["checks"], json_value!(2));
         assert_eq!(value["verify"]["status"], json_value!("already_satisfied"));
         assert_eq!(value["verify"]["attempts"], json_value!(0));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_projects_declared_finding_outputs_into_dependent_stages() -> Result<(), ShellError>
+    {
+        let (engine_state, mut stack, root) = test_engine("workflow-stage-outputs")?;
+        let program = lower_source(
+            r#"def agent_loop(step):
+    if step.stage == "inspect":
+        if step.stage_inputs != [] or step.stage_outputs != {}:
+            fail("an input-free stage received prior outputs")
+        return {
+            "ok": True,
+            "kind": "decision_recorded",
+            "message": "Source layout resolved.",
+            "findings": {
+                "source_layout": {
+                    "state": "resolved",
+                    "value": "sources are under src",
+                    "basis": "runtime fixture inspection",
+                },
+            },
+            "transition_id": "fixture-stage-output",
+        }
+    if step.stage_inputs != ["inspect"]:
+        fail("dependent stage did not receive its declared input list")
+    finding = step.stage_outputs.inspect.findings.source_layout
+    if finding.kind != "path" or finding.state != "resolved":
+        fail("dependent stage did not receive the typed finding")
+    if finding.value != "sources are under src":
+        fail("dependent stage received the wrong finding value")
+    return run(["sh", "-c", "printf '%s' \"$1\" > artifact.txt", "stage-output", finding.value])
+
+workflow task:
+    stage inspect(goal="resolve source layout", max_actions=1):
+        agent_loop()
+        ensure decision_recorded(resolved={
+            "source_layout": {
+                "kind": "path",
+                "question": "Where are the sources?",
+            },
+        })
+
+    stage build(goal="consume source layout", inputs=["inspect"], max_actions=1):
+        agent_loop()
+        ensure file_nonempty("artifact.txt")
+
+report = workflow_run(task)
+emit({
+    "ok": report.ok,
+    "build_inputs": report.stages[1].inputs,
+    "artifact": read_text("artifact.txt"),
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, Span::unknown())?,
+            json_value!({
+                "ok": true,
+                "build_inputs": ["inspect"],
+                "artifact": "sources are under src",
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_stage_inputs_reject_forward_and_unknown_references() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-stage-input-order")?;
+        let program = lower_source(
+            r#"workflow task:
+    stage build(goal="build", inputs=["inspect"], max_actions=1):
+        ensure file_nonempty("artifact.txt")
+
+    stage inspect(goal="inspect", max_actions=1):
+        ensure file_nonempty("artifact.txt")
+
+report = workflow_run(task)
+"#,
+        )?;
+        let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("forward stage input");
+        let detail = format!("{error:?}");
+        assert!(
+            detail.contains("input `inspect` must name an earlier stage"),
+            "{detail}"
+        );
         cleanup_dir(&root);
         Ok(())
     }

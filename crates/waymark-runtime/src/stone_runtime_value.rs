@@ -253,6 +253,15 @@ mod tests {
     }
 
     #[test]
+    fn runtime_values_remain_stack_compact() {
+        #[cfg(target_pointer_width = "64")]
+        assert!(
+            std::mem::size_of::<RuntimeValue>() <= 336,
+            "large enum variants inflate every evaluator stack frame"
+        );
+    }
+
+    #[test]
     fn file_handles_are_not_session_persistable() {
         let value = RuntimeValue::File(FileHandle {
             scope_index: 1,

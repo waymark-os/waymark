@@ -359,5 +359,51 @@ Artifacts:
 and
 `../../waymark-gateway/target/runs/staged-stone-doom-v29-toolchain-strategy-terra/cell/cell.json`.
 
+## Explicit stage inputs and typed outputs
+
+The stage header now admits an explicit ordered dataflow edge:
+
+```stone
+stage build(
+    goal="build the target",
+    inputs=["inspect"],
+    max_actions=8,
+):
+    agent_loop()
+    ensure artifact("doomgeneric_mips", format="elf", arch="mips")
+```
+
+An input must name an earlier stage; forward, current-stage, unknown, duplicate,
+and more than eight references fail admission. The kernel exports only the
+resolved fields declared by that stage's `decision_recorded(resolved=...)`
+contract. They appear under
+`step.stage_outputs.inspect.findings.<field>` with `kind`, `state`, `value`,
+and `basis`. Artifact-only stages deliberately export an empty semantic map:
+their durable interface remains the workspace plus fresh evidence.
+
+The first blind canary learned the construct without repair. It connected
+build to inspect and independently connected execute to inspect and build; the
+source passed both the feature gate and the actual interpreter. This supports
+the Python-shaped header form and suggests that an additional graph language
+is unnecessary for simple ordered dependencies.
+
+The v30 Doom cell then completed build in nine actions and advanced to run,
+where v29 had failed build after 12 actions. The standard controller received
+the four verified inspection findings directly. Build still had to refine the
+location/implementation of `my_stdlib.h`, because inspection had exported only
+the fact that it was required. Explicit transport fixes state loss, not weak
+stage-output specifications.
+
+The terminal run failure retained a repair checkpoint after its trace had been
+collected. The staged benchmark parent now records each created checkpoint and
+force-discards it before final lifecycle accounting; v30's retained checkpoint
+was also reclaimed manually. Terminal experiment cleanup is parent authority,
+not a responsibility of the failed child controller.
+
+Artifacts:
+`target/runs/staged-harness-stage-inputs-authorship-v1-terra/aggregate.json`
+and
+`../../waymark-gateway/target/runs/staged-stone-doom-v30-typed-stage-inputs-terra/cell/cell.json`.
+
 Artifact:
 `../../waymark-gateway/target/runs/staged-stone-doom-v12-typed-decisions-terra/cell/cell.json`

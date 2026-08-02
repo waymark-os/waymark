@@ -1643,6 +1643,32 @@ This is ordinary typed dataflow between process phases, not an incidental
 memory-search optimization; the harness should be able to name and constrain
 the interface while the runtime owns retention and provenance.
 
+Stone now expresses that boundary with `inputs=["inspect"]` on a dependent
+stage. Inputs must name earlier stages and are capped at eight. The workflow
+kernel projects only their declared resolved findings into
+`step.stage_outputs`, preserving `kind`, `state`, `value`, and runtime-owned
+`basis`. The standard controller injects that typed record directly; general
+semantic memory is no longer the correctness mechanism for a declared stage
+interface. An ordered workflow therefore remains code-like while gaining
+explicit dataflow edges where they matter.
+
+The construct was authored correctly in the first blind canary. On Doom it
+moved the frontier from a 12-action build failure to a nine-action successful
+build and the known VM run failure. It did not answer facts the prior stage had
+failed to declare precisely: a finding that says `my_stdlib.h` is required
+does not say where it lives or how it should be implemented. This separates
+three obligations cleanly: acquisition predicates establish a lower bound on
+evidence, typed stage outputs preserve the interpreted result, and later
+artifact/verifier contracts test its consequences.
+
+Runtime representation matters to viability. Storing another `Vec` inline in
+the recursive runtime-value enum caused the large standard controller to cross
+the test-thread stack limit. Stage goal/input metadata is now boxed as one
+owned unit, shrinking the enum rather than making every value pay for the new
+feature. At experiment termination, the parent runner also discards retained
+repair checkpoints after recording their trace, preserving inspectability
+without leaking resources.
+
 Runtime diagnostics are part of that interface. A generic JSON `oneOf` error
 did not help the model repair an illegal action. Validation now reports allowed
 discriminators and the nearest branch's missing or extra fields, and the

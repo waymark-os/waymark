@@ -4,7 +4,8 @@
 # The workflow kernel, not this function, owns the loop: it checks every
 # `ensure` contract before the first decision and after each returned action,
 # passes the current missing-contract summary in `step.evidence`, and stops at
-# the stage's `max_actions` budget.
+# the stage's `max_actions` budget. Explicit stage `inputs` are available as
+# typed, runtime-owned findings in `step.stage_outputs`.
 #
 # Extension seams:
 # - replace stage_agent_messages to change context selection or prompting;
@@ -492,6 +493,9 @@ def stage_agent_messages(step):
                 "the next probe at one of those unresolved fields. Do not "
                 "use decide only to publish unknown state; reserve it for a "
                 "resolved decision or the final bounded report. Treat "
+                "stage_outputs as the authoritative typed findings exported "
+                "by explicitly named input stages; consume them before "
+                "rediscovering the same facts. Treat "
                 "stage_history as the completed action ledger and do not "
                 "repeat a successful probe unless new evidence requires it. "
                 "In execute_or_repair mode, take a workspace-changing action "
@@ -515,6 +519,7 @@ def stage_agent_messages(step):
                 "workflow": step.workflow,
                 "stage": step.stage,
                 "stage_goal": step.goal,
+                "stage_outputs": step.stage_outputs,
                 "decision": step.attempt,
                 "max_actions": step.max_actions,
                 "remaining_actions": step.max_actions - step.attempt + 1,

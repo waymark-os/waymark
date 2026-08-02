@@ -156,9 +156,15 @@ impl WorkflowCheckpointPolicyValue {
 }
 
 #[derive(Clone)]
+pub(super) struct WorkflowStageMetadataValue {
+    goal: String,
+    inputs: Vec<String>,
+}
+
+#[derive(Clone)]
 pub(super) struct WorkflowStageValue {
     pub(super) name: String,
-    pub(super) goal: String,
+    pub(super) metadata: Box<WorkflowStageMetadataValue>,
     pub(super) agent_loop: bool,
     pub(super) evidence: WorkflowEvidenceSourceValue,
     pub(super) action: WorkflowHandlerValue,
@@ -169,6 +175,21 @@ pub(super) struct WorkflowStageValue {
 }
 
 impl WorkflowStageValue {
+    pub(super) fn new_metadata(
+        goal: String,
+        inputs: Vec<String>,
+    ) -> Box<WorkflowStageMetadataValue> {
+        Box::new(WorkflowStageMetadataValue { goal, inputs })
+    }
+
+    pub(super) fn goal(&self) -> &str {
+        &self.metadata.goal
+    }
+
+    pub(super) fn inputs(&self) -> &[String] {
+        &self.metadata.inputs
+    }
+
     pub(super) fn is_session_persistable(&self) -> bool {
         self.evidence.is_session_persistable()
             && self.action.is_session_persistable()

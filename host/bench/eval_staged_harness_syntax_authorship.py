@@ -51,10 +51,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Require resolved finding descriptors to use executable evidence predicates.",
     )
+    parser.add_argument(
+        "--stage-inputs",
+        action="store_true",
+        help="Require later stages to declare and consume inspection finding outputs.",
+    )
     return parser.parse_args()
 
 
-def common_prompt(require_finding_evidence: bool = False) -> str:
+def common_prompt(
+    require_finding_evidence: bool = False,
+    require_stage_inputs: bool = False,
+) -> str:
     predicate_guidance = ""
     if require_finding_evidence:
         predicate_guidance = """
@@ -85,6 +93,18 @@ Use predicates for source layout, exact toolchain, frame backend dependencies,
 and VM runtime/ABI requirements. They are evidence-acquisition obligations, not
 claims that the fact is already known. Put descriptors only in
 `decision_recorded(resolved={...})`; `agent_loop()` takes no arguments.
+"""
+    stage_input_guidance = ""
+    if require_stage_inputs:
+        stage_input_guidance = """
+When a later stage consumes findings declared by an earlier decision stage,
+make that dataflow explicit with `inputs=["earlier_stage_name"]` in the later
+stage header. The runtime projects only those completed stages into
+`step.stage_outputs`, preserving each finding's kind, state, value, and basis.
+For example, a stage declared with `inputs=["prepare"]` receives
+`step.stage_outputs.prepare.findings`. Do not rely on generic memory retrieval
+to rediscover a declared stage interface, and do not reference the current or
+a later stage.
 """
     return f"""You are evaluating an LLM-oriented programming-language surface.
 Write one complete Stone harness specification for the public task below. Do
@@ -127,13 +147,18 @@ for every field. An unknown finding keeps the stage open. Use fields= only when
 a non-empty structural finding is sufficient.
 Existing task inputs and generic prose are not evidence that planning happened.
 {predicate_guidance}
+{stage_input_guidance}
 
 Public task:
 {TASK}
 """
 
 
-def arm_prompt(arm: str, require_finding_evidence: bool = False) -> str:
+def arm_prompt(
+    arm: str,
+    require_finding_evidence: bool = False,
+    require_stage_inputs: bool = False,
+) -> str:
     if arm == "decorator":
         interface = r'''
 Use only this declaration form:
@@ -205,7 +230,11 @@ workflow(...), or workflow_run(...).
 '''
     else:
         raise ValueError(f"unknown arm: {arm}")
-    return common_prompt(require_finding_evidence) + "\nSyntax arm:\n" + interface
+    return (
+        common_prompt(require_finding_evidence, require_stage_inputs)
+        + "\nSyntax arm:\n"
+        + interface
+    )
 
 
 def output_schema() -> dict[str, Any]:
@@ -255,6 +284,16 @@ def stage_names(arm: str, source: str) -> list[str]:
 
 def source_features(arm: str, source: str) -> dict[str, Any]:
     names = stage_names(arm, source)
+    decision_stage_names = [
+        name
+        for name in names
+        if any(token in name.lower() for token in ("inspect", "plan", "select", "decide"))
+    ]
+    stage_input_references = [
+        reference
+        for body in re.findall(r"\binputs\s*=\s*\[([^\]]*)\]", source)
+        for reference in re.findall(r"['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]", body)
+    ]
     lowered = source.lower()
     resolved_descriptors = resolved_descriptor_source(source)
     finding_kinds = re.findall(
@@ -311,6 +350,14 @@ def source_features(arm: str, source: str) -> dict[str, Any]:
             token in name.lower()
             for name in names
             for token in ("inspect", "plan", "select", "decide")
+        ),
+        "stage_inputs_count": len(
+            re.findall(r"\binputs\s*=\s*\[", source)
+        ),
+        "stage_input_references": stage_input_references,
+        "typed_stage_handoff": any(
+            reference in decision_stage_names
+            for reference in stage_input_references
         ),
         "decision_evidence": "decision_recorded(" in source,
         "typed_decision_fields": bool(
@@ -425,7 +472,9 @@ def syntax_gate(arm: str, features: dict[str, Any]) -> list[str]:
 
 
 def semantic_gate(
-    features: dict[str, Any], require_finding_evidence: bool = False
+    features: dict[str, Any],
+    require_finding_evidence: bool = False,
+    require_stage_inputs: bool = False,
 ) -> list[str]:
     violations: list[str] = []
     for field in (
@@ -464,6 +513,11 @@ def semantic_gate(
             violations.append(
                 "invalid finding kinds: " + ", ".join(invalid_kinds)
             )
+    if require_stage_inputs and features["decision_stage"]:
+        if not features["typed_stage_handoff"]:
+            violations.append(
+                "later stages do not declare an input from the decision stage"
+            )
     return violations
 
 
@@ -490,7 +544,9 @@ def evaluate_once(
         if not admission_ok:
             syntax_violations.append(f"Stone admission failed: {admission_error}")
         semantic_violations = semantic_gate(
-            features, args.finding_evidence_predicates
+            features,
+            args.finding_evidence_predicates,
+            args.stage_inputs,
         )
         result = {
             **prior,
@@ -538,7 +594,11 @@ def evaluate_once(
     )
     if not admission_ok:
         syntax_violations.append(f"Stone admission failed: {admission_error}")
-    semantic_violations = semantic_gate(features, args.finding_evidence_predicates)
+    semantic_violations = semantic_gate(
+        features,
+        args.finding_evidence_predicates,
+        args.stage_inputs,
+    )
     violations = [*syntax_violations, *semantic_violations]
     result = {
         "ok": (
@@ -661,7 +721,11 @@ def main() -> int:
     run_root.mkdir(parents=True, exist_ok=True)
     selected_arms = tuple(args.arms or ARMS)
     prompts = {
-        arm: arm_prompt(arm, args.finding_evidence_predicates)
+        arm: arm_prompt(
+            arm,
+            args.finding_evidence_predicates,
+            args.stage_inputs,
+        )
         for arm in selected_arms
     }
     results = {arm: [] for arm in selected_arms}
@@ -690,6 +754,7 @@ def main() -> int:
         "reasoning_effort": args.reasoning_effort,
         "trials": args.trials,
         "finding_evidence_predicates": args.finding_evidence_predicates,
+        "stage_inputs": args.stage_inputs,
         "arms": arms,
         "run_root": str(run_root),
     }

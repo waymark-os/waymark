@@ -575,6 +575,65 @@ Artifacts:
 and
 `../../waymark-gateway/target/runs/staged-stone-doom-v29-toolchain-strategy-terra/cell/cell.json`.
 
+### Explicit typed stage inputs
+
+Resolved decision fields already define a stage's semantic output schema. A
+later stage can now name the earlier stages whose outputs it consumes:
+
+```stone
+workflow project:
+    stage inspect(goal="resolve build inputs", max_actions=8):
+        agent_loop()
+        ensure decision_recorded(resolved={
+            "source_layout": {
+                "kind": "path",
+                "question": "Where are the sources?",
+            },
+        })
+
+    stage build(
+        goal="build the artifact",
+        inputs=["inspect"],
+        max_actions=8,
+    ):
+        agent_loop()
+        ensure artifact("output", format="elf")
+```
+
+`inputs` accepts at most eight unique names and each must identify an earlier
+stage in the same ordered workflow. The runtime projects only those stages
+into `step.stage_outputs`. Each declared finding retains its `kind`, `state`,
+`value`, and runtime-owned `basis`; stages without resolved-decision fields
+export an empty finding map. The standard controller places this record
+directly in the model request and tells the model to consume it before
+rediscovering the same facts. This makes dataflow explicit and keeps automatic
+context growth governed by authored dependencies.
+
+A blind low-reasoning canary used `inputs=["inspect"]` correctly on its first
+response and passed actual Stone admission. In the Doom comparison, v29
+completed inspection but exhausted all 12 build actions. With the typed
+handoff, v30 completed inspection in 12 actions, completed build in nine, made
+a valid MIPS ELF, and reached the run stage. The run still executed only nine
+VM instructions and produced no frame, which is the known ABI/runtime failure
+rather than a handoff failure.
+
+The output quality remains part of the spec. Inspection established that
+`my_stdlib.h` was required but not where to obtain it, so build still searched
+for the header and eventually authored a compatibility version. Typed
+transport prevents forgetting; it cannot strengthen an underspecified
+finding. A later experiment may add field-level consumers or stronger output
+types, but should preserve the explicit dependency boundary.
+
+Adding stage inputs initially enlarged the recursive runtime-value enum enough
+to overflow the standard-controller test stack. Grouping goal and input
+metadata behind one owned box reduced the enum footprint below its previous
+size. This keeps per-value stack cost from growing with each new stage feature.
+
+Artifacts:
+`target/runs/staged-harness-stage-inputs-authorship-v1-terra/aggregate.json`
+and
+`../../waymark-gateway/target/runs/staged-stone-doom-v30-typed-stage-inputs-terra/cell/cell.json`.
+
 ```stone
 def repair_output(step):
     return run(["sh", "-c", "printf ready > artifact.txt"])

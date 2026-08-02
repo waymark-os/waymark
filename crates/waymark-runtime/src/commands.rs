@@ -156,9 +156,9 @@ report = workflow_run(workflow("build", build_artifact))"#,
     },
     StoneHelpEntry {
         name: "stage",
-        signature: r#"@stage(evidence: workflow_evidence_spec | callable, name: str? = None, goal: str? = None, repair: callable? = None, max_attempts: int = 1, max_actions: int = 1, checkpoint: str = "none")
+        signature: r#"@stage(evidence: workflow_evidence_spec | callable, name: str? = None, goal: str? = None, inputs: list[str] = [], repair: callable? = None, max_attempts: int = 1, max_actions: int = 1, checkpoint: str = "none")
 def name(step): ... -> workflow_stage"#,
-        use_when: "Declare a named evidence-gated workflow stage with its action body directly below the decorator. Use checkpoint=\"workspace\" for workspace plus memory, checkpoint=\"forkable\" for an attempt-scoped reconstructable tool environment, or checkpoint=\"repairable\" when a verified frontier must survive a late harness failure.",
+        use_when: "Declare a named evidence-gated workflow stage with its action body directly below the decorator. inputs=[...] names earlier stages whose typed finding outputs are projected into step.stage_outputs. Use checkpoint=\"workspace\" for workspace plus memory, checkpoint=\"forkable\" for an attempt-scoped reconstructable tool environment, or checkpoint=\"repairable\" when a verified frontier must survive a late harness failure.",
         examples: &[
             r#"def repair_artifact(step):
     return run(["sh", "-c", "printf ready > artifact.txt"])
@@ -181,8 +181,8 @@ emit(report)"#,
     },
     StoneHelpEntry {
         name: "workflow_stage",
-        signature: r#"workflow_stage(name: str, evidence: callable, action: callable, repair: callable? = None, max_attempts: int = 1, checkpoint: str = "none") -> workflow_stage"#,
-        use_when: "Define one typed stage whose action may run only within a bounded evidence-check and optional repair cycle.",
+        signature: r#"workflow_stage(name: str, evidence: callable, action: callable, inputs: list[str] = [], repair: callable? = None, max_attempts: int = 1, checkpoint: str = "none") -> workflow_stage"#,
+        use_when: "Define one typed stage whose action may run only within a bounded evidence-check and optional repair cycle. inputs names at most eight earlier stages whose declared finding outputs appear in step.stage_outputs.",
         examples: &[
             r#"stage = workflow_stage(
     "artifact",
@@ -1661,7 +1661,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
         name: "staged_workflow",
         summary: "Author a sequential evidence-gated task harness with optional one-decision agent control inside each bounded stage.",
         bullets: &[
-            "Write `workflow name:` at top level, indent `stage name(goal=..., max_actions=..., checkpoint=...):` by four spaces, place direct `ensure <typed evidence>` contracts in the stage body, and execute with `run name` or workflow_run(name).",
+            "Write `workflow name:` at top level, indent `stage name(goal=..., inputs=[...], max_actions=..., checkpoint=...):` by four spaces, place direct `ensure <typed evidence>` contracts in the stage body, and execute with `run name` or workflow_run(name).",
             "A deterministic stage may contain ordinary Stone effects. `agent_loop()` must be its only executable action and resolves to a visible `def agent_loop(step)` callback, such as examples/scripts/standard_stage_agent.stone.",
             "The kernel calls that callback once per decision, checks every ensure contract after each returned action, and stops after max_actions; the callback receives goal, current missing evidence, previous outcome, and completed stages in step.",
             "A finish claim is only another returned action. It cannot advance a stage while evidence remains missing.",

@@ -86,6 +86,11 @@ PREDICATE_CONTRACT_SOURCE = CONTRACT_SOURCE.replace(
         }''',
 )
 
+HANDOFF_CONTRACT_SOURCE = CONTRACT_SOURCE.replace(
+    'stage build(goal="build", max_actions=8, checkpoint="repairable"):',
+    'stage build(goal="build", inputs=["inspect"], max_actions=8, checkpoint="repairable"):',
+)
+
 
 class StagedHarnessSyntaxAuthorshipTests(unittest.TestCase):
     def test_prompts_share_task_and_semantics(self) -> None:
@@ -128,6 +133,19 @@ class StagedHarnessSyntaxAuthorshipTests(unittest.TestCase):
         invalid_features = EXPERIMENT.source_features("contract", invalid_kind)
         invalid_violations = EXPERIMENT.semantic_gate(invalid_features, True)
         self.assertTrue(any("invalid finding kinds" in item for item in invalid_violations))
+
+    def test_stage_input_prompt_and_gate_require_typed_handoff(self) -> None:
+        prompt = EXPERIMENT.arm_prompt("contract", False, True)
+        self.assertIn('inputs=["earlier_stage_name"]', prompt)
+        self.assertIn("step.stage_outputs", prompt)
+        features = EXPERIMENT.source_features(
+            "contract", HANDOFF_CONTRACT_SOURCE
+        )
+        self.assertEqual([], EXPERIMENT.semantic_gate(features, False, True))
+        self.assertEqual(["inspect"], features["stage_input_references"])
+        missing = EXPERIMENT.source_features("contract", CONTRACT_SOURCE)
+        violations = EXPERIMENT.semantic_gate(missing, False, True)
+        self.assertTrue(any("input from the decision stage" in item for item in violations))
 
     def test_structural_gate_accepts_equivalent_examples(self) -> None:
         for arm, source in (
