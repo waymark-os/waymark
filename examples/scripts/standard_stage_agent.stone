@@ -25,14 +25,14 @@ def stage_agent_schema_prompt(step):
             if get(get(probes, field, {}), "status", "missing") != "observed":
                 unobserved.append(field)
     decision_stage = "decision_recorded" in step.contracts
-    allowed_now = "read, write, run_linux, or run_complete"
+    allowed_now = "read, find, search, write, run_linux, or run_complete"
     if decision_stage and remaining == 1:
-        allowed_now = "decide, finish, or final"
+        allowed_now = "read, find, search, write, run_linux, run_complete, decide, finish, or final"
     elif decision_stage and len(unobserved) == 0 and len(resolved_fields) > 0:
         allowed_now = "decide, finish, or final"
     elif decision_stage and len(resolved_fields) == 0:
-        allowed_now = "read, write, run_linux, run_complete, decide, finish, or final"
-    return "Return {\"actions\":[A]} with exactly one A. Allowed now: " + allowed_now + ". Canonical probe shape: {\"tool\":\"read\",\"input\":{\"path\":\"src\"},\"for_field\":\"source_layout\"}. Canonical probe-and-resolve shape: {\"tool\":\"run_linux\",\"input\":{\"argv\":[\"command\",\"-v\",\"mipsel-linux-gnu-gcc\"]},\"for_field\":\"toolchain\",\"resolves\":{\"source_layout\":\"sources are under src\"}}. Canonical decision shape: {\"tool\":\"decide\",\"input\":{\"answer\":\"...\"},\"resolves\":{\"toolchain\":\"use mipsel-linux-gnu-gcc\"}}. Never replace tool with action/type, and never put answer beside tool. On a resolved-finding stage, every tool action must use for_field to name the unresolved obligation it probes. resolves may interpret only retained probe observations; the runtime supplies provenance. A final decision may carry unknown={field: reason}. read(path) returns bounded file text or a shallow directory listing. Use run_linux for environment or toolchain facts and run_complete only for a bounded build/test gate. Full findings records remain accepted for compatibility but need not be repeated. Use relative workspace paths; Linux commands see the root at /app. Do not invent outcomes or use unlisted fields."
+        allowed_now = "read, find, search, write, run_linux, run_complete, decide, finish, or final"
+    return "Return {\"actions\":[A]} with exactly one A. Allowed now: " + allowed_now + ". Canonical probes: {\"tool\":\"find\",\"input\":{\"path\":\".\",\"name_glob\":\"*img*.c\"},\"for_field\":\"frame_backend\"}; {\"tool\":\"search\",\"input\":{\"path\":\"vm.js\",\"needle\":\"process.argv\"},\"for_field\":\"runtime_contract\"}; {\"tool\":\"read\",\"input\":{\"path\":\"vm.js\",\"start_line\":400,\"end_line\":500},\"for_field\":\"runtime_contract\"}. Canonical probe-and-resolve shape: {\"tool\":\"run_linux\",\"input\":{\"argv\":[\"command\",\"-v\",\"mipsel-linux-gnu-gcc\"]},\"for_field\":\"toolchain\",\"resolves\":{\"source_layout\":\"sources are under src\"}}. Canonical decision shape: {\"tool\":\"decide\",\"input\":{\"answer\":\"...\"},\"resolves\":{\"toolchain\":\"use mipsel-linux-gnu-gcc\"}}. Never replace tool with action/type, and never put answer beside tool. On a resolved-finding stage, every tool action must use for_field to name the unresolved obligation it probes. resolves may interpret only retained probe observations; the runtime supplies provenance. If an observation is insufficient, probe the same field again with a more focused action. A final decision may carry unknown={field: reason}. find is recursive, search is bounded recursive literal/regex grep, and read supports byte/tail/line ranges. Use run_linux for environment or toolchain facts and run_complete only for a bounded build/test gate. Use relative workspace paths; Linux commands see the root at /app. Do not invent outcomes or use unlisted fields."
 
 
 def stage_agent_action_schema(step):
@@ -44,17 +44,22 @@ def stage_agent_action_schema(step):
         if get(get(current_findings, field, {}), "state", "unknown") != "resolved":
             unresolved_decision_fields.append(field)
     observed_probe_fields = []
+    insufficient_probe_fields = []
     unobserved_probe_fields = []
     probes = get(step, "probes", {})
     for field in unresolved_decision_fields:
-        if get(get(probes, field, {}), "status", "missing") == "observed":
+        probe_status = get(get(probes, field, {}), "status", "missing")
+        if probe_status == "observed":
             observed_probe_fields.append(field)
+        elif probe_status == "insufficient":
+            insufficient_probe_fields.append(field)
         else:
             unobserved_probe_fields.append(field)
     can_resolve = len(observed_probe_fields) > 0
     all_unresolved_observed = (
         len(unresolved_decision_fields) > 0
         and len(unobserved_probe_fields) == 0
+        and len(insufficient_probe_fields) == 0
     )
     answer = {
         "type": "object",
@@ -117,8 +122,36 @@ def stage_agent_action_schema(step):
         answer["required"].append("findings")
     path = {
         "type": "object",
-        "properties": {"path": {"type": "string", "minLength": 1}},
+        "properties": {
+            "path": {"type": "string", "minLength": 1},
+            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 65536},
+            "offset": {"type": "integer", "minimum": 0},
+            "tail_bytes": {"type": "integer", "minimum": 1, "maximum": 65536},
+            "start_line": {"type": "integer", "minimum": 1},
+            "end_line": {"type": "integer", "minimum": 1},
+        },
         "required": ["path"],
+        "additionalProperties": False,
+    }
+    find_input = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "minLength": 1},
+            "name_glob": {"type": "string", "minLength": 1},
+            "type": {"type": "string", "enum": ["file", "dir", "any"]},
+            "max_depth": {"type": "integer", "minimum": 0, "maximum": 64},
+        },
+        "required": ["path", "name_glob"],
+        "additionalProperties": False,
+    }
+    search_input = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "minLength": 1},
+            "needle": {"type": "string", "minLength": 1},
+            "regex": {"type": "boolean"},
+        },
+        "required": ["path", "needle"],
         "additionalProperties": False,
     }
     write = {
@@ -156,6 +189,18 @@ def stage_agent_action_schema(step):
         "required": ["tool", "input"],
         "additionalProperties": False,
     }
+    find_action = {
+        "type": "object",
+        "properties": {"tool": {"const": "find"}, "input": find_input},
+        "required": ["tool", "input"],
+        "additionalProperties": False,
+    }
+    search_action = {
+        "type": "object",
+        "properties": {"tool": {"const": "search"}, "input": search_input},
+        "required": ["tool", "input"],
+        "additionalProperties": False,
+    }
     write_action = {
         "type": "object",
         "properties": {"tool": {"const": "write"}, "input": write},
@@ -175,12 +220,21 @@ def stage_agent_action_schema(step):
         "additionalProperties": False,
     }
     if len(resolved_decision_fields) > 0:
-        probe_targets = unobserved_probe_fields
-        if len(probe_targets) == 0:
-            probe_targets = unresolved_decision_fields
+        # Cover every still-unobserved obligation before spending more of the
+        # bounded action budget refining an already-observed field. Once each
+        # field has an observation, refinement may target any unresolved field.
+        probe_targets = unresolved_decision_fields
+        if len(unobserved_probe_fields) > 0:
+            probe_targets = unobserved_probe_fields
+        elif len(insufficient_probe_fields) > 0:
+            probe_targets = insufficient_probe_fields
         probe_field = {"type": "string", "enum": probe_targets}
         read_action["properties"]["for_field"] = probe_field
         read_action["required"].append("for_field")
+        find_action["properties"]["for_field"] = probe_field
+        find_action["required"].append("for_field")
+        search_action["properties"]["for_field"] = probe_field
+        search_action["required"].append("for_field")
         write_action["properties"]["for_field"] = probe_field
         write_action["required"].append("for_field")
         run_action["properties"]["for_field"] = probe_field
@@ -221,22 +275,32 @@ def stage_agent_action_schema(step):
                 "additionalProperties": False,
             }
             read_action["properties"]["resolves"] = resolutions
+            find_action["properties"]["resolves"] = resolutions
+            search_action["properties"]["resolves"] = resolutions
             write_action["properties"]["resolves"] = resolutions
             run_action["properties"]["resolves"] = resolutions
             complete_action["properties"]["resolves"] = resolutions
             decide_action["properties"]["resolves"] = resolutions
             finish_action["properties"]["resolves"] = resolutions
             final_action["properties"]["resolves"] = resolutions
-    choices = [read_action, write_action, run_action, complete_action]
+    probes = [
+        read_action,
+        find_action,
+        search_action,
+        write_action,
+        run_action,
+        complete_action,
+    ]
+    choices = probes
     remaining = step.max_actions - step.attempt + 1
     decision_stage = "decision_recorded" in step.contracts
     mode = stage_agent_mode(step)
     if decision_stage and remaining == 1:
         choices = [decide_action, finish_action, final_action]
     elif decision_stage and all_unresolved_observed:
-        choices = [decide_action, finish_action, final_action]
+        choices = probes + [decide_action, finish_action, final_action]
     elif decision_stage and len(unresolved_decision_fields) > 0:
-        choices = [read_action, write_action, run_action, complete_action]
+        choices = probes
     elif decision_stage and len(resolved_decision_fields) > 0:
         choices = [decide_action, finish_action, final_action]
     elif decision_stage and mode == "execute_or_repair":
@@ -244,6 +308,8 @@ def stage_agent_action_schema(step):
     elif decision_stage:
         choices = [
             read_action,
+            find_action,
+            search_action,
             write_action,
             run_action,
             complete_action,
@@ -365,17 +431,26 @@ def stage_agent_messages(step):
     session = agent_session()
     unresolved_decision_fields = []
     pending_probe_fields = []
-    focus_field = None
+    missing_probe_fields = []
+    insufficient_probe_fields = []
     current_findings = get(step, "findings", {})
     probes = get(step, "probes", {})
     for field in get(step, "resolved_decision_fields", []):
         if get(get(current_findings, field, {}), "state", "unknown") != "resolved":
             unresolved_decision_fields.append(field)
-            if get(get(probes, field, {}), "status", "missing") == "observed":
+            probe_status = get(get(probes, field, {}), "status", "missing")
+            if probe_status == "observed":
                 pending_probe_fields.append(field)
-            elif focus_field is None:
-                focus_field = field
-    if focus_field is None and len(unresolved_decision_fields) > 0:
+            elif probe_status == "insufficient":
+                insufficient_probe_fields.append(field)
+            else:
+                missing_probe_fields.append(field)
+    focus_field = None
+    if len(missing_probe_fields) > 0:
+        focus_field = missing_probe_fields[0]
+    elif len(insufficient_probe_fields) > 0:
+        focus_field = insufficient_probe_fields[0]
+    elif len(unresolved_decision_fields) > 0:
         focus_field = unresolved_decision_fields[0]
     memory = context_project(
         focus=(
@@ -404,7 +479,12 @@ def stage_agent_messages(step):
                 "the runtime supplies its provenance and rejects resolutions "
                 "without a prior observation. One response may resolve an old "
                 "probe while launching the next field probe. Use read for file facts "
-                "and run_linux for environment or toolchain facts. Do not "
+                "and run_linux for environment or toolchain facts. Use recursive "
+                "find for names, search for symbols or text, and ranged read around "
+                "matches. An observed probe is not automatically sufficient: refine "
+                "the same field when needed, and resolve it only when the retained "
+                "evidence answers finding_specs[field].question. Empty output is "
+                "retained as insufficient and must be refined, not resolved. Do not "
                 "repeat fields absent from unresolved_decision_fields. Direct "
                 "the next probe at one of those unresolved fields. Do not "
                 "use decide only to publish unknown state; reserve it for a "
@@ -444,6 +524,7 @@ def stage_agent_messages(step):
                 "findings": get(step, "findings", {}),
                 "probes": probes,
                 "pending_probe_fields": pending_probe_fields,
+                "insufficient_probe_fields": insufficient_probe_fields,
                 "focus_field": focus_field,
                 "probe_budget": max(step.max_actions - 1, 0),
                 "remaining_probe_actions": max(
@@ -471,11 +552,62 @@ def stage_agent_dispatch(action):
                     "path": args.path,
                     "content": slice(json_dumps(ls(args.path)), 0, 8192),
                 }
+            max_bytes = min(get(args, "max_bytes", 8192), 65536)
+            offset = get(args, "offset", None)
+            tail_bytes = get(args, "tail_bytes", None)
+            start_line = get(args, "start_line", None)
+            end_line = get(args, "end_line", None)
+            if tail_bytes is not None:
+                content = read_file(
+                    args.path, max_bytes=max_bytes, tail_bytes=tail_bytes
+                )
+            elif offset is not None:
+                content = read_file(args.path, max_bytes=max_bytes, offset=offset)
+            elif start_line is not None and end_line is not None:
+                content = read_file(
+                    args.path,
+                    max_bytes=max_bytes,
+                    start_line=start_line,
+                    end_line=end_line,
+                )
+            elif start_line is not None:
+                content = read_file(
+                    args.path, max_bytes=max_bytes, start_line=start_line
+                )
+            elif end_line is not None:
+                content = read_file(args.path, max_bytes=max_bytes, end_line=end_line)
+            else:
+                content = read_file(args.path, max_bytes=max_bytes)
             return {
                 "ok": True,
                 "kind": "read",
                 "path": args.path,
-                "content": read_file(args.path, max_bytes=8192),
+                "content": content,
+            }
+        if tool == "find":
+            entries = find(
+                args.path,
+                args.name_glob,
+                max_depth=get(args, "max_depth", 32),
+                type=get(args, "type", "any"),
+            )
+            return {
+                "ok": True,
+                "kind": "find",
+                "path": args.path,
+                "content": slice(json_dumps(entries), 0, 8192),
+            }
+        if tool == "search":
+            matches = search(
+                args.path,
+                args.needle,
+                regex=get(args, "regex", False),
+            )
+            return {
+                "ok": True,
+                "kind": "search",
+                "path": args.path,
+                "content": slice(json_dumps(matches), 0, 8192),
             }
         if tool == "write":
             write_text(args.path, args.content)

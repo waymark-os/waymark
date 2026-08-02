@@ -1598,6 +1598,24 @@ search/tail, and retry accounting. The runtime should distinguish `observed`
 from `sufficient`, rather than treating one action per field as a complete
 acquisition policy.
 
+The focused-acquisition slice implements that mechanical layer. The visible
+controller now exposes recursive `find`, bounded literal/regex `search`, and
+offset, tail, and streamed line-range reads. Per-field probes carry bounded
+revision/provenance history; fields without observations are covered before
+refinement, and empty output is retained as `insufficient`. A local Doom-tree
+probe (95 C files, symbol search, and a 4 KiB tail) took about 40 ms, so native
+Rust acquisition is cheap relative to model calls.
+
+The updated Doom cell completed inspection and produced a valid MIPS ELF before
+failing at runtime. That advance validates the control hypothesis, while the
+failure sharpens the remaining distinction: `observed` can be checked
+mechanically, but `sufficient` is relative to the declared question. A filename
+and a compiler path do not prove that the program satisfies the JavaScript VM's
+freestanding ABI, entry, and frame-output contract. Future finding descriptors
+should therefore admit task-authored evidence predicates or typed acquisition
+recipes, and multi-contract gates should direct repair at the still-missing
+contract without discarding already-satisfied evidence.
+
 Runtime diagnostics are part of that interface. A generic JSON `oneOf` error
 did not help the model repair an illegal action. Validation now reports allowed
 discriminators and the nearest branch's missing or extra fields, and the

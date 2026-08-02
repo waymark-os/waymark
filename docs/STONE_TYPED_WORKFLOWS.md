@@ -489,6 +489,35 @@ retry budget beyond one probe per field.
 Artifact:
 `../../waymark-gateway/target/runs/staged-stone-doom-v24-field-directed-probes-terra/cell/cell.json`
 
+The acquisition follow-up exposes native recursive `find` and bounded
+literal/regex `search` actions, plus byte-offset, tail, and streamed line-range
+reads. Probe refinements retain a bounded revision and up to four runtime-owned
+bases. Scheduling covers fields with no observation before revisiting an
+observed field. An empty tool result is now retained as `insufficient`, so it
+cannot be resolved until a non-empty refinement supplies evidence.
+
+This removed two concrete controller failures. The first rollout exposed the
+new tools but starved three fields while repeatedly reading `vm.js`; it also
+found that a line range was incorrectly sliced from only the first 8 KiB. After
+streaming line ranges and coverage-first scheduling, Doom completed inspection
+in five actions with four resolved fields, built a valid MIPS ELF, and reached
+the run stage. It then failed because the produced conventional Linux ELF ran
+only nine VM instructions and emitted no frame; the final repair also replaced
+the required exact `node vm.js` command with a build-and-run shell command.
+
+The Rust acquisition path is not the bottleneck: a local recursive find over
+95 C files, symbol search, and 4 KiB tail read took about 40 ms. The successful
+inspection/build rollout spent about 150 seconds overall and made 23 model
+calls. The next typed-acquisition problem is semantic sufficiency: non-empty
+evidence must answer the field question (for example, freestanding VM ABI and
+entry requirements), and a failed multi-contract run gate needs a more useful
+contract-directed repair interface.
+
+Artifacts:
+`../../waymark-gateway/target/runs/staged-stone-doom-v25-native-acquisition-terra/cell/cell.json`
+and
+`../../waymark-gateway/target/runs/staged-stone-doom-v26-streamed-lines-coverage-terra/cell/cell.json`
+
 ```stone
 def repair_output(step):
     return run(["sh", "-c", "printf ready > artifact.txt"])

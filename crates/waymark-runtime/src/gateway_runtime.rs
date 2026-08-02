@@ -1243,13 +1243,89 @@ fn elapsed_ms(started: std::time::Instant) -> u64 {
 }
 
 pub(crate) fn read_text(path: &Path, max_bytes: usize) -> Result<String, ShellError> {
+    read_text_range(path, 0, max_bytes)
+}
+
+pub(crate) fn read_text_range(
+    path: &Path,
+    offset: u64,
+    max_bytes: usize,
+) -> Result<String, ShellError> {
+    let bytes = read_bytes_range(path, offset, max_bytes)?;
+    decode_bounded_gateway_text(bytes, path)
+}
+
+fn read_bytes_range(path: &Path, offset: u64, max_bytes: usize) -> Result<Vec<u8>, ShellError> {
     let config = required_config()?;
     let rel = workspace_path(&config, path)?;
     let max_bytes = u64::try_from(max_bytes).unwrap_or(u64::MAX);
     let response = with_client(&config, |client| {
-        client.workspace_tx_read(&config.tx, rel, max_bytes)
+        client.workspace_tx_read_range(&config.tx, rel, offset, max_bytes)
     })?;
-    String::from_utf8(response.content).map_err(|err| {
+    Ok(response.content)
+}
+
+pub(crate) fn read_text_lines(
+    path: &Path,
+    start_line: usize,
+    end_line: Option<usize>,
+    max_bytes: usize,
+) -> Result<String, ShellError> {
+    const CHUNK_BYTES: usize = 64 * 1024;
+
+    let config = required_config()?;
+    let rel = workspace_path(&config, path)?;
+    let mut offset = 0_u64;
+    let mut line_number = 1usize;
+    let mut output = Vec::with_capacity(max_bytes.min(CHUNK_BYTES));
+    'chunks: loop {
+        let response = with_client(&config, |client| {
+            client.workspace_tx_read_range(
+                &config.tx,
+                rel.clone(),
+                offset,
+                u64::try_from(CHUNK_BYTES).unwrap_or(u64::MAX),
+            )
+        })?;
+        if response.content.is_empty() {
+            break;
+        }
+        offset = offset.saturating_add(u64::try_from(response.content.len()).unwrap_or(u64::MAX));
+        for byte in response.content {
+            if line_number >= start_line
+                && end_line.is_none_or(|end| line_number <= end)
+                && output.len() < max_bytes
+            {
+                output.push(byte);
+            }
+            if output.len() >= max_bytes {
+                break 'chunks;
+            }
+            if byte == b'\n' {
+                line_number = line_number.saturating_add(1);
+                if end_line.is_some_and(|end| line_number > end) {
+                    break 'chunks;
+                }
+            }
+        }
+        if !response.truncated {
+            break;
+        }
+    }
+    decode_bounded_gateway_text(output, path)
+}
+
+fn decode_bounded_gateway_text(mut bytes: Vec<u8>, path: &Path) -> Result<String, ShellError> {
+    if let Err(err) = std::str::from_utf8(&bytes) {
+        if err.error_len().is_some() {
+            return Err(stone_error(
+                "gateway read_text",
+                format!("{}: invalid UTF-8: {err}", path.display()),
+            ));
+        }
+        bytes.truncate(err.valid_up_to());
+    }
+    String::from_utf8(bytes).map_err(|err| {
         stone_error(
             "gateway read_text",
             format!("{}: invalid UTF-8: {err}", path.display()),

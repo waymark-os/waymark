@@ -626,9 +626,13 @@ for line in open("/app/input.txt"):
     },
     StoneHelpEntry {
         name: "read_file",
-        signature: "read_file(path: str, max_bytes: int? = None) -> str",
-        use_when: "Use for bounded plain-text reads. Alias for read_text.",
-        examples: &[r#"text = read_file("/app/report.txt")"#],
+        signature: "read_file(path: str, max_bytes: int? = None, offset: int = 0, tail_bytes: int? = None, start_line: int? = None, end_line: int? = None) -> str",
+        use_when: "Use for bounded plain-text reads, byte ranges, file tails, or 1-based line ranges. Alias for read_text.",
+        examples: &[
+            r#"text = read_file("/app/report.txt")"#,
+            r#"chunk = read_file("/app/report.txt", offset=4, max_bytes=16)"#,
+            r#"ending = read_file("/app/report.txt", tail_bytes=16)"#,
+        ],
         avoid: &["Do not parse JSON/CSV manually if read_json/read_jsonl/read_csv fits."],
         aliases: &["read_text"],
     },
@@ -645,7 +649,7 @@ for line in open("/app/input.txt"):
     },
     StoneHelpEntry {
         name: "find",
-        signature: "find(root: str, name_glob: str = '*', path_glob: str? = None, type: str? = None) -> list[record]",
+        signature: "find(root: str, name_glob: str = '*', path_glob: str? = None, type: str? = None, max_depth: int? = None) -> list[record]",
         use_when: "Use to discover task input files by name/path glob and optional type, size, or modified-time filters.",
         examples: &[
             r#"files = find("/app", "*.jsonl")"#,
@@ -665,9 +669,12 @@ for line in open("/app/input.txt"):
     },
     StoneHelpEntry {
         name: "search",
-        signature: "search(root: str, needle: str) -> list[record]",
-        use_when: "Use for bounded literal text search across UTF-8 files.",
-        examples: &[r#"matches = search("/app", "ERROR")"#],
+        signature: "search(root: str, needle: str, regex: bool = False) -> list[record]",
+        use_when: "Use for bounded recursive literal or regex text search across UTF-8 files. Results include path, line, and matching text.",
+        examples: &[
+            r#"matches = search("/app", "ERROR")"#,
+            r#"symbols = search("/app", "DG_(Draw|Init)", regex=True)"#,
+        ],
         avoid: &["Use read_json/read_csv/read_jsonl for structured data filtering."],
         aliases: &[],
     },

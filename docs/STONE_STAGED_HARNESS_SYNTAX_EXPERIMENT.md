@@ -282,5 +282,27 @@ search/tail probes, rather than another decision-record shape.
 Artifact:
 `../../waymark-gateway/target/runs/staged-stone-doom-v24-field-directed-probes-terra/cell/cell.json`
 
+The next slice added native recursive `find`, bounded literal/regex `search`,
+and offset/tail/line-range reads to the standard controller. Line ranges are
+streamed from the requested line instead of slicing an 8 KiB prefix. Repeated
+probes retain bounded revisions and provenance, and the schema schedules every
+unobserved field before refinement. Empty results are explicitly
+`insufficient` rather than resolvable observations.
+
+The first native-acquisition cell exposed the line-range and field-starvation
+bugs and still stopped at inspection. With both fixed, the next cell completed
+inspection in five actions, completed the build with a valid MIPS ELF, and
+failed at the run gate. `node vm.js` exited successfully with stdout but
+executed only nine instructions and produced no BMP; a final combined rebuild
+and run action then violated the exact-command contract and failed because it
+lost the configured compiler. This is evidence that the acquisition syntax
+improves control, but filename/tool discovery alone is too weak for a task
+whose real requirement is a VM-compatible freestanding ABI.
+
+Artifacts:
+`../../waymark-gateway/target/runs/staged-stone-doom-v25-native-acquisition-terra/cell/cell.json`
+and
+`../../waymark-gateway/target/runs/staged-stone-doom-v26-streamed-lines-coverage-terra/cell/cell.json`
+
 Artifact:
 `../../waymark-gateway/target/runs/staged-stone-doom-v12-typed-decisions-terra/cell/cell.json`

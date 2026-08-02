@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -104,6 +104,23 @@ pub(crate) fn cat_text(path: &Path) -> Result<String, ShellError> {
 
 pub(crate) fn read_text(path: &Path, max_bytes: usize) -> Result<String, ShellError> {
     stone_file_adapter().read_text(path, max_bytes)
+}
+
+pub(crate) fn read_text_range(
+    path: &Path,
+    offset: u64,
+    max_bytes: usize,
+) -> Result<String, ShellError> {
+    stone_file_adapter().read_text_range(path, offset, max_bytes)
+}
+
+pub(crate) fn read_text_lines(
+    path: &Path,
+    start_line: usize,
+    end_line: Option<usize>,
+    max_bytes: usize,
+) -> Result<String, ShellError> {
+    stone_file_adapter().read_text_lines(path, start_line, end_line, max_bytes)
 }
 
 pub(crate) fn write_text(path: &Path, text: &str, append: bool) -> Result<Value, ShellError> {
@@ -777,6 +794,19 @@ fn parse_csv_record_fields(text: &str) -> Result<Vec<Vec<String>>, String> {
 
 trait StoneFileAdapter {
     fn read_text(&self, path: &Path, max_bytes: usize) -> Result<String, ShellError>;
+    fn read_text_range(
+        &self,
+        path: &Path,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<String, ShellError>;
+    fn read_text_lines(
+        &self,
+        path: &Path,
+        start_line: usize,
+        end_line: Option<usize>,
+        max_bytes: usize,
+    ) -> Result<String, ShellError>;
     fn write_text(
         &self,
         path: &Path,
@@ -833,23 +863,65 @@ fn stone_file_adapter() -> &'static dyn StoneFileAdapter {
 
 impl StoneFileAdapter for StdStoneFileAdapter {
     fn read_text(&self, path: &Path, max_bytes: usize) -> Result<String, ShellError> {
+        self.read_text_range(path, 0, max_bytes)
+    }
+
+    fn read_text_range(
+        &self,
+        path: &Path,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<String, ShellError> {
         if gateway_runtime::enabled() {
-            return gateway_runtime::read_text(path, max_bytes);
+            return gateway_runtime::read_text_range(path, offset, max_bytes);
         }
-        let mut bytes =
-            fs::read(path).map_err(|err| io_read_stone_error("read_text", err, path))?;
-        if bytes.len() > max_bytes {
-            bytes.truncate(max_bytes);
-            while std::str::from_utf8(&bytes).is_err() && !bytes.is_empty() {
-                bytes.pop();
+        let mut file =
+            File::open(path).map_err(|err| io_read_stone_error("read_text", err, path))?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|err| io_stone_error("read_text seek", err, path))?;
+        let mut bytes = Vec::new();
+        file.take(u64::try_from(max_bytes).unwrap_or(u64::MAX))
+            .read_to_end(&mut bytes)
+            .map_err(|err| io_read_stone_error("read_text", err, path))?;
+        decode_bounded_text(bytes, path, "read_text")
+    }
+
+    fn read_text_lines(
+        &self,
+        path: &Path,
+        start_line: usize,
+        end_line: Option<usize>,
+        max_bytes: usize,
+    ) -> Result<String, ShellError> {
+        if gateway_runtime::enabled() {
+            return gateway_runtime::read_text_lines(path, start_line, end_line, max_bytes);
+        }
+        let file = File::open(path).map_err(|err| io_read_stone_error("read_text", err, path))?;
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        let mut output = Vec::with_capacity(max_bytes.min(64 * 1024));
+        let mut line_number = 1usize;
+        loop {
+            line.clear();
+            let read = reader
+                .read_until(b'\n', &mut line)
+                .map_err(|err| io_read_stone_error("read_text", err, path))?;
+            if read == 0 {
+                break;
             }
+            if line_number >= start_line {
+                if end_line.is_some_and(|end| line_number > end) {
+                    break;
+                }
+                let remaining = max_bytes.saturating_sub(output.len());
+                output.extend_from_slice(&line[..line.len().min(remaining)]);
+                if output.len() >= max_bytes {
+                    break;
+                }
+            }
+            line_number = line_number.saturating_add(1);
         }
-        String::from_utf8(bytes).map_err(|err| {
-            stone_error(
-                "read_text",
-                format!("{}: invalid UTF-8: {err}", path.display()),
-            )
-        })
+        decode_bounded_text(output, path, "read_text")
     }
 
     fn write_text(
@@ -958,6 +1030,28 @@ fn file_stat_from_metadata(path: PathBuf, metadata: &fs::Metadata) -> StoneFileS
         accessed_ms: system_time_ms(metadata.accessed().ok()),
         created_ms: system_time_ms(metadata.created().ok()),
     }
+}
+
+fn decode_bounded_text(
+    mut bytes: Vec<u8>,
+    path: &Path,
+    operation: &str,
+) -> Result<String, ShellError> {
+    if let Err(err) = std::str::from_utf8(&bytes) {
+        if err.error_len().is_some() {
+            return Err(stone_error(
+                operation,
+                format!("{}: invalid UTF-8: {err}", path.display()),
+            ));
+        }
+        bytes.truncate(err.valid_up_to());
+    }
+    String::from_utf8(bytes).map_err(|err| {
+        stone_error(
+            operation,
+            format!("{}: invalid UTF-8: {err}", path.display()),
+        )
+    })
 }
 
 fn stone_file_stat_from_gateway(path: &Path) -> Result<StoneFileStat, ShellError> {

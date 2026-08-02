@@ -66,9 +66,9 @@ use crate::stone_correction;
 use crate::stone_file_ops::{
     cat_text, create_dir_all, diff_record_for_paths, edit_text_file, file_nonempty_probe,
     file_regular_probe, find_records, io_stone_error, list_dir_records, open_runtime_file,
-    read_bytes, read_bytes_for_jsonl, read_csv_file, read_json_file, read_text as stone_read_text,
-    remove_path, save_value_file, search_records, stat_record, write_json_file, write_jsonl_file,
-    write_text as stone_write_text, RuntimeFile, StoneFindOptions,
+    read_bytes, read_bytes_for_jsonl, read_csv_file, read_json_file, read_text_lines,
+    read_text_range, remove_path, save_value_file, search_records, stat_record, write_json_file,
+    write_jsonl_file, write_text as stone_write_text, RuntimeFile, StoneFindOptions,
 };
 use crate::stone_hash::hash_builtin;
 #[cfg(not(target_os = "hermit"))]
@@ -2910,6 +2910,9 @@ impl Evaluator<'_> {
         let mut max_bytes = 1_048_576;
         let mut start_line: Option<usize> = None;
         let mut end_line: Option<usize> = None;
+        let mut offset = 0_u64;
+        let mut offset_supplied = false;
+        let mut tail_bytes: Option<usize> = None;
         if let Some(max_bytes_expr) = max_bytes_expr {
             let value = self
                 .eval_expr_value(max_bytes_expr, PipelineData::empty())?
@@ -2939,11 +2942,16 @@ impl Evaluator<'_> {
                 "max_bytes" | "limit" => max_bytes = value_to_limit(&value, "read_text max_bytes")?,
                 "start_line" => start_line = Some(value_to_limit(&value, "read_text start_line")?),
                 "end_line" => end_line = Some(value_to_limit(&value, "read_text end_line")?),
+                "offset" => {
+                    offset = value_to_u64(&value, "read_text offset")?;
+                    offset_supplied = true;
+                }
+                "tail_bytes" => tail_bytes = Some(value_to_limit(&value, "read_text tail_bytes")?),
                 other => {
                     return Err(stone_error(
                         "read_text",
                         format!(
-                            "unsupported keyword `{other}`; expected path, max_bytes, limit, start_line, or end_line"
+                            "unsupported keyword `{other}`; expected path, max_bytes, limit, start_line, end_line, offset, or tail_bytes"
                         ),
                     ));
                 }
@@ -2960,11 +2968,40 @@ impl Evaluator<'_> {
             return Err(stone_error("read_text", "read_text() requires a path"));
         };
         let target = self.resolve_script_path(&path)?;
-        let text = stone_read_text(&target, max_bytes)?;
-        let text = if start_line.is_some() || end_line.is_some() {
-            slice_text_lines(&text, start_line, end_line)?
+        if tail_bytes.is_some() && offset_supplied {
+            return Err(stone_error(
+                "read_text",
+                "read_text() offset and tail_bytes are mutually exclusive",
+            ));
+        }
+        if tail_bytes.is_some() && (start_line.is_some() || end_line.is_some()) {
+            return Err(stone_error(
+                "read_text",
+                "read_text() tail_bytes cannot be combined with start_line or end_line",
+            ));
+        }
+        if let Some(tail_bytes) = tail_bytes {
+            let size = file_regular_probe(&target)?.ok_or_else(|| {
+                stone_error(
+                    "read_text",
+                    format!("read_text() expects a regular file: {}", target.display()),
+                )
+            })?;
+            offset = size.saturating_sub(tail_bytes as u64);
+            max_bytes = max_bytes.min(tail_bytes);
+        }
+        let text = if (start_line.is_some() || end_line.is_some()) && !offset_supplied {
+            // Validate the 1-based range before dispatching it to the file
+            // adapter, which streams only the requested lines.
+            slice_text_lines("", start_line, end_line)?;
+            read_text_lines(&target, start_line.unwrap_or(1), end_line, max_bytes)?
         } else {
-            text
+            let text = read_text_range(&target, offset, max_bytes)?;
+            if start_line.is_some() || end_line.is_some() {
+                slice_text_lines(&text, start_line, end_line)?
+            } else {
+                text
+            }
         };
         Ok(RuntimeValue::Nu(Value::string(text, Span::unknown())))
     }
@@ -11911,15 +11948,7 @@ fn merge_workflow_finding_updates(
                     "stage probe resolution `{field}` requires an observed unresolved probe"
                 )));
             }
-            let basis = probe
-                .get("basis")
-                .map(|value| value_to_string(value, "probe observation basis"))
-                .transpose()?
-                .ok_or_else(|| {
-                    workflow_error(format!(
-                        "stage probe observation `{field}` has no runtime basis"
-                    ))
-                })?;
+            let basis = workflow_probe_resolution_basis(probe, field)?;
             let value = match value {
                 Value::String { val, .. } | Value::Glob { val, .. }
                     if !val.trim().is_empty() && val.chars().count() <= 2_048 =>
@@ -12078,19 +12107,49 @@ fn merge_workflow_finding_updates(
             .unwrap_or_default();
         if !matches!(
             tool.as_str(),
-            "read" | "write" | "run_linux" | "run_complete"
+            "read" | "find" | "search" | "write" | "run_linux" | "run_complete"
         ) {
             return Err(workflow_error(format!(
-                "stage probe_field `{field}` must be attached to read, write, run_linux, or run_complete, not `{tool}`"
+                "stage probe_field `{field}` must be attached to read, find, search, write, run_linux, or run_complete, not `{tool}`"
             )));
         }
         let span = Span::unknown();
+        let basis = workflow_action_record_basis(outcome, attempt);
+        let mut revision = 1_i64;
+        let mut bases = Vec::new();
+        if let Some(Value::Record { val: prior, .. }) = probes.get(&field) {
+            revision = prior
+                .get("revision")
+                .and_then(|value| match value {
+                    Value::Int { val, .. } => Some(val.saturating_add(1)),
+                    _ => None,
+                })
+                .unwrap_or(2);
+            if let Some(Value::List { vals, .. }) = prior.get("bases") {
+                bases.extend(vals.iter().rev().take(3).cloned().rev());
+            } else if let Some(Value::String { val, .. } | Value::Glob { val, .. }) =
+                prior.get("basis")
+            {
+                bases.push(Value::string(val.clone(), span));
+            }
+        }
+        bases.push(Value::string(basis.clone(), span));
+        let summary = workflow_probe_summary(outcome);
         let mut probe = Record::new();
-        probe.push("status", Value::string("observed", span));
         probe.push(
-            "basis",
-            Value::string(workflow_action_record_basis(outcome, attempt), span),
+            "status",
+            Value::string(
+                if summary.is_some() {
+                    "observed"
+                } else {
+                    "insufficient"
+                },
+                span,
+            ),
         );
+        probe.push("basis", Value::string(basis, span));
+        probe.push("bases", Value::list(bases, span));
+        probe.push("revision", Value::int(revision, span));
         probe.push("attempt", Value::int(attempt as i64, span));
         probe.push("tool", Value::string(tool, span));
         if let Some(kind) = outcome.get("kind") {
@@ -12101,7 +12160,7 @@ fn merge_workflow_finding_updates(
         if let Some(Value::Bool { val, .. }) = outcome.get("ok") {
             probe.push("ok", Value::bool(*val, span));
         }
-        if let Some(summary) = workflow_probe_summary(outcome) {
+        if let Some(summary) = summary {
             probe.push("summary", Value::string(summary, span));
         }
         probes.insert(field, Value::record(probe, span));
@@ -12125,6 +12184,43 @@ fn workflow_probe_summary(outcome: &Record) -> Option<String> {
         }
     }
     None
+}
+
+fn workflow_probe_resolution_basis(probe: &Record, field: &str) -> Result<String, ShellError> {
+    let bases = probe.get("bases").and_then(|value| match value {
+        Value::List { vals, .. } => Some(
+            vals.iter()
+                .filter_map(|value| match value {
+                    Value::String { val, .. } | Value::Glob { val, .. }
+                        if !val.trim().is_empty() =>
+                    {
+                        Some(val.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        ),
+        _ => None,
+    });
+    if let Some(bases) = bases.filter(|bases| !bases.is_empty()) {
+        if bases.len() == 1 {
+            return Ok(bases[0].clone());
+        }
+        return Ok(bounded_text(
+            &format!("runtime:probe-set:[{}]", bases.join(",")),
+            1_024,
+        ));
+    }
+    probe
+        .get("basis")
+        .map(|value| value_to_string(value, "probe observation basis"))
+        .transpose()?
+        .filter(|basis| !basis.trim().is_empty())
+        .ok_or_else(|| {
+            workflow_error(format!(
+                "stage probe observation `{field}` has no runtime basis"
+            ))
+        })
 }
 
 fn workflow_prior_action_basis(outcome: &Value, attempt: u32) -> String {
@@ -17123,6 +17219,19 @@ resolved_initial_schema = stage_agent_action_schema({
     "resolved_decision_fields": ["source_layout", "toolchain", "runtime_contract"],
     "outcome": None,
 })
+refinement_schema = stage_agent_action_schema({
+    "attempt": 3,
+    "max_actions": 5,
+    "contracts": ["decision_recorded"],
+    "decision_fields": [],
+    "resolved_decision_fields": ["toolchain", "runtime_contract"],
+    "findings": {},
+    "probes": {
+        "toolchain": {"status": "observed"},
+        "runtime_contract": {"status": "observed"},
+    },
+    "outcome": None,
+})
 emit({
     "summary_stdout": summary.stdout,
     "summary_stderr": summary.stderr,
@@ -17147,6 +17256,8 @@ emit({
     "tool_required": resolved_tool_schema.properties.actions.items.oneOf[0].required,
     "tool_probe_targets": resolved_tool_schema.properties.actions.items.oneOf[0].properties.for_field.enum,
     "initial_resolves": get(resolved_initial_schema.properties.actions.items.oneOf[0].properties, "resolves", None),
+    "refinement_choices": len(refinement_schema.properties.actions.items.oneOf),
+    "refinement_targets": refinement_schema.properties.actions.items.oneOf[0].properties.for_field.enum,
 })
 "#,
         );
@@ -17162,7 +17273,7 @@ emit({
                 "history_stdout": "fatal error: required_header.h: No such file",
                 "history_stderr": "collect2: error: ld returned 1 exit status",
                 "failed_gate_mode": "diagnose_or_repair",
-                "failed_gate_choices": 4,
+                "failed_gate_choices": 6,
                 "diagnostic_mode": "execute_or_repair",
                 "diagnostic_choices": 3,
                 "decision_mode": "decision_required",
@@ -17170,7 +17281,7 @@ emit({
                 "typed_decision_required": ["answer", "findings"],
                 "typed_finding_required": ["source_layout", "toolchain"],
                 "resolved_mode": "resolve_findings",
-                "resolved_choices": 4,
+                "resolved_choices": 6,
                 "resolved_decision_required": ["answer"],
                 "resolved_finding_required": ["state", "value", "basis"],
                 "resolved_state_enum": ["resolved", "unknown"],
@@ -17180,8 +17291,73 @@ emit({
                 "tool_required": ["tool", "input", "for_field"],
                 "tool_probe_targets": ["runtime_contract"],
                 "initial_resolves": null,
+                "refinement_choices": 9,
+                "refinement_targets": ["toolchain", "runtime_contract"],
             })
         );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn standard_stage_agent_dispatches_native_acquisition_tools() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("stage-agent-acquisition-tools")?;
+        fs::create_dir_all(root.join("pkg/sub")).expect("create fixture tree");
+        fs::write(
+            root.join("pkg/sub/frame_backend.c"),
+            "alpha\nDG_DrawFrame();\nomega\n",
+        )
+        .expect("write fixture source");
+        let source = format!(
+            "{}\n{}",
+            include_str!("../../../examples/scripts/standard_stage_agent.stone"),
+            r#"
+found = stage_agent_dispatch({
+    "tool": "find",
+    "input": {"path": ".", "name_glob": "*backend.c"},
+})
+searched = stage_agent_dispatch({
+    "tool": "search",
+    "input": {"path": ".", "needle": "DG_DrawFrame"},
+})
+ranged = stage_agent_dispatch({
+    "tool": "read",
+    "input": {
+        "path": "pkg/sub/frame_backend.c",
+        "start_line": 2,
+        "end_line": 2,
+    },
+})
+ending = stage_agent_dispatch({
+    "tool": "read",
+    "input": {"path": "pkg/sub/frame_backend.c", "tail_bytes": 6},
+})
+emit({
+    "find_ok": found.ok,
+    "find_content": found.content,
+    "search_ok": searched.ok,
+    "search_content": searched.content,
+    "range_content": ranged.content,
+    "tail_content": ending.content,
+})
+"#,
+        );
+        let program = lower_source(&source)?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["find_ok"], json_value!(true));
+        assert!(value["find_content"]
+            .as_str()
+            .expect("find content")
+            .contains("frame_backend.c"));
+        assert_eq!(value["search_ok"], json_value!(true));
+        assert!(value["search_content"]
+            .as_str()
+            .expect("search content")
+            .contains("DG_DrawFrame"));
+        assert_eq!(value["range_content"], json_value!("DG_DrawFrame();\n"));
+        assert_eq!(value["tail_content"], json_value!("omega\n"));
         cleanup_dir(&root);
         Ok(())
     }
@@ -17565,6 +17741,140 @@ workflow_run(task)
         let message = format!("{error:?}");
         assert!(message.contains("has no retained observation"), "{message}");
         assert!(message.contains("toolchain"), "{message}");
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_requires_refinement_after_an_empty_probe() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-empty-probe-refinement")?;
+        let program = lower_source(
+            r#"def agent_loop(step):
+    if step.attempt == 1:
+        return {
+            "ok": True,
+            "kind": "success",
+            "tool": "run_linux",
+            "stdout": "",
+            "stderr": "",
+            "probe_field": "toolchain",
+        }
+    if step.attempt == 2:
+        if step.probes.toolchain.status != "insufficient":
+            fail("empty probe must remain insufficient")
+        return {
+            "ok": True,
+            "kind": "success",
+            "tool": "run_linux",
+            "stdout": "/usr/bin/mipsel-linux-gnu-gcc\n",
+            "probe_field": "toolchain",
+        }
+    if step.probes.toolchain.status != "observed":
+        fail("non-empty refinement must become observable evidence")
+    return {
+        "ok": True,
+        "kind": "decision_recorded",
+        "message": "The compiler is resolved.",
+        "probe_resolutions": {
+            "toolchain": "use /usr/bin/mipsel-linux-gnu-gcc",
+        },
+        "transition_id": "fixture-empty-probe-refinement",
+    }
+
+workflow task:
+    stage inspect(goal="resolve compiler", max_actions=3):
+        agent_loop()
+        ensure decision_recorded(resolved={
+            "toolchain": {
+                "kind": "command",
+                "question": "Which compiler builds the target?",
+            },
+        })
+
+report = workflow_run(task)
+emit({
+    "ok": report.ok,
+    "status": report.stages[0].probes.toolchain.status,
+    "revision": report.stages[0].probes.toolchain.revision,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(true));
+        assert_eq!(value["status"], json_value!("resolved"));
+        assert_eq!(value["revision"], json_value!(2));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_retains_bounded_provenance_across_probe_refinement() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-probe-refinement")?;
+        let program = lower_source(
+            r#"def agent_loop(step):
+    if step.attempt == 1:
+        return {
+            "ok": True,
+            "kind": "search",
+            "tool": "search",
+            "path": "vm.js",
+            "content": "process.argv at line 400",
+            "probe_field": "runtime_contract",
+        }
+    if step.attempt == 2:
+        return {
+            "ok": True,
+            "kind": "read",
+            "tool": "read",
+            "path": "vm.js",
+            "content": "vm.run(process.argv[2]); console.log('frame complete')",
+            "probe_field": "runtime_contract",
+        }
+    if step.probes.runtime_contract.revision != 2:
+        fail("probe refinement revision was not retained")
+    if len(step.probes.runtime_contract.bases) != 2:
+        fail("probe refinement bases were not retained")
+    return {
+        "ok": True,
+        "kind": "decision_recorded",
+        "message": "The runtime contract is resolved.",
+        "probe_resolutions": {
+            "runtime_contract": "vm.js consumes argv[2] and prints frame complete",
+        },
+        "transition_id": "fixture-probe-refinement",
+    }
+
+workflow task:
+    stage inspect(goal="resolve runtime contract", max_actions=3):
+        agent_loop()
+        ensure decision_recorded(resolved={
+            "runtime_contract": {
+                "kind": "command",
+                "question": "How is the program invoked?",
+            },
+        })
+
+report = workflow_run(task)
+emit({
+    "ok": report.ok,
+    "basis": report.stages[0].findings.runtime_contract.basis,
+    "revision": report.stages[0].probes.runtime_contract.revision,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(true));
+        assert_eq!(value["revision"], json_value!(2));
+        assert_eq!(
+            value["basis"],
+            json_value!(
+                "runtime:probe-set:[runtime:action:1:search:vm.js,runtime:action:2:read:vm.js]"
+            )
+        );
         cleanup_dir(&root);
         Ok(())
     }
@@ -21261,6 +21571,10 @@ emit({
         let (engine_state, mut stack, root) = test_engine("file-helper-aliases")?;
         fs::create_dir_all(root.join("pkg/sub")).expect("create nested dirs");
         fs::write(root.join("pkg/main.py"), "alpha\nneedle\nomega\n").expect("write main");
+        let long_text = (1..=2_000)
+            .map(|line| format!("line-{line}\n"))
+            .collect::<String>();
+        fs::write(root.join("pkg/long.txt"), long_text).expect("write long fixture");
         fs::write(root.join("pkg/sub/deep.py"), "needle\n").expect("write deep");
         fs::write(root.join("a.tmp"), "").expect("write a");
         fs::write(root.join("b.tmp"), "").expect("write b");
@@ -21269,12 +21583,18 @@ emit({
             r#"named = find(path=".", name="main.py")
 shallow = find(path=".", glob="**/*.py", max_depth=2)
 lines = read_text(path="pkg/main.py", start_line=2, end_line=2)
+deep_lines = read_text(path="pkg/long.txt", max_bytes=128, start_line=1690, end_line=1692)
+offset_text = read_text(path="pkg/main.py", offset=6, max_bytes=6)
+tail_text = read_text(path="pkg/main.py", tail_bytes=6)
 matches = search(path=".", query="needle")
 rm(paths=["a.tmp", "b.tmp", "missing.tmp"], force=True)
 emit({
     "named": [file["name"] for file in named],
     "shallow": [file["name"] for file in shallow],
     "lines": lines,
+    "deep_lines": deep_lines,
+    "offset_text": offset_text,
+    "tail_text": tail_text,
     "matches": len(matches),
 })
 "#,
@@ -21287,6 +21607,9 @@ emit({
                 "named": ["main.py"],
                 "shallow": ["main.py"],
                 "lines": "needle\n",
+                "deep_lines": "line-1690\nline-1691\nline-1692\n",
+                "offset_text": "needle",
+                "tail_text": "omega\n",
                 "matches": 2,
             })
         );
