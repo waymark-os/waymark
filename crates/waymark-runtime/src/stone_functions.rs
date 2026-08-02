@@ -156,9 +156,21 @@ impl WorkflowCheckpointPolicyValue {
 }
 
 #[derive(Clone)]
+pub(super) struct WorkflowStageInputFieldValue {
+    pub(super) name: String,
+    pub(super) kind: String,
+}
+
+#[derive(Clone)]
+pub(super) struct WorkflowStageInputValue {
+    pub(super) stage: String,
+    pub(super) fields: Option<Vec<WorkflowStageInputFieldValue>>,
+}
+
+#[derive(Clone)]
 pub(super) struct WorkflowStageMetadataValue {
     goal: String,
-    inputs: Vec<String>,
+    inputs: Vec<WorkflowStageInputValue>,
 }
 
 #[derive(Clone)]
@@ -177,7 +189,7 @@ pub(super) struct WorkflowStageValue {
 impl WorkflowStageValue {
     pub(super) fn new_metadata(
         goal: String,
-        inputs: Vec<String>,
+        inputs: Vec<WorkflowStageInputValue>,
     ) -> Box<WorkflowStageMetadataValue> {
         Box::new(WorkflowStageMetadataValue { goal, inputs })
     }
@@ -186,7 +198,7 @@ impl WorkflowStageValue {
         &self.metadata.goal
     }
 
-    pub(super) fn inputs(&self) -> &[String] {
+    pub(super) fn inputs(&self) -> &[WorkflowStageInputValue] {
         &self.metadata.inputs
     }
 

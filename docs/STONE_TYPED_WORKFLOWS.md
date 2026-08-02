@@ -634,6 +634,40 @@ Artifacts:
 and
 `../../waymark-gateway/target/runs/staged-stone-doom-v30-typed-stage-inputs-terra/cell/cell.json`.
 
+### Field-typed stage inputs
+
+The all-fields form remains useful for small interfaces. Consumers may now
+select and type-check individual fields when a producer exports more than they
+need:
+
+```stone
+stage build(
+    goal="build the artifact",
+    inputs={"inspect": {
+        "source_layout": "path",
+        "toolchain": "command",
+    }},
+    max_actions=8,
+):
+    agent_loop()
+    ensure artifact("output", format="elf")
+```
+
+Workflow admission rejects a missing producer field or a kind that differs
+from its `decision_recorded(resolved={...})` descriptor. Runtime projection
+then includes only the selected fields. `inputs=["inspect"]` remains the
+compact compatibility form and imports all of that stage's resolved findings.
+
+A fresh low-reasoning canary authored two correct selective interfaces on its
+first response: build consumed all four inspection fields, while execute
+consumed only `vm_abi`. The generated 81-line harness passed actual Stone
+admission without repair. This supports keeping field-typed inputs as an
+optional strict boundary. It does not yet show better task success, so no new
+Doom execution is claimed for this mechanically equivalent projection slice.
+
+Artifact:
+`target/runs/staged-harness-typed-input-fields-authorship-v1-terra/aggregate.json`.
+
 ```stone
 def repair_output(step):
     return run(["sh", "-c", "printf ready > artifact.txt"])

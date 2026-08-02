@@ -405,5 +405,33 @@ Artifacts:
 and
 `../../waymark-gateway/target/runs/staged-stone-doom-v30-typed-stage-inputs-terra/cell/cell.json`.
 
+### Selective field-typed inputs
+
+The next syntax slice strengthens an existing ordered edge rather than adding
+a graph construct:
+
+```stone
+inputs={"inspect": {
+    "source_layout": "path",
+    "toolchain": "command",
+}}
+```
+
+The record selects fields and repeats their expected kinds. Admission checks
+those names and kinds against the earlier stage's resolved-decision contract;
+the runtime projects only the selection. The list form continues to mean
+"import every resolved field." This makes strictness proportional to the
+importance of the boundary and avoids forcing verbose annotations everywhere.
+
+The first blind low-reasoning canary used the record form correctly for both
+build and execute, selected a narrower interface for execute, and passed the
+interpreter without a correction round. Combined with mismatch and projection
+tests, this supports the syntax as learnable and useful for static errors and
+bounded context. Behavioral benefit remains unmeasured until a task depends on
+preventing irrelevant or incorrectly typed stage data.
+
+Artifact:
+`target/runs/staged-harness-typed-input-fields-authorship-v1-terra/aggregate.json`.
+
 Artifact:
 `../../waymark-gateway/target/runs/staged-stone-doom-v12-typed-decisions-terra/cell/cell.json`

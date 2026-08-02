@@ -52,7 +52,14 @@ workflow project:
 
     stage build(
         goal="build the doomgeneric_mips ELF using the supplied frame writer",
-        inputs=["inspect"],
+        inputs={
+            "inspect": {
+                "source_layout": "path",
+                "toolchain": "command",
+                "frame_backend": "file",
+                "runtime_contract": "command",
+            },
+        },
         max_actions=12,
         checkpoint="repairable",
     ):
@@ -61,7 +68,12 @@ workflow project:
 
     stage run(
         goal="run the supplied VM and confirm its observable output",
-        inputs=["inspect"],
+        inputs={
+            "inspect": {
+                "frame_backend": "file",
+                "runtime_contract": "command",
+            },
+        },
         max_actions=3,
     ):
         agent_loop()

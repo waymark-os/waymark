@@ -113,7 +113,8 @@ use stone_functions::{
     WorkflowEvidenceSourceValue as WorkflowEvidenceSource,
     WorkflowFindingEvidencePredicateValue as WorkflowFindingEvidencePredicate,
     WorkflowFindingSpecValue as WorkflowFindingSpec, WorkflowHandlerValue as WorkflowHandler,
-    WorkflowPatchValue as WorkflowPatch, WorkflowStageValue as WorkflowStage,
+    WorkflowPatchValue as WorkflowPatch, WorkflowStageInputFieldValue as WorkflowStageInputField,
+    WorkflowStageInputValue as WorkflowStageInput, WorkflowStageValue as WorkflowStage,
     WorkflowValue as Workflow,
 };
 use stone_json_view::{
@@ -5141,11 +5142,70 @@ impl Evaluator<'_> {
         &mut self,
         expression: &Expr,
         context: &str,
-    ) -> Result<Vec<String>, ShellError> {
+    ) -> Result<Vec<WorkflowStageInput>, ShellError> {
         let value = self
             .eval_expr_value(expression, PipelineData::empty())?
             .into_nu_value(&format!("{context} inputs"))?;
-        let inputs = value_to_string_list(&value, &format!("{context} inputs"))?;
+        let inputs = match &value {
+            Value::List { .. } => value_to_string_list(&value, &format!("{context} inputs"))?
+                .into_iter()
+                .map(|stage| WorkflowStageInput {
+                    stage,
+                    fields: None,
+                })
+                .collect::<Vec<_>>(),
+            Value::Record { val: stages, .. } => {
+                let mut inputs = Vec::with_capacity(stages.len());
+                for (stage, value) in stages.iter() {
+                    let Value::Record { val: fields, .. } = value else {
+                        return Err(workflow_error(format!(
+                            "{context} input `{stage}` must map finding names to text, path, file, or command kinds"
+                        )));
+                    };
+                    if fields.is_empty() || fields.len() > 12 {
+                        return Err(workflow_error(format!(
+                            "{context} input `{stage}` must select between one and 12 finding fields"
+                        )));
+                    }
+                    let mut selection = Vec::with_capacity(fields.len());
+                    for (name, value) in fields.iter() {
+                        if name.is_empty()
+                            || name.len() > 64
+                            || !name.chars().all(|character| {
+                                character.is_ascii_alphanumeric() || character == '_'
+                            })
+                        {
+                            return Err(workflow_error(format!(
+                                "{context} input `{stage}` field `{name}` must be a 1..64 character ASCII identifier"
+                            )));
+                        }
+                        let kind = value_to_string(
+                            value,
+                            &format!("{context} input `{stage}` field `{name}` kind"),
+                        )?;
+                        if !matches!(kind.as_str(), "text" | "path" | "file" | "command") {
+                            return Err(workflow_error(format!(
+                                "{context} input `{stage}` field `{name}` kind must be text, path, file, or command"
+                            )));
+                        }
+                        selection.push(WorkflowStageInputField {
+                            name: name.clone(),
+                            kind,
+                        });
+                    }
+                    inputs.push(WorkflowStageInput {
+                        stage: stage.clone(),
+                        fields: Some(selection),
+                    });
+                }
+                inputs
+            }
+            _ => {
+                return Err(workflow_error(format!(
+                    "{context} inputs must be a list of earlier stage names or a record of typed field selections"
+                )))
+            }
+        };
         if inputs.len() > 8 {
             return Err(workflow_error(format!(
                 "{context} inputs accepts at most eight completed stage names"
@@ -5153,10 +5213,11 @@ impl Evaluator<'_> {
         }
         let mut seen = HashSet::new();
         for input in &inputs {
-            validate_workflow_name(input, "stage input")?;
-            if !seen.insert(input.as_str()) {
+            validate_workflow_name(&input.stage, "stage input")?;
+            if !seen.insert(input.stage.as_str()) {
                 return Err(workflow_error(format!(
-                    "{context} inputs contains duplicate stage `{input}`"
+                    "{context} inputs contains duplicate stage `{}`",
+                    input.stage
                 )));
             }
         }
@@ -5255,11 +5316,33 @@ impl Evaluator<'_> {
                 )));
             };
             for input in stage.inputs() {
-                if !names.contains(input) {
+                if !names.contains(&input.stage) {
                     return Err(workflow_error(format!(
-                        "workflow `{name}` stage `{}` input `{input}` must name an earlier stage in the same workflow",
-                        stage.name
+                        "workflow `{name}` stage `{}` input `{}` must name an earlier stage in the same workflow",
+                        stage.name, input.stage
                     )));
+                }
+                if let Some(fields) = &input.fields {
+                    let producer = stages
+                        .iter()
+                        .find(|candidate: &&WorkflowStage| candidate.name == input.stage)
+                        .expect("input stage membership was checked above");
+                    let mut specs = Vec::new();
+                    workflow_resolved_decision_specs(&producer.evidence, &mut specs);
+                    for field in fields {
+                        let Some(spec) = specs.iter().find(|spec| spec.name == field.name) else {
+                            return Err(workflow_error(format!(
+                                "workflow `{name}` stage `{}` input `{}.{}` is not declared by the producer's resolved decision contract",
+                                stage.name, input.stage, field.name
+                            )));
+                        };
+                        if spec.kind != field.kind {
+                            return Err(workflow_error(format!(
+                                "workflow `{name}` stage `{}` input `{}.{}` expects kind `{}`, but the producer declares `{}`",
+                                stage.name, input.stage, field.name, field.kind, spec.kind
+                            )));
+                        }
+                    }
                 }
             }
             if !names.insert(stage.name.clone()) {
@@ -12827,15 +12910,19 @@ fn workflow_context_value(
             stage
                 .inputs()
                 .iter()
-                .map(|name| Value::string(name.clone(), span))
+                .map(|input| Value::string(input.stage.clone(), span))
                 .collect(),
             span,
         ),
     );
+    record.push(
+        "stage_input_specs",
+        workflow_stage_input_specs_value(stage.inputs()),
+    );
     let mut stage_outputs = Record::with_capacity(stage.inputs().len());
     for input in stage.inputs() {
-        if let Some(output) = completed_stage_outputs.get(input) {
-            stage_outputs.push(input, output.clone());
+        if let Some(output) = completed_stage_outputs.get(&input.stage) {
+            stage_outputs.push(&input.stage, workflow_select_stage_output(output, input));
         }
     }
     record.push("stage_outputs", Value::record(stage_outputs, span));
@@ -12951,6 +13038,62 @@ fn workflow_stage_output(stage: &WorkflowStage, finding_state: &Record) -> Value
     Value::record(output, span)
 }
 
+fn workflow_stage_input_specs_value(inputs: &[WorkflowStageInput]) -> Value {
+    let span = Span::unknown();
+    let mut specs = Record::with_capacity(inputs.len());
+    for input in inputs {
+        let value = match &input.fields {
+            None => Value::string("*", span),
+            Some(fields) => {
+                let mut selected = Record::with_capacity(fields.len());
+                for field in fields {
+                    selected.push(&field.name, Value::string(field.kind.clone(), span));
+                }
+                Value::record(selected, span)
+            }
+        };
+        specs.push(&input.stage, value);
+    }
+    Value::record(specs, span)
+}
+
+fn workflow_select_stage_output(output: &Value, input: &WorkflowStageInput) -> Value {
+    let Some(fields) = &input.fields else {
+        return output.clone();
+    };
+    let span = Span::unknown();
+    let Value::Record { val: output, .. } = output else {
+        return output.clone();
+    };
+    let source_findings = output.get("findings").and_then(|value| match value {
+        Value::Record { val, .. } => Some(val.as_ref()),
+        _ => None,
+    });
+    let mut findings = Record::with_capacity(fields.len());
+    for field in fields {
+        if let Some(value) = source_findings.and_then(|values| values.get(&field.name)) {
+            findings.push(&field.name, value.clone());
+        }
+    }
+    let mut selected = Record::new();
+    selected.push(
+        "schema",
+        output
+            .get("schema")
+            .cloned()
+            .unwrap_or_else(|| Value::string("waymark.workflow-stage-output.v1", span)),
+    );
+    selected.push(
+        "stage",
+        output
+            .get("stage")
+            .cloned()
+            .unwrap_or_else(|| Value::string(input.stage.clone(), span)),
+    );
+    selected.push("findings", Value::record(findings, span));
+    Value::record(selected, span)
+}
+
 fn workflow_contract_names(source: &WorkflowEvidenceSource, names: &mut Vec<&'static str>) {
     match source {
         WorkflowEvidenceSource::Handler(_) => names.push("custom"),
@@ -13052,10 +13195,14 @@ fn workflow_stage_report(
             stage
                 .inputs()
                 .iter()
-                .map(|name| Value::string(name.clone(), span))
+                .map(|input| Value::string(input.stage.clone(), span))
                 .collect(),
             span,
         ),
+    );
+    record.push(
+        "input_specs",
+        workflow_stage_input_specs_value(stage.inputs()),
     );
     record.push("status", Value::string(status, span));
     record.push("attempts", Value::int(attempts as i64, span));
@@ -17467,16 +17614,25 @@ emit({
                     "value": "sources are under src",
                     "basis": "runtime fixture inspection",
                 },
+                "toolchain": {
+                    "state": "resolved",
+                    "value": "use cc",
+                    "basis": "runtime fixture inspection",
+                },
             },
             "transition_id": "fixture-stage-output",
         }
     if step.stage_inputs != ["inspect"]:
         fail("dependent stage did not receive its declared input list")
+    if step.stage_input_specs != {"inspect": {"source_layout": "path"}}:
+        fail("dependent stage did not receive its typed input specification")
     finding = step.stage_outputs.inspect.findings.source_layout
     if finding.kind != "path" or finding.state != "resolved":
         fail("dependent stage did not receive the typed finding")
     if finding.value != "sources are under src":
         fail("dependent stage received the wrong finding value")
+    if get(step.stage_outputs.inspect.findings, "toolchain", None) is not None:
+        fail("dependent stage received an unrequested finding")
     return run(["sh", "-c", "printf '%s' \"$1\" > artifact.txt", "stage-output", finding.value])
 
 workflow task:
@@ -17487,9 +17643,17 @@ workflow task:
                 "kind": "path",
                 "question": "Where are the sources?",
             },
+            "toolchain": {
+                "kind": "command",
+                "question": "Which compiler builds them?",
+            },
         })
 
-    stage build(goal="consume source layout", inputs=["inspect"], max_actions=1):
+    stage build(
+        goal="consume source layout",
+        inputs={"inspect": {"source_layout": "path"}},
+        max_actions=1,
+    ):
         agent_loop()
         ensure file_nonempty("artifact.txt")
 
@@ -17497,6 +17661,7 @@ report = workflow_run(task)
 emit({
     "ok": report.ok,
     "build_inputs": report.stages[1].inputs,
+    "build_input_specs": report.stages[1].input_specs,
     "artifact": read_text("artifact.txt"),
 })
 "#,
@@ -17508,6 +17673,7 @@ emit({
             json_value!({
                 "ok": true,
                 "build_inputs": ["inspect"],
+                "build_input_specs": {"inspect": {"source_layout": "path"}},
                 "artifact": "sources are under src",
             })
         );
@@ -17534,6 +17700,38 @@ report = workflow_run(task)
         let detail = format!("{error:?}");
         assert!(
             detail.contains("input `inspect` must name an earlier stage"),
+            "{detail}"
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_stage_inputs_reject_producer_field_kind_mismatches() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-stage-input-kind")?;
+        let program = lower_source(
+            r#"workflow task:
+    stage inspect(goal="inspect", max_actions=1):
+        ensure decision_recorded(resolved={
+            "source_layout": {"kind": "path", "question": "Where?"},
+        })
+
+    stage build(
+        goal="build",
+        inputs={"inspect": {"source_layout": "command"}},
+        max_actions=1,
+    ):
+        ensure file_nonempty("artifact.txt")
+
+report = workflow_run(task)
+"#,
+        )?;
+        let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("stage input kind mismatch");
+        let detail = format!("{error:?}");
+        assert!(
+            detail.contains("input `inspect.source_layout` expects kind `command`")
+                && detail.contains("producer declares `path`"),
             "{detail}"
         );
         cleanup_dir(&root);

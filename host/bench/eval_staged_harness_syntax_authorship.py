@@ -56,12 +56,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Require later stages to declare and consume inspection finding outputs.",
     )
+    parser.add_argument(
+        "--typed-stage-input-fields",
+        action="store_true",
+        help="Require stage inputs to select producer fields with matching kinds.",
+    )
     return parser.parse_args()
 
 
 def common_prompt(
     require_finding_evidence: bool = False,
     require_stage_inputs: bool = False,
+    require_typed_stage_inputs: bool = False,
 ) -> str:
     predicate_guidance = ""
     if require_finding_evidence:
@@ -95,7 +101,24 @@ claims that the fact is already known. Put descriptors only in
 `decision_recorded(resolved={...})`; `agent_loop()` takes no arguments.
 """
     stage_input_guidance = ""
-    if require_stage_inputs:
+    if require_typed_stage_inputs:
+        stage_input_guidance = """
+When a later stage consumes findings declared by an earlier decision stage,
+declare a field-typed input record in the later stage header. For example:
+```
+inputs={"inspect": {
+    "source_layout": "path",
+    "toolchain": "command",
+}}
+```
+Every selected field must appear in the producer's
+`decision_recorded(resolved={...})` contract and its kind must match exactly.
+Select only fields the consumer needs. The runtime statically checks this
+interface and exposes the selected findings under
+`step.stage_outputs.inspect.findings`, preserving state, value, and basis. Do
+not use the list form of inputs for this experiment.
+"""
+    elif require_stage_inputs:
         stage_input_guidance = """
 When a later stage consumes findings declared by an earlier decision stage,
 make that dataflow explicit with `inputs=["earlier_stage_name"]` in the later
@@ -158,6 +181,7 @@ def arm_prompt(
     arm: str,
     require_finding_evidence: bool = False,
     require_stage_inputs: bool = False,
+    require_typed_stage_inputs: bool = False,
 ) -> str:
     if arm == "decorator":
         interface = r'''
@@ -231,7 +255,11 @@ workflow(...), or workflow_run(...).
     else:
         raise ValueError(f"unknown arm: {arm}")
     return (
-        common_prompt(require_finding_evidence, require_stage_inputs)
+        common_prompt(
+            require_finding_evidence,
+            require_stage_inputs,
+            require_typed_stage_inputs,
+        )
         + "\nSyntax arm:\n"
         + interface
     )
@@ -289,10 +317,18 @@ def source_features(arm: str, source: str) -> dict[str, Any]:
         for name in names
         if any(token in name.lower() for token in ("inspect", "plan", "select", "decide"))
     ]
-    stage_input_references = [
+    list_stage_input_references = [
         reference
         for body in re.findall(r"\binputs\s*=\s*\[([^\]]*)\]", source)
         for reference in re.findall(r"['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]", body)
+    ]
+    typed_stage_input_references = re.findall(
+        r"\binputs\s*=\s*\{\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*:",
+        source,
+    )
+    stage_input_references = [
+        *list_stage_input_references,
+        *typed_stage_input_references,
     ]
     lowered = source.lower()
     resolved_descriptors = resolved_descriptor_source(source)
@@ -351,13 +387,17 @@ def source_features(arm: str, source: str) -> dict[str, Any]:
             for name in names
             for token in ("inspect", "plan", "select", "decide")
         ),
-        "stage_inputs_count": len(
-            re.findall(r"\binputs\s*=\s*\[", source)
-        ),
+        "stage_inputs_count": len(list_stage_input_references)
+        + len(typed_stage_input_references),
+        "field_typed_stage_inputs_count": len(typed_stage_input_references),
         "stage_input_references": stage_input_references,
         "typed_stage_handoff": any(
             reference in decision_stage_names
             for reference in stage_input_references
+        ),
+        "field_typed_stage_handoff": any(
+            reference in decision_stage_names
+            for reference in typed_stage_input_references
         ),
         "decision_evidence": "decision_recorded(" in source,
         "typed_decision_fields": bool(
@@ -475,6 +515,7 @@ def semantic_gate(
     features: dict[str, Any],
     require_finding_evidence: bool = False,
     require_stage_inputs: bool = False,
+    require_typed_stage_inputs: bool = False,
 ) -> list[str]:
     violations: list[str] = []
     for field in (
@@ -518,6 +559,11 @@ def semantic_gate(
             violations.append(
                 "later stages do not declare an input from the decision stage"
             )
+    if require_typed_stage_inputs and features["decision_stage"]:
+        if not features["field_typed_stage_handoff"]:
+            violations.append(
+                "later stages do not declare field-typed inputs from the decision stage"
+            )
     return violations
 
 
@@ -547,6 +593,7 @@ def evaluate_once(
             features,
             args.finding_evidence_predicates,
             args.stage_inputs,
+            args.typed_stage_input_fields,
         )
         result = {
             **prior,
@@ -598,6 +645,7 @@ def evaluate_once(
         features,
         args.finding_evidence_predicates,
         args.stage_inputs,
+        args.typed_stage_input_fields,
     )
     violations = [*syntax_violations, *semantic_violations]
     result = {
@@ -725,6 +773,7 @@ def main() -> int:
             arm,
             args.finding_evidence_predicates,
             args.stage_inputs,
+            args.typed_stage_input_fields,
         )
         for arm in selected_arms
     }
@@ -755,6 +804,7 @@ def main() -> int:
         "trials": args.trials,
         "finding_evidence_predicates": args.finding_evidence_predicates,
         "stage_inputs": args.stage_inputs,
+        "typed_stage_input_fields": args.typed_stage_input_fields,
         "arms": arms,
         "run_root": str(run_root),
     }

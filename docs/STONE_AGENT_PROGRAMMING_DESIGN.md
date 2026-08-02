@@ -1661,6 +1661,16 @@ three obligations cleanly: acquisition predicates establish a lower bound on
 evidence, typed stage outputs preserve the interpreted result, and later
 artifact/verifier contracts test its consequences.
 
+Consumers can now strengthen `inputs=["inspect"]` to a selective interface
+such as `inputs={"inspect": {"source_layout": "path"}}`. Workflow admission
+checks that the producer declares the field with the same kind, and runtime
+projection omits unrequested findings. The all-fields list remains the default
+for small boundaries. A blind low-reasoning author used the stricter form
+correctly on its first response and narrowed the run stage to one of four
+inspection fields. This is evidence for an optional typed module boundary,
+not yet evidence of improved end-task success; its immediate value is earlier
+diagnosis and bounded context, with a useful static shape for a future JIT.
+
 Runtime representation matters to viability. Storing another `Vec` inline in
 the recursive runtime-value enum caused the large standard controller to cross
 the test-thread stack limit. Stage goal/input metadata is now boxed as one

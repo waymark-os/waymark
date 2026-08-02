@@ -91,6 +91,17 @@ HANDOFF_CONTRACT_SOURCE = CONTRACT_SOURCE.replace(
     'stage build(goal="build", inputs=["inspect"], max_actions=8, checkpoint="repairable"):',
 )
 
+TYPED_HANDOFF_CONTRACT_SOURCE = CONTRACT_SOURCE.replace(
+    'resolved=["source_layout", "toolchain"]',
+    '''resolved={
+            "source_layout": {"kind": "path", "question": "Where?"},
+            "toolchain": {"kind": "command", "question": "Which compiler?"},
+        }''',
+).replace(
+    'stage build(goal="build", max_actions=8, checkpoint="repairable"):',
+    'stage build(goal="build", inputs={"inspect": {"source_layout": "path", "toolchain": "command"}}, max_actions=8, checkpoint="repairable"):',
+)
+
 
 class StagedHarnessSyntaxAuthorshipTests(unittest.TestCase):
     def test_prompts_share_task_and_semantics(self) -> None:
@@ -146,6 +157,27 @@ class StagedHarnessSyntaxAuthorshipTests(unittest.TestCase):
         missing = EXPERIMENT.source_features("contract", CONTRACT_SOURCE)
         violations = EXPERIMENT.semantic_gate(missing, False, True)
         self.assertTrue(any("input from the decision stage" in item for item in violations))
+
+    def test_field_typed_stage_input_prompt_and_gate(self) -> None:
+        prompt = EXPERIMENT.arm_prompt("contract", False, False, True)
+        self.assertIn('inputs={"inspect": {', prompt)
+        self.assertIn('"source_layout": "path"', prompt)
+        self.assertIn("must match exactly", prompt)
+        features = EXPERIMENT.source_features(
+            "contract", TYPED_HANDOFF_CONTRACT_SOURCE
+        )
+        self.assertEqual(
+            [], EXPERIMENT.semantic_gate(features, False, False, True)
+        )
+        self.assertEqual(["inspect"], features["stage_input_references"])
+        self.assertEqual(1, features["field_typed_stage_inputs_count"])
+        list_features = EXPERIMENT.source_features(
+            "contract", HANDOFF_CONTRACT_SOURCE
+        )
+        violations = EXPERIMENT.semantic_gate(
+            list_features, False, False, True
+        )
+        self.assertTrue(any("field-typed inputs" in item for item in violations))
 
     def test_structural_gate_accepts_equivalent_examples(self) -> None:
         for arm, source in (
