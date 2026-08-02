@@ -1671,6 +1671,26 @@ inspection fields. This is evidence for an optional typed module boundary,
 not yet evidence of improved end-task success; its immediate value is earlier
 diagnosis and bounded context, with a useful static shape for a future JIT.
 
+The first selective-input task follow-up did not reach the stage where
+selection differed: three conformant Doom cells completed inspection and
+failed build, whose four-field projection is equivalent to import-all. The
+useful evidence came from repair behavior. The controller lacked Stone's
+exact-match edit operation, and its compact memory accidentally kept the front
+of an already-bounded process tail. Standard control now exposes typed
+`edit(path, old, new, all?)`, treats failed `run_linux` like failed
+`run_complete` for diagnostic reopening, and preserves the terminal N
+characters of process diagnostics. A live v34 cell used exact edit and then
+reacted to successive concrete compiler/linker errors instead of manually
+recovering a hidden tail.
+
+That cell still stopped at a `__start` collision. Inspection had transported
+two individually correct facts—backend `__start` and VM-selected `main`—without
+requiring a compatible linker/startup strategy. This suggests the next
+specification slice should be a relational finding obligation over existing
+flat typed values. If models can author and resolve that with current Stone,
+nested structural types are unnecessary; if they cannot, the failure will
+motivate a concrete richer type rather than an aesthetic one.
+
 Runtime representation matters to viability. Storing another `Vec` inline in
 the recursive runtime-value enum caused the large standard controller to cross
 the test-thread stack limit. Stage goal/input metadata is now boxed as one

@@ -433,5 +433,28 @@ preventing irrelevant or incorrectly typed stage data.
 Artifact:
 `target/runs/staged-harness-typed-input-fields-authorship-v1-terra/aggregate.json`.
 
+## Behavioral follow-up
+
+Three conformant staged Doom cells did not reach the narrower run-stage
+projection: inspection completed, while build exhausted its 12 actions. Since
+build selected all four producer fields in both the old and new forms, this is
+model/control variance rather than evidence that selective inputs harmed the
+stage. Field selection remains supported for static interface errors and
+bounded context; its end-task effect remains unmeasured.
+
+The traces instead found two concrete standard-library issues. First, repair
+offered only full `write` and arbitrary commands even though Stone already had
+safe exact replacement. A typed `edit` action now exposes `{path, old, new,
+all?}` and the model used it in v34. Second, diagnostic compaction selected the
+front of `stderr_tail`; it now selects the actual end. V34 consequently saw
+and addressed each terminal compiler/linker error without manually creating
+and tailing a log. The build still ended on the deeper `__start`/CRT collision.
+
+This result moves the next harness question from representation to semantics:
+can an author express and an inner agent resolve a compatibility finding that
+relates the backend's `__start`, the VM's required `main`, and linker startup
+policy? Test that flat relational obligation before introducing nested finding
+schemas.
+
 Artifact:
 `../../waymark-gateway/target/runs/staged-stone-doom-v12-typed-decisions-terra/cell/cell.json`

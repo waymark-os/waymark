@@ -17810,6 +17810,12 @@ diagnostic = {
     "contracts": ["file_valid"],
     "outcome": {"tool": "read"},
 }
+linux_failed_gate = {
+    "attempt": 2,
+    "max_actions": 3,
+    "contracts": ["file_valid"],
+    "outcome": {"tool": "run_linux"},
+}
 decision = {
     "attempt": 4,
     "max_actions": 4,
@@ -17894,12 +17900,16 @@ refinement_schema = stage_agent_action_schema({
 emit({
     "summary_stdout": summary.stdout,
     "summary_stderr": summary.stderr,
+    "terminal_stderr": stage_agent_diagnostic_stream(
+        outcome, "stderr", "stderr_tail", 11
+    ),
     "history_stdout": history.stdout,
     "history_stderr": history.stderr,
     "failed_gate_mode": stage_agent_mode(failed_gate),
     "failed_gate_choices": len(stage_agent_action_schema(failed_gate).properties.actions.items.oneOf),
     "diagnostic_mode": stage_agent_mode(diagnostic),
     "diagnostic_choices": len(stage_agent_action_schema(diagnostic).properties.actions.items.oneOf),
+    "linux_failed_gate_mode": stage_agent_mode(linux_failed_gate),
     "decision_mode": stage_agent_mode(decision),
     "decision_choices": len(stage_agent_action_schema(decision).properties.actions.items.oneOf),
     "typed_decision_required": typed_schema.properties.actions.items.oneOf[0].properties.input.required,
@@ -17929,12 +17939,14 @@ emit({
             json_value!({
                 "summary_stdout": "fatal error: required_header.h: No such file",
                 "summary_stderr": "collect2: error: ld returned 1 exit status",
+                "terminal_stderr": "exit status",
                 "history_stdout": "fatal error: required_header.h: No such file",
                 "history_stderr": "collect2: error: ld returned 1 exit status",
                 "failed_gate_mode": "diagnose_or_repair",
-                "failed_gate_choices": 6,
+                "failed_gate_choices": 7,
                 "diagnostic_mode": "execute_or_repair",
-                "diagnostic_choices": 3,
+                "diagnostic_choices": 4,
+                "linux_failed_gate_mode": "diagnose_or_repair",
                 "decision_mode": "decision_required",
                 "decision_choices": 3,
                 "typed_decision_required": ["answer", "findings"],
@@ -17991,6 +18003,14 @@ ending = stage_agent_dispatch({
     "tool": "read",
     "input": {"path": "pkg/sub/frame_backend.c", "tail_bytes": 6},
 })
+edited = stage_agent_dispatch({
+    "tool": "edit",
+    "input": {
+        "path": "pkg/sub/frame_backend.c",
+        "old": "alpha",
+        "new": "beta",
+    },
+})
 emit({
     "find_ok": found.ok,
     "find_content": found.content,
@@ -17998,6 +18018,9 @@ emit({
     "search_content": searched.content,
     "range_content": ranged.content,
     "tail_content": ending.content,
+    "edit_ok": edited.ok,
+    "edit_replacements": edited.replacements,
+    "edited_content": read_text("pkg/sub/frame_backend.c"),
 })
 "#,
         );
@@ -18017,6 +18040,12 @@ emit({
             .contains("DG_DrawFrame"));
         assert_eq!(value["range_content"], json_value!("DG_DrawFrame();\n"));
         assert_eq!(value["tail_content"], json_value!("omega\n"));
+        assert_eq!(value["edit_ok"], json_value!(true));
+        assert_eq!(value["edit_replacements"], json_value!(1));
+        assert_eq!(
+            value["edited_content"],
+            json_value!("beta\nDG_DrawFrame();\nomega\n")
+        );
         cleanup_dir(&root);
         Ok(())
     }

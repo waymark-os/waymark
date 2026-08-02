@@ -668,6 +668,50 @@ Doom execution is claimed for this mechanically equivalent projection slice.
 Artifact:
 `target/runs/staged-harness-typed-input-fields-authorship-v1-terra/aggregate.json`.
 
+### Exact repair edits and terminal diagnostics
+
+The first behavioral follow-up did not reach the selective run-stage input.
+After an invalid v31 cell exposed a stale LibOS guest binary, conformant v32
+and v33 cells both completed inspection but exhausted the build budget. The
+build projection was identical to the import-all form because it selected all
+four inspection fields, so these failures do not show a field-selection
+regression or benefit.
+
+The v32 trace did expose an avoidable repair hazard: the visible controller
+offered whole-file `write` but not Stone's exact-match `edit`, and one partial
+Makefile read was followed by a destructive replacement. The standard library
+now admits:
+
+```json
+{"tool":"edit","input":{"path":"Makefile","old":"CC ?= cc","new":"CC = target-gcc"}}
+```
+
+It reports the replacement count and fails rather than guessing when `old`
+does not match. A focused runtime test covers dispatch. In v34 the model chose
+the new edit action after reading the Makefile; later, when several changes
+could be combined with a build, it still reasonably chose a shell command.
+The interface is therefore useful but not a replacement for general commands.
+
+More importantly, the controller was retaining the beginning of an already
+bounded `stderr_tail`. On long compiler output this removed the terminal error
+that made the tail valuable. It now keeps the final N characters. V34 retained
+and acted on successive terminal failures: missing compiler, X11 backend,
+`my_stdlib.h`, an invalid `__start` rewrite, and finally the CRT `__start`
+collision. It still exhausted 12 build actions, but no longer needed a manual
+log-redirection round merely to reveal the hidden error.
+
+The remaining failure is semantic rather than transport: inspection exported
+the separate facts that the backend defines `__start` and the VM selects
+`main`, but not a reconciled linking/entry strategy. The next experiment should
+first test a dedicated relational finding for that compatibility obligation
+before adding a richer structured-finding type.
+
+Artifacts:
+`../../waymark-gateway/target/runs/staged-stone-doom-v32-field-typed-inputs-terra/cell/cell.json`,
+`../../waymark-gateway/target/runs/staged-stone-doom-v33-native-edit-terra/cell/cell.json`,
+and
+`../../waymark-gateway/target/runs/staged-stone-doom-v34-terminal-diagnostics-terra/cell/cell.json`.
+
 ```stone
 def repair_output(step):
     return run(["sh", "-c", "printf ready > artifact.txt"])

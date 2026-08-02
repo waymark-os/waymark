@@ -26,14 +26,14 @@ def stage_agent_schema_prompt(step):
             if get(get(probes, field, {}), "status", "missing") != "observed":
                 unobserved.append(field)
     decision_stage = "decision_recorded" in step.contracts
-    allowed_now = "read, find, search, write, run_linux, or run_complete"
+    allowed_now = "read, find, search, edit, write, run_linux, or run_complete"
     if decision_stage and remaining == 1:
         allowed_now = "read, find, search, write, run_linux, run_complete, decide, finish, or final"
     elif decision_stage and len(unobserved) == 0 and len(resolved_fields) > 0:
         allowed_now = "decide, finish, or final"
     elif decision_stage and len(resolved_fields) == 0:
         allowed_now = "read, find, search, write, run_linux, run_complete, decide, finish, or final"
-    return "Return {\"actions\":[A]} with exactly one A. Allowed now: " + allowed_now + ". Canonical probes: {\"tool\":\"find\",\"input\":{\"path\":\".\",\"name_glob\":\"*img*.c\"},\"for_field\":\"frame_backend\"}; {\"tool\":\"search\",\"input\":{\"path\":\"vm.js\",\"needle\":\"process.argv\"},\"for_field\":\"runtime_contract\"}; {\"tool\":\"read\",\"input\":{\"path\":\"vm.js\",\"start_line\":400,\"end_line\":500},\"for_field\":\"runtime_contract\"}. Canonical probe-and-resolve shape: {\"tool\":\"run_linux\",\"input\":{\"argv\":[\"command\",\"-v\",\"mipsel-linux-gnu-gcc\"]},\"for_field\":\"toolchain\",\"resolves\":{\"source_layout\":\"sources are under src\"}}. Canonical decision shape: {\"tool\":\"decide\",\"input\":{\"answer\":\"...\"},\"resolves\":{\"toolchain\":\"use mipsel-linux-gnu-gcc\"}}. Never replace tool with action/type, and never put answer beside tool. On a resolved-finding stage, every tool action must use for_field to name the unresolved obligation it probes. resolves may interpret only retained probe observations; the runtime supplies provenance. If an observation is insufficient, probe the same field again with a more focused action. A final decision may carry unknown={field: reason}. find is recursive, search is bounded recursive literal/regex grep, and read supports byte/tail/line ranges. Use run_linux for environment or toolchain facts and run_complete only for a bounded build/test gate. Use relative workspace paths; Linux commands see the root at /app. Do not invent outcomes or use unlisted fields."
+    return "Return {\"actions\":[A]} with exactly one A. Allowed now: " + allowed_now + ". Canonical probes: {\"tool\":\"find\",\"input\":{\"path\":\".\",\"name_glob\":\"*img*.c\"},\"for_field\":\"frame_backend\"}; {\"tool\":\"search\",\"input\":{\"path\":\"vm.js\",\"needle\":\"process.argv\"},\"for_field\":\"runtime_contract\"}; {\"tool\":\"read\",\"input\":{\"path\":\"vm.js\",\"start_line\":400,\"end_line\":500},\"for_field\":\"runtime_contract\"}. Canonical edit shape: {\"tool\":\"edit\",\"input\":{\"path\":\"Makefile\",\"old\":\"CC ?= cc\",\"new\":\"CC = target-gcc\"}}. Canonical probe-and-resolve shape: {\"tool\":\"run_linux\",\"input\":{\"argv\":[\"command\",\"-v\",\"mipsel-linux-gnu-gcc\"]},\"for_field\":\"toolchain\",\"resolves\":{\"source_layout\":\"sources are under src\"}}. Canonical decision shape: {\"tool\":\"decide\",\"input\":{\"answer\":\"...\"},\"resolves\":{\"toolchain\":\"use mipsel-linux-gnu-gcc\"}}. Never replace tool with action/type, and never put answer beside tool. On a resolved-finding stage, every tool action must use for_field to name the unresolved obligation it probes. resolves may interpret only retained probe observations; the runtime supplies provenance. If an observation is insufficient, probe the same field again with a more focused action. A final decision may carry unknown={field: reason}. find is recursive, search is bounded recursive literal/regex grep, and read supports byte/tail/line ranges. Prefer edit with exact old/new text for a localized change to an existing file; use write only for a new file or a deliberate complete replacement. Use run_linux for environment or toolchain facts and run_complete only for a bounded build/test gate. Use relative workspace paths; Linux commands see the root at /app. Do not invent outcomes or use unlisted fields."
 
 
 def stage_agent_action_schema(step):
@@ -164,6 +164,17 @@ def stage_agent_action_schema(step):
         "required": ["path", "content"],
         "additionalProperties": False,
     }
+    edit_input = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "minLength": 1},
+            "old": {"type": "string", "minLength": 1, "maxLength": 16384},
+            "new": {"type": "string", "maxLength": 16384},
+            "all": {"type": "boolean"},
+        },
+        "required": ["path", "old", "new"],
+        "additionalProperties": False,
+    }
     command = {
         "type": "object",
         "properties": {
@@ -205,6 +216,12 @@ def stage_agent_action_schema(step):
     write_action = {
         "type": "object",
         "properties": {"tool": {"const": "write"}, "input": write},
+        "required": ["tool", "input"],
+        "additionalProperties": False,
+    }
+    edit_action = {
+        "type": "object",
+        "properties": {"tool": {"const": "edit"}, "input": edit_input},
         "required": ["tool", "input"],
         "additionalProperties": False,
     }
@@ -292,7 +309,7 @@ def stage_agent_action_schema(step):
         run_action,
         complete_action,
     ]
-    choices = probes
+    choices = probes + [edit_action]
     remaining = step.max_actions - step.attempt + 1
     decision_stage = "decision_recorded" in step.contracts
     mode = stage_agent_mode(step)
@@ -321,7 +338,7 @@ def stage_agent_action_schema(step):
     elif remaining == 1 or mode == "execute_or_repair":
         # run_linux/run_complete differ in completion mechanics, not effect
         # intent. Either can perform the required mutation or gate command.
-        choices = [write_action, run_action, complete_action]
+        choices = [edit_action, write_action, run_action, complete_action]
     action = {"oneOf": choices}
     return {
         "type": "object",
@@ -344,7 +361,7 @@ def stage_agent_diagnostic_stream(outcome, field, tail_field, limit):
     # file/read outcomes have no tail and naturally fall back to their content.
     diagnostic_tail = get(outcome, tail_field, "")
     if diagnostic_tail != "":
-        return slice(diagnostic_tail, 0, limit)
+        return diagnostic_tail[-limit:]
     return slice(get(outcome, field, ""), 0, limit)
 
 
@@ -423,7 +440,7 @@ def stage_agent_mode(step):
     for field in get(step, "resolved_decision_fields", []):
         if get(get(current_findings, field, {}), "state", "unknown") != "resolved":
             return "resolve_findings"
-    if previous_tool in ["write", "run_complete"]:
+    if previous_tool in ["edit", "write", "run_linux", "run_complete"]:
         return "diagnose_or_repair"
     return "execute_or_repair"
 
@@ -498,13 +515,15 @@ def stage_agent_messages(step):
                 "rediscovering the same facts. Treat "
                 "stage_history as the completed action ledger and do not "
                 "repeat a successful probe unless new evidence requires it. "
-                "In execute_or_repair mode, take a workspace-changing action "
+                "For localized changes to existing files, prefer edit with "
+                "exact old/new text; use write only for new files or deliberate "
+                "complete replacement. In execute_or_repair mode, take a workspace-changing action "
                 "or run the actual gate-producing build/test; read is "
                 "intentionally unavailable, and run_linux is permitted only "
                 "when its command changes the workspace or exercises the gate. "
                 "In diagnose_or_repair mode, "
                 "a failed gate has reopened bounded observation: use read or "
-                "run_linux for one focused diagnostic, write for a repair, or "
+                "run_linux for one focused diagnostic, edit/write for a repair, or "
                 "run_complete only for the actual gate. A diagnostic action "
                 "is followed by execute_or_repair mode. In decision_required mode, "
                 "record the stage decision now. Return one schema-valid "
@@ -620,6 +639,20 @@ def stage_agent_dispatch(action):
         if tool == "write":
             write_text(args.path, args.content)
             return {"ok": True, "kind": "write", "path": args.path}
+        if tool == "edit":
+            result = edit(
+                args.path,
+                args.old,
+                args.new,
+                all=get(args, "all", False),
+            )
+            return {
+                "ok": True,
+                "kind": "edit",
+                "path": args.path,
+                "replacements": result.replacements,
+                "matched": result.matched,
+            }
         if tool == "run_linux":
             return run(
                 args.argv,
