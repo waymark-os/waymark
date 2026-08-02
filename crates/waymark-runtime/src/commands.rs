@@ -129,12 +129,13 @@ report = workflow_run(workflow("build", build_artifact))"#,
     StoneHelpEntry {
         name: "decision_recorded",
         signature: r#"decision_recorded(fields: list[str] | record? = [], resolved: list[str] | record? = []) -> workflow_evidence_spec"#,
-        use_when: "Gate an inspection, planning, or selection stage on an explicit non-empty stage decision. fields= requires named non-empty strings. resolved= instead requires state/value/basis records and advances only when every state is resolved. A descriptor record maps each field to a question string or {kind, question}, where kind is text, path, file, or command. The two keywords are mutually exclusive.",
+        use_when: "Gate an inspection, planning, or selection stage on an explicit non-empty stage decision. fields= requires named non-empty strings. resolved= instead requires state/value/basis records and advances only when every state is resolved. A descriptor record maps each field to a question string or {kind, question, evidence?}, where evidence may constrain tool, required text, and success. The two keywords are mutually exclusive.",
         examples: &[
             r#"decision_gate = decision_recorded()"#,
             r#"decision_gate = decision_recorded(fields=["source_layout", "toolchain"])"#,
             r#"decision_gate = decision_recorded(resolved=["source_layout", "toolchain"])"#,
             r#"decision_gate = decision_recorded(resolved={"source_layout": {"kind": "path", "question": "Where are the sources?"}, "toolchain": {"kind": "command", "question": "Which compiler builds the target?"}})"#,
+            r#"decision_gate = decision_recorded(resolved={"runtime_contract": {"kind": "command", "question": "How does the VM load the ELF?", "evidence": {"tool": "read", "contains": ["entryPoint"], "success": True}}})"#,
         ],
         avoid: &[
             "Do not use the existence of task inputs as proof that inspection or planning produced a decision.",

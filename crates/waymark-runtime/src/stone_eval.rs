@@ -111,6 +111,7 @@ use stone_functions::{
     TransitionHooksValue as TransitionHooks,
     WorkflowCheckpointPolicyValue as WorkflowCheckpointPolicy,
     WorkflowEvidenceSourceValue as WorkflowEvidenceSource,
+    WorkflowFindingEvidencePredicateValue as WorkflowFindingEvidencePredicate,
     WorkflowFindingSpecValue as WorkflowFindingSpec, WorkflowHandlerValue as WorkflowHandler,
     WorkflowPatchValue as WorkflowPatch, WorkflowStageValue as WorkflowStage,
     WorkflowValue as Workflow,
@@ -4713,21 +4714,22 @@ impl Evaluator<'_> {
                             question: format!("resolve {name}"),
                             name,
                             kind: "text".to_string(),
+                            evidence: None,
                         })
                     })
                     .collect::<Result<Vec<_>, ShellError>>()?,
                 Value::Record { val: specs, .. } => {
                     let mut parsed = Vec::with_capacity(specs.len());
                     for (name, descriptor) in specs.iter() {
-                        let (kind, question) = match descriptor {
+                        let (kind, question, evidence) = match descriptor {
                             Value::String { val, .. } | Value::Glob { val, .. } => {
-                                ("text".to_string(), val.clone())
+                                ("text".to_string(), val.clone(), None)
                             }
                             Value::Record { val, .. } => {
                                 for (key, _) in val.iter() {
-                                    if !matches!(key.as_str(), "kind" | "question") {
+                                    if !matches!(key.as_str(), "kind" | "question" | "evidence") {
                                         return Err(workflow_error(format!(
-                                            "decision_recorded() descriptor `{name}` has unsupported field `{key}`; expected kind and question"
+                                            "decision_recorded() descriptor `{name}` has unsupported field `{key}`; expected kind, question, and evidence"
                                         )));
                                     }
                                 }
@@ -4755,11 +4757,17 @@ impl Evaluator<'_> {
                                     })
                                     .transpose()?
                                     .unwrap_or_else(|| format!("resolve {name}"));
-                                (kind, question)
+                                let evidence = val
+                                    .get("evidence")
+                                    .map(|value| {
+                                        parse_workflow_finding_evidence_predicate(name, value)
+                                    })
+                                    .transpose()?;
+                                (kind, question, evidence)
                             }
                             _ => {
                                 return Err(workflow_error(format!(
-                                    "decision_recorded() descriptor `{name}` must be a question string or a {{kind, question}} record"
+                                    "decision_recorded() descriptor `{name}` must be a question string or a {{kind, question, evidence?}} record"
                                 )))
                             }
                         };
@@ -4777,6 +4785,7 @@ impl Evaluator<'_> {
                             name: name.clone(),
                             kind,
                             question,
+                            evidence,
                         });
                     }
                     parsed
@@ -5455,8 +5464,12 @@ impl Evaluator<'_> {
             let mut latest_outcome = None;
             let mut finding_state = Record::new();
             let mut probe_state = Record::new();
-            let mut resolved_finding_names = Vec::new();
-            workflow_resolved_decision_fields(&stage.evidence, &mut resolved_finding_names);
+            let mut resolved_finding_specs = Vec::new();
+            workflow_resolved_decision_specs(&stage.evidence, &mut resolved_finding_specs);
+            let resolved_finding_names = resolved_finding_specs
+                .iter()
+                .map(|spec| spec.name.clone())
+                .collect::<Vec<_>>();
 
             let context = workflow_context_value(
                 workflow,
@@ -5522,6 +5535,7 @@ impl Evaluator<'_> {
                     &mut probe_state,
                     &action.full,
                     &resolved_finding_names,
+                    &resolved_finding_specs,
                     latest_outcome.as_ref(),
                     attempt,
                 )?;
@@ -5578,6 +5592,7 @@ impl Evaluator<'_> {
                         &mut probe_state,
                         &repair.full,
                         &resolved_finding_names,
+                        &resolved_finding_specs,
                         latest_outcome.as_ref(),
                         attempt,
                     )?;
@@ -11756,6 +11771,88 @@ fn workflow_stdout_evidence(context: &Value) -> Result<(bool, String, usize), Sh
     })
 }
 
+fn parse_workflow_finding_evidence_predicate(
+    field: &str,
+    value: &Value,
+) -> Result<WorkflowFindingEvidencePredicate, ShellError> {
+    let record = value_record(
+        value,
+        &format!("decision_recorded descriptor `{field}` evidence"),
+    )?;
+    for (name, _) in record.iter() {
+        if !matches!(name.as_str(), "tool" | "contains" | "success") {
+            return Err(workflow_error(format!(
+                "decision_recorded() descriptor `{field}` evidence has unsupported field `{name}`; expected tool, contains, or success"
+            )));
+        }
+    }
+    let tool = record
+        .get("tool")
+        .map(|value| {
+            value_to_string(
+                value,
+                &format!("decision_recorded descriptor `{field}` evidence tool"),
+            )
+        })
+        .transpose()?;
+    if tool.as_deref().is_some_and(|tool| {
+        !matches!(
+            tool,
+            "read" | "find" | "search" | "run_linux" | "run_complete"
+        )
+    }) {
+        return Err(workflow_error(format!(
+            "decision_recorded() descriptor `{field}` evidence tool must be read, find, search, run_linux, or run_complete"
+        )));
+    }
+    let contains = match record.get("contains") {
+        None => Vec::new(),
+        Some(Value::String { val, .. } | Value::Glob { val, .. }) => vec![val.clone()],
+        Some(Value::List { vals, .. }) => vals
+            .iter()
+            .map(|value| {
+                value_to_string(
+                    value,
+                    &format!("decision_recorded descriptor `{field}` evidence contains"),
+                )
+            })
+            .collect::<Result<Vec<_>, ShellError>>()?,
+        Some(_) => {
+            return Err(workflow_error(format!(
+                "decision_recorded() descriptor `{field}` evidence contains must be a string or list of strings"
+            )))
+        }
+    };
+    if contains.len() > 8
+        || contains
+            .iter()
+            .any(|needle| needle.trim().is_empty() || needle.chars().count() > 128)
+    {
+        return Err(workflow_error(format!(
+            "decision_recorded() descriptor `{field}` evidence contains accepts at most eight strings of 1..128 characters"
+        )));
+    }
+    let success = record
+        .get("success")
+        .map(|value| {
+            value_to_bool(
+                value,
+                &format!("decision_recorded descriptor `{field}` evidence success"),
+            )
+        })
+        .transpose()?;
+    if tool.is_none() && contains.is_empty() && success.is_none() {
+        return Err(workflow_error(format!(
+            "decision_recorded() descriptor `{field}` evidence must constrain at least one of tool, contains, or success"
+        )));
+    }
+    Ok(WorkflowFindingEvidencePredicate {
+        tool,
+        contains,
+        success,
+    })
+}
+
 fn workflow_decision_evidence(
     context: &Value,
     required_fields: &[WorkflowFindingSpec],
@@ -11907,6 +12004,7 @@ fn merge_workflow_finding_updates(
     probes: &mut Record,
     outcome: &Value,
     allowed_fields: &[String],
+    finding_specs: &[&WorkflowFindingSpec],
     previous_outcome: Option<&Value>,
     attempt: u32,
 ) -> Result<(), ShellError> {
@@ -11992,6 +12090,11 @@ fn merge_workflow_finding_updates(
                     allowed_fields.join(", ")
                 )));
             }
+            if workflow_finding_has_evidence_predicate(finding_specs, field) {
+                return Err(workflow_error(format!(
+                    "stage finding value `{field}` cannot bypass its evidence predicate; resolve it through probe_resolutions after a sufficient probe"
+                )));
+            }
             let value = match value {
                 Value::String { val, .. } | Value::Glob { val, .. }
                     if !val.trim().is_empty() && val.chars().count() <= 2_048 =>
@@ -12073,6 +12176,13 @@ fn merge_workflow_finding_updates(
                     "stage finding update `{field}.state` must be resolved or unknown"
                 )));
             }
+            if state_name == "resolved"
+                && workflow_finding_has_evidence_predicate(finding_specs, field)
+            {
+                return Err(workflow_error(format!(
+                    "stage finding update `{field}` cannot bypass its evidence predicate; resolve it through probe_resolutions after a sufficient probe"
+                )));
+            }
             state.insert(
                 field.clone(),
                 Value::record(finding.as_ref().clone(), Span::unknown()),
@@ -12117,6 +12227,8 @@ fn merge_workflow_finding_updates(
         let basis = workflow_action_record_basis(outcome, attempt);
         let mut revision = 1_i64;
         let mut bases = Vec::new();
+        let mut summaries = Vec::new();
+        let mut matched_contains = Vec::new();
         if let Some(Value::Record { val: prior, .. }) = probes.get(&field) {
             revision = prior
                 .get("revision")
@@ -12132,23 +12244,61 @@ fn merge_workflow_finding_updates(
             {
                 bases.push(Value::string(val.clone(), span));
             }
+            if let Some(Value::List { vals, .. }) = prior.get("summaries") {
+                summaries.extend(vals.iter().rev().take(3).cloned().rev());
+            } else if let Some(Value::String { val, .. } | Value::Glob { val, .. }) =
+                prior.get("summary")
+            {
+                summaries.push(Value::string(val.clone(), span));
+            }
+            if let Some(Value::List { vals, .. }) = prior.get("matched_contains") {
+                matched_contains.extend(vals.iter().cloned());
+            }
         }
         bases.push(Value::string(basis.clone(), span));
         let summary = workflow_probe_summary(outcome);
-        let mut probe = Record::new();
-        probe.push(
-            "status",
-            Value::string(
-                if summary.is_some() {
-                    "observed"
-                } else {
-                    "insufficient"
-                },
-                span,
-            ),
+        if let Some(summary) = &summary {
+            summaries.push(Value::string(summary.clone(), span));
+        }
+        let outcome_ok = outcome.get("ok").and_then(|value| match value {
+            Value::Bool { val, .. } => Some(*val),
+            _ => None,
+        });
+        let finding_spec = finding_specs
+            .iter()
+            .find(|spec| spec.name == field)
+            .copied();
+        if let Some(predicate) = finding_spec.and_then(|spec| spec.evidence.as_ref()) {
+            for needle in &predicate.contains {
+                let already_matched = matched_contains.iter().any(|value| match value {
+                    Value::String { val, .. } | Value::Glob { val, .. } => val == needle,
+                    _ => false,
+                });
+                if !already_matched && workflow_probe_outcome_contains(outcome, needle) {
+                    matched_contains.push(Value::string(needle.clone(), span));
+                }
+            }
+        }
+        let matched_text = matched_contains
+            .iter()
+            .filter_map(|value| match value {
+                Value::String { val, .. } | Value::Glob { val, .. } => Some(val.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let (probe_status, insufficiency) = workflow_probe_evidence_assessment(
+            finding_spec,
+            &tool,
+            outcome_ok,
+            summary.as_deref(),
+            &matched_text,
         );
+        let mut probe = Record::new();
+        probe.push("status", Value::string(probe_status, span));
         probe.push("basis", Value::string(basis, span));
         probe.push("bases", Value::list(bases, span));
+        probe.push("summaries", Value::list(summaries, span));
+        probe.push("matched_contains", Value::list(matched_contains, span));
         probe.push("revision", Value::int(revision, span));
         probe.push("attempt", Value::int(attempt as i64, span));
         probe.push("tool", Value::string(tool, span));
@@ -12163,9 +12313,21 @@ fn merge_workflow_finding_updates(
         if let Some(summary) = summary {
             probe.push("summary", Value::string(summary, span));
         }
+        if let Some(insufficiency) = insufficiency {
+            probe.push("insufficiency", Value::string(insufficiency, span));
+        }
         probes.insert(field, Value::record(probe, span));
     }
     Ok(())
+}
+
+fn workflow_finding_has_evidence_predicate(
+    finding_specs: &[&WorkflowFindingSpec],
+    field: &str,
+) -> bool {
+    finding_specs
+        .iter()
+        .any(|spec| spec.name == field && spec.evidence.is_some())
 }
 
 fn workflow_probe_summary(outcome: &Record) -> Option<String> {
@@ -12184,6 +12346,74 @@ fn workflow_probe_summary(outcome: &Record) -> Option<String> {
         }
     }
     None
+}
+
+fn workflow_probe_evidence_assessment(
+    spec: Option<&WorkflowFindingSpec>,
+    tool: &str,
+    outcome_ok: Option<bool>,
+    current_summary: Option<&str>,
+    matched_contains: &[&str],
+) -> (&'static str, Option<String>) {
+    if current_summary.is_none_or(|summary| summary.trim().is_empty()) {
+        return (
+            "insufficient",
+            Some("probe output is empty; refine with an action that returns evidence".to_string()),
+        );
+    }
+    let Some(predicate) = spec.and_then(|spec| spec.evidence.as_ref()) else {
+        return ("observed", None);
+    };
+    let mut problems = Vec::new();
+    if let Some(expected) = predicate.tool.as_deref() {
+        if tool != expected {
+            problems.push(format!("expected tool `{expected}`, observed `{tool}`"));
+        }
+    }
+    if let Some(expected) = predicate.success {
+        if outcome_ok != Some(expected) {
+            problems.push(format!(
+                "expected success={expected}, observed {}",
+                outcome_ok
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "missing".to_string())
+            ));
+        }
+    }
+    if !predicate.contains.is_empty() {
+        let missing = predicate
+            .contains
+            .iter()
+            .filter(|needle| !matched_contains.contains(&needle.as_str()))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            problems.push(format!("missing required text: {}", missing.join(", ")));
+        }
+    }
+    if problems.is_empty() {
+        ("observed", None)
+    } else {
+        ("insufficient", Some(problems.join("; ")))
+    }
+}
+
+fn workflow_probe_outcome_contains(outcome: &Record, needle: &str) -> bool {
+    [
+        "content",
+        "stdout_tail",
+        "stderr_tail",
+        "stdout",
+        "stderr",
+        "message",
+    ]
+    .iter()
+    .any(|field| {
+        outcome.get(field).is_some_and(|value| match value {
+            Value::String { val, .. } | Value::Glob { val, .. } => val.contains(needle),
+            _ => false,
+        })
+    })
 }
 
 fn workflow_probe_resolution_basis(probe: &Record, field: &str) -> Result<String, ShellError> {
@@ -12583,6 +12813,29 @@ fn workflow_context_value(
         let mut descriptor = Record::new();
         descriptor.push("kind", Value::string(spec.kind.clone(), span));
         descriptor.push("question", Value::string(spec.question.clone(), span));
+        if let Some(evidence) = &spec.evidence {
+            let mut predicate = Record::new();
+            if let Some(tool) = &evidence.tool {
+                predicate.push("tool", Value::string(tool.clone(), span));
+            }
+            if !evidence.contains.is_empty() {
+                predicate.push(
+                    "contains",
+                    Value::list(
+                        evidence
+                            .contains
+                            .iter()
+                            .map(|needle| Value::string(needle.clone(), span))
+                            .collect(),
+                        span,
+                    ),
+                );
+            }
+            if let Some(success) = evidence.success {
+                predicate.push("success", Value::bool(success, span));
+            }
+            descriptor.push("evidence", Value::record(predicate, span));
+        }
         spec_record.push(&spec.name, Value::record(descriptor, span));
     }
     record.push("finding_specs", Value::record(spec_record, span));
@@ -17619,6 +17872,10 @@ emit({
         fail("typed finding kind was not exposed")
     if step.finding_specs.toolchain.question != "Which compiler builds a MIPS ELF?":
         fail("typed finding question was not exposed")
+    if step.finding_specs.toolchain.evidence.tool != "run_linux":
+        fail("typed finding evidence tool was not exposed")
+    if step.finding_specs.toolchain.evidence.contains != ["mipsel-linux-gnu-gcc"]:
+        fail("typed finding evidence text was not exposed")
     if step.attempt == 1:
         if step.probes != {}:
             fail("probe state must start empty")
@@ -17671,6 +17928,11 @@ workflow task:
             "toolchain": {
                 "kind": "command",
                 "question": "Which compiler builds a MIPS ELF?",
+                "evidence": {
+                    "tool": "run_linux",
+                    "contains": ["mipsel-linux-gnu-gcc"],
+                    "success": True,
+                },
             },
         })
 
@@ -17805,6 +18067,165 @@ emit({
         assert_eq!(value["ok"], json_value!(true));
         assert_eq!(value["status"], json_value!("resolved"));
         assert_eq!(value["revision"], json_value!(2));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_predicate_matches_full_outcome_beyond_retained_summary() {
+        let mut outcome = nu_protocol::Record::new();
+        outcome.push(
+            "content",
+            Value::string(
+                format!("{}required-tail-marker", "x".repeat(3_000)),
+                Span::unknown(),
+            ),
+        );
+        let summary = super::workflow_probe_summary(&outcome).expect("bounded summary");
+        assert!(!summary.contains("required-tail-marker"));
+        assert!(super::workflow_probe_outcome_contains(
+            &outcome,
+            "required-tail-marker"
+        ));
+    }
+
+    #[test]
+    fn workflow_finding_evidence_predicate_explains_required_refinement() -> Result<(), ShellError>
+    {
+        let (engine_state, mut stack, root) = test_engine("workflow-evidence-predicate")?;
+        let program = lower_source(
+            r#"def agent_loop(step):
+    if step.attempt == 1:
+        return {
+            "ok": True,
+            "kind": "read",
+            "tool": "read",
+            "content": "/usr/bin/clang\n",
+            "probe_field": "toolchain",
+        }
+    if step.attempt == 2:
+        if step.probes.toolchain.status != "insufficient":
+            fail("wrong evidence tool must remain insufficient")
+        if "expected tool `run_linux`" not in step.probes.toolchain.insufficiency:
+            fail("wrong-tool recovery was not explained")
+        return {
+            "ok": True,
+            "kind": "success",
+            "tool": "run_linux",
+            "stdout": "/usr/bin/clang\n",
+            "probe_field": "toolchain",
+        }
+    if step.attempt == 3:
+        if step.probes.toolchain.status != "insufficient":
+            fail("missing required text must remain insufficient")
+        if "mipsel-linux-gnu-gcc" not in step.probes.toolchain.insufficiency:
+            fail("missing-text recovery was not explained")
+        return {
+            "ok": True,
+            "kind": "success",
+            "tool": "run_linux",
+            "stdout": "/usr/bin/mipsel-linux-gnu-gcc\n",
+            "probe_field": "toolchain",
+        }
+    if step.probes.toolchain.status != "observed":
+        fail("matching evidence must become resolvable")
+    if len(step.probes.toolchain.summaries) != 3:
+        fail("bounded refinement summaries were not retained")
+    return {
+        "ok": True,
+        "kind": "decision_recorded",
+        "message": "The toolchain evidence predicate is satisfied.",
+        "probe_resolutions": {
+            "toolchain": "use /usr/bin/mipsel-linux-gnu-gcc",
+        },
+        "transition_id": "fixture-evidence-predicate",
+    }
+
+workflow task:
+    stage inspect(goal="resolve compiler", max_actions=4):
+        agent_loop()
+        ensure decision_recorded(resolved={
+            "toolchain": {
+                "kind": "command",
+                "question": "Which compiler builds the target?",
+                "evidence": {
+                    "tool": "run_linux",
+                    "contains": ["mipsel-linux-gnu-gcc"],
+                    "success": True,
+                },
+            },
+        })
+
+report = workflow_run(task)
+emit({
+    "ok": report.ok,
+    "status": report.stages[0].probes.toolchain.status,
+    "revision": report.stages[0].probes.toolchain.revision,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(true));
+        assert_eq!(value["status"], json_value!("resolved"));
+        assert_eq!(value["revision"], json_value!(3));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_finding_evidence_predicate_rejects_legacy_resolution_bypass(
+    ) -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-evidence-bypass")?;
+        let program = lower_source(
+            r#"def agent_loop(step):
+    return {
+        "ok": True,
+        "kind": "decision_recorded",
+        "message": "Claimed through a compatibility field.",
+        "finding_updates": {
+            "toolchain": {
+                "state": "resolved",
+                "value": "use mipsel-linux-gnu-gcc",
+                "basis": "model-authored basis",
+            },
+        },
+    }
+
+workflow task:
+    stage inspect(goal="resolve compiler", max_actions=1):
+        agent_loop()
+        ensure decision_recorded(resolved={
+            "toolchain": {
+                "kind": "command",
+                "question": "Which compiler builds the target?",
+                "evidence": {
+                    "tool": "run_linux",
+                    "contains": ["mipsel-linux-gnu-gcc"],
+                    "success": True,
+                },
+            },
+        })
+
+workflow_run(task)
+"#,
+        )?;
+        let error = match eval_program_with_output(
+            &engine_state,
+            &mut stack,
+            &program,
+            PipelineData::empty(),
+        ) {
+            Ok(_) => panic!("predicate-backed finding bypass must fail"),
+            Err(error) => error,
+        };
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("cannot bypass its evidence predicate"),
+            "{message}"
+        );
+        assert!(message.contains("probe_resolutions"), "{message}");
         cleanup_dir(&root);
         Ok(())
     }

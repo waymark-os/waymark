@@ -304,5 +304,60 @@ Artifacts:
 and
 `../../waymark-gateway/target/runs/staged-stone-doom-v26-streamed-lines-coverage-terra/cell/cell.json`
 
+## Executable evidence predicates
+
+The author can now refine `{kind, question}` with a small predicate over the
+acquiring tool outcome:
+
+```stone
+ensure decision_recorded(resolved={
+    "frame_backend": {
+        "kind": "file",
+        "question": "Which source implements the frame writer and entry?",
+        "evidence": {
+            "tool": "read",
+            "contains": ["/tmp/frame.bmp", "my_stdlib.h", "__start"],
+            "success": True,
+        },
+    },
+})
+```
+
+The interpreter checks the full outcome, retains only bounded summaries and
+matched needles, and reports wrong-tool, wrong-success, empty-output, and
+missing-string obligations as `probe.insufficiency`. Legacy finding updates
+cannot bypass a predicate. `contains` is deliberately a minimal executable
+predicate, not a claim that substring presence proves arbitrary semantics.
+
+The learnability canary took three prompt iterations. The first draft attached
+the descriptor to `agent_loop`; the second used the right location but
+invented `kind="inspection"`; after showing the complete form and the
+`text|path|file|command` enum, the third draft passed the feature gate and the
+actual Stone parser on its first response. Complete local syntax examples and
+explicit enums materially reduce repair rounds.
+
+The Doom experiment then found two specification/runtime errors rather than
+silently accepting weak findings. Required strings beyond the retained summary
+initially failed, so matching moved to the full outcome with bounded retained
+witnesses. Requiring `success=True` for compiler discovery also rejected valid
+evidence that the compiler was absent but available as a package, so that
+field now accepts either an installed command or a concrete installation
+strategy. The corrected harness resolved all four inspection fields and
+entered build.
+
+The next failure is a stage-interface failure: build received
+`completed_stages=["inspect"]` but not inspection's typed findings. It
+rediscovered the compiler and backend, then ran out of actions locating the
+known `my_stdlib.h` dependency. The next syntax/runtime experiment should make
+completed-stage findings a bounded typed input to later stages; prompt memory
+projection should not be the only dataflow mechanism.
+
+Artifacts:
+`target/runs/staged-harness-finding-evidence-authorship-v3-terra/aggregate.json`,
+`../../waymark-gateway/target/runs/staged-stone-doom-v27-finding-evidence-predicates-terra/cell/cell.json`,
+`../../waymark-gateway/target/runs/staged-stone-doom-v28-full-outcome-predicates-terra/cell/cell.json`,
+and
+`../../waymark-gateway/target/runs/staged-stone-doom-v29-toolchain-strategy-terra/cell/cell.json`.
+
 Artifact:
 `../../waymark-gateway/target/runs/staged-stone-doom-v12-typed-decisions-terra/cell/cell.json`

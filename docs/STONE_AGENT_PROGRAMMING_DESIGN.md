@@ -1616,6 +1616,33 @@ should therefore admit task-authored evidence predicates or typed acquisition
 recipes, and multi-contract gates should direct repair at the still-missing
 contract without discarding already-satisfied evidence.
 
+The first task-authored predicate is deliberately small:
+`evidence={tool?, contains?, success?}` on a resolved finding descriptor. The
+kernel checks it against the full acquiring outcome, but retains only bounded
+summaries and the exact required strings that matched. Failed checks produce a
+structured insufficiency reason and cannot be bypassed through legacy finding
+updates. This gives the task harness a mechanical lower bound on evidence
+quality while leaving semantic interpretation with the model and final task
+truth with artifact, command, and verifier contracts.
+
+Both authorship and execution refined the design. Models learned the construct
+once the prompt showed its complete syntactic parent and enumerated valid
+finding kinds. Full-outcome checking avoided false negatives caused by compact
+memory, while a toolchain predicate showed that `success=True` is not
+universally desirable: command failure can prove absence and motivate a
+specific install strategy. On Doom, the corrected predicates resolved source
+layout, toolchain, frame backend, and VM runtime contract, and inspection
+advanced honestly.
+
+That success exposed a missing programming-model boundary. The build context
+received only the name of the completed inspection stage, not its verified
+typed findings. It consequently rediscovered facts and exhausted its budget
+on a dependency inspection had already named. Completed-stage findings should
+be explicit, bounded stage outputs projected into later workflow contexts.
+This is ordinary typed dataflow between process phases, not an incidental
+memory-search optimization; the harness should be able to name and constrain
+the interface while the runtime owns retention and provenance.
+
 Runtime diagnostics are part of that interface. A generic JSON `oneOf` error
 did not help the model repair an illegal action. Validation now reports allowed
 discriminators and the nearest branch's missing or extra fields, and the

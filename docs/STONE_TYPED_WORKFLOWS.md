@@ -518,6 +518,63 @@ Artifacts:
 and
 `../../waymark-gateway/target/runs/staged-stone-doom-v26-streamed-lines-coverage-terra/cell/cell.json`
 
+### Executable finding-evidence predicates
+
+A finding descriptor may now state a small, mechanically checked acquisition
+obligation:
+
+```stone
+ensure decision_recorded(resolved={
+    "runtime_contract": {
+        "kind": "text",
+        "question": "Which ELF sections and entry symbol does vm.js use?",
+        "evidence": {
+            "tool": "read",
+            "contains": ["sectionsToLoad", "symbolName === 'main'"],
+            "success": True,
+        },
+    },
+})
+```
+
+`tool`, `contains`, and `success` are optional, but at least one must be
+present. The runtime evaluates them against the full tool outcome while
+retaining only bounded summaries and the matched required strings. A wrong
+tool, wrong success state, empty result, or missing string marks the probe
+`insufficient` and records the exact unmet condition. Predicate-backed fields
+cannot be resolved through the legacy unproven finding-update paths.
+
+This form was learnable after the authoring prompt showed the complete
+`agent_loop()` plus `decision_recorded(resolved=...)` shape and enumerated the
+four valid finding kinds. Two earlier canaries respectively misplaced the
+predicate on `agent_loop` and invented a fifth kind; the corrected canary
+authored and passed Stone admission on its first response. This is evidence
+that the construct is learnable with a concrete grammar example, not that
+field questions or predicates can yet be inferred automatically.
+
+The Doom runs exposed two useful semantics. First, matching against a retained
+2 KiB summary produced a false negative when required text appeared later in a
+file; matching the full outcome while retaining only matched needles fixes
+that without growing memory. Second, a successful-command predicate was wrong
+for toolchain discovery: proving that a compiler is absent and an installable
+package exists is useful evidence despite a failed lookup. The final predicate
+therefore asks for a `mips` tool or installation strategy without requiring a
+successful lookup.
+
+With those corrections, inspection resolved all four fields and the workflow
+advanced to build. The build stage did not receive the verified findings,
+however; workflow context currently exposes only completed stage names. It
+rediscovered some facts and exhausted its budget while looking for the already
+known header. The next typed-workflow construct should therefore expose
+bounded, typed outputs from completed stages to dependent stages.
+
+Artifacts:
+`target/runs/staged-harness-finding-evidence-authorship-v3-terra/aggregate.json`,
+`../../waymark-gateway/target/runs/staged-stone-doom-v27-finding-evidence-predicates-terra/cell/cell.json`,
+`../../waymark-gateway/target/runs/staged-stone-doom-v28-full-outcome-predicates-terra/cell/cell.json`,
+and
+`../../waymark-gateway/target/runs/staged-stone-doom-v29-toolchain-strategy-terra/cell/cell.json`.
+
 ```stone
 def repair_output(step):
     return run(["sh", "-c", "printf ready > artifact.txt"])

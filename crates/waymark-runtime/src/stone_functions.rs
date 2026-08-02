@@ -67,10 +67,18 @@ impl WorkflowHandlerValue {
 }
 
 #[derive(Clone)]
+pub(super) struct WorkflowFindingEvidencePredicateValue {
+    pub(super) tool: Option<String>,
+    pub(super) contains: Vec<String>,
+    pub(super) success: Option<bool>,
+}
+
+#[derive(Clone)]
 pub(super) struct WorkflowFindingSpecValue {
     pub(super) name: String,
     pub(super) kind: String,
     pub(super) question: String,
+    pub(super) evidence: Option<WorkflowFindingEvidencePredicateValue>,
 }
 
 #[derive(Clone)]

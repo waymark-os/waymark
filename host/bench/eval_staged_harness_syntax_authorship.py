@@ -25,6 +25,7 @@ file called doomgeneric_mips and will run it. Please figure out the rest and
 build the doomgeneric_mips ELF for me, so that I can run `node vm.js`. After
 running `node vm.js` I expect that stdout will be printed appropriately, and
 frames will be written to the file system."""
+STANDARD_AGENT_LIBRARY = ROOT / "examples/scripts/standard_stage_agent.stone"
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,6 +36,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arm", action="append", choices=ARMS, dest="arms")
     parser.add_argument("--codex", default="codex")
     parser.add_argument(
+        "--waymark-bin", type=Path, default=ROOT / "target/debug/waymark"
+    )
+    parser.add_argument(
         "--run-root",
         type=Path,
         default=ROOT / "target/runs/staged-harness-syntax-authorship-v1",
@@ -42,10 +46,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--reuse-existing", action="store_true")
+    parser.add_argument(
+        "--finding-evidence-predicates",
+        action="store_true",
+        help="Require resolved finding descriptors to use executable evidence predicates.",
+    )
     return parser.parse_args()
 
 
-def common_prompt() -> str:
+def common_prompt(require_finding_evidence: bool = False) -> str:
+    predicate_guidance = ""
+    if require_finding_evidence:
+        predicate_guidance = """
+For every resolved inspection finding, use a descriptor with an executable
+`evidence` predicate. The predicate supports exactly:
+- `kind`: one of text, path, file, or command
+- `tool`: one of read, find, search, run_linux, or run_complete
+- `contains`: a string or list of required literal substrings
+- `success`: a boolean required tool outcome
+
+Example:
+```
+agent_loop()
+ensure decision_recorded(resolved={
+    "runtime_contract": {
+        "kind": "command",
+        "question": "How is the ELF loaded?",
+        "evidence": {
+            "tool": "read",
+            "contains": ["entryPoint"],
+            "success": True,
+        },
+    },
+})
+```
+
+Use predicates for source layout, exact toolchain, frame backend dependencies,
+and VM runtime/ABI requirements. They are evidence-acquisition obligations, not
+claims that the fact is already known. Put descriptors only in
+`decision_recorded(resolved={...})`; `agent_loop()` takes no arguments.
+"""
     return f"""You are evaluating an LLM-oriented programming-language surface.
 Write one complete Stone harness specification for the public task below. Do
 not call tools, inspect files, solve the task, or return prose. Return only the
@@ -86,13 +126,14 @@ agent's decide action must then record state, value, and an observation basis
 for every field. An unknown finding keeps the stage open. Use fields= only when
 a non-empty structural finding is sufficient.
 Existing task inputs and generic prose are not evidence that planning happened.
+{predicate_guidance}
 
 Public task:
 {TASK}
 """
 
 
-def arm_prompt(arm: str) -> str:
+def arm_prompt(arm: str, require_finding_evidence: bool = False) -> str:
     if arm == "decorator":
         interface = r'''
 Use only this declaration form:
@@ -164,7 +205,7 @@ workflow(...), or workflow_run(...).
 '''
     else:
         raise ValueError(f"unknown arm: {arm}")
-    return common_prompt() + "\nSyntax arm:\n" + interface
+    return common_prompt(require_finding_evidence) + "\nSyntax arm:\n" + interface
 
 
 def output_schema() -> dict[str, Any]:
@@ -215,6 +256,11 @@ def stage_names(arm: str, source: str) -> list[str]:
 def source_features(arm: str, source: str) -> dict[str, Any]:
     names = stage_names(arm, source)
     lowered = source.lower()
+    resolved_descriptors = resolved_descriptor_source(source)
+    finding_kinds = re.findall(
+        r"(?:['\"]kind['\"]|\bkind)\s*:\s*['\"]([^'\"]+)['\"]",
+        resolved_descriptors,
+    )
     build_index = next(
         (index for index, name in enumerate(names) if "build" in name.lower()),
         None,
@@ -273,6 +319,35 @@ def source_features(arm: str, source: str) -> dict[str, Any]:
         "resolved_decision_fields": bool(
             re.search(r"decision_recorded\s*\([^)]*\bresolved\s*=", source)
         ),
+        "finding_evidence_count": len(
+            re.findall(
+                r"(?:['\"]evidence['\"]|\bevidence)\s*:",
+                resolved_descriptors,
+            )
+        ),
+        "finding_evidence_tool": bool(
+            re.search(
+                r"(?:['\"]tool['\"]|\btool)\s*:", resolved_descriptors
+            )
+        ),
+        "finding_evidence_contains": bool(
+            re.search(
+                r"(?:['\"]contains['\"]|\bcontains)\s*:",
+                resolved_descriptors,
+            )
+        ),
+        "finding_evidence_success": bool(
+            re.search(
+                r"(?:['\"]success['\"]|\bsuccess)\s*:",
+                resolved_descriptors,
+            )
+        ),
+        "finding_kinds": finding_kinds,
+        "invalid_finding_kinds": [
+            kind
+            for kind in finding_kinds
+            if kind not in ("text", "path", "file", "command")
+        ],
         "decorator_count": source.count("@stage("),
         "workflow_call": "workflow(" in source and "workflow_run(" in source,
         "workflow_block": bool(
@@ -284,6 +359,37 @@ def source_features(arm: str, source: str) -> dict[str, Any]:
         "lines": len(source.splitlines()),
         "bytes": len(source.encode("utf-8")),
     }
+
+
+def resolved_descriptor_source(source: str) -> str:
+    match = re.search(
+        r"decision_recorded\s*\(\s*resolved\s*=\s*\{", source
+    )
+    if match is None:
+        return ""
+    start = match.end() - 1
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for index in range(start, len(source)):
+        char = source[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in ("'", '"'):
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : index + 1]
+    return ""
 
 
 def syntax_gate(arm: str, features: dict[str, Any]) -> list[str]:
@@ -318,7 +424,9 @@ def syntax_gate(arm: str, features: dict[str, Any]) -> list[str]:
     return violations
 
 
-def semantic_gate(features: dict[str, Any]) -> list[str]:
+def semantic_gate(
+    features: dict[str, Any], require_finding_evidence: bool = False
+) -> list[str]:
     violations: list[str] = []
     for field in (
         "repairable_checkpoint",
@@ -341,6 +449,21 @@ def semantic_gate(features: dict[str, Any]) -> list[str]:
         violations.append("inspection/planning decision lacks typed finding fields")
     if features["decision_stage"] and not features["resolved_decision_fields"]:
         violations.append("inspection/planning findings do not require resolved state")
+    if require_finding_evidence and features["decision_stage"]:
+        if int(features["finding_evidence_count"]) < 4:
+            violations.append("expected at least four finding evidence predicates")
+        for field in (
+            "finding_evidence_tool",
+            "finding_evidence_contains",
+            "finding_evidence_success",
+        ):
+            if not features[field]:
+                violations.append(f"missing {field}")
+        invalid_kinds = features.get("invalid_finding_kinds", [])
+        if invalid_kinds:
+            violations.append(
+                "invalid finding kinds: " + ", ".join(invalid_kinds)
+            )
     return violations
 
 
@@ -361,11 +484,20 @@ def evaluate_once(
         source = source_path.read_text(encoding="utf-8")
         features = source_features(arm, source)
         syntax_violations = syntax_gate(arm, features)
-        semantic_violations = semantic_gate(features)
+        admission_ok, admission_error = admit_block_source(
+            args, arm, source, run_dir
+        )
+        if not admission_ok:
+            syntax_violations.append(f"Stone admission failed: {admission_error}")
+        semantic_violations = semantic_gate(
+            features, args.finding_evidence_predicates
+        )
         result = {
             **prior,
             "ok": not syntax_violations and not semantic_violations,
             "syntax_ok": not syntax_violations,
+            "admission_ok": admission_ok,
+            "admission_error": admission_error,
             "semantic_ok": not semantic_violations,
             "features": features,
             "syntax_violations": syntax_violations,
@@ -401,7 +533,12 @@ def evaluate_once(
         )
     features = source_features(arm, source or "")
     syntax_violations = syntax_gate(arm, features)
-    semantic_violations = semantic_gate(features)
+    admission_ok, admission_error = admit_block_source(
+        args, arm, source or "", run_dir
+    )
+    if not admission_ok:
+        syntax_violations.append(f"Stone admission failed: {admission_error}")
+    semantic_violations = semantic_gate(features, args.finding_evidence_predicates)
     violations = [*syntax_violations, *semantic_violations]
     result = {
         "ok": (
@@ -418,6 +555,8 @@ def evaluate_once(
         "duration_seconds": duration,
         "output_error": output_error,
         "syntax_ok": not syntax_violations,
+        "admission_ok": admission_ok,
+        "admission_error": admission_error,
         "semantic_ok": not semantic_violations,
         "features": features,
         "syntax_violations": syntax_violations,
@@ -429,6 +568,45 @@ def evaluate_once(
         json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     return result
+
+
+def admit_block_source(
+    args: argparse.Namespace, arm: str, source: str, run_dir: Path
+) -> tuple[bool, str | None]:
+    if arm == "decorator":
+        return True, None
+    library = STANDARD_AGENT_LIBRARY.read_text(encoding="utf-8")
+    declarations = re.sub(
+        r"(?m)^run\s+[A-Za-z_][A-Za-z0-9_]*\s*$", "", source
+    )
+    admission_source = (
+        library.rstrip()
+        + "\n\n"
+        + declarations.rstrip()
+        + '\n\nemit({"admitted": True})\n'
+    )
+    admission_path = run_dir / "admission.stone"
+    admission_path.write_text(admission_source, encoding="utf-8")
+    work = run_dir / "admission-work"
+    work.mkdir(exist_ok=True)
+    completed = base.run_capture(
+        [str(args.waymark_bin.resolve()), "eval", str(admission_path)],
+        cwd=work,
+        timeout=60,
+    )
+    payload = base.response_payload(completed)
+    if (
+        completed.returncode == 0
+        and isinstance(payload, dict)
+        and payload.get("ok") is True
+    ):
+        return True, None
+    detail = completed.stderr.strip()
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            detail = str(error.get("detail") or error.get("message") or detail)
+    return False, detail or f"waymark exited {completed.returncode}"
 
 
 def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -482,7 +660,10 @@ def main() -> int:
         shutil.rmtree(run_root)
     run_root.mkdir(parents=True, exist_ok=True)
     selected_arms = tuple(args.arms or ARMS)
-    prompts = {arm: arm_prompt(arm) for arm in selected_arms}
+    prompts = {
+        arm: arm_prompt(arm, args.finding_evidence_predicates)
+        for arm in selected_arms
+    }
     results = {arm: [] for arm in selected_arms}
     for trial in range(1, args.trials + 1):
         for arm in selected_arms:
@@ -508,6 +689,7 @@ def main() -> int:
         "model": args.model,
         "reasoning_effort": args.reasoning_effort,
         "trials": args.trials,
+        "finding_evidence_predicates": args.finding_evidence_predicates,
         "arms": arms,
         "run_root": str(run_root),
     }

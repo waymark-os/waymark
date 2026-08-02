@@ -2,31 +2,51 @@
 #
 # The inspection contract names the semantic obligations, their observation
 # kinds, and the concrete questions to answer. Four probe actions plus one
-# final decision plus bounded refinements fit the nine-action budget. The standard controller binds
-# every observation to one field and the workflow runtime owns provenance.
+# final decision plus locator and sufficiency refinements fit the fourteen-action
+# budget. The standard controller binds every observation to one field and the
+# workflow runtime owns provenance.
 
 workflow project:
     stage inspect(
         goal="inspect the Doom source, target runtime, and build requirements",
-        max_actions=9,
+        max_actions=14,
     ):
         agent_loop()
         ensure decision_recorded(resolved={
             "source_layout": {
                 "kind": "path",
-                "question": "Which directory contains the Doom C sources?",
+                "question": "Which directory and build file contain the Doom C sources?",
+                "evidence": {
+                    "tool": "find",
+                    "contains": ["doomgeneric.c", "Makefile"],
+                    "success": True,
+                },
             },
             "toolchain": {
                 "kind": "command",
-                "question": "Which compiler and flags produce the required MIPS ELF?",
+                "question": "Which compiler/linker should produce a freestanding little-endian MIPS ELF, and what package should be installed if it is absent?",
+                "evidence": {
+                    "tool": "run_linux",
+                    "contains": ["mips"],
+                },
             },
             "frame_backend": {
                 "kind": "file",
-                "question": "Which source implements the required frame writer?",
+                "question": "What frame output, custom-library dependency, and entry symbol does doomgeneric_img.c require?",
+                "evidence": {
+                    "tool": "read",
+                    "contains": ["/tmp/frame.bmp", "my_stdlib.h", "__start"],
+                    "success": True,
+                },
             },
             "runtime_contract": {
                 "kind": "command",
-                "question": "How does vm.js invoke the ELF and what output does it require?",
+                "question": "Which ELF sections and symbol does vm.js load before executing the program?",
+                "evidence": {
+                    "tool": "read",
+                    "contains": ["sectionsToLoad", "symbolName === 'main'"],
+                    "success": True,
+                },
             },
         })
 

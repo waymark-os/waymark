@@ -76,6 +76,17 @@ run doom
 '''
 
 
+PREDICATE_CONTRACT_SOURCE = CONTRACT_SOURCE.replace(
+    'resolved=["source_layout", "toolchain"]',
+    '''resolved={
+            "source_layout": {"question": "Where?", "evidence": {"tool": "find", "contains": "doomgeneric.c", "success": True}},
+            "toolchain": {"question": "Which compiler?", "evidence": {"tool": "run_linux", "contains": "mips", "success": True}},
+            "frame_backend": {"question": "Which backend?", "evidence": {"tool": "read", "contains": "/tmp/frame.bmp", "success": True}},
+            "runtime_contract": {"question": "Which ABI?", "evidence": {"tool": "read", "contains": "entryPoint", "success": True}},
+        }''',
+)
+
+
 class StagedHarnessSyntaxAuthorshipTests(unittest.TestCase):
     def test_prompts_share_task_and_semantics(self) -> None:
         decorator = EXPERIMENT.arm_prompt("decorator")
@@ -90,6 +101,33 @@ class StagedHarnessSyntaxAuthorshipTests(unittest.TestCase):
         self.assertIn("@stage(", decorator)
         self.assertIn("workflow project:", block)
         self.assertIn("ensure expression", EXPERIMENT.arm_prompt("contract"))
+
+    def test_predicate_prompt_and_gate_require_executable_evidence(self) -> None:
+        prompt = EXPERIMENT.arm_prompt("contract", True)
+        self.assertIn("descriptor with an executable", prompt)
+        self.assertIn("`evidence` predicate", prompt)
+        self.assertIn('"contains"', prompt)
+        features = EXPERIMENT.source_features(
+            "contract", PREDICATE_CONTRACT_SOURCE
+        )
+        self.assertEqual([], EXPERIMENT.semantic_gate(features, True))
+        missing = EXPERIMENT.source_features("contract", CONTRACT_SOURCE)
+        violations = EXPERIMENT.semantic_gate(missing, True)
+        self.assertTrue(any("four finding evidence" in item for item in violations))
+        misplaced = CONTRACT_SOURCE.replace(
+            "agent_loop()",
+            'agent_loop({"evidence": {"tool": "read", "contains": "x", "success": True}})',
+            1,
+        )
+        misplaced_features = EXPERIMENT.source_features("contract", misplaced)
+        self.assertEqual(0, misplaced_features["finding_evidence_count"])
+        invalid_kind = PREDICATE_CONTRACT_SOURCE.replace(
+            '"question": "Where?"',
+            '"kind": "inspection", "question": "Where?"',
+        )
+        invalid_features = EXPERIMENT.source_features("contract", invalid_kind)
+        invalid_violations = EXPERIMENT.semantic_gate(invalid_features, True)
+        self.assertTrue(any("invalid finding kinds" in item for item in invalid_violations))
 
     def test_structural_gate_accepts_equivalent_examples(self) -> None:
         for arm, source in (
