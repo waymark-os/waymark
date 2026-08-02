@@ -420,6 +420,75 @@ observation. Finding state and budget accounting are therefore separate design
 axes: retain the strict state gate, then make incremental publication cheaper
 or give it an explicit budget class.
 
+### Runtime-owned incremental findings
+
+The workflow kernel now retains one bounded finding map per stage and exposes
+it as `step.findings`. An action may return `finding_values={field: value}` for
+facts established by its prior tool outcome. The kernel accepts only declared
+resolved fields, creates the `{state: "resolved", value, basis}` record, and
+derives `basis` from that prior action. Explicit nested `finding_updates` and
+decision findings remain supported as the lower-level compatibility surface.
+
+The standard controller presents the smaller form as a top-level
+`learned={field: value}` action annotation and accepts
+`unknown={field: reason}` on the bounded final report. Only unresolved fields
+appear in those schemas. `learned` is unavailable until a real `read`, `write`,
+`run_linux`, or `run_complete` outcome exists, so a schema error or prose
+decision cannot become provenance. The final decision requires only its
+answer; evidence evaluation reads the accumulated kernel state.
+
+For resolved-decision stages, unresolved fields admit only tool/probe actions.
+Decision actions become available once all fields resolve, or on the last
+action so failure can be reported honestly. The schema prompt is generated
+from the same state. Validation failures for `oneOf` action schemas enumerate
+allowed discriminators and describe the nearest branch, making the recovery
+visible to the model.
+
+A Doom rollout used this form without a separate publication action and
+retained `source_layout` with basis `runtime:action:1:read:.`. It then failed
+safely with the other three fields named as missing. This validates incremental
+state retention and control gating; it does not yet validate evidence
+acquisition policy. Field-directed probes are the next open construct.
+
+### Field-directed probes
+
+`decision_recorded(resolved=...)` also accepts typed finding descriptors:
+
+```stone
+ensure decision_recorded(resolved={
+    "source_layout": {
+        "kind": "path",
+        "question": "Which directory contains the Doom C sources?",
+    },
+    "toolchain": {
+        "kind": "command",
+        "question": "Which compiler and flags produce the target ELF?",
+    },
+})
+```
+
+The kernel exposes these as `step.finding_specs` and retains bounded
+`step.probes`. On a resolved-finding stage, each ordinary tool action carries
+`for_field`; a later action may carry `resolves={field: interpretation}`. The
+kernel accepts a resolution only when that field has a retained observation,
+copies the observation's runtime-owned basis into the finding, and marks the
+probe resolved. A response may resolve one observed field while probing the
+next. The compatibility forms `finding_values` and `finding_updates` remain
+available but are no longer the standard controller surface.
+
+The Doom comparison improved obligation coverage from one of four fields to
+four of four. It still failed safely: only `source_layout` resolved. Compiler
+discovery failed, a shallow source listing did not identify the supplied frame
+backend, and the bounded prefix of `vm.js` did not reach its invocation logic.
+This separates two concerns that the earlier interface conflated:
+field-directed scheduling works, but an observation is not necessarily
+sufficient evidence. The next acquisition construct should support focused
+search/tail or other typed probes, an explicit insufficient/refine state, and
+retry budget beyond one probe per field.
+
+Artifact:
+`../../waymark-gateway/target/runs/staged-stone-doom-v24-field-directed-probes-terra/cell/cell.json`
+
 ```stone
 def repair_output(step):
     return run(["sh", "-c", "printf ready > artifact.txt"])

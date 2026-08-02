@@ -12,13 +12,50 @@
 # - replace agent_loop itself to add hooks, critics, or a different policy.
 # Every replacement remains ordinary admitted Stone source.
 
-def stage_agent_schema_prompt():
-    return "Return {\"actions\":[A]} with exactly one A: read(path), write(path,content), run_linux(argv,cwd?,stdin?,timeout_ms?), run_complete(argv,cwd?,stdin?,timeout_ms?), decide(answer,findings?), finish(answer,findings?), or final(answer,findings?). read(path) returns bounded text for a file or a bounded shallow listing for a directory. decide records a stage-local inspection or planning decision. decision_fields require one non-empty string per name. resolved_decision_fields require one {state: resolved|unknown, value: string, basis: string} record per name; report unknown honestly until observation supports a resolved value. It does not finish the whole task. Encode tools as {\"tool\":name,\"input\":object}; encode final as {\"final\":{\"answer\":string}}. Use relative paths for task-workspace files; Linux commands see that same root at /app. Prefer run_complete for a bounded build or test that must finish. Do not invent outcomes or use unlisted fields."
+def stage_agent_schema_prompt(step):
+    remaining = step.max_actions - step.attempt + 1
+    resolved_fields = get(step, "resolved_decision_fields", [])
+    unresolved = []
+    current_findings = get(step, "findings", {})
+    probes = get(step, "probes", {})
+    unobserved = []
+    for field in resolved_fields:
+        if get(get(current_findings, field, {}), "state", "unknown") != "resolved":
+            unresolved.append(field)
+            if get(get(probes, field, {}), "status", "missing") != "observed":
+                unobserved.append(field)
+    decision_stage = "decision_recorded" in step.contracts
+    allowed_now = "read, write, run_linux, or run_complete"
+    if decision_stage and remaining == 1:
+        allowed_now = "decide, finish, or final"
+    elif decision_stage and len(unobserved) == 0 and len(resolved_fields) > 0:
+        allowed_now = "decide, finish, or final"
+    elif decision_stage and len(resolved_fields) == 0:
+        allowed_now = "read, write, run_linux, run_complete, decide, finish, or final"
+    return "Return {\"actions\":[A]} with exactly one A. Allowed now: " + allowed_now + ". Canonical probe shape: {\"tool\":\"read\",\"input\":{\"path\":\"src\"},\"for_field\":\"source_layout\"}. Canonical probe-and-resolve shape: {\"tool\":\"run_linux\",\"input\":{\"argv\":[\"command\",\"-v\",\"mipsel-linux-gnu-gcc\"]},\"for_field\":\"toolchain\",\"resolves\":{\"source_layout\":\"sources are under src\"}}. Canonical decision shape: {\"tool\":\"decide\",\"input\":{\"answer\":\"...\"},\"resolves\":{\"toolchain\":\"use mipsel-linux-gnu-gcc\"}}. Never replace tool with action/type, and never put answer beside tool. On a resolved-finding stage, every tool action must use for_field to name the unresolved obligation it probes. resolves may interpret only retained probe observations; the runtime supplies provenance. A final decision may carry unknown={field: reason}. read(path) returns bounded file text or a shallow directory listing. Use run_linux for environment or toolchain facts and run_complete only for a bounded build/test gate. Full findings records remain accepted for compatibility but need not be repeated. Use relative workspace paths; Linux commands see the root at /app. Do not invent outcomes or use unlisted fields."
 
 
 def stage_agent_action_schema(step):
     decision_fields = get(step, "decision_fields", [])
     resolved_decision_fields = get(step, "resolved_decision_fields", [])
+    unresolved_decision_fields = []
+    current_findings = get(step, "findings", {})
+    for field in resolved_decision_fields:
+        if get(get(current_findings, field, {}), "state", "unknown") != "resolved":
+            unresolved_decision_fields.append(field)
+    observed_probe_fields = []
+    unobserved_probe_fields = []
+    probes = get(step, "probes", {})
+    for field in unresolved_decision_fields:
+        if get(get(probes, field, {}), "status", "missing") == "observed":
+            observed_probe_fields.append(field)
+        else:
+            unobserved_probe_fields.append(field)
+    can_resolve = len(observed_probe_fields) > 0
+    all_unresolved_observed = (
+        len(unresolved_decision_fields) > 0
+        and len(unobserved_probe_fields) == 0
+    )
     answer = {
         "type": "object",
         "properties": {"answer": {"type": "string", "minLength": 1}},
@@ -27,6 +64,8 @@ def stage_agent_action_schema(step):
     }
     if len(resolved_decision_fields) > 0:
         finding_properties = {}
+        resolution_properties = {}
+        unknown_properties = {}
         for field in resolved_decision_fields:
             finding_properties[field] = {
                 "type": "object",
@@ -38,13 +77,29 @@ def stage_agent_action_schema(step):
                 "required": ["state", "value", "basis"],
                 "additionalProperties": False,
             }
+            if field in observed_probe_fields:
+                resolution_properties[field] = {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2048,
+                }
+            if field in unresolved_decision_fields:
+                unknown_properties[field] = {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024,
+                }
         answer["properties"]["findings"] = {
             "type": "object",
             "properties": finding_properties,
             "required": resolved_decision_fields,
             "additionalProperties": False,
         }
-        answer["required"].append("findings")
+        answer["properties"]["unknown"] = {
+            "type": "object",
+            "properties": unknown_properties,
+            "additionalProperties": False,
+        }
     elif len(decision_fields) > 0:
         finding_properties = {}
         for field in decision_fields:
@@ -119,6 +174,19 @@ def stage_agent_action_schema(step):
         "required": ["tool", "input"],
         "additionalProperties": False,
     }
+    if len(resolved_decision_fields) > 0:
+        probe_targets = unobserved_probe_fields
+        if len(probe_targets) == 0:
+            probe_targets = unresolved_decision_fields
+        probe_field = {"type": "string", "enum": probe_targets}
+        read_action["properties"]["for_field"] = probe_field
+        read_action["required"].append("for_field")
+        write_action["properties"]["for_field"] = probe_field
+        write_action["required"].append("for_field")
+        run_action["properties"]["for_field"] = probe_field
+        run_action["required"].append("for_field")
+        complete_action["properties"]["for_field"] = probe_field
+        complete_action["required"].append("for_field")
     decide_action = {
         "type": "object",
         "properties": {"tool": {"const": "decide"}, "input": answer},
@@ -137,11 +205,39 @@ def stage_agent_action_schema(step):
         "required": ["final"],
         "additionalProperties": False,
     }
+    if len(resolved_decision_fields) > 0:
+        unknown = {
+            "type": "object",
+            "properties": unknown_properties,
+            "additionalProperties": False,
+        }
+        decide_action["properties"]["unknown"] = unknown
+        finish_action["properties"]["unknown"] = unknown
+        final_action["properties"]["unknown"] = unknown
+        if can_resolve:
+            resolutions = {
+                "type": "object",
+                "properties": resolution_properties,
+                "additionalProperties": False,
+            }
+            read_action["properties"]["resolves"] = resolutions
+            write_action["properties"]["resolves"] = resolutions
+            run_action["properties"]["resolves"] = resolutions
+            complete_action["properties"]["resolves"] = resolutions
+            decide_action["properties"]["resolves"] = resolutions
+            finish_action["properties"]["resolves"] = resolutions
+            final_action["properties"]["resolves"] = resolutions
     choices = [read_action, write_action, run_action, complete_action]
     remaining = step.max_actions - step.attempt + 1
     decision_stage = "decision_recorded" in step.contracts
     mode = stage_agent_mode(step)
     if decision_stage and remaining == 1:
+        choices = [decide_action, finish_action, final_action]
+    elif decision_stage and all_unresolved_observed:
+        choices = [decide_action, finish_action, final_action]
+    elif decision_stage and len(unresolved_decision_fields) > 0:
+        choices = [read_action, write_action, run_action, complete_action]
+    elif decision_stage and len(resolved_decision_fields) > 0:
         choices = [decide_action, finish_action, final_action]
     elif decision_stage and mode == "execute_or_repair":
         choices = [write_action, complete_action, decide_action, finish_action, final_action]
@@ -203,6 +299,10 @@ def stage_agent_outcome_summary(outcome):
         ),
         "content": slice(get(outcome, "content", ""), 0, 4096),
         "message": slice(get(outcome, "message", ""), 0, 2048),
+        "probe_field": get(outcome, "probe_field", None),
+        "probe_resolutions": get(outcome, "probe_resolutions", {}),
+        "finding_values": get(outcome, "finding_values", {}),
+        "unknown_findings": get(outcome, "unknown_findings", {}),
     }
 
 
@@ -232,8 +332,12 @@ def stage_agent_history_item(step, action, outcome):
             outcome, "stderr", "stderr_tail", 512
         ),
         "content": slice(get(outcome, "content", ""), 0, 1024),
-        "message": slice(get(outcome, "message", ""), 0, 512),
+        "message": slice(get(outcome, "message", ""), 0, 2048),
+        "probe_field": get(outcome, "probe_field", None),
+        "probe_resolutions": get(outcome, "probe_resolutions", {}),
         "findings": get(outcome, "findings", {}),
+        "finding_values": get(outcome, "finding_values", {}),
+        "unknown_findings": get(outcome, "unknown_findings", {}),
     }
 
 
@@ -248,10 +352,10 @@ def stage_agent_mode(step):
     previous_tool = ""
     if step.outcome is not None:
         previous_tool = get(step.outcome, "tool", "")
-        findings = get(step.outcome, "findings", {})
-        for field in get(step, "resolved_decision_fields", []):
-            if get(get(findings, field, {}), "state", "unknown") != "resolved":
-                return "resolve_findings"
+    current_findings = get(step, "findings", {})
+    for field in get(step, "resolved_decision_fields", []):
+        if get(get(current_findings, field, {}), "state", "unknown") != "resolved":
+            return "resolve_findings"
     if previous_tool in ["write", "run_complete"]:
         return "diagnose_or_repair"
     return "execute_or_repair"
@@ -259,6 +363,20 @@ def stage_agent_mode(step):
 
 def stage_agent_messages(step):
     session = agent_session()
+    unresolved_decision_fields = []
+    pending_probe_fields = []
+    focus_field = None
+    current_findings = get(step, "findings", {})
+    probes = get(step, "probes", {})
+    for field in get(step, "resolved_decision_fields", []):
+        if get(get(current_findings, field, {}), "state", "unknown") != "resolved":
+            unresolved_decision_fields.append(field)
+            if get(get(probes, field, {}), "status", "missing") == "observed":
+                pending_probe_fields.append(field)
+            elif focus_field is None:
+                focus_field = field
+    if focus_field is None and len(unresolved_decision_fields) > 0:
+        focus_field = unresolved_decision_fields[0]
     memory = context_project(
         focus=(
             "current workflow stage, prior stage actions, concrete tool "
@@ -276,10 +394,21 @@ def stage_agent_messages(step):
                 "the stage while evidence is missing. Commands run in the "
                 "task workspace mounted at /app. When decision_recorded is "
                 "the remaining contract, inspect as needed and then use "
-                "decide(answer, findings) to retain the stage-local decision; "
+                "decide(answer, resolves?, unknown?) to retain the stage-local decision; "
                 "decision_fields lists every required non-empty finding. "
-                "resolved_decision_fields require state, value, and a compact "
-                "observation basis; unknown is valid but keeps the gate open. Treat "
+                "The runtime accumulates resolved_decision_fields as typed "
+                "state with value and observation provenance. unknown is "
+                "valid for the bounded report but keeps the gate open. "
+                "Every probe action declares for_field. On a later action, "
+                "interpret a retained observation with resolves={field: value}; "
+                "the runtime supplies its provenance and rejects resolutions "
+                "without a prior observation. One response may resolve an old "
+                "probe while launching the next field probe. Use read for file facts "
+                "and run_linux for environment or toolchain facts. Do not "
+                "repeat fields absent from unresolved_decision_fields. Direct "
+                "the next probe at one of those unresolved fields. Do not "
+                "use decide only to publish unknown state; reserve it for a "
+                "resolved decision or the final bounded report. Treat "
                 "stage_history as the completed action ledger and do not "
                 "repeat a successful probe unless new evidence requires it. "
                 "In execute_or_repair mode, take a workspace-changing action "
@@ -310,6 +439,16 @@ def stage_agent_messages(step):
                 "contract_kinds": step.contracts,
                 "decision_fields": get(step, "decision_fields", []),
                 "resolved_decision_fields": get(step, "resolved_decision_fields", []),
+                "unresolved_decision_fields": unresolved_decision_fields,
+                "finding_specs": get(step, "finding_specs", {}),
+                "findings": get(step, "findings", {}),
+                "probes": probes,
+                "pending_probe_fields": pending_probe_fields,
+                "focus_field": focus_field,
+                "probe_budget": max(step.max_actions - 1, 0),
+                "remaining_probe_actions": max(
+                    step.max_actions - step.attempt, 0
+                ),
                 "contracts": step.evidence,
                 "previous_outcome": stage_agent_outcome_summary(step.outcome),
                 "stage_history": stage_agent_history(step),
@@ -390,10 +529,12 @@ def agent_loop(step):
             stage_agent_action_schema(step),
             retries=1,
             repair_prompt=(
-                "Correct only the response shape and arguments. Preserve the "
-                "intended next stage action."
+                "Use the allowed alternatives and nearest-branch details in "
+                "the validation error. Preserve the intended action only if "
+                "it is currently allowed; otherwise choose an allowed action. "
+                "Use the canonical tool/input nesting exactly."
             ),
-            schema_prompt=stage_agent_schema_prompt(),
+            schema_prompt=stage_agent_schema_prompt(step),
             model_class="agent",
             max_output_tokens=768,
         )
@@ -426,6 +567,8 @@ def agent_loop(step):
             "kind": "decision_recorded",
             "message": decision.answer,
             "findings": get(decision, "findings", {}),
+            "probe_resolutions": get(action, "resolves", {}),
+            "unknown_findings": get(action, "unknown", get(decision, "unknown", {})),
             "transition_id": inference.response.transition_id,
         }
     elif final is not None:
@@ -434,10 +577,18 @@ def agent_loop(step):
             "kind": "finish_requested",
             "message": final.answer,
             "findings": get(final, "findings", {}),
+            "probe_resolutions": get(action, "resolves", {}),
+            "unknown_findings": get(action, "unknown", get(final, "unknown", {})),
             "transition_id": inference.response.transition_id,
         }
     else:
         outcome = stage_agent_dispatch(action)
+        probe_field = get(action, "for_field", None)
+        if probe_field is not None:
+            outcome["probe_field"] = probe_field
+        resolutions = get(action, "resolves", {})
+        if len(resolutions) > 0:
+            outcome["probe_resolutions"] = resolutions
     outcome["tool"] = get(action, "tool", "final")
     return stage_agent_remember(
         step,

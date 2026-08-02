@@ -1562,6 +1562,49 @@ observation compete for one flat action budget. A subsequent control primitive
 should make incremental finding state cheap to retain, or account for it
 separately, while preserving the model-call cost in observability.
 
+The follow-up makes findings runtime-owned stage state. Controllers publish
+small semantic deltas after observations; the kernel validates and merges them,
+adds action-derived provenance, projects the accumulated map into the next
+decision, and gates transition on the whole map. Final decisions no longer
+restate state the runtime already owns. This is the same ownership rule used
+elsewhere in the system: the model proposes meaning, while the runtime owns
+lifecycle, typing, provenance, and bounded retention.
+
+Typed state must also constrain control. Offering `decide` while required
+fields were unresolved produced fluent but evidence-free decisions. The
+standard controller therefore projects action availability from the current
+finding type state: unresolved fields admit probes, resolved fields admit a
+decision, and the final bounded action admits an honest partial report. The
+model used this interface to retain one field on the Doom task, but failed to
+choose probes for the other three. The next useful PL construct is therefore a
+field-directed probe/evidence-acquisition interface, not another finding record
+shape.
+
+That interface now has a minimal executable form. A resolved decision contract
+may describe each field with `{kind, question}`. The controller tags each
+inspection action with `for_field`, while the kernel retains a bounded probe
+record and exposes it to subsequent decisions. `resolves={field: value}` is
+admitted only after an observation for that field and receives runtime-derived
+provenance. This keeps the model responsible for semantic interpretation while
+preventing it from inventing the observation source.
+
+The first comparison changed control behavior as intended: the model probed
+all four Doom obligations instead of one. It resolved only `source_layout` and
+honestly left the other three open. The remaining failure clarifies the next
+layer. `for_field` answers *what to investigate*, but generic bounded `read` and
+`run_linux` do not ensure that the observation answers the field's question.
+Typed acquisition needs a refinement state, focused operations such as
+search/tail, and retry accounting. The runtime should distinguish `observed`
+from `sufficient`, rather than treating one action per field as a complete
+acquisition policy.
+
+Runtime diagnostics are part of that interface. A generic JSON `oneOf` error
+did not help the model repair an illegal action. Validation now reports allowed
+discriminators and the nearest branch's missing or extra fields, and the
+stage-specific schema hint states the actions currently admitted. This is a
+general design rule for Waymark: rejected effects should explain the available
+recovery path, not merely expose an error code.
+
 Verifier-populated outcomes and aggregate budget/event views remain necessary.
 See
 [Caffe Bounded-Explore Library Experiment](../../waymark-gateway/docs/CAFFE_BOUNDED_EXPLORE_LIBRARY_EXPERIMENT.md).

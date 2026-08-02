@@ -67,6 +67,13 @@ impl WorkflowHandlerValue {
 }
 
 #[derive(Clone)]
+pub(super) struct WorkflowFindingSpecValue {
+    pub(super) name: String,
+    pub(super) kind: String,
+    pub(super) question: String,
+}
+
+#[derive(Clone)]
 pub(super) enum WorkflowEvidenceSourceValue {
     Handler(WorkflowHandlerValue),
     FileNonempty {
@@ -87,7 +94,7 @@ pub(super) enum WorkflowEvidenceSourceValue {
     },
     StdoutNonempty,
     DecisionRecorded {
-        fields: Vec<String>,
+        fields: Vec<WorkflowFindingSpecValue>,
         resolved: bool,
     },
     All(Vec<WorkflowEvidenceSourceValue>),

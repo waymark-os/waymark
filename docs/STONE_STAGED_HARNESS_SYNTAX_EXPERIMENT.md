@@ -220,5 +220,67 @@ limit.
 Artifact:
 `../../waymark-gateway/target/runs/staged-stone-doom-v13-resolved-findings-terra/cell/cell.json`
 
+The next slice removed that publication action. The workflow kernel now owns a
+bounded accumulated per-stage finding map and exposes it as `step.findings`. A
+model may
+attach a small `learned={field: value}` delta to the action following a real
+tool observation; the runtime validates the field, marks it resolved, and
+derives provenance from the prior action. Final decisions consume accumulated
+state instead of regenerating every `{state, value, basis}` record. An optional
+`unknown={field: reason}` keeps bounded failure reports explicit.
+
+The rollout distinguished representation from control. Nested finding updates
+were ignored, while the smaller delta was used spontaneously. But the model
+still spent decisions before resolving the declared interface. The standard
+controller now exposes only tool actions while resolved fields remain open,
+then exposes decision actions after resolution or on the last bounded action.
+Its schema hint is generated from the same current state. JSON `oneOf`
+diagnostics name allowed discriminators and the nearest branch error rather
+than reporting only “matched zero branches.”
+
+In the final Doom cell, all four responses were schema-valid, `source_layout`
+was retained with runtime provenance, and the report named `toolchain`,
+`frame_backend`, and `runtime_contract` as still missing. The stage still
+failed because the remaining probes were weak. This is positive evidence for
+runtime-owned incremental state and evidence-gated action availability, not
+for task success. The next construct should help select field-directed probes
+rather than further changing the finding representation.
+
+Artifact:
+`../../waymark-gateway/target/runs/staged-stone-doom-v22-dynamic-schema-hint-terra/cell/cell.json`
+
+The field-directed follow-up lets the harness author name not just finding
+fields but their observation kinds and questions:
+
+```stone
+ensure decision_recorded(resolved={
+    "frame_backend": {
+        "kind": "file",
+        "question": "Which source implements the required frame writer?",
+    },
+    "runtime_contract": {
+        "kind": "command",
+        "question": "How does vm.js invoke the ELF and what output is required?",
+    },
+})
+```
+
+The standard controller requires `for_field` on every inspection tool action
+and permits `resolves` only for fields with retained observations. The runtime
+owns the bounded probe ledger and provenance. Four declared fields plus one
+decision used `max_actions=5`.
+
+The Doom rollout selected all four fields, retained all four observations, and
+resolved one. The last decision explicitly reported the other three as
+unknown, and the evidence summary named them as missing. This is substantially
+better control coverage than the prior rollout, but not success: a failed
+compiler lookup, a shallow directory listing, and a prefix-only file read did
+not answer their questions. A useful next syntax/runtime experiment is a
+per-field acquisition loop with evidence-quality feedback and focused
+search/tail probes, rather than another decision-record shape.
+
+Artifact:
+`../../waymark-gateway/target/runs/staged-stone-doom-v24-field-directed-probes-terra/cell/cell.json`
+
 Artifact:
 `../../waymark-gateway/target/runs/staged-stone-doom-v12-typed-decisions-terra/cell/cell.json`

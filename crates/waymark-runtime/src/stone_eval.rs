@@ -110,7 +110,8 @@ use stone_functions::{
     CallableValue, TransitionHookHandlerValue as TransitionHookHandler,
     TransitionHooksValue as TransitionHooks,
     WorkflowCheckpointPolicyValue as WorkflowCheckpointPolicy,
-    WorkflowEvidenceSourceValue as WorkflowEvidenceSource, WorkflowHandlerValue as WorkflowHandler,
+    WorkflowEvidenceSourceValue as WorkflowEvidenceSource,
+    WorkflowFindingSpecValue as WorkflowFindingSpec, WorkflowHandlerValue as WorkflowHandler,
     WorkflowPatchValue as WorkflowPatch, WorkflowStageValue as WorkflowStage,
     WorkflowValue as Workflow,
 };
@@ -4666,7 +4667,89 @@ impl Evaluator<'_> {
             let value = self
                 .eval_expr_value(expression, PipelineData::empty())?
                 .into_nu_value("decision_recorded finding names")?;
-            fields = value_to_string_list(&value, "decision_recorded finding names")?;
+            fields = match &value {
+                Value::List { vals, .. } => vals
+                    .iter()
+                    .map(|value| {
+                        let name = value_to_string(value, "decision_recorded finding name")?;
+                        Ok(WorkflowFindingSpec {
+                            question: format!("resolve {name}"),
+                            name,
+                            kind: "text".to_string(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ShellError>>()?,
+                Value::Record { val: specs, .. } => {
+                    let mut parsed = Vec::with_capacity(specs.len());
+                    for (name, descriptor) in specs.iter() {
+                        let (kind, question) = match descriptor {
+                            Value::String { val, .. } | Value::Glob { val, .. } => {
+                                ("text".to_string(), val.clone())
+                            }
+                            Value::Record { val, .. } => {
+                                for (key, _) in val.iter() {
+                                    if !matches!(key.as_str(), "kind" | "question") {
+                                        return Err(workflow_error(format!(
+                                            "decision_recorded() descriptor `{name}` has unsupported field `{key}`; expected kind and question"
+                                        )));
+                                    }
+                                }
+                                let kind = val
+                                    .get("kind")
+                                    .map(|value| {
+                                        value_to_string(
+                                            value,
+                                            &format!(
+                                                "decision_recorded descriptor `{name}` kind"
+                                            ),
+                                        )
+                                    })
+                                    .transpose()?
+                                    .unwrap_or_else(|| "text".to_string());
+                                let question = val
+                                    .get("question")
+                                    .map(|value| {
+                                        value_to_string(
+                                            value,
+                                            &format!(
+                                                "decision_recorded descriptor `{name}` question"
+                                            ),
+                                        )
+                                    })
+                                    .transpose()?
+                                    .unwrap_or_else(|| format!("resolve {name}"));
+                                (kind, question)
+                            }
+                            _ => {
+                                return Err(workflow_error(format!(
+                                    "decision_recorded() descriptor `{name}` must be a question string or a {{kind, question}} record"
+                                )))
+                            }
+                        };
+                        if !matches!(kind.as_str(), "text" | "path" | "file" | "command") {
+                            return Err(workflow_error(format!(
+                                "decision_recorded() descriptor `{name}` kind must be text, path, file, or command"
+                            )));
+                        }
+                        if question.trim().is_empty() || question.chars().count() > 256 {
+                            return Err(workflow_error(format!(
+                                "decision_recorded() descriptor `{name}` question must contain 1..256 characters"
+                            )));
+                        }
+                        parsed.push(WorkflowFindingSpec {
+                            name: name.clone(),
+                            kind,
+                            question,
+                        });
+                    }
+                    parsed
+                }
+                _ => {
+                    return Err(workflow_error(
+                        "decision_recorded finding names must be a list of identifiers or a record of typed descriptors",
+                    ))
+                }
+            };
         }
         if fields.len() > 12 {
             return Err(workflow_error(
@@ -4675,19 +4758,22 @@ impl Evaluator<'_> {
         }
         let mut unique = HashSet::new();
         for field in &fields {
-            if field.is_empty()
-                || field.len() > 64
+            if field.name.is_empty()
+                || field.name.len() > 64
                 || !field
+                    .name
                     .chars()
                     .all(|character| character.is_ascii_alphanumeric() || character == '_')
             {
                 return Err(workflow_error(format!(
-                    "decision_recorded() field `{field}` must be a 1..64 character ASCII identifier"
+                    "decision_recorded() field `{}` must be a 1..64 character ASCII identifier",
+                    field.name
                 )));
             }
-            if !unique.insert(field.clone()) {
+            if !unique.insert(field.name.clone()) {
                 return Err(workflow_error(format!(
-                    "decision_recorded() field `{field}` is duplicated"
+                    "decision_recorded() field `{}` is duplicated",
+                    field.name
                 )));
             }
         }
@@ -5330,6 +5416,10 @@ impl Evaluator<'_> {
             let mut last_action = None;
             let mut last_repair = None;
             let mut latest_outcome = None;
+            let mut finding_state = Record::new();
+            let mut probe_state = Record::new();
+            let mut resolved_finding_names = Vec::new();
+            workflow_resolved_decision_fields(&stage.evidence, &mut resolved_finding_names);
 
             let context = workflow_context_value(
                 workflow,
@@ -5339,6 +5429,8 @@ impl Evaluator<'_> {
                 0,
                 &completed,
                 None,
+                &finding_state,
+                &probe_state,
                 None,
             );
             let mut evidence =
@@ -5359,6 +5451,8 @@ impl Evaluator<'_> {
                     &evidence,
                     last_action,
                     last_repair,
+                    &finding_state,
+                    &probe_state,
                     &checkpoint,
                 ));
                 continue;
@@ -5375,6 +5469,8 @@ impl Evaluator<'_> {
                     attempt,
                     &completed,
                     Some(&evidence),
+                    &finding_state,
+                    &probe_state,
                     latest_outcome.as_ref(),
                 );
                 let action = self.invoke_workflow_action_handler(
@@ -5383,6 +5479,14 @@ impl Evaluator<'_> {
                     "action",
                     &stage.action,
                     context,
+                )?;
+                merge_workflow_finding_updates(
+                    &mut finding_state,
+                    &mut probe_state,
+                    &action.full,
+                    &resolved_finding_names,
+                    latest_outcome.as_ref(),
+                    attempt,
                 )?;
                 last_action = Some(action.compact.clone());
                 latest_outcome = Some(action.full);
@@ -5395,6 +5499,8 @@ impl Evaluator<'_> {
                     attempt,
                     &completed,
                     Some(&evidence),
+                    &finding_state,
+                    &probe_state,
                     latest_outcome.as_ref(),
                 );
                 evidence = self.invoke_workflow_evidence_handler(
@@ -5419,6 +5525,8 @@ impl Evaluator<'_> {
                         attempt,
                         &completed,
                         Some(&evidence),
+                        &finding_state,
+                        &probe_state,
                         latest_outcome.as_ref(),
                     );
                     let repair = self.invoke_workflow_action_handler(
@@ -5427,6 +5535,14 @@ impl Evaluator<'_> {
                         "repair",
                         repair_handler,
                         context,
+                    )?;
+                    merge_workflow_finding_updates(
+                        &mut finding_state,
+                        &mut probe_state,
+                        &repair.full,
+                        &resolved_finding_names,
+                        latest_outcome.as_ref(),
+                        attempt,
                     )?;
                     last_repair = Some(repair.compact.clone());
                     latest_outcome = Some(repair.full);
@@ -5439,6 +5555,8 @@ impl Evaluator<'_> {
                         attempt,
                         &completed,
                         Some(&evidence),
+                        &finding_state,
+                        &probe_state,
                         latest_outcome.as_ref(),
                     );
                     evidence = self.invoke_workflow_evidence_handler(
@@ -5467,6 +5585,8 @@ impl Evaluator<'_> {
                         &evidence,
                         last_action,
                         last_repair,
+                        &finding_state,
+                        &probe_state,
                         &checkpoint,
                     ));
                     return Ok(workflow_report_value(
@@ -5487,6 +5607,8 @@ impl Evaluator<'_> {
                     &evidence,
                     last_action,
                     last_repair,
+                    &finding_state,
+                    &probe_state,
                     &checkpoint,
                 ));
                 continue;
@@ -5505,6 +5627,8 @@ impl Evaluator<'_> {
                 &evidence,
                 last_action,
                 last_repair,
+                &finding_state,
+                &probe_state,
                 &checkpoint,
             ));
             return Ok(workflow_report_value(
@@ -11597,7 +11721,7 @@ fn workflow_stdout_evidence(context: &Value) -> Result<(bool, String, usize), Sh
 
 fn workflow_decision_evidence(
     context: &Value,
-    required_fields: &[String],
+    required_fields: &[WorkflowFindingSpec],
     require_resolved: bool,
 ) -> Result<(bool, String, Option<String>), ShellError> {
     let Some(outcome) = workflow_context_outcome(context) else {
@@ -11626,16 +11750,26 @@ fn workflow_decision_evidence(
             None,
         ));
     }
-    let findings = outcome.get("findings").and_then(|value| match value {
-        Value::Record { val, .. } => Some(val.as_ref()),
-        _ => None,
-    });
+    let findings = if require_resolved {
+        match context {
+            Value::Record { val, .. } => val.get("findings").and_then(|value| match value {
+                Value::Record { val, .. } => Some(val.as_ref()),
+                _ => None,
+            }),
+            _ => None,
+        }
+    } else {
+        outcome.get("findings").and_then(|value| match value {
+            Value::Record { val, .. } => Some(val.as_ref()),
+            _ => None,
+        })
+    };
     let mut missing = Vec::new();
     let mut unresolved = Vec::new();
     let mut invalid = Vec::new();
     for field in required_fields {
-        let Some(finding) = findings.and_then(|findings| findings.get(field)) else {
-            missing.push(field.as_str());
+        let Some(finding) = findings.and_then(|findings| findings.get(&field.name)) else {
+            missing.push(field.name.as_str());
             continue;
         };
         if !require_resolved {
@@ -11646,12 +11780,12 @@ fn workflow_decision_evidence(
                 _ => false,
             };
             if !present {
-                invalid.push(field.as_str());
+                invalid.push(field.name.as_str());
             }
             continue;
         }
         let Value::Record { val: record, .. } = finding else {
-            invalid.push(field.as_str());
+            invalid.push(field.name.as_str());
             continue;
         };
         let bounded_string = |name: &str, limit: usize| {
@@ -11665,17 +11799,17 @@ fn workflow_decision_evidence(
             })
         };
         let Some(state) = bounded_string("state", 16) else {
-            invalid.push(field.as_str());
+            invalid.push(field.name.as_str());
             continue;
         };
         if bounded_string("value", 2_048).is_none() || bounded_string("basis", 1_024).is_none() {
-            invalid.push(field.as_str());
+            invalid.push(field.name.as_str());
             continue;
         }
         match state {
             "resolved" => {}
-            "unknown" => unresolved.push(field.as_str()),
-            _ => invalid.push(field.as_str()),
+            "unknown" => unresolved.push(field.name.as_str()),
+            _ => invalid.push(field.name.as_str()),
         }
     }
     if !missing.is_empty() || !unresolved.is_empty() || !invalid.is_empty() {
@@ -11699,6 +11833,10 @@ fn workflow_decision_evidence(
         ));
     }
     let bytes = message.len();
+    let required_names = required_fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect::<Vec<_>>();
     let transition = outcome
         .get("transition_id")
         .map(|value| value_to_string(value, "decision_recorded transition_id"))
@@ -11711,12 +11849,12 @@ fn workflow_decision_evidence(
         } else if require_resolved {
             format!(
                 "explicit stage decision recorded ({bytes} bytes) with resolved findings: {}",
-                required_fields.join(", ")
+                required_names.join(", ")
             )
         } else {
             format!(
                 "explicit stage decision recorded ({bytes} bytes) with typed findings: {}",
-                required_fields.join(", ")
+                required_names.join(", ")
             )
         },
         Some(
@@ -11725,6 +11863,291 @@ fn workflow_decision_evidence(
                 .unwrap_or_else(|| format!("decision:bytes={bytes}")),
         ),
     ))
+}
+
+fn merge_workflow_finding_updates(
+    state: &mut Record,
+    probes: &mut Record,
+    outcome: &Value,
+    allowed_fields: &[String],
+    previous_outcome: Option<&Value>,
+    attempt: u32,
+) -> Result<(), ShellError> {
+    let Value::Record { val: outcome, .. } = outcome else {
+        return Ok(());
+    };
+    if let Some(resolutions) = outcome.get("probe_resolutions") {
+        let Value::Record {
+            val: resolutions, ..
+        } = resolutions
+        else {
+            return Err(workflow_error(
+                "stage probe_resolutions must be a record keyed by observed finding names",
+            ));
+        };
+        if resolutions.len() > 4 {
+            return Err(workflow_error(
+                "stage probe_resolutions accepts at most four fields per action",
+            ));
+        }
+        for (field, value) in resolutions.iter() {
+            if !allowed_fields.iter().any(|allowed| allowed == field) {
+                return Err(workflow_error(format!(
+                    "stage probe_resolutions contains undeclared field `{field}`; allowed resolved fields: {}",
+                    allowed_fields.join(", ")
+                )));
+            }
+            let Some(Value::Record { val: probe, .. }) = probes.get(field) else {
+                return Err(workflow_error(format!(
+                    "stage probe resolution `{field}` has no retained observation; run a tool action with for_field={field:?} first"
+                )));
+            };
+            let observed = probe.get("status").is_some_and(|value| match value {
+                Value::String { val, .. } | Value::Glob { val, .. } => val == "observed",
+                _ => false,
+            });
+            if !observed {
+                return Err(workflow_error(format!(
+                    "stage probe resolution `{field}` requires an observed unresolved probe"
+                )));
+            }
+            let basis = probe
+                .get("basis")
+                .map(|value| value_to_string(value, "probe observation basis"))
+                .transpose()?
+                .ok_or_else(|| {
+                    workflow_error(format!(
+                        "stage probe observation `{field}` has no runtime basis"
+                    ))
+                })?;
+            let value = match value {
+                Value::String { val, .. } | Value::Glob { val, .. }
+                    if !val.trim().is_empty() && val.chars().count() <= 2_048 =>
+                {
+                    val.clone()
+                }
+                _ => {
+                    return Err(workflow_error(format!(
+                        "stage probe resolution `{field}` must be a non-empty string of at most 2048 characters"
+                    )))
+                }
+            };
+            let span = Span::unknown();
+            let mut finding = Record::new();
+            finding.push("state", Value::string("resolved", span));
+            finding.push("value", Value::string(value, span));
+            finding.push("basis", Value::string(basis, span));
+            state.insert(field.clone(), Value::record(finding, span));
+
+            let mut resolved_probe = probe.as_ref().clone();
+            resolved_probe.insert("status", Value::string("resolved", span));
+            probes.insert(field.clone(), Value::record(resolved_probe, span));
+        }
+    }
+    if let Some(values) = outcome.get("finding_values") {
+        let Value::Record { val: values, .. } = values else {
+            return Err(workflow_error(
+                "stage finding_values must be a record keyed by declared resolved finding names",
+            ));
+        };
+        let Some(previous_outcome) = previous_outcome else {
+            return Err(workflow_error(
+                "stage finding_values require a prior action outcome as their evidence basis",
+            ));
+        };
+        let basis = workflow_prior_action_basis(previous_outcome, attempt.saturating_sub(1));
+        for (field, value) in values.iter() {
+            if !allowed_fields.iter().any(|allowed| allowed == field) {
+                return Err(workflow_error(format!(
+                    "stage finding_values contains undeclared field `{field}`; allowed resolved fields: {}",
+                    allowed_fields.join(", ")
+                )));
+            }
+            let value = match value {
+                Value::String { val, .. } | Value::Glob { val, .. }
+                    if !val.trim().is_empty() && val.chars().count() <= 2_048 =>
+                {
+                    val.clone()
+                }
+                _ => {
+                    return Err(workflow_error(format!(
+                        "stage finding value `{field}` must be a non-empty string of at most 2048 characters"
+                    )))
+                }
+            };
+            let span = Span::unknown();
+            let mut finding = Record::new();
+            finding.push("state", Value::string("resolved", span));
+            finding.push("value", Value::string(value, span));
+            finding.push("basis", Value::string(basis.clone(), span));
+            state.insert(field.clone(), Value::record(finding, span));
+        }
+    }
+    let explicit = outcome.get("finding_updates");
+    let decision_findings = if allowed_fields.is_empty() {
+        None
+    } else {
+        outcome.get("kind").and_then(|value| match value {
+            Value::String { val, .. } | Value::Glob { val, .. }
+                if matches!(val.as_str(), "decision_recorded" | "finish_requested") =>
+            {
+                outcome.get("findings")
+            }
+            _ => None,
+        })
+    };
+    if let Some(updates) = explicit.or(decision_findings) {
+        let Value::Record { val: updates, .. } = updates else {
+            return Err(workflow_error(
+                "stage finding_updates must be a record keyed by declared resolved finding names",
+            ));
+        };
+        if updates.len() > 12 {
+            return Err(workflow_error(
+                "stage finding_updates accepts at most 12 fields",
+            ));
+        }
+        for (field, finding) in updates.iter() {
+            if !allowed_fields.iter().any(|allowed| allowed == field) {
+                return Err(workflow_error(format!(
+                    "stage finding_updates contains undeclared field `{field}`; allowed resolved fields: {}",
+                    allowed_fields.join(", ")
+                )));
+            }
+            let Value::Record { val: finding, .. } = finding else {
+                return Err(workflow_error(format!(
+                    "stage finding update `{field}` must be a {{state, value, basis}} record"
+                )));
+            };
+            for (name, limit) in [("state", 16), ("value", 2_048), ("basis", 1_024)] {
+                let valid = finding.get(name).is_some_and(|value| match value {
+                    Value::String { val, .. } | Value::Glob { val, .. } => {
+                        !val.trim().is_empty() && val.chars().count() <= limit
+                    }
+                    _ => false,
+                });
+                if !valid {
+                    return Err(workflow_error(format!(
+                        "stage finding update `{field}.{name}` must be a non-empty string of at most {limit} characters"
+                    )));
+                }
+            }
+            let state_name = match finding
+                .get("state")
+                .expect("state field was validated above")
+            {
+                Value::String { val, .. } | Value::Glob { val, .. } => val.as_str(),
+                _ => unreachable!("state field was validated as a string"),
+            };
+            if !matches!(state_name, "resolved" | "unknown") {
+                return Err(workflow_error(format!(
+                    "stage finding update `{field}.state` must be resolved or unknown"
+                )));
+            }
+            state.insert(
+                field.clone(),
+                Value::record(finding.as_ref().clone(), Span::unknown()),
+            );
+        }
+    }
+
+    if let Some(field) = outcome.get("probe_field") {
+        let field = value_to_string(field, "stage probe_field")?;
+        if !allowed_fields.iter().any(|allowed| allowed == &field) {
+            return Err(workflow_error(format!(
+                "stage probe_field `{field}` is undeclared; allowed unresolved fields: {}",
+                allowed_fields.join(", ")
+            )));
+        }
+        let already_resolved = state.get(&field).is_some_and(|value| match value {
+            Value::Record { val, .. } => val.get("state").is_some_and(|value| match value {
+                Value::String { val, .. } | Value::Glob { val, .. } => val == "resolved",
+                _ => false,
+            }),
+            _ => false,
+        });
+        if already_resolved {
+            return Err(workflow_error(format!(
+                "stage probe_field `{field}` is already resolved; target one of the remaining fields"
+            )));
+        }
+        let tool = outcome
+            .get("tool")
+            .map(|value| value_to_string(value, "stage probe tool"))
+            .transpose()?
+            .unwrap_or_default();
+        if !matches!(
+            tool.as_str(),
+            "read" | "write" | "run_linux" | "run_complete"
+        ) {
+            return Err(workflow_error(format!(
+                "stage probe_field `{field}` must be attached to read, write, run_linux, or run_complete, not `{tool}`"
+            )));
+        }
+        let span = Span::unknown();
+        let mut probe = Record::new();
+        probe.push("status", Value::string("observed", span));
+        probe.push(
+            "basis",
+            Value::string(workflow_action_record_basis(outcome, attempt), span),
+        );
+        probe.push("attempt", Value::int(attempt as i64, span));
+        probe.push("tool", Value::string(tool, span));
+        if let Some(kind) = outcome.get("kind") {
+            if let Ok(kind) = value_to_string(kind, "stage probe outcome kind") {
+                probe.push("kind", Value::string(kind, span));
+            }
+        }
+        if let Some(Value::Bool { val, .. }) = outcome.get("ok") {
+            probe.push("ok", Value::bool(*val, span));
+        }
+        if let Some(summary) = workflow_probe_summary(outcome) {
+            probe.push("summary", Value::string(summary, span));
+        }
+        probes.insert(field, Value::record(probe, span));
+    }
+    Ok(())
+}
+
+fn workflow_probe_summary(outcome: &Record) -> Option<String> {
+    for field in [
+        "content",
+        "stdout_tail",
+        "stderr_tail",
+        "stdout",
+        "stderr",
+        "message",
+    ] {
+        if let Some(Value::String { val, .. } | Value::Glob { val, .. }) = outcome.get(field) {
+            if !val.trim().is_empty() {
+                return Some(bounded_text(val, 2_048));
+            }
+        }
+    }
+    None
+}
+
+fn workflow_prior_action_basis(outcome: &Value, attempt: u32) -> String {
+    let Value::Record { val: outcome, .. } = outcome else {
+        return format!("runtime:action:{attempt}");
+    };
+    workflow_action_record_basis(outcome, attempt)
+}
+
+fn workflow_action_record_basis(outcome: &Record, attempt: u32) -> String {
+    let text = |name: &str| {
+        outcome.get(name).and_then(|value| match value {
+            Value::String { val, .. } | Value::Glob { val, .. } if !val.is_empty() => {
+                Some(val.as_str())
+            }
+            _ => None,
+        })
+    };
+    let tool = text("tool").or_else(|| text("kind")).unwrap_or("action");
+    let subject = text("path").or_else(|| text("cwd"));
+    subject
+        .map(|subject| format!("runtime:action:{attempt}:{tool}:{subject}"))
+        .unwrap_or_else(|| format!("runtime:action:{attempt}:{tool}"))
 }
 
 fn combine_workflow_evidence(
@@ -11861,6 +12284,7 @@ fn compact_workflow_action_record(record: &Record) -> Value {
         "completion_waits",
         "requested_timeout_ms",
         "tool",
+        "probe_field",
     ];
     let span = Span::unknown();
     let mut compact = Record::new();
@@ -11870,7 +12294,8 @@ fn compact_workflow_action_record(record: &Record) -> Value {
         };
         let bounded = match value {
             Value::String { val, .. } | Value::Glob { val, .. } => {
-                Some(Value::string(bounded_text(val, 512), span))
+                let limit = if *field == "message" { 2_048 } else { 512 };
+                Some(Value::string(bounded_text(val, limit), span))
             }
             Value::Bool { .. }
             | Value::Int { .. }
@@ -11882,32 +12307,40 @@ fn compact_workflow_action_record(record: &Record) -> Value {
             compact.push(*field, value);
         }
     }
-    if let Some(Value::Record { val: findings, .. }) = record.get("findings") {
-        let mut bounded = Record::new();
-        for (field, value) in findings.iter().take(12) {
-            match value {
-                Value::String { val, .. } | Value::Glob { val, .. } => {
-                    bounded.push(field, Value::string(bounded_text(val, 2_048), span));
-                }
-                Value::Record { val: finding, .. } => {
-                    let mut compact_finding = Record::new();
-                    for (name, limit) in [("state", 16), ("value", 2_048), ("basis", 1_024)] {
-                        if let Some(Value::String { val, .. } | Value::Glob { val, .. }) =
-                            finding.get(name)
-                        {
-                            compact_finding
-                                .push(name, Value::string(bounded_text(val, limit), span));
+    for finding_field in [
+        "findings",
+        "finding_updates",
+        "finding_values",
+        "probe_resolutions",
+        "unknown_findings",
+    ] {
+        if let Some(Value::Record { val: findings, .. }) = record.get(finding_field) {
+            let mut bounded = Record::new();
+            for (field, value) in findings.iter().take(12) {
+                match value {
+                    Value::String { val, .. } | Value::Glob { val, .. } => {
+                        bounded.push(field, Value::string(bounded_text(val, 2_048), span));
+                    }
+                    Value::Record { val: finding, .. } => {
+                        let mut compact_finding = Record::new();
+                        for (name, limit) in [("state", 16), ("value", 2_048), ("basis", 1_024)] {
+                            if let Some(Value::String { val, .. } | Value::Glob { val, .. }) =
+                                finding.get(name)
+                            {
+                                compact_finding
+                                    .push(name, Value::string(bounded_text(val, limit), span));
+                            }
+                        }
+                        if !compact_finding.is_empty() {
+                            bounded.push(field, Value::record(compact_finding, span));
                         }
                     }
-                    if !compact_finding.is_empty() {
-                        bounded.push(field, Value::record(compact_finding, span));
-                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-        if !bounded.is_empty() {
-            compact.push("findings", Value::record(bounded, span));
+            if !bounded.is_empty() {
+                compact.push(finding_field, Value::record(bounded, span));
+            }
         }
     }
     for (field, fallback, limit) in [
@@ -11959,6 +12392,8 @@ fn workflow_context_value(
     attempt: u32,
     completed_stages: &[String],
     evidence: Option<&WorkflowEvidence>,
+    finding_state: &Record,
+    probe_state: &Record,
     outcome: Option<&Value>,
 ) -> Value {
     let span = Span::unknown();
@@ -12007,6 +12442,8 @@ fn workflow_context_value(
             .map(workflow_evidence_value)
             .unwrap_or_else(|| Value::nothing(span)),
     );
+    record.push("findings", Value::record(finding_state.clone(), span));
+    record.push("probes", Value::record(probe_state.clone(), span));
     let mut contracts = Vec::new();
     workflow_contract_names(&stage.evidence, &mut contracts);
     record.push(
@@ -12043,6 +12480,16 @@ fn workflow_context_value(
             span,
         ),
     );
+    let mut finding_specs = Vec::new();
+    workflow_resolved_decision_specs(&stage.evidence, &mut finding_specs);
+    let mut spec_record = Record::new();
+    for spec in finding_specs {
+        let mut descriptor = Record::new();
+        descriptor.push("kind", Value::string(spec.kind.clone(), span));
+        descriptor.push("question", Value::string(spec.question.clone(), span));
+        spec_record.push(&spec.name, Value::record(descriptor, span));
+    }
+    record.push("finding_specs", Value::record(spec_record, span));
     record.push(
         "outcome",
         outcome.cloned().unwrap_or_else(|| Value::nothing(span)),
@@ -12072,7 +12519,7 @@ fn workflow_decision_fields(source: &WorkflowEvidenceSource, fields: &mut Vec<St
         WorkflowEvidenceSource::DecisionRecorded {
             fields: required,
             resolved: false,
-        } => fields.extend(required.iter().cloned()),
+        } => fields.extend(required.iter().map(|field| field.name.clone())),
         WorkflowEvidenceSource::All(sources) => {
             for source in sources {
                 workflow_decision_fields(source, fields);
@@ -12087,10 +12534,28 @@ fn workflow_resolved_decision_fields(source: &WorkflowEvidenceSource, fields: &m
         WorkflowEvidenceSource::DecisionRecorded {
             fields: required,
             resolved: true,
-        } => fields.extend(required.iter().cloned()),
+        } => fields.extend(required.iter().map(|field| field.name.clone())),
         WorkflowEvidenceSource::All(sources) => {
             for source in sources {
                 workflow_resolved_decision_fields(source, fields);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn workflow_resolved_decision_specs<'a>(
+    source: &'a WorkflowEvidenceSource,
+    fields: &mut Vec<&'a WorkflowFindingSpec>,
+) {
+    match source {
+        WorkflowEvidenceSource::DecisionRecorded {
+            fields: required,
+            resolved: true,
+        } => fields.extend(required.iter()),
+        WorkflowEvidenceSource::All(sources) => {
+            for source in sources {
+                workflow_resolved_decision_specs(source, fields);
             }
         }
         _ => {}
@@ -12107,6 +12572,8 @@ fn workflow_stage_report(
     evidence: &WorkflowEvidence,
     last_action: Option<Value>,
     last_repair: Option<Value>,
+    finding_state: &Record,
+    probe_state: &Record,
     checkpoint: &WorkflowCheckpointResult,
 ) -> Value {
     let span = Span::unknown();
@@ -12138,6 +12605,8 @@ fn workflow_stage_report(
         "last_repair",
         last_repair.unwrap_or_else(|| Value::nothing(span)),
     );
+    record.push("findings", Value::record(finding_state.clone(), span));
+    record.push("probes", Value::record(probe_state.clone(), span));
     record.push("checkpoint", workflow_checkpoint_result_value(checkpoint));
     Value::record(record, span)
 }
@@ -16606,21 +17075,33 @@ resolved_decision = {
     "max_actions": 4,
     "contracts": ["decision_recorded"],
     "decision_fields": [],
-    "resolved_decision_fields": ["source_layout", "toolchain"],
-    "outcome": {
-        "tool": "decide",
-        "findings": {
-            "source_layout": {
-                "state": "resolved",
-                "value": "sources found",
-                "basis": "directory listing",
-            },
-            "toolchain": {
-                "state": "unknown",
-                "value": "compiler not located",
-                "basis": "top-level Makefile is absent",
-            },
+    "resolved_decision_fields": ["source_layout", "toolchain", "runtime_contract"],
+    "findings": {
+        "source_layout": {
+            "state": "resolved",
+            "value": "sources found",
+            "basis": "directory listing",
         },
+        "toolchain": {
+            "state": "unknown",
+            "value": "compiler not located",
+            "basis": "top-level Makefile is absent",
+        },
+        "runtime_contract": {
+            "state": "unknown",
+            "value": "VM invocation not inspected",
+            "basis": "no retained observation",
+        },
+    },
+    "probes": {
+        "toolchain": {
+            "status": "observed",
+            "basis": "runtime:action:1:run_linux",
+        },
+    },
+    "outcome": {
+        "tool": "read",
+        "kind": "read",
     },
 }
 resolved_schema = stage_agent_action_schema({
@@ -16628,8 +17109,19 @@ resolved_schema = stage_agent_action_schema({
     "max_actions": 4,
     "contracts": ["decision_recorded"],
     "decision_fields": [],
-    "resolved_decision_fields": ["source_layout", "toolchain"],
+    "resolved_decision_fields": ["source_layout", "toolchain", "runtime_contract"],
+    "findings": resolved_decision.findings,
+    "probes": resolved_decision.probes,
     "outcome": resolved_decision.outcome,
+})
+resolved_tool_schema = stage_agent_action_schema(resolved_decision)
+resolved_initial_schema = stage_agent_action_schema({
+    "attempt": 1,
+    "max_actions": 4,
+    "contracts": ["decision_recorded"],
+    "decision_fields": [],
+    "resolved_decision_fields": ["source_layout", "toolchain", "runtime_contract"],
+    "outcome": None,
 })
 emit({
     "summary_stdout": summary.stdout,
@@ -16646,8 +17138,15 @@ emit({
     "typed_finding_required": typed_schema.properties.actions.items.oneOf[0].properties.input.properties.findings.required,
     "resolved_mode": stage_agent_mode(resolved_decision),
     "resolved_choices": len(stage_agent_action_schema(resolved_decision).properties.actions.items.oneOf),
+    "resolved_decision_required": resolved_schema.properties.actions.items.oneOf[0].properties.input.required,
     "resolved_finding_required": resolved_schema.properties.actions.items.oneOf[0].properties.input.properties.findings.properties.toolchain.required,
     "resolved_state_enum": resolved_schema.properties.actions.items.oneOf[0].properties.input.properties.findings.properties.toolchain.properties.state.enum,
+    "resolved_resolution_type": resolved_schema.properties.actions.items.oneOf[0].properties.resolves.properties.toolchain.type,
+    "resolved_unknown_type": resolved_schema.properties.actions.items.oneOf[0].properties.unknown.properties.toolchain.type,
+    "tool_resolution_type": resolved_tool_schema.properties.actions.items.oneOf[0].properties.resolves.properties.toolchain.type,
+    "tool_required": resolved_tool_schema.properties.actions.items.oneOf[0].required,
+    "tool_probe_targets": resolved_tool_schema.properties.actions.items.oneOf[0].properties.for_field.enum,
+    "initial_resolves": get(resolved_initial_schema.properties.actions.items.oneOf[0].properties, "resolves", None),
 })
 "#,
         );
@@ -16671,9 +17170,16 @@ emit({
                 "typed_decision_required": ["answer", "findings"],
                 "typed_finding_required": ["source_layout", "toolchain"],
                 "resolved_mode": "resolve_findings",
-                "resolved_choices": 7,
+                "resolved_choices": 4,
+                "resolved_decision_required": ["answer"],
                 "resolved_finding_required": ["state", "value", "basis"],
                 "resolved_state_enum": ["resolved", "unknown"],
+                "resolved_resolution_type": "string",
+                "resolved_unknown_type": "string",
+                "tool_resolution_type": "string",
+                "tool_required": ["tool", "input", "for_field"],
+                "tool_probe_targets": ["runtime_contract"],
+                "initial_resolves": null,
             })
         );
         cleanup_dir(&root);
@@ -16853,6 +17359,212 @@ emit({
             value["findings"]["toolchain"]["basis"],
             json_value!("compiler probe returned /usr/bin/mipsel-linux-gnu-gcc")
         );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_merges_incremental_findings_from_ordinary_actions() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-incremental-findings")?;
+        let program = lower_source(
+            r#"def agent_loop(step):
+    if step.attempt == 1:
+        if step.findings != {}:
+            fail("finding state must start empty")
+        return {"ok": True, "kind": "list", "content": "workspace root"}
+    if step.attempt == 2:
+        if step.findings != {}:
+            fail("the first observation did not publish findings")
+        return {
+            "ok": True,
+            "kind": "list",
+            "content": "nested source tree",
+            "finding_values": {
+                "source_layout": "sources are nested under doomgeneric",
+            },
+        }
+    if step.findings.source_layout.state != "resolved":
+        fail("ordinary action finding update was not merged into stage state")
+    return {
+        "ok": True,
+        "kind": "decision_recorded",
+        "message": "Build inputs are resolved.",
+        "finding_values": {
+            "toolchain": "use mipsel-linux-gnu-gcc",
+        },
+        "transition_id": "fixture-incremental-findings",
+    }
+
+workflow task:
+    stage inspect(goal="resolve build inputs", max_actions=3):
+        agent_loop()
+        ensure decision_recorded(resolved=["source_layout", "toolchain"])
+
+report = workflow_run(task)
+emit({
+    "ok": report.ok,
+    "attempts": report.stages[0].attempts,
+    "findings": report.stages[0].findings,
+    "evidence": report.stages[0].evidence,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(true));
+        assert_eq!(value["attempts"], json_value!(3));
+        assert_eq!(
+            value["findings"]["source_layout"]["value"],
+            json_value!("sources are nested under doomgeneric")
+        );
+        assert_eq!(
+            value["findings"]["toolchain"]["state"],
+            json_value!("resolved")
+        );
+        assert_eq!(
+            value["findings"]["source_layout"]["basis"],
+            json_value!("runtime:action:1:list")
+        );
+        assert_eq!(
+            value["evidence"]["evidence"],
+            json_value!(["transition:fixture-incremental-findings:decision"])
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_tracks_field_directed_probes_and_runtime_provenance() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-field-probes")?;
+        let program = lower_source(
+            r#"def agent_loop(step):
+    if step.finding_specs.source_layout.kind != "path":
+        fail("typed finding kind was not exposed")
+    if step.finding_specs.toolchain.question != "Which compiler builds a MIPS ELF?":
+        fail("typed finding question was not exposed")
+    if step.attempt == 1:
+        if step.probes != {}:
+            fail("probe state must start empty")
+        return {
+            "ok": True,
+            "kind": "list",
+            "tool": "read",
+            "path": ".",
+            "content": "doomgeneric/\nvm.js",
+            "probe_field": "source_layout",
+        }
+    if step.attempt == 2:
+        if step.probes.source_layout.status != "observed":
+            fail("the source-layout observation was not retained")
+        return {
+            "ok": True,
+            "kind": "exec",
+            "tool": "run_linux",
+            "cwd": ".",
+            "stdout": "/usr/bin/mipsel-linux-gnu-gcc",
+            "probe_resolutions": {
+                "source_layout": "sources are under doomgeneric",
+            },
+            "probe_field": "toolchain",
+        }
+    if step.findings.source_layout.basis != "runtime:action:1:read:.":
+        fail("the runtime did not own source-layout provenance")
+    if step.probes.source_layout.status != "resolved":
+        fail("the resolved probe was not marked resolved")
+    if step.probes.toolchain.status != "observed":
+        fail("the toolchain observation was not retained")
+    return {
+        "ok": True,
+        "kind": "decision_recorded",
+        "message": "The source layout and toolchain are resolved.",
+        "probe_resolutions": {
+            "toolchain": "use mipsel-linux-gnu-gcc",
+        },
+        "transition_id": "fixture-field-probes",
+    }
+
+workflow task:
+    stage inspect(goal="resolve build inputs", max_actions=3):
+        agent_loop()
+        ensure decision_recorded(resolved={
+            "source_layout": {
+                "kind": "path",
+                "question": "Where are the Doom sources?",
+            },
+            "toolchain": {
+                "kind": "command",
+                "question": "Which compiler builds a MIPS ELF?",
+            },
+        })
+
+report = workflow_run(task)
+emit({
+    "ok": report.ok,
+    "attempts": report.stages[0].attempts,
+    "findings": report.stages[0].findings,
+    "probes": report.stages[0].probes,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(true));
+        assert_eq!(value["attempts"], json_value!(3));
+        assert_eq!(
+            value["findings"]["source_layout"]["basis"],
+            json_value!("runtime:action:1:read:.")
+        );
+        assert_eq!(
+            value["findings"]["toolchain"]["basis"],
+            json_value!("runtime:action:2:run_linux:.")
+        );
+        assert_eq!(
+            value["probes"]["toolchain"]["status"],
+            json_value!("resolved")
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_rejects_probe_resolution_without_retained_observation() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-unobserved-resolution")?;
+        let program = lower_source(
+            r#"def agent_loop(step):
+    return {
+        "ok": True,
+        "kind": "decision_recorded",
+        "message": "Claimed without observing.",
+        "probe_resolutions": {"toolchain": "use an unobserved compiler"},
+    }
+
+workflow task:
+    stage inspect(goal="resolve compiler", max_actions=1):
+        agent_loop()
+        ensure decision_recorded(resolved={
+            "toolchain": {
+                "kind": "command",
+                "question": "Which compiler builds the target?",
+            },
+        })
+
+workflow_run(task)
+"#,
+        )?;
+        let error = match eval_program_with_output(
+            &engine_state,
+            &mut stack,
+            &program,
+            PipelineData::empty(),
+        ) {
+            Ok(_) => panic!("an unobserved field resolution must fail"),
+            Err(error) => error,
+        };
+        let message = format!("{error:?}");
+        assert!(message.contains("has no retained observation"), "{message}");
+        assert!(message.contains("toolchain"), "{message}");
         cleanup_dir(&root);
         Ok(())
     }

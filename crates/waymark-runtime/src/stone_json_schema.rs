@@ -270,17 +270,21 @@ fn validate_instance_node(
     }
 
     if let Some(branches) = object.get("oneOf").and_then(JsonValue::as_array) {
-        let matches = branches
+        let branch_issues = branches
             .iter()
-            .filter(|branch| validate_instance(branch, instance).is_empty())
+            .map(|branch| validate_instance(branch, instance))
+            .collect::<Vec<_>>();
+        let matches = branch_issues
+            .iter()
+            .filter(|branch| branch.is_empty())
             .count();
         if matches != 1 {
-            push_issue(
-                issues,
-                path,
-                "oneOf",
-                &format!("expected exactly one matching schema, found {matches}"),
-            );
+            let message = if matches == 0 {
+                one_of_mismatch_message(branches, &branch_issues)
+            } else {
+                format!("expected exactly one matching schema, found {matches}")
+            };
+            push_issue(issues, path, "oneOf", &message);
         }
     }
     if let Some(branches) = object.get("anyOf").and_then(JsonValue::as_array) {
@@ -425,6 +429,70 @@ fn push_issue(issues: &mut Vec<ValidationIssue>, path: &str, keyword: &str, mess
     }
 }
 
+fn one_of_mismatch_message(
+    branches: &[JsonValue],
+    branch_issues: &[Vec<ValidationIssue>],
+) -> String {
+    let allowed = branches
+        .iter()
+        .filter_map(one_of_branch_label)
+        .take(8)
+        .collect::<Vec<_>>();
+    let nearest = branch_issues
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, issues)| issues.len())
+        .and_then(|(index, issues)| {
+            if issues.is_empty() {
+                return None;
+            }
+            let label = branches
+                .get(index)
+                .and_then(one_of_branch_label)
+                .unwrap_or_else(|| format!("branch {index}"));
+            let details = issues
+                .iter()
+                .take(3)
+                .map(|issue| format!("{} {}: {}", issue.path, issue.keyword, issue.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            Some(format!("nearest {label}: {details}"))
+        });
+    let mut parts = vec!["value matches no allowed schema".to_string()];
+    if !allowed.is_empty() {
+        parts.push(format!("allowed alternatives: {}", allowed.join(" | ")));
+    }
+    if let Some(nearest) = nearest {
+        parts.push(nearest);
+    }
+    parts.join("; ")
+}
+
+fn one_of_branch_label(branch: &JsonValue) -> Option<String> {
+    let object = branch.as_object()?;
+    let properties = object.get("properties").and_then(JsonValue::as_object);
+    if let Some(properties) = properties {
+        for (name, property) in properties {
+            if let Some(value) = property.get("const") {
+                let value = serde_json::to_string(value).unwrap_or_else(|_| "?".to_string());
+                return Some(format!("{name}={value}"));
+            }
+        }
+    }
+    let required = object
+        .get("required")
+        .and_then(JsonValue::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .take(4)
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())?;
+    Some(format!("object requiring {{{}}}", required.join(", ")))
+}
+
 fn instance_has_type(value: &JsonValue, kind: &str) -> bool {
     match kind {
         "object" => value.is_object(),
@@ -525,9 +593,12 @@ mod tests {
         });
         validate_schema_definition(&schema).unwrap();
         assert!(validate_instance(&schema, &json!({"kind": "run"})).is_empty());
-        assert_eq!(
-            validate_instance(&schema, &json!({"kind": "other"}))[0].keyword,
-            "oneOf"
-        );
+        let issues = validate_instance(&schema, &json!({"kind": "other"}));
+        let issue = &issues[0];
+        assert_eq!(issue.keyword, "oneOf");
+        assert!(issue
+            .message
+            .contains("allowed alternatives: kind=\"run\" | kind=\"finish\""));
+        assert!(issue.message.contains("nearest kind=\"run\""));
     }
 }
