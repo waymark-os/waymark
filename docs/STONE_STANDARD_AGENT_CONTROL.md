@@ -254,6 +254,19 @@ action outcome. Manual `run_start`/status/wait/terminate remains available for
 real overlap and services. At the language level, `await run(...)` lowers to
 the same owned lifecycle.
 
+The staged controller additionally exposes `ensure_command` for a finding that
+declares `evidence.tool="ensure_command"`. It owns a check, an optional explicit
+provisioning command, and a verification check as one action, returning typed
+environment-transition and verification records. The action is omitted from
+schemas for unrelated findings. This is an effect-structuring convenience, not
+an authority bypass; the provisioning argv is still subject to Gateway policy.
+
+In the first task-shaped rollout, a medium-reasoning model selected this action
+without a repair, installed `gcc-mips-linux-gnu`, and verified the resulting
+compiler path in the same action. Inspection nevertheless exhausted its budget
+before two unrelated findings, so this is evidence for the action interface,
+not for end-task success or the controller's acquisition schedule.
+
 The first Gateway fixture used one `run_complete` action to create an output,
 then one read and one finish action. It made no model-driven run observations,
 retained verified evidence and audit state, reported zero active handles, and

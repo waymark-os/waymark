@@ -4926,12 +4926,7 @@ impl Evaluator<'_> {
             .as_ref()
             .map(|expression| self.eval_workflow_max_actions(expression, "@stage"))
             .transpose()?
-            .unwrap_or(1);
-        if agent_loop && decorator.max_actions.is_none() {
-            return Err(workflow_error(
-                "@stage agent_loop=True requires an explicit max_actions budget",
-            ));
-        }
+            .unwrap_or(0);
         if agent_loop && explicit_max_attempts.is_some() {
             return Err(workflow_error(
                 "@stage agent_loop=True uses max_actions as its sole decision budget; do not also provide max_attempts",
@@ -4980,9 +4975,8 @@ impl Evaluator<'_> {
         let mut action = None;
         let mut repair = None;
         let mut max_attempts = 1_u32;
-        let mut max_actions = 1_u32;
+        let mut max_actions = 0_u32;
         let mut explicit_max_attempts = false;
-        let mut explicit_max_actions = false;
         let mut checkpoint = WorkflowCheckpointPolicy::None;
         let mut seen = HashSet::new();
         for (field, expression) in &call.named {
@@ -5017,7 +5011,6 @@ impl Evaluator<'_> {
                     max_attempts = self.eval_workflow_max_attempts(expression, "workflow_stage")?;
                 }
                 "max_actions" => {
-                    explicit_max_actions = true;
                     max_actions = self.eval_workflow_max_actions(expression, "workflow_stage")?;
                 }
                 "checkpoint" => {
@@ -5035,11 +5028,6 @@ impl Evaluator<'_> {
             evidence.ok_or_else(|| workflow_error("workflow_stage() requires evidence="))?;
         let action = action.ok_or_else(|| workflow_error("workflow_stage() requires action="))?;
         if agent_loop {
-            if !explicit_max_actions {
-                return Err(workflow_error(
-                    "workflow_stage(agent_loop=True) requires an explicit max_actions budget",
-                ));
-            }
             if explicit_max_attempts {
                 return Err(workflow_error(
                     "workflow_stage(agent_loop=True) uses max_actions as its sole decision budget; do not also provide max_attempts",
@@ -5233,14 +5221,7 @@ impl Evaluator<'_> {
             .eval_expr_value(expression, PipelineData::empty())?
             .into_nu_value(&format!("{context} max_actions"))?;
         let actions = value_to_limit(&value, &format!("{context} max_actions"))?;
-        let actions =
-            u32::try_from(actions).map_err(|_| workflow_error("max_actions is too large"))?;
-        if !(1..=64).contains(&actions) {
-            return Err(workflow_error(format!(
-                "{context} max_actions must be between 1 and 64"
-            )));
-        }
-        Ok(actions)
+        u32::try_from(actions).map_err(|_| workflow_error("max_actions is too large"))
     }
 
     fn eval_workflow_checkpoint_policy(
@@ -5642,7 +5623,8 @@ impl Evaluator<'_> {
             }
 
             let mut stage_completed = false;
-            for attempt in 1..=stage.max_attempts {
+            let mut attempt = 1_u32;
+            loop {
                 attempts = attempt;
                 let context = workflow_context_value(
                     workflow,
@@ -5760,6 +5742,15 @@ impl Evaluator<'_> {
                         break;
                     }
                 }
+
+                if stage.max_attempts != 0 && attempt >= stage.max_attempts {
+                    break;
+                }
+                attempt = attempt.checked_add(1).ok_or_else(|| {
+                    workflow_error(
+                        "agent-loop action counter exhausted u32 without satisfying evidence",
+                    )
+                })?;
             }
 
             if stage_completed {
@@ -11843,16 +11834,21 @@ fn workflow_command_evidence(
     expected: &[String],
 ) -> Result<(bool, String), ShellError> {
     let expected_text = serde_json::to_string(expected).unwrap_or_else(|_| "[]".to_string());
+    let summary = |text: String| bounded_text(&text, 1_024);
     let Some(outcome) = workflow_context_outcome(context) else {
         return Ok((
             false,
-            format!("command {expected_text} has no stage action outcome yet"),
+            summary(format!(
+                "command {expected_text} has no stage action outcome yet"
+            )),
         ));
     };
     let Some(argv) = outcome.get("argv") else {
         return Ok((
             false,
-            format!("latest stage action does not identify command {expected_text}"),
+            summary(format!(
+                "latest stage action does not identify command {expected_text}"
+            )),
         ));
     };
     let observed = value_to_string_list(argv, "command_succeeded outcome argv")?;
@@ -11860,7 +11856,9 @@ fn workflow_command_evidence(
     if observed != expected {
         return Ok((
             false,
-            format!("expected command {expected_text}, observed {observed_text}"),
+            summary(format!(
+                "expected command {expected_text}, observed {observed_text}"
+            )),
         ));
     }
     let ok = outcome
@@ -11873,16 +11871,16 @@ fn workflow_command_evidence(
         _ => None,
     });
     if ok && exit_code.unwrap_or(0) == 0 {
-        Ok((true, format!("command {expected_text} succeeded")))
+        Ok((true, summary(format!("command {expected_text} succeeded"))))
     } else {
         Ok((
             false,
-            format!(
+            summary(format!(
                 "command {expected_text} failed{}",
                 exit_code
                     .map(|code| format!(" with exit code {code}"))
                     .unwrap_or_default()
-            ),
+            )),
         ))
     }
 }
@@ -11939,11 +11937,11 @@ fn parse_workflow_finding_evidence_predicate(
     if tool.as_deref().is_some_and(|tool| {
         !matches!(
             tool,
-            "read" | "find" | "search" | "run_linux" | "run_complete"
+            "read" | "find" | "search" | "ensure_command" | "run_linux" | "run_complete"
         )
     }) {
         return Err(workflow_error(format!(
-            "decision_recorded() descriptor `{field}` evidence tool must be read, find, search, run_linux, or run_complete"
+            "decision_recorded() descriptor `{field}` evidence tool must be read, find, search, ensure_command, run_linux, or run_complete"
         )));
     }
     let contains = match record.get("contains") {
@@ -12347,6 +12345,20 @@ fn merge_workflow_finding_updates(
             _ => false,
         });
         if already_resolved {
+            let resolved_by_this_action =
+                outcome
+                    .get("probe_resolutions")
+                    .is_some_and(|value| match value {
+                        Value::Record { val, .. } => val.get(&field).is_some(),
+                        _ => false,
+                    });
+            if resolved_by_this_action {
+                // The schema was produced before this action, so a model may
+                // interpret the retained probe and redundantly launch another
+                // probe for the same field in one response. Keep the proven
+                // resolution and discard only that redundant observation.
+                return Ok(());
+            }
             return Err(workflow_error(format!(
                 "stage probe_field `{field}` is already resolved; target one of the remaining fields"
             )));
@@ -12358,10 +12370,10 @@ fn merge_workflow_finding_updates(
             .unwrap_or_default();
         if !matches!(
             tool.as_str(),
-            "read" | "find" | "search" | "write" | "run_linux" | "run_complete"
+            "read" | "find" | "search" | "write" | "ensure_command" | "run_linux" | "run_complete"
         ) {
             return Err(workflow_error(format!(
-                "stage probe_field `{field}` must be attached to read, find, search, write, run_linux, or run_complete, not `{tool}`"
+                "stage probe_field `{field}` must be attached to read, find, search, write, ensure_command, run_linux, or run_complete, not `{tool}`"
             )));
         }
         let span = Span::unknown();
@@ -12701,6 +12713,9 @@ fn workflow_probe_feedback(
         ),
         "search" => Some(
             "use one required literal as needle, narrow path, then range-read the matching source".to_string(),
+        ),
+        "ensure_command" => Some(
+            "set command to the required executable; if it is absent and policy permits, add provision={argv: [...]} so the runtime can apply and verify one explicit environment transition; otherwise refine the contract to an available alternative".to_string(),
         ),
         "run_linux" | "run_complete" if revision >= 2 && empty => Some(
             "the capability remains absent: query or install it in the retained tool environment when policy permits, then run a concrete capability or artifact diagnostic; otherwise switch strategy instead of repeating the same lookup".to_string(),
@@ -18106,6 +18121,26 @@ budget_assistance = stage_agent_budget_assistance(
     ["source_layout", "toolchain", "interface_contract", "runtime_contract", "deployment_policy"],
     [],
 )
+capability_schema = stage_agent_action_schema({
+    "attempt": 1,
+    "max_actions": 3,
+    "contracts": ["decision_recorded"],
+    "decision_fields": [],
+    "resolved_decision_fields": ["toolchain"],
+    "finding_specs": {
+        "toolchain": {
+            "kind": "command",
+            "question": "Which command provides the required capability?",
+            "evidence": {
+                "tool": "ensure_command",
+                "contains": ["fixture-command"],
+                "success": True,
+            },
+        },
+    },
+    "outcome": None,
+})
+capability_action = capability_schema.properties.actions.items.oneOf[6]
 emit({
     "summary_stdout": summary.stdout,
     "summary_stderr": summary.stderr,
@@ -18140,6 +18175,11 @@ emit({
     "budget_pressure": budget_assistance.pressure,
     "budget_slack": budget_assistance.refinement_slack,
     "budget_warning": budget_assistance.warning,
+    "capability_choices": len(capability_schema.properties.actions.items.oneOf),
+    "capability_tool": capability_action.properties.tool.const,
+    "capability_targets": capability_action.properties.for_field.enum,
+    "capability_input_required": capability_action.properties.input.required,
+    "provision_required": capability_action.properties.input.properties.provision.required,
 })
 "#,
         );
@@ -18181,6 +18221,11 @@ emit({
                 "budget_pressure": "no_refinement_slack",
                 "budget_slack": 0,
                 "budget_warning": "The budget allows one probe per missing/insufficient field and one final decision, with no refinement slack. Avoid broad or speculative probes and follow probe recommendations exactly.",
+                "capability_choices": 7,
+                "capability_tool": "ensure_command",
+                "capability_targets": ["toolchain"],
+                "capability_input_required": ["command"],
+                "provision_required": ["argv"],
             })
         );
         cleanup_dir(&root);
@@ -18268,6 +18313,65 @@ emit({
     }
 
     #[test]
+    fn standard_stage_agent_applies_and_verifies_environment_transition() -> Result<(), ShellError>
+    {
+        let (engine_state, mut stack, root) = test_engine("stage-agent-environment-transition")?;
+        let source = format!(
+            "{}\n{}",
+            include_str!("../../../examples/scripts/standard_stage_agent.stone"),
+            r#"
+missing = stage_agent_dispatch({
+    "tool": "ensure_command",
+    "input": {"command": "./never-created"},
+})
+provisioned = stage_agent_dispatch({
+    "tool": "ensure_command",
+    "input": {
+        "command": "./fixture-command",
+        "provision": {
+            "argv": [
+                "sh",
+                "-c",
+                "printf '#!/bin/sh\\nexit 0\\n' > fixture-command && chmod +x fixture-command",
+            ],
+        },
+    },
+})
+retained = stage_agent_dispatch({
+    "tool": "ensure_command",
+    "input": {"command": "./fixture-command"},
+})
+emit({
+    "missing_ok": missing.ok,
+    "missing_kind": missing.kind,
+    "missing_transition": missing.environment_transition.state,
+    "provisioned_ok": provisioned.ok,
+    "provisioned_kind": provisioned.kind,
+    "provisioned_transition": provisioned.environment_transition.state,
+    "provisioned_attempted": provisioned.environment_transition.attempted,
+    "verified": provisioned.verification.ok,
+    "retained_transition": retained.environment_transition.state,
+})
+"#,
+        );
+        let program = lower_source(&source)?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["missing_ok"], json_value!(false));
+        assert_eq!(value["missing_kind"], json_value!("capability_absent"));
+        assert_eq!(value["missing_transition"], json_value!("not_requested"));
+        assert_eq!(value["provisioned_ok"], json_value!(true));
+        assert_eq!(value["provisioned_kind"], json_value!("capability_ready"));
+        assert_eq!(value["provisioned_transition"], json_value!("applied"));
+        assert_eq!(value["provisioned_attempted"], json_value!(true));
+        assert_eq!(value["verified"], json_value!(true));
+        assert_eq!(value["retained_transition"], json_value!("not_needed"));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
     fn workflow_agent_loop_supports_task_scaled_bounded_action_budget() -> Result<(), ShellError> {
         let (engine_state, mut stack, root) = test_engine("workflow-agent-loop-budget")?;
         let program = lower_source(
@@ -18275,7 +18379,7 @@ emit({
     return {"ok": True, "kind": "decision", "message": "no progress"}
 
 workflow task:
-    stage build(goal="produce artifact", max_actions=12):
+    stage build(goal="produce artifact", max_actions=200):
         agent_loop()
         ensure file_nonempty("missing.txt")
 
@@ -18293,11 +18397,58 @@ emit({
         let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
         assert_eq!(value["ok"], json_value!(false));
         assert_eq!(value["failed_stage"], json_value!("build"));
-        assert_eq!(value["attempts"], json_value!(12));
+        assert_eq!(value["attempts"], json_value!(200));
         assert!(value["summary"]
             .as_str()
             .expect("summary")
             .contains("missing.txt"));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_agent_loop_defaults_to_unlimited_and_accepts_zero() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-agent-loop-unlimited")?;
+        let program = lower_source(
+            r#"def agent_loop(step):
+    path = step.stage + ".txt"
+    target = 3 if step.stage == "implicit" else 2
+    if step.attempt == target:
+        write_text(path, "done\n")
+    return {"ok": True, "kind": "progress", "message": "continue until evidence"}
+
+workflow task:
+    stage implicit(goal="finish without an action limit"):
+        agent_loop()
+        ensure file_nonempty("implicit.txt")
+
+    stage explicit(goal="finish with the zero sentinel", max_actions=0):
+        agent_loop()
+        ensure file_nonempty("explicit.txt")
+
+report = workflow_run(task)
+emit({
+    "ok": report.ok,
+    "implicit_attempts": report.stages[0].attempts,
+    "implicit_limit": report.stages[0].max_actions,
+    "explicit_attempts": report.stages[1].attempts,
+    "explicit_limit": report.stages[1].max_actions,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(
+            value,
+            json_value!({
+                "ok": true,
+                "implicit_attempts": 3,
+                "implicit_limit": 0,
+                "explicit_attempts": 2,
+                "explicit_limit": 0,
+            })
+        );
         cleanup_dir(&root);
         Ok(())
     }
@@ -18889,6 +19040,148 @@ emit({"ok": report.ok, "revision": report.stages[0].probes.entry_points.revision
     }
 
     #[test]
+    fn workflow_retains_typed_environment_transition_guidance() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-environment-transition")?;
+        let program = lower_source(
+            r#"def agent_loop(step):
+    if step.attempt == 1:
+        return {
+            "ok": False,
+            "kind": "capability_absent",
+            "tool": "ensure_command",
+            "command": "fixture-command",
+            "message": "command `fixture-command` remains unavailable",
+            "probe_field": "toolchain",
+        }
+    if step.attempt == 2:
+        probe = step.probes.toolchain
+        if probe.status != "insufficient":
+            fail("an absent capability must keep the finding open")
+        if probe.recommendations[0].tool != "ensure_command":
+            fail("feedback did not preserve the typed transition tool")
+        if "provision" not in probe.recommendations[0].input_hint:
+            fail("feedback did not explain the explicit transition input")
+        return {
+            "ok": True,
+            "kind": "capability_ready",
+            "tool": "ensure_command",
+            "command": "fixture-command",
+            "stdout": "/opt/bin/fixture-command\n",
+            "message": "command `fixture-command` is available at /opt/bin/fixture-command",
+            "probe_field": "toolchain",
+        }
+    if step.probes.toolchain.status != "observed":
+        fail("verified capability evidence must become observed")
+    return {
+        "ok": True,
+        "kind": "decision_recorded",
+        "message": "The required command capability is ready.",
+        "probe_resolutions": {
+            "toolchain": "use /opt/bin/fixture-command",
+        },
+        "transition_id": "fixture-environment-transition",
+    }
+
+workflow task:
+    stage inspect(goal="resolve command capability", max_actions=3):
+        agent_loop()
+        ensure decision_recorded(resolved={
+            "toolchain": {
+                "kind": "command",
+                "question": "Which command provides the required capability?",
+                "evidence": {
+                    "tool": "ensure_command",
+                    "contains": ["fixture-command"],
+                    "success": True,
+                },
+            },
+        })
+
+report = workflow_run(task)
+emit({
+    "ok": report.ok,
+    "status": report.stages[0].probes.toolchain.status,
+    "revision": report.stages[0].probes.toolchain.revision,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(true));
+        assert_eq!(value["status"], json_value!("resolved"));
+        assert_eq!(value["revision"], json_value!(2));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_keeps_resolution_when_same_action_reprobes_the_field() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-redundant-resolved-probe")?;
+        let program = lower_source(
+            r#"def agent_loop(step):
+    if step.attempt == 1:
+        return {
+            "ok": True,
+            "kind": "success",
+            "tool": "run_linux",
+            "stdout": "/opt/bin/fixture-command\n",
+            "probe_field": "toolchain",
+        }
+    if step.attempt == 2:
+        return {
+            "ok": True,
+            "kind": "success",
+            "tool": "run_linux",
+            "stdout": "redundant diagnostic\n",
+            "probe_field": "toolchain",
+            "probe_resolutions": {
+                "toolchain": "use /opt/bin/fixture-command",
+            },
+        }
+    if step.findings.toolchain.state != "resolved":
+        fail("same-action redundant probe erased the resolution")
+    return {
+        "ok": True,
+        "kind": "decision_recorded",
+        "message": "The required command is resolved.",
+        "transition_id": "fixture-redundant-probe",
+    }
+
+workflow task:
+    stage inspect(goal="resolve command capability", max_actions=3):
+        agent_loop()
+        ensure decision_recorded(resolved={
+            "toolchain": {
+                "kind": "command",
+                "question": "Which command provides the required capability?",
+                "evidence": {
+                    "tool": "run_linux",
+                    "contains": ["fixture-command"],
+                    "success": True,
+                },
+            },
+        })
+
+report = workflow_run(task)
+emit({
+    "ok": report.ok,
+    "status": report.stages[0].probes.toolchain.status,
+    "revision": report.stages[0].probes.toolchain.revision,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(true));
+        assert_eq!(value["status"], json_value!("resolved"));
+        assert_eq!(value["revision"], json_value!(1));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
     fn workflow_finding_evidence_predicate_explains_required_refinement() -> Result<(), ShellError>
     {
         let (engine_state, mut stack, root) = test_engine("workflow-evidence-predicate")?;
@@ -19216,6 +19509,39 @@ emit({
             .expect("summary")
             .contains("all 2 stage contracts satisfied"));
         assert_eq!(value["references"].as_array().expect("references").len(), 2);
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn command_contract_bounds_runtime_generated_mismatch_summary() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-command-summary-bound")?;
+        let long_command = format!("printf ignored #{}", "x".repeat(2_000));
+        let source = format!(
+            r#"def execute(step):
+    return run(["sh", "-c", {long_command:?}])
+
+stage = workflow_stage(
+    "execute",
+    evidence=command_succeeded(["node", "vm.js"]),
+    action=execute,
+    max_attempts=1,
+)
+report = workflow_run(workflow("run-and-observe", stage))
+emit({{
+    "ok": report.ok,
+    "summary": report.stages[0].evidence.summary,
+}})
+"#
+        );
+        let program = lower_source(&source)?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(false));
+        let summary = value["summary"].as_str().expect("evidence summary");
+        assert!(summary.contains("expected command"), "{summary}");
+        assert!(summary.chars().count() <= 1_024, "{summary}");
         cleanup_dir(&root);
         Ok(())
     }

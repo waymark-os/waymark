@@ -389,6 +389,60 @@ workflow project:
         ])
 ```
 
+`max_actions` is a containment policy, not a required prediction of task
+length. Omitting it, or setting it to `0`, leaves an agent-loop stage without
+an action-count limit; evidence satisfaction, cancellation, and external
+resource policy still terminate execution. A positive value bounds the stage
+when a parent wants a contained child probe or a benchmark needs comparable
+work. Large design-exploration budgets should not change the controller's
+phase schedule: the standard stage agent derives its next mode from evidence
+and prior outcomes rather than from the fraction of budget consumed.
+
+The Doom V42 rollout supports that separation. With a 200-action ceiling,
+inspection, build, and execution completed in 14, 13, and 17 actions; every
+stage would have exceeded its previous small ceiling, while none came close to
+200. The workflow still failed the official verifier for a different reason:
+`stdout_nonempty()` accepted a VM termination diagnostic, and
+`file_valid(format="bmp", nonempty=True)` accepted a separately generated
+58-byte 1x1 BMP. The verify stage then observed those retained facts as already
+satisfied and took no fresh action.
+
+Typed evidence therefore needs semantic and provenance strength as well as
+shape. The standalone image violated the public requirement that the supplied
+backend write drawn frames, so that provenance lesson is valid. However, the
+frozen task instruction did not publish the verifier's exact stdout marker,
+640x400 dimensions, or 95% image-similarity threshold. Rejection on those
+hidden criteria is a specification/verifier mismatch, not evidence against the
+programming model. Task harnesses should be able to require declared
+predicates over observable output and artifact properties, tie an artifact to
+the action that produced it, and require a fresh observation at an acceptance
+boundary. A verifier result that cannot map to a public requirement should be
+classified separately. These remain generic evidence forms; the runtime
+should not encode task-specific verifier answers.
+
+Artifact:
+`../../waymark-gateway/target/runs/staged-stone-doom-v42-action-budget-200-terra/cell/cell.json`.
+
+The matched public-contract follow-up sharpened this result. With the exact
+stdout marker, 640x400 dimensions, 95% image threshold, timeout, and producer
+requirement visible in the task, the model no longer fabricated a BMP or
+treated PC-0 termination as success. After one runtime-diagnostic fix, it
+completed inspection and build but spent at least 78 execution actions on the
+ELF/VM boundary until the 900-second parent deadline. The official verifier
+did not run.
+
+This is evidence for public specifications, but also against prompt-only
+enforcement. The unchanged Stone harness still encoded only nonempty stdout
+and BMP shape. Public acceptance clauses should lower to typed evidence when a
+predicate exists, while unlowered clauses remain visible obligations that
+prevent an unsupported completion claim. Action ceilings and wall-time policy
+remain orthogonal: this cell hit wall time far below its 200-action ceiling.
+
+Artifacts:
+`../../waymark-gateway/target/runs/staged-stone-doom-v45-explicit-public-contract-matched-terra/cell/cell.json`
+and
+`../../waymark-gateway/target/runs/staged-stone-doom-v46-explicit-public-contract-evidence-fix-terra/cell/cell.json`.
+
 The standard stage agent's `decide` action must provide an answer plus a
 non-empty finding for each field. The runtime rechecks those fields before the
 stage advances and reports the missing names. This proves that the typed
@@ -768,6 +822,53 @@ Artifacts:
 `../../waymark-gateway/target/runs/staged-stone-doom-v37-evidence-aware-fairness-terra/cell/cell.json`,
 and
 `../../waymark-gateway/target/runs/staged-stone-doom-v38-evidence-aware-advisory-terra/cell/cell.json`.
+
+### Typed environment transitions
+
+An absent command is not another search result. The visible stage-control
+library now admits an `ensure_command` action only for unresolved findings
+whose evidence contract explicitly names that tool:
+
+```json
+{
+  "tool": "ensure_command",
+  "input": {
+    "command": "target-cc",
+    "provision": {"argv": ["pkg-tool", "install", "target-cc-package"]}
+  },
+  "for_field": "toolchain"
+}
+```
+
+The action performs check, optional provisioning, and verification as one
+runtime-owned transition. Its outcome distinguishes `capability_ready` from
+`capability_absent` and retains a bounded `environment_transition` record plus
+verification evidence. Omitting `provision` is a typed absence probe; providing
+it makes the environment mutation explicit and auditable.
+
+This library construct does not grant package-install authority. The model
+could already request the same command through `run_complete`; Gateway policy
+still admits or denies it. The improvement is semantic: the harness declares
+that environment mutation is an allowed way to satisfy this particular
+finding, and the runtime verifies the postcondition without another model
+round. A local canary covers absent, applied, verified, and already-present
+states. In the frozen Doom comparison, the model selected `ensure_command`,
+requested the correct cross-compiler package, and received a verified
+`/usr/bin/mips-linux-gnu-gcc` path in one action. The finding then resolved with
+`runtime:action:11:ensure_command` provenance.
+
+That cell still failed inspection: four source-layout probes and five backend
+probes delayed the transition until action 11, leaving VM ABI and derived
+startup strategy unacquired. The result supports the transition construct but
+not the overall schedule. It also exposed and fixed one deterministic recovery
+case: if an action resolves a retained field and redundantly probes that same
+field, keep the proven resolution and discard the redundant observation rather
+than aborting the workflow.
+
+Artifacts:
+`../../waymark-gateway/target/runs/staged-stone-doom-v39-environment-transition-terra/cell/cell.json`
+and
+`../../waymark-gateway/target/runs/staged-stone-doom-v40-environment-transition-recovery-terra/cell/cell.json`.
 
 ```stone
 def repair_output(step):

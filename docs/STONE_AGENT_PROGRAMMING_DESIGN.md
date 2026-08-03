@@ -1713,6 +1713,25 @@ acquisition order is harness policy. Neither form resolved an absent toolchain
 or the derived startup decision, which still require explicit environment or
 contract transitions rather than more prompt context.
 
+The next slice makes the environment path explicit. `ensure_command` appears
+only when a finding contract selects it as the evidence tool. It checks for the
+command, may run one harness/model-supplied provisioning argv, and verifies
+availability before returning a structured outcome. This collapses
+check/install/recheck polling into one action without adding authority:
+Gateway still controls the underlying command effect. A failed or denied
+transition remains an insufficient finding with a concrete recovery path; it
+cannot be mistaken for acquired capability evidence.
+
+The matched Doom rollout supports this surface. On its first opportunity the
+model chose `ensure_command`, mapped the missing command to
+`gcc-mips-linux-gnu`, and the runtime applied and verified the install in one
+action. The toolchain finding resolved with runtime provenance. The attempt
+still failed inspection because the transition occurred at action 11 and two
+other obligations were untouched. This separates two concerns: typed effects
+make one environment transition reliable, while obligation scheduling and
+derived-finding semantics determine whether the attempt spends its budget on
+the right transitions.
+
 Runtime representation matters to viability. Storing another `Vec` inline in
 the recursive runtime-value enum caused the large standard controller to cross
 the test-thread stack limit. Stage goal/input metadata is now boxed as one

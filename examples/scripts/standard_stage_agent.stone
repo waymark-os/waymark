@@ -3,9 +3,11 @@
 # A workflow block lowers `agent_loop()` to repeated calls to this function.
 # The workflow kernel, not this function, owns the loop: it checks every
 # `ensure` contract before the first decision and after each returned action,
-# passes the current missing-contract summary in `step.evidence`, and stops at
-# the stage's `max_actions` budget. Explicit stage `inputs` are available as
-# typed, runtime-owned findings in `step.stage_outputs`.
+# passes the current missing-contract summary in `step.evidence`, and continues
+# until the evidence is satisfied. A positive `max_actions` is an optional
+# parent-controlled ceiling; omitted or zero means no action limit. Explicit
+# stage `inputs` are available as typed, runtime-owned findings in
+# `step.stage_outputs`.
 #
 # Extension seams:
 # - replace stage_agent_messages to change context selection or prompting;
@@ -13,8 +15,21 @@
 # - replace agent_loop itself to add hooks, critics, or a different policy.
 # Every replacement remains ordinary admitted Stone source.
 
+def stage_agent_remaining_actions(step):
+    if step.max_actions == 0:
+        return None
+    return max(step.max_actions - step.attempt + 1, 0)
+
+
+def stage_agent_remaining_probe_actions(step):
+    remaining = stage_agent_remaining_actions(step)
+    if remaining is None:
+        return None
+    return max(remaining - 1, 0)
+
+
 def stage_agent_schema_prompt(step):
-    remaining = step.max_actions - step.attempt + 1
+    remaining = stage_agent_remaining_actions(step)
     resolved_fields = get(step, "resolved_decision_fields", [])
     unresolved = []
     current_findings = get(step, "findings", {})
@@ -26,14 +41,16 @@ def stage_agent_schema_prompt(step):
             if get(get(probes, field, {}), "status", "missing") != "observed":
                 unobserved.append(field)
     decision_stage = "decision_recorded" in step.contracts
-    allowed_now = "read, find, search, edit, write, run_linux, or run_complete"
+    allowed_now = (
+        "read, find, search, edit, write, ensure_command, run_linux, or run_complete"
+    )
     if decision_stage and remaining == 1:
-        allowed_now = "read, find, search, write, run_linux, run_complete, decide, finish, or final"
+        allowed_now = "read, find, search, write, ensure_command, run_linux, run_complete, decide, finish, or final"
     elif decision_stage and len(unobserved) == 0 and len(resolved_fields) > 0:
-        allowed_now = "read, find, search, write, run_linux, run_complete, decide, finish, or final"
+        allowed_now = "read, find, search, write, ensure_command, run_linux, run_complete, decide, finish, or final"
     elif decision_stage and len(resolved_fields) == 0:
-        allowed_now = "read, find, search, write, run_linux, run_complete, decide, finish, or final"
-    return "Return {\"actions\":[A]} with exactly one A. Allowed now: " + allowed_now + ". Canonical probes: {\"tool\":\"find\",\"input\":{\"path\":\".\",\"name_glob\":\"*.toml\"},\"for_field\":\"source_layout\"}; {\"tool\":\"search\",\"input\":{\"path\":\"config/runtime.toml\",\"needle\":\"entry_point\"},\"for_field\":\"runtime_contract\"}; {\"tool\":\"read\",\"input\":{\"path\":\"config/runtime.toml\",\"start_line\":20,\"end_line\":60},\"for_field\":\"runtime_contract\"}. Canonical edit shape: {\"tool\":\"edit\",\"input\":{\"path\":\"Makefile\",\"old\":\"CC ?= cc\",\"new\":\"CC = /usr/bin/cc\"}}. Canonical probe-and-resolve shape: {\"tool\":\"run_linux\",\"input\":{\"argv\":[\"command\",\"-v\",\"cc\"]},\"for_field\":\"toolchain\",\"resolves\":{\"source_layout\":\"sources are under src\"}}. Canonical decision shape: {\"tool\":\"decide\",\"input\":{\"answer\":\"...\"},\"resolves\":{\"toolchain\":\"use /usr/bin/cc\"}}. Never replace tool with action/type, and never put answer beside tool. On a resolved-finding stage, every tool action must use for_field to name the unresolved obligation it probes. resolves may interpret only retained probe observations; the runtime supplies provenance. If an observation is insufficient, probe the same field again with a more focused action. A final decision may carry unknown={field: reason}. find is recursive, search is bounded recursive literal/regex grep, and read supports byte/tail/line ranges. Prefer edit with exact old/new text for a localized change to an existing file; use write only for a new file or a deliberate complete replacement. Use run_linux for environment or toolchain facts and run_complete only for a bounded build/test gate. Use relative workspace paths; Linux commands see the root at /app. Do not invent outcomes or use unlisted fields."
+        allowed_now = "read, find, search, write, ensure_command, run_linux, run_complete, decide, finish, or final"
+    return "Return {\"actions\":[A]} with exactly one A. Allowed now: " + allowed_now + ". Canonical probes: {\"tool\":\"find\",\"input\":{\"path\":\".\",\"name_glob\":\"*.toml\"},\"for_field\":\"source_layout\"}; {\"tool\":\"search\",\"input\":{\"path\":\"config/runtime.toml\",\"needle\":\"entry_point\"},\"for_field\":\"runtime_contract\"}; {\"tool\":\"read\",\"input\":{\"path\":\"config/runtime.toml\",\"start_line\":20,\"end_line\":60},\"for_field\":\"runtime_contract\"}. Canonical environment-transition shape: {\"tool\":\"ensure_command\",\"input\":{\"command\":\"target-cc\",\"provision\":{\"argv\":[\"pkg-tool\",\"install\",\"target-cc-package\"]}},\"for_field\":\"toolchain\"}. Canonical edit shape: {\"tool\":\"edit\",\"input\":{\"path\":\"Makefile\",\"old\":\"CC ?= cc\",\"new\":\"CC = /usr/bin/cc\"}}. Canonical probe-and-resolve shape: {\"tool\":\"run_linux\",\"input\":{\"argv\":[\"command\",\"-v\",\"cc\"]},\"for_field\":\"toolchain\",\"resolves\":{\"source_layout\":\"sources are under src\"}}. Canonical decision shape: {\"tool\":\"decide\",\"input\":{\"answer\":\"...\"},\"resolves\":{\"toolchain\":\"use /usr/bin/cc\"}}. Never replace tool with action/type, and never put answer beside tool. On a resolved-finding stage, every tool action must use for_field to name the unresolved obligation it probes. resolves may interpret only retained probe observations; the runtime supplies provenance. If an observation is insufficient, probe the same field again with a more focused action. A final decision may carry unknown={field: reason}. find is recursive, search is bounded recursive literal/regex grep, and read supports byte/tail/line ranges. Prefer edit with exact old/new text for a localized change to an existing file; use write only for a new file or a deliberate complete replacement. Use ensure_command only for a finding whose evidence tool is ensure_command; it checks, optionally provisions with the explicit argv, and verifies in one typed environment transition. Use run_linux for other environment facts and run_complete only for a bounded build/test gate. Use relative workspace paths; Linux commands see the root at /app. Do not invent outcomes or use unlisted fields."
 
 
 def stage_agent_least_revised_field(fields, probes):
@@ -59,6 +76,8 @@ def stage_agent_action_schema(step):
     insufficient_probe_fields = []
     unobserved_probe_fields = []
     probes = get(step, "probes", {})
+    finding_specs = get(step, "finding_specs", {})
+    capability_probe_fields = []
     for field in unresolved_decision_fields:
         probe_status = get(get(probes, field, {}), "status", "missing")
         if probe_status == "observed":
@@ -67,6 +86,11 @@ def stage_agent_action_schema(step):
             insufficient_probe_fields.append(field)
         else:
             unobserved_probe_fields.append(field)
+        expected_tool = get(
+            get(get(finding_specs, field, {}), "evidence", {}), "tool", None
+        )
+        if expected_tool == "ensure_command":
+            capability_probe_fields.append(field)
     can_resolve = len(observed_probe_fields) > 0
     all_unresolved_observed = (
         len(unresolved_decision_fields) > 0
@@ -248,6 +272,35 @@ def stage_agent_action_schema(step):
         "required": ["tool", "input"],
         "additionalProperties": False,
     }
+    provision = {
+        "type": "object",
+        "properties": {
+            "argv": command["properties"]["argv"],
+            "cwd": command["properties"]["cwd"],
+            "stdin": command["properties"]["stdin"],
+            "timeout_ms": command["properties"]["timeout_ms"],
+        },
+        "required": ["argv"],
+        "additionalProperties": False,
+    }
+    ensure_command_input = {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "minLength": 1, "maxLength": 256},
+            "provision": provision,
+        },
+        "required": ["command"],
+        "additionalProperties": False,
+    }
+    ensure_command_action = {
+        "type": "object",
+        "properties": {
+            "tool": {"const": "ensure_command"},
+            "input": ensure_command_input,
+        },
+        "required": ["tool", "input"],
+        "additionalProperties": False,
+    }
     if len(resolved_decision_fields) > 0:
         # The schema enforces the semantic boundary (only unresolved fields),
         # while stage_agent_messages recommends a focus. Do not encode the
@@ -267,6 +320,12 @@ def stage_agent_action_schema(step):
         run_action["required"].append("for_field")
         complete_action["properties"]["for_field"] = probe_field
         complete_action["required"].append("for_field")
+        if len(capability_probe_fields) > 0:
+            ensure_command_action["properties"]["for_field"] = {
+                "type": "string",
+                "enum": capability_probe_fields,
+            }
+            ensure_command_action["required"].append("for_field")
     decide_action = {
         "type": "object",
         "properties": {"tool": {"const": "decide"}, "input": answer},
@@ -306,6 +365,7 @@ def stage_agent_action_schema(step):
             write_action["properties"]["resolves"] = resolutions
             run_action["properties"]["resolves"] = resolutions
             complete_action["properties"]["resolves"] = resolutions
+            ensure_command_action["properties"]["resolves"] = resolutions
             decide_action["properties"]["resolves"] = resolutions
             finish_action["properties"]["resolves"] = resolutions
             final_action["properties"]["resolves"] = resolutions
@@ -317,8 +377,10 @@ def stage_agent_action_schema(step):
         run_action,
         complete_action,
     ]
+    if len(capability_probe_fields) > 0:
+        probes.append(ensure_command_action)
     choices = probes + [edit_action]
-    remaining = step.max_actions - step.attempt + 1
+    remaining = stage_agent_remaining_actions(step)
     decision_stage = "decision_recorded" in step.contracts
     mode = stage_agent_mode(step)
     if decision_stage and remaining == 1:
@@ -391,6 +453,9 @@ def stage_agent_outcome_summary(outcome):
         ),
         "content": slice(get(outcome, "content", ""), 0, 4096),
         "message": slice(get(outcome, "message", ""), 0, 2048),
+        "command": get(outcome, "command", None),
+        "environment_transition": get(outcome, "environment_transition", None),
+        "verification": get(outcome, "verification", None),
         "content_truncated": get(outcome, "content_truncated", False),
         "probe_field": get(outcome, "probe_field", None),
         "probe_resolutions": get(outcome, "probe_resolutions", {}),
@@ -426,6 +491,9 @@ def stage_agent_history_item(step, action, outcome):
         ),
         "content": slice(get(outcome, "content", ""), 0, 1024),
         "message": slice(get(outcome, "message", ""), 0, 2048),
+        "command": get(outcome, "command", None),
+        "environment_transition": get(outcome, "environment_transition", None),
+        "verification": get(outcome, "verification", None),
         "content_truncated": get(outcome, "content_truncated", False),
         "probe_field": get(outcome, "probe_field", None),
         "probe_resolutions": get(outcome, "probe_resolutions", {}),
@@ -436,13 +504,9 @@ def stage_agent_history_item(step, action, outcome):
 
 
 def stage_agent_mode(step):
-    remaining = step.max_actions - step.attempt + 1
+    remaining = stage_agent_remaining_actions(step)
     if "decision_recorded" in step.contracts and remaining == 1:
         return "decision_required"
-    if step.attempt * 3 <= step.max_actions:
-        return "explore"
-    if remaining == 1:
-        return "execute_or_repair"
     previous_tool = ""
     if step.outcome is not None:
         previous_tool = get(step.outcome, "tool", "")
@@ -450,6 +514,12 @@ def stage_agent_mode(step):
     for field in get(step, "resolved_decision_fields", []):
         if get(get(current_findings, field, {}), "state", "unknown") != "resolved":
             return "resolve_findings"
+    if "decision_recorded" in step.contracts:
+        return "decision_required"
+    if step.outcome is None:
+        return "explore"
+    if remaining == 1:
+        return "execute_or_repair"
     if previous_tool in ["edit", "write", "run_linux", "run_complete"]:
         return "diagnose_or_repair"
     return "execute_or_repair"
@@ -458,9 +528,18 @@ def stage_agent_mode(step):
 def stage_agent_budget_assistance(
     step, unresolved_fields, missing_fields, insufficient_fields
 ):
-    remaining_actions = step.max_actions - step.attempt + 1
-    remaining_probe_actions = max(remaining_actions - 1, 0)
+    remaining_actions = stage_agent_remaining_actions(step)
+    remaining_probe_actions = stage_agent_remaining_probe_actions(step)
     minimum_probe_actions = len(missing_fields) + len(insufficient_fields)
+    if remaining_actions is None:
+        return {
+            "pressure": "unbounded",
+            "remaining_actions": None,
+            "remaining_probe_actions": None,
+            "minimum_probe_actions": minimum_probe_actions,
+            "refinement_slack": None,
+            "warning": None,
+        }
     refinement_slack = remaining_probe_actions - minimum_probe_actions
     pressure = "healthy"
     warning = None
@@ -590,7 +669,7 @@ def stage_agent_messages(step):
                 "stage_outputs": step.stage_outputs,
                 "decision": step.attempt,
                 "max_actions": step.max_actions,
-                "remaining_actions": step.max_actions - step.attempt + 1,
+                "remaining_actions": stage_agent_remaining_actions(step),
                 "mode": stage_agent_mode(step),
                 "contract_kinds": step.contracts,
                 "decision_fields": get(step, "decision_fields", []),
@@ -608,10 +687,10 @@ def stage_agent_messages(step):
                     missing_probe_fields,
                     insufficient_probe_fields,
                 ),
-                "probe_budget": max(step.max_actions - 1, 0),
-                "remaining_probe_actions": max(
-                    step.max_actions - step.attempt, 0
+                "probe_budget": (
+                    None if step.max_actions == 0 else max(step.max_actions - 1, 0)
                 ),
+                "remaining_probe_actions": stage_agent_remaining_probe_actions(step),
                 "contracts": step.evidence,
                 "previous_outcome": stage_agent_outcome_summary(step.outcome),
                 "stage_history": stage_agent_history(step),
@@ -619,6 +698,80 @@ def stage_agent_messages(step):
             }),
         },
     ]
+
+
+def stage_agent_check_command(command):
+    return run(
+        ["sh", "-c", "command -v \"$1\"", "waymark-ensure-command", command],
+        timeout_ms=10000,
+        max_stdout_bytes=2048,
+        max_stderr_bytes=2048,
+    )
+
+
+def stage_agent_ensure_command(args):
+    before = stage_agent_check_command(args.command)
+    after = before
+    provision = get(args, "provision", None)
+    provision_result = None
+    transition = {
+        "kind": "environment",
+        "attempted": False,
+        "state": "not_needed" if before.ok else "not_requested",
+        "argv": [],
+        "exit_code": None,
+    }
+    if not before.ok and provision is not None:
+        provision_result = run_complete(
+            provision.argv,
+            cwd=get(provision, "cwd", None),
+            stdin=get(provision, "stdin", None),
+            timeout_ms=min(get(provision, "timeout_ms", 900000), 1800000),
+            max_stdout_bytes=8192,
+            max_stderr_bytes=8192,
+        )
+        after = stage_agent_check_command(args.command)
+        transition = {
+            "kind": "environment",
+            "attempted": True,
+            "state": (
+                "applied"
+                if after.ok
+                else "verification_failed"
+                if provision_result.ok
+                else "failed"
+            ),
+            "argv": provision.argv,
+            "exit_code": get(provision_result, "exit_code", None),
+        }
+    path = slice(get(after, "stdout", ""), 0, 2048)
+    diagnostic = get(after, "stderr", "")
+    if provision_result is not None:
+        diagnostic = get(
+            provision_result,
+            "stderr_tail",
+            get(provision_result, "stderr", diagnostic),
+        )
+    diagnostic = slice(diagnostic, 0, 2048)
+    message = "command `" + args.command + "` remains unavailable"
+    if after.ok:
+        message = "command `" + args.command + "` is available at " + path
+    return {
+        "ok": after.ok,
+        "kind": "capability_ready" if after.ok else "capability_absent",
+        "command": args.command,
+        "stdout": path,
+        "stderr": diagnostic,
+        "message": message,
+        "exit_code": get(after, "exit_code", None),
+        "environment_transition": transition,
+        "verification": {
+            "ok": after.ok,
+            "exit_code": get(after, "exit_code", None),
+            "path": path,
+            "stderr": slice(get(after, "stderr", ""), 0, 2048),
+        },
+    }
 
 
 def stage_agent_dispatch(action):
@@ -718,6 +871,8 @@ def stage_agent_dispatch(action):
                 "replacements": result.replacements,
                 "matched": result.matched,
             }
+        if tool == "ensure_command":
+            return stage_agent_ensure_command(args)
         if tool == "run_linux":
             return run(
                 args.argv,

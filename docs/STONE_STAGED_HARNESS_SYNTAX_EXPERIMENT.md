@@ -104,9 +104,9 @@ run task
 typed workflow/stage/evidence IR. `ensure` is a re-checkable stage contract, not
 a Python assertion: the runner checks it before execution when meaningful and
 after every action or repair. A checkpoint is created only after every contract
-is freshly satisfied. `max_actions` bounds model decisions inside the optional
-stage-scoped `agent_loop()`; a deterministic stage may omit that loop and use
-ordinary Stone effects.
+is freshly satisfied. A positive `max_actions` bounds model decisions inside
+the optional stage-scoped `agent_loop()`; omitted or zero means no action-count
+limit. A deterministic stage may omit that loop and use ordinary Stone effects.
 
 Sequential source remains the default authoring model. The lowered runtime may
 derive a graph for validation, scheduling, and observability, but authors do not
