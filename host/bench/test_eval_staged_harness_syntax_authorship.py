@@ -102,6 +102,19 @@ TYPED_HANDOFF_CONTRACT_SOURCE = CONTRACT_SOURCE.replace(
     'stage build(goal="build", inputs={"inspect": {"source_layout": "path", "toolchain": "command"}}, max_actions=8, checkpoint="repairable"):',
 )
 
+RELATIONAL_STARTUP_CONTRACT_SOURCE = PREDICATE_CONTRACT_SOURCE.replace(
+    '"runtime_contract": {"question": "Which ABI?", "evidence": {"tool": "read", "contains": "entryPoint", "success": True}},',
+    '''"runtime_contract": {"question": "Which ABI?", "evidence": {"tool": "read", "contains": "entryPoint", "success": True}},
+            "startup_strategy": {
+                "kind": "command",
+                "question": "Which source/compiler/linker strategy reconciles backend __start, vm.js main selection, and the CRT startup-object policy?",
+                "evidence": {"tool": "run_linux", "contains": ["__start", "main", "Scrt1.o"]},
+            },''',
+).replace(
+    'stage build(goal="build", max_actions=8, checkpoint="repairable"):',
+    'stage build(goal="build", inputs={"inspect": {"startup_strategy": "command"}}, max_actions=8, checkpoint="repairable"):',
+)
+
 
 class StagedHarnessSyntaxAuthorshipTests(unittest.TestCase):
     def test_prompts_share_task_and_semantics(self) -> None:
@@ -178,6 +191,36 @@ class StagedHarnessSyntaxAuthorshipTests(unittest.TestCase):
             list_features, False, False, True
         )
         self.assertTrue(any("field-typed inputs" in item for item in violations))
+
+    def test_relational_startup_finding_prompt_and_gate(self) -> None:
+        prompt = EXPERIMENT.arm_prompt(
+            "contract", True, False, True, True
+        )
+        self.assertIn("`startup_strategy`", prompt)
+        self.assertIn("`__start`", prompt)
+        self.assertIn("CRT/startup-object policy", prompt)
+        self.assertIn("Do not put a guessed", prompt)
+        features = EXPERIMENT.source_features(
+            "contract", RELATIONAL_STARTUP_CONTRACT_SOURCE
+        )
+        self.assertEqual(
+            [], EXPERIMENT.semantic_gate(features, True, False, True, True)
+        )
+        for field in (
+            "startup_strategy_finding",
+            "startup_strategy_command_kind",
+            "startup_strategy_relational",
+            "startup_strategy_evidence_markers",
+            "startup_strategy_typed_input",
+        ):
+            self.assertTrue(features[field], field)
+        missing = EXPERIMENT.source_features(
+            "contract", TYPED_HANDOFF_CONTRACT_SOURCE
+        )
+        violations = EXPERIMENT.semantic_gate(
+            missing, False, False, True, True
+        )
+        self.assertTrue(any("startup_strategy" in item for item in violations))
 
     def test_structural_gate_accepts_equivalent_examples(self) -> None:
         for arm, source in (

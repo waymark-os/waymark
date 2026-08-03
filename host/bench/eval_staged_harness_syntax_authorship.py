@@ -61,6 +61,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Require stage inputs to select producer fields with matching kinds.",
     )
+    parser.add_argument(
+        "--relational-startup-finding",
+        action="store_true",
+        help="Require a startup_strategy finding that relates backend, VM, and CRT entry semantics.",
+    )
     return parser.parse_args()
 
 
@@ -68,6 +73,7 @@ def common_prompt(
     require_finding_evidence: bool = False,
     require_stage_inputs: bool = False,
     require_typed_stage_inputs: bool = False,
+    require_relational_startup_finding: bool = False,
 ) -> str:
     predicate_guidance = ""
     if require_finding_evidence:
@@ -129,6 +135,20 @@ For example, a stage declared with `inputs=["prepare"]` receives
 to rediscover a declared stage interface, and do not reference the current or
 a later stage.
 """
+    relational_finding_guidance = ""
+    if require_relational_startup_finding:
+        relational_finding_guidance = """
+Inspection must resolve a separate field named `startup_strategy` with kind
+`command`. Its question must ask for one concrete source/compiler/linker
+strategy that reconciles all three observed constraints: the selected frame
+backend's `__start`, vm.js selecting a function symbol named `main`, and the
+compiler driver's CRT/startup-object policy. Give this field an executable
+evidence predicate that requires observations containing `__start`, `main`,
+and a CRT/startup-object marker. The build stage must consume
+`startup_strategy` through its field-typed input record. Do not put a guessed
+solution in the descriptor; the inspection agent must acquire and synthesize
+it from the workspace and toolchain.
+"""
     return f"""You are evaluating an LLM-oriented programming-language surface.
 Write one complete Stone harness specification for the public task below. Do
 not call tools, inspect files, solve the task, or return prose. Return only the
@@ -171,6 +191,7 @@ a non-empty structural finding is sufficient.
 Existing task inputs and generic prose are not evidence that planning happened.
 {predicate_guidance}
 {stage_input_guidance}
+{relational_finding_guidance}
 
 Public task:
 {TASK}
@@ -182,6 +203,7 @@ def arm_prompt(
     require_finding_evidence: bool = False,
     require_stage_inputs: bool = False,
     require_typed_stage_inputs: bool = False,
+    require_relational_startup_finding: bool = False,
 ) -> str:
     if arm == "decorator":
         interface = r'''
@@ -259,6 +281,7 @@ workflow(...), or workflow_run(...).
             require_finding_evidence,
             require_stage_inputs,
             require_typed_stage_inputs,
+            require_relational_startup_finding,
         )
         + "\nSyntax arm:\n"
         + interface
@@ -332,6 +355,12 @@ def source_features(arm: str, source: str) -> dict[str, Any]:
     ]
     lowered = source.lower()
     resolved_descriptors = resolved_descriptor_source(source)
+    startup_strategy_descriptor = named_record_descriptor_source(
+        resolved_descriptors, "startup_strategy"
+    )
+    startup_strategy_evidence = named_record_descriptor_source(
+        startup_strategy_descriptor, "evidence"
+    )
     finding_kinds = re.findall(
         r"(?:['\"]kind['\"]|\bkind)\s*:\s*['\"]([^'\"]+)['\"]",
         resolved_descriptors,
@@ -429,6 +458,36 @@ def source_features(arm: str, source: str) -> dict[str, Any]:
                 resolved_descriptors,
             )
         ),
+        "startup_strategy_finding": bool(startup_strategy_descriptor),
+        "startup_strategy_command_kind": bool(
+            re.search(
+                r"(?:['\"]kind['\"]|\bkind)\s*:\s*['\"]command['\"]",
+                startup_strategy_descriptor,
+            )
+        ),
+        "startup_strategy_relational": (
+            "__start" in startup_strategy_descriptor
+            and bool(re.search(r"\bmain\b", startup_strategy_descriptor))
+            and bool(
+                re.search(
+                    r"\bcrt\b|startup[-_ ]?object",
+                    startup_strategy_descriptor,
+                    re.IGNORECASE,
+                )
+            )
+        ),
+        "startup_strategy_evidence_markers": (
+            "__start" in startup_strategy_evidence
+            and bool(re.search(r"\bmain\b", startup_strategy_evidence))
+            and "crt" in startup_strategy_evidence.lower()
+        ),
+        "startup_strategy_typed_input": bool(
+            re.search(
+                r"\binputs\s*=\s*\{.*?['\"]startup_strategy['\"]\s*:\s*['\"]command['\"]",
+                source,
+                re.DOTALL,
+            )
+        ),
         "finding_kinds": finding_kinds,
         "invalid_finding_kinds": [
             kind
@@ -479,6 +538,38 @@ def resolved_descriptor_source(source: str) -> str:
     return ""
 
 
+def named_record_descriptor_source(mapping: str, field: str) -> str:
+    match = re.search(
+        rf"(?:['\"]{re.escape(field)}['\"]|\b{re.escape(field)}\b)\s*:\s*\{{",
+        mapping,
+    )
+    if match is None:
+        return ""
+    start = match.end() - 1
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for index in range(start, len(mapping)):
+        char = mapping[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in ("'", '"'):
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return mapping[start : index + 1]
+    return ""
+
+
 def syntax_gate(arm: str, features: dict[str, Any]) -> list[str]:
     violations: list[str] = []
     count = int(features["stage_count"])
@@ -516,6 +607,7 @@ def semantic_gate(
     require_finding_evidence: bool = False,
     require_stage_inputs: bool = False,
     require_typed_stage_inputs: bool = False,
+    require_relational_startup_finding: bool = False,
 ) -> list[str]:
     violations: list[str] = []
     for field in (
@@ -564,6 +656,16 @@ def semantic_gate(
             violations.append(
                 "later stages do not declare field-typed inputs from the decision stage"
             )
+    if require_relational_startup_finding and features["decision_stage"]:
+        for field in (
+            "startup_strategy_finding",
+            "startup_strategy_command_kind",
+            "startup_strategy_relational",
+            "startup_strategy_evidence_markers",
+            "startup_strategy_typed_input",
+        ):
+            if not features[field]:
+                violations.append(f"missing {field}")
     return violations
 
 
@@ -594,6 +696,7 @@ def evaluate_once(
             args.finding_evidence_predicates,
             args.stage_inputs,
             args.typed_stage_input_fields,
+            args.relational_startup_finding,
         )
         result = {
             **prior,
@@ -646,6 +749,7 @@ def evaluate_once(
         args.finding_evidence_predicates,
         args.stage_inputs,
         args.typed_stage_input_fields,
+        args.relational_startup_finding,
     )
     violations = [*syntax_violations, *semantic_violations]
     result = {
@@ -774,6 +878,7 @@ def main() -> int:
             args.finding_evidence_predicates,
             args.stage_inputs,
             args.typed_stage_input_fields,
+            args.relational_startup_finding,
         )
         for arm in selected_arms
     }
@@ -805,6 +910,7 @@ def main() -> int:
         "finding_evidence_predicates": args.finding_evidence_predicates,
         "stage_inputs": args.stage_inputs,
         "typed_stage_input_fields": args.typed_stage_input_fields,
+        "relational_startup_finding": args.relational_startup_finding,
         "arms": arms,
         "run_root": str(run_root),
     }

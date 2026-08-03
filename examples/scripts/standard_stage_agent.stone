@@ -30,10 +30,21 @@ def stage_agent_schema_prompt(step):
     if decision_stage and remaining == 1:
         allowed_now = "read, find, search, write, run_linux, run_complete, decide, finish, or final"
     elif decision_stage and len(unobserved) == 0 and len(resolved_fields) > 0:
-        allowed_now = "decide, finish, or final"
+        allowed_now = "read, find, search, write, run_linux, run_complete, decide, finish, or final"
     elif decision_stage and len(resolved_fields) == 0:
         allowed_now = "read, find, search, write, run_linux, run_complete, decide, finish, or final"
-    return "Return {\"actions\":[A]} with exactly one A. Allowed now: " + allowed_now + ". Canonical probes: {\"tool\":\"find\",\"input\":{\"path\":\".\",\"name_glob\":\"*img*.c\"},\"for_field\":\"frame_backend\"}; {\"tool\":\"search\",\"input\":{\"path\":\"vm.js\",\"needle\":\"process.argv\"},\"for_field\":\"runtime_contract\"}; {\"tool\":\"read\",\"input\":{\"path\":\"vm.js\",\"start_line\":400,\"end_line\":500},\"for_field\":\"runtime_contract\"}. Canonical edit shape: {\"tool\":\"edit\",\"input\":{\"path\":\"Makefile\",\"old\":\"CC ?= cc\",\"new\":\"CC = target-gcc\"}}. Canonical probe-and-resolve shape: {\"tool\":\"run_linux\",\"input\":{\"argv\":[\"command\",\"-v\",\"mipsel-linux-gnu-gcc\"]},\"for_field\":\"toolchain\",\"resolves\":{\"source_layout\":\"sources are under src\"}}. Canonical decision shape: {\"tool\":\"decide\",\"input\":{\"answer\":\"...\"},\"resolves\":{\"toolchain\":\"use mipsel-linux-gnu-gcc\"}}. Never replace tool with action/type, and never put answer beside tool. On a resolved-finding stage, every tool action must use for_field to name the unresolved obligation it probes. resolves may interpret only retained probe observations; the runtime supplies provenance. If an observation is insufficient, probe the same field again with a more focused action. A final decision may carry unknown={field: reason}. find is recursive, search is bounded recursive literal/regex grep, and read supports byte/tail/line ranges. Prefer edit with exact old/new text for a localized change to an existing file; use write only for a new file or a deliberate complete replacement. Use run_linux for environment or toolchain facts and run_complete only for a bounded build/test gate. Use relative workspace paths; Linux commands see the root at /app. Do not invent outcomes or use unlisted fields."
+    return "Return {\"actions\":[A]} with exactly one A. Allowed now: " + allowed_now + ". Canonical probes: {\"tool\":\"find\",\"input\":{\"path\":\".\",\"name_glob\":\"*.toml\"},\"for_field\":\"source_layout\"}; {\"tool\":\"search\",\"input\":{\"path\":\"config/runtime.toml\",\"needle\":\"entry_point\"},\"for_field\":\"runtime_contract\"}; {\"tool\":\"read\",\"input\":{\"path\":\"config/runtime.toml\",\"start_line\":20,\"end_line\":60},\"for_field\":\"runtime_contract\"}. Canonical edit shape: {\"tool\":\"edit\",\"input\":{\"path\":\"Makefile\",\"old\":\"CC ?= cc\",\"new\":\"CC = /usr/bin/cc\"}}. Canonical probe-and-resolve shape: {\"tool\":\"run_linux\",\"input\":{\"argv\":[\"command\",\"-v\",\"cc\"]},\"for_field\":\"toolchain\",\"resolves\":{\"source_layout\":\"sources are under src\"}}. Canonical decision shape: {\"tool\":\"decide\",\"input\":{\"answer\":\"...\"},\"resolves\":{\"toolchain\":\"use /usr/bin/cc\"}}. Never replace tool with action/type, and never put answer beside tool. On a resolved-finding stage, every tool action must use for_field to name the unresolved obligation it probes. resolves may interpret only retained probe observations; the runtime supplies provenance. If an observation is insufficient, probe the same field again with a more focused action. A final decision may carry unknown={field: reason}. find is recursive, search is bounded recursive literal/regex grep, and read supports byte/tail/line ranges. Prefer edit with exact old/new text for a localized change to an existing file; use write only for a new file or a deliberate complete replacement. Use run_linux for environment or toolchain facts and run_complete only for a bounded build/test gate. Use relative workspace paths; Linux commands see the root at /app. Do not invent outcomes or use unlisted fields."
+
+
+def stage_agent_least_revised_field(fields, probes):
+    selected = fields[0]
+    selected_revision = get(get(probes, selected, {}), "revision", 0)
+    for field in fields:
+        revision = get(get(probes, field, {}), "revision", 0)
+        if revision < selected_revision:
+            selected = field
+            selected_revision = revision
+    return selected
 
 
 def stage_agent_action_schema(step):
@@ -238,14 +249,11 @@ def stage_agent_action_schema(step):
         "additionalProperties": False,
     }
     if len(resolved_decision_fields) > 0:
-        # Cover every still-unobserved obligation before spending more of the
-        # bounded action budget refining an already-observed field. Once each
-        # field has an observation, refinement may target any unresolved field.
+        # The schema enforces the semantic boundary (only unresolved fields),
+        # while stage_agent_messages recommends a focus. Do not encode the
+        # advisory acquisition schedule as a hard enum: a model may reasonably
+        # deepen a mechanically observed field before probing every sibling.
         probe_targets = unresolved_decision_fields
-        if len(unobserved_probe_fields) > 0:
-            probe_targets = unobserved_probe_fields
-        elif len(insufficient_probe_fields) > 0:
-            probe_targets = insufficient_probe_fields
         probe_field = {"type": "string", "enum": probe_targets}
         read_action["properties"]["for_field"] = probe_field
         read_action["required"].append("for_field")
@@ -383,6 +391,7 @@ def stage_agent_outcome_summary(outcome):
         ),
         "content": slice(get(outcome, "content", ""), 0, 4096),
         "message": slice(get(outcome, "message", ""), 0, 2048),
+        "content_truncated": get(outcome, "content_truncated", False),
         "probe_field": get(outcome, "probe_field", None),
         "probe_resolutions": get(outcome, "probe_resolutions", {}),
         "finding_values": get(outcome, "finding_values", {}),
@@ -417,6 +426,7 @@ def stage_agent_history_item(step, action, outcome):
         ),
         "content": slice(get(outcome, "content", ""), 0, 1024),
         "message": slice(get(outcome, "message", ""), 0, 2048),
+        "content_truncated": get(outcome, "content_truncated", False),
         "probe_field": get(outcome, "probe_field", None),
         "probe_resolutions": get(outcome, "probe_resolutions", {}),
         "findings": get(outcome, "findings", {}),
@@ -445,6 +455,40 @@ def stage_agent_mode(step):
     return "execute_or_repair"
 
 
+def stage_agent_budget_assistance(
+    step, unresolved_fields, missing_fields, insufficient_fields
+):
+    remaining_actions = step.max_actions - step.attempt + 1
+    remaining_probe_actions = max(remaining_actions - 1, 0)
+    minimum_probe_actions = len(missing_fields) + len(insufficient_fields)
+    refinement_slack = remaining_probe_actions - minimum_probe_actions
+    pressure = "healthy"
+    warning = None
+    if len(unresolved_fields) > 0 and refinement_slack < 0:
+        pressure = "insufficient"
+        warning = (
+            "The remaining budget cannot give every missing/insufficient field "
+            "another probe while reserving the final decision. Use the most "
+            "targeted evidence-producing actions available; the attempt harness "
+            "needs a larger stage budget if any field still requires refinement."
+        )
+    elif len(unresolved_fields) > 0 and refinement_slack == 0:
+        pressure = "no_refinement_slack"
+        warning = (
+            "The budget allows one probe per missing/insufficient field and one "
+            "final decision, with no refinement slack. Avoid broad or speculative "
+            "probes and follow probe recommendations exactly."
+        )
+    return {
+        "pressure": pressure,
+        "remaining_actions": remaining_actions,
+        "remaining_probe_actions": remaining_probe_actions,
+        "minimum_probe_actions": minimum_probe_actions,
+        "refinement_slack": refinement_slack,
+        "warning": warning,
+    }
+
+
 def stage_agent_messages(step):
     session = agent_session()
     unresolved_decision_fields = []
@@ -467,7 +511,9 @@ def stage_agent_messages(step):
     if len(missing_probe_fields) > 0:
         focus_field = missing_probe_fields[0]
     elif len(insufficient_probe_fields) > 0:
-        focus_field = insufficient_probe_fields[0]
+        focus_field = stage_agent_least_revised_field(
+            insufficient_probe_fields, probes
+        )
     elif len(unresolved_decision_fields) > 0:
         focus_field = unresolved_decision_fields[0]
     memory = context_project(
@@ -505,7 +551,10 @@ def stage_agent_messages(step):
                 "retained as insufficient and must be refined, not resolved. When a "
                 "finding spec has evidence={tool, contains, success}, choose probes "
                 "that satisfy those executable requirements; probe.insufficiency "
-                "states exactly what a refinement still owes. Do not "
+                "states exactly what a refinement still owes. Treat each probe's "
+                "warnings and recommendations as runtime-grounded shell feedback. "
+                "Required markers printed by echo/printf are not observed evidence. "
+                "Treat stage_assistance budget pressure as authoritative. Do not "
                 "repeat fields absent from unresolved_decision_fields. Direct "
                 "the next probe at one of those unresolved fields. Do not "
                 "use decide only to publish unknown state; reserve it for a "
@@ -553,6 +602,12 @@ def stage_agent_messages(step):
                 "pending_probe_fields": pending_probe_fields,
                 "insufficient_probe_fields": insufficient_probe_fields,
                 "focus_field": focus_field,
+                "stage_assistance": stage_agent_budget_assistance(
+                    step,
+                    unresolved_decision_fields,
+                    missing_probe_fields,
+                    insufficient_probe_fields,
+                ),
                 "probe_budget": max(step.max_actions - 1, 0),
                 "remaining_probe_actions": max(
                     step.max_actions - step.attempt, 0
@@ -573,11 +628,13 @@ def stage_agent_dispatch(action):
         if tool == "read":
             info = stat(args.path)
             if info.is_dir:
+                listing = json_dumps(ls(args.path))
                 return {
                     "ok": True,
                     "kind": "list",
                     "path": args.path,
-                    "content": slice(json_dumps(ls(args.path)), 0, 8192),
+                    "content": slice(listing, 0, 8192),
+                    "content_truncated": len(listing) > 8192,
                 }
             max_bytes = min(get(args, "max_bytes", 8192), 65536)
             offset = get(args, "offset", None)
@@ -610,6 +667,7 @@ def stage_agent_dispatch(action):
                 "kind": "read",
                 "path": args.path,
                 "content": content,
+                "content_truncated": len(content) >= max_bytes,
             }
         if tool == "find":
             entries = find(
@@ -618,11 +676,14 @@ def stage_agent_dispatch(action):
                 max_depth=get(args, "max_depth", 32),
                 type=get(args, "type", "any"),
             )
+            serialized = json_dumps(entries)
             return {
                 "ok": True,
                 "kind": "find",
                 "path": args.path,
-                "content": slice(json_dumps(entries), 0, 8192),
+                "name_glob": args.name_glob,
+                "content": slice(serialized, 0, 8192),
+                "content_truncated": len(serialized) > 8192,
             }
         if tool == "search":
             matches = search(
@@ -630,11 +691,15 @@ def stage_agent_dispatch(action):
                 args.needle,
                 regex=get(args, "regex", False),
             )
+            serialized = json_dumps(matches)
             return {
                 "ok": True,
                 "kind": "search",
                 "path": args.path,
-                "content": slice(json_dumps(matches), 0, 8192),
+                "needle": args.needle,
+                "regex": get(args, "regex", False),
+                "content": slice(serialized, 0, 8192),
+                "content_truncated": len(serialized) > 8192,
             }
         if tool == "write":
             write_text(args.path, args.content)
@@ -705,7 +770,10 @@ def agent_loop(step):
                 "Use the allowed alternatives and nearest-branch details in "
                 "the validation error. Preserve the intended action only if "
                 "it is currently allowed; otherwise choose an allowed action. "
-                "Use the canonical tool/input nesting exactly."
+                "Use the canonical tool/input nesting exactly. For read, use "
+                "tail_bytes for a byte tail or start_line/end_line for lines; "
+                "the ambiguous option tail is not valid. Do not resend an "
+                "unchanged invalid field or option."
             ),
             schema_prompt=stage_agent_schema_prompt(step),
             model_class="agent",

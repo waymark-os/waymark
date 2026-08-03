@@ -12409,14 +12409,21 @@ fn merge_workflow_finding_updates(
             .iter()
             .find(|spec| spec.name == field)
             .copied();
+        let generated_required_text = finding_spec
+            .and_then(|spec| spec.evidence.as_ref())
+            .is_some_and(|predicate| {
+                workflow_probe_generates_required_text(outcome, &tool, predicate)
+            });
         if let Some(predicate) = finding_spec.and_then(|spec| spec.evidence.as_ref()) {
-            for needle in &predicate.contains {
-                let already_matched = matched_contains.iter().any(|value| match value {
-                    Value::String { val, .. } | Value::Glob { val, .. } => val == needle,
-                    _ => false,
-                });
-                if !already_matched && workflow_probe_outcome_contains(outcome, needle) {
-                    matched_contains.push(Value::string(needle.clone(), span));
+            if !generated_required_text {
+                for needle in &predicate.contains {
+                    let already_matched = matched_contains.iter().any(|value| match value {
+                        Value::String { val, .. } | Value::Glob { val, .. } => val == needle,
+                        _ => false,
+                    });
+                    if !already_matched && workflow_probe_outcome_contains(outcome, needle) {
+                        matched_contains.push(Value::string(needle.clone(), span));
+                    }
                 }
             }
         }
@@ -12427,12 +12434,37 @@ fn merge_workflow_finding_updates(
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let (probe_status, insufficiency) = workflow_probe_evidence_assessment(
+        let (mut probe_status, mut insufficiency) = workflow_probe_evidence_assessment(
             finding_spec,
             &tool,
             outcome_ok,
             summary.as_deref(),
             &matched_text,
+        );
+        if generated_required_text {
+            probe_status = "insufficient";
+            let generated = "probe command appears to generate the required text with echo/printf; observe it from source, toolchain, or command diagnostics instead";
+            insufficiency = Some(match insufficiency {
+                Some(existing) => format!("{existing}; {generated}"),
+                None => generated.to_string(),
+            });
+        }
+        if workflow_probe_content_truncated(outcome) {
+            probe_status = "insufficient";
+            let truncated = "probe output was truncated; narrow the query or use a bounded range before resolving this finding";
+            insufficiency = Some(match insufficiency {
+                Some(existing) => format!("{existing}; {truncated}"),
+                None => truncated.to_string(),
+            });
+        }
+        let (warnings, recommendations) = workflow_probe_feedback(
+            finding_spec,
+            &tool,
+            outcome,
+            summary.as_deref(),
+            generated_required_text,
+            probe_status == "insufficient",
+            revision,
         );
         let mut probe = Record::new();
         probe.push("status", Value::string(probe_status, span));
@@ -12456,6 +12488,21 @@ fn merge_workflow_finding_updates(
         }
         if let Some(insufficiency) = insufficiency {
             probe.push("insufficiency", Value::string(insufficiency, span));
+        }
+        if !warnings.is_empty() {
+            probe.push(
+                "warnings",
+                Value::list(
+                    warnings
+                        .into_iter()
+                        .map(|warning| Value::string(warning, span))
+                        .collect(),
+                    span,
+                ),
+            );
+        }
+        if !recommendations.is_empty() {
+            probe.push("recommendations", Value::list(recommendations, span));
         }
         probes.insert(field, Value::record(probe, span));
     }
@@ -12555,6 +12602,155 @@ fn workflow_probe_outcome_contains(outcome: &Record, needle: &str) -> bool {
             _ => false,
         })
     })
+}
+
+fn workflow_probe_generates_required_text(
+    outcome: &Record,
+    tool: &str,
+    predicate: &WorkflowFindingEvidencePredicate,
+) -> bool {
+    if !matches!(tool, "run_linux" | "run_complete") || predicate.contains.is_empty() {
+        return false;
+    }
+    let Some(Value::List { vals, .. }) = outcome.get("argv") else {
+        return false;
+    };
+    let command = vals
+        .iter()
+        .filter_map(|value| match value {
+            Value::String { val, .. } | Value::Glob { val, .. } => Some(val.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lowered = command.to_ascii_lowercase();
+    let explicit_generator = lowered.contains("printf ")
+        || lowered.contains("printf'")
+        || lowered.contains("printf\"")
+        || lowered.contains("echo ");
+    explicit_generator
+        && predicate
+            .contains
+            .iter()
+            .all(|needle| command.contains(needle))
+}
+
+fn workflow_probe_feedback(
+    spec: Option<&WorkflowFindingSpec>,
+    tool: &str,
+    outcome: &Record,
+    current_summary: Option<&str>,
+    generated_required_text: bool,
+    insufficient: bool,
+    revision: i64,
+) -> (Vec<String>, Vec<Value>) {
+    let span = Span::unknown();
+    let mut warnings = Vec::new();
+    let mut recommendations = Vec::new();
+    let content_truncated = workflow_probe_content_truncated(outcome);
+    if content_truncated {
+        warnings.push(
+            "tool output was truncated before evidence assessment; narrow the query or use a range"
+                .to_string(),
+        );
+    }
+    if generated_required_text {
+        warnings.push(
+            "required markers originated in an echo/printf command and were not counted as observed evidence"
+                .to_string(),
+        );
+    }
+    let regex_syntax_used_literally = tool == "search"
+        && outcome
+            .get("regex")
+            .is_some_and(|value| matches!(value, Value::Bool { val: false, .. }))
+        && outcome.get("needle").is_some_and(|value| match value {
+            Value::String { val, .. } | Value::Glob { val, .. } => {
+                val.chars().any(|character| "|()[]+?".contains(character))
+            }
+            _ => false,
+        });
+    if regex_syntax_used_literally {
+        warnings.push(
+            "search needle contains regex operators while regex=false; they were matched literally"
+                .to_string(),
+        );
+    }
+    if insufficient && revision >= 3 {
+        warnings.push(
+            "this field has remained insufficient across multiple probes; switch input/tool strategy rather than repeating the same lookup"
+                .to_string(),
+        );
+    }
+
+    let expected_tool = spec
+        .and_then(|finding| finding.evidence.as_ref())
+        .and_then(|predicate| predicate.tool.as_deref());
+    let empty = current_summary.is_none_or(|summary| summary.trim().is_empty());
+    let recommended_tool = expected_tool.unwrap_or(tool);
+    let input_hint = match recommended_tool {
+        "find" => Some(
+            "set name_glob to one required filename and narrow path/max_depth; avoid a recursive `*` when output is truncated".to_string(),
+        ),
+        "read" => Some(
+            "search for a required literal first, then read a bounded line range around each match".to_string(),
+        ),
+        "search" if regex_syntax_used_literally => Some(
+            "set regex=true for regex operators, or search one required literal at a time"
+                .to_string(),
+        ),
+        "search" => Some(
+            "use one required literal as needle, narrow path, then range-read the matching source".to_string(),
+        ),
+        "run_linux" | "run_complete" if revision >= 2 && empty => Some(
+            "the capability remains absent: query or install it in the retained tool environment when policy permits, then run a concrete capability or artifact diagnostic; otherwise switch strategy instead of repeating the same lookup".to_string(),
+        ),
+        "run_linux" | "run_complete" => Some(
+            "run a concrete capability or artifact diagnostic that emits observed facts; do not echo required markers".to_string(),
+        ),
+        _ => None,
+    };
+    let wrong_tool = expected_tool.is_some_and(|expected| expected != tool);
+    if insufficient
+        || empty
+        || content_truncated
+        || generated_required_text
+        || regex_syntax_used_literally
+        || wrong_tool
+    {
+        if let Some(input_hint) = input_hint {
+            let mut recommendation = Record::new();
+            recommendation.push("tool", Value::string(recommended_tool, span));
+            recommendation.push("input_hint", Value::string(input_hint, span));
+            recommendation.push(
+                "reason",
+                Value::string(
+                    if generated_required_text {
+                        "replace self-generated markers with externally observed evidence"
+                    } else if regex_syntax_used_literally {
+                        "the previous search used regex syntax as a literal needle"
+                    } else if content_truncated {
+                        "recover the missing evidence with a narrower result"
+                    } else if empty {
+                        "the previous probe returned no evidence"
+                    } else if revision >= 3 {
+                        "repeated probes have not satisfied the finding"
+                    } else {
+                        "the previous probe did not satisfy the finding contract"
+                    },
+                    span,
+                ),
+            );
+            recommendations.push(Value::record(recommendation, span));
+        }
+    }
+    (warnings, recommendations)
+}
+
+fn workflow_probe_content_truncated(outcome: &Record) -> bool {
+    outcome
+        .get("content_truncated")
+        .is_some_and(|value| matches!(value, Value::Bool { val: true, .. }))
 }
 
 fn workflow_probe_resolution_basis(probe: &Record, field: &str) -> Result<String, ShellError> {
@@ -17897,6 +18093,19 @@ refinement_schema = stage_agent_action_schema({
     },
     "outcome": None,
 })
+fair_refinement_focus = stage_agent_least_revised_field(
+    ["toolchain", "interface_contract"],
+    {
+        "toolchain": {"status": "insufficient", "revision": 3},
+        "interface_contract": {"status": "insufficient", "revision": 1},
+    },
+)
+budget_assistance = stage_agent_budget_assistance(
+    {"attempt": 1, "max_actions": 6},
+    ["source_layout", "toolchain", "interface_contract", "runtime_contract", "deployment_policy"],
+    ["source_layout", "toolchain", "interface_contract", "runtime_contract", "deployment_policy"],
+    [],
+)
 emit({
     "summary_stdout": summary.stdout,
     "summary_stderr": summary.stderr,
@@ -17927,6 +18136,10 @@ emit({
     "initial_resolves": get(resolved_initial_schema.properties.actions.items.oneOf[0].properties, "resolves", None),
     "refinement_choices": len(refinement_schema.properties.actions.items.oneOf),
     "refinement_targets": refinement_schema.properties.actions.items.oneOf[0].properties.for_field.enum,
+    "fair_refinement_focus": fair_refinement_focus,
+    "budget_pressure": budget_assistance.pressure,
+    "budget_slack": budget_assistance.refinement_slack,
+    "budget_warning": budget_assistance.warning,
 })
 "#,
         );
@@ -17960,10 +18173,14 @@ emit({
                 "resolved_unknown_type": "string",
                 "tool_resolution_type": "string",
                 "tool_required": ["tool", "input", "for_field"],
-                "tool_probe_targets": ["runtime_contract"],
+                "tool_probe_targets": ["toolchain", "runtime_contract"],
                 "initial_resolves": null,
                 "refinement_choices": 9,
                 "refinement_targets": ["toolchain", "runtime_contract"],
+                "fair_refinement_focus": "interface_contract",
+                "budget_pressure": "no_refinement_slack",
+                "budget_slack": 0,
+                "budget_warning": "The budget allows one probe per missing/insufficient field and one final decision, with no refinement slack. Avoid broad or speculative probes and follow probe recommendations exactly.",
             })
         );
         cleanup_dir(&root);
@@ -18522,6 +18739,153 @@ emit({
             &outcome,
             "required-tail-marker"
         ));
+    }
+
+    #[test]
+    fn workflow_rejects_self_generated_predicate_markers_with_guidance() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-evidence-guidance")?;
+        let program = lower_source(
+            r#"def agent_loop(step):
+    if step.attempt == 1:
+        return {
+            "ok": True,
+            "kind": "success",
+            "tool": "run_linux",
+            "argv": ["sh", "-lc", "printf 'producer_entry consumer_entry startup_policy\\n'"],
+            "stdout": "producer_entry consumer_entry startup_policy\n",
+            "probe_field": "integration_contract",
+        }
+    if step.attempt == 2:
+        probe = step.probes.integration_contract
+        if probe.status != "insufficient":
+            fail("self-generated markers must remain insufficient")
+        if "echo/printf" not in probe.insufficiency:
+            fail("self-generated evidence warning was not explained")
+        if len(probe.warnings) == 0 or len(probe.recommendations) == 0:
+            fail("evidence-aware feedback was not attached")
+        if probe.recommendations[0].tool != "run_linux":
+            fail("feedback did not recommend the contract tool")
+        return {
+            "ok": True,
+            "kind": "success",
+            "tool": "run_linux",
+            "argv": ["system-inspect", "--explain", "component.conf"],
+            "stderr": "producer exposes producer_entry; consumer selects consumer_entry; runtime applies startup_policy",
+            "probe_field": "integration_contract",
+        }
+    if step.probes.integration_contract.status != "observed":
+        fail("external diagnostic must become observed evidence")
+    return {
+        "ok": True,
+        "kind": "decision_recorded",
+        "message": "The integration contract is resolved from external diagnostics.",
+        "probe_resolutions": {
+            "integration_contract": "use a compatible producer/consumer policy",
+        },
+        "transition_id": "fixture-evidence-guidance",
+    }
+
+workflow task:
+    stage inspect(goal="resolve integration contract", max_actions=3):
+        agent_loop()
+        ensure decision_recorded(resolved={
+            "integration_contract": {
+                "kind": "command",
+                "question": "Which policy reconciles the producer and consumer entry contracts?",
+                "evidence": {
+                    "tool": "run_linux",
+                    "contains": ["producer_entry", "consumer_entry", "startup_policy"],
+                    "success": True,
+                },
+            },
+        })
+
+report = workflow_run(task)
+emit({
+    "ok": report.ok,
+    "status": report.stages[0].probes.integration_contract.status,
+    "revision": report.stages[0].probes.integration_contract.revision,
+})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(true));
+        assert_eq!(value["status"], json_value!("resolved"));
+        assert_eq!(value["revision"], json_value!(2));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_warns_when_search_regex_is_used_as_a_literal() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("workflow-search-guidance")?;
+        let program = lower_source(
+            r#"def agent_loop(step):
+    if step.attempt == 1:
+        return {
+            "ok": True,
+            "kind": "search",
+            "tool": "search",
+            "needle": "producer_entry|consumer_entry",
+            "regex": False,
+            "content": "[]",
+            "probe_field": "entry_points",
+        }
+    if step.attempt == 2:
+        probe = step.probes.entry_points
+        if probe.status != "insufficient":
+            fail("literal regex search must remain insufficient")
+        if "regex=false" not in probe.warnings[0]:
+            fail("wrong search option was not explained")
+        if "regex=true" not in probe.recommendations[0].input_hint:
+            fail("search correction did not name the useful option")
+        return {
+            "ok": True,
+            "kind": "search",
+            "tool": "search",
+            "needle": "producer_entry|consumer_entry",
+            "regex": True,
+            "content": "producer.conf: producer_entry; consumer.conf: consumer_entry",
+            "probe_field": "entry_points",
+        }
+    return {
+        "ok": True,
+        "kind": "decision_recorded",
+        "message": "Both entry points were observed.",
+        "probe_resolutions": {
+            "entry_points": "the producer and consumer entry points are compatible",
+        },
+        "transition_id": "fixture-search-guidance",
+    }
+
+workflow task:
+    stage inspect(goal="resolve entry points", max_actions=3):
+        agent_loop()
+        ensure decision_recorded(resolved={
+            "entry_points": {
+                "kind": "text",
+                "question": "Which entry points are required?",
+                "evidence": {
+                    "tool": "search",
+                    "contains": ["producer_entry", "consumer_entry"],
+                    "success": True,
+                },
+            },
+        })
+
+report = workflow_run(task)
+emit({"ok": report.ok, "revision": report.stages[0].probes.entry_points.revision})
+"#,
+        )?;
+        let output =
+            eval_program_with_output(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output.pipeline, Span::unknown())?;
+        assert_eq!(value["ok"], json_value!(true));
+        assert_eq!(value["revision"], json_value!(2));
+        cleanup_dir(&root);
+        Ok(())
     }
 
     #[test]

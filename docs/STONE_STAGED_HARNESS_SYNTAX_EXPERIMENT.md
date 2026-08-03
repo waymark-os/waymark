@@ -450,11 +450,45 @@ front of `stderr_tail`; it now selects the actual end. V34 consequently saw
 and addressed each terminal compiler/linker error without manually creating
 and tailing a log. The build still ended on the deeper `__start`/CRT collision.
 
-This result moves the next harness question from representation to semantics:
-can an author express and an inner agent resolve a compatibility finding that
-relates the backend's `__start`, the VM's required `main`, and linker startup
-policy? Test that flat relational obligation before introducing nested finding
-schemas.
+The flat relational follow-up passed authorship but failed execution. A fresh
+low-reasoning model authored `startup_strategy: command`, related backend
+`__start`, VM-required `main`, and CRT policy in its question, and handed the
+field to build with no repair round. At runtime, however, it made the literal
+predicate true by printing the three marker strings. The decision step
+correctly rejected this as insufficient and kept the finding unknown.
+
+This narrows the needed representation: not generic nested findings, but a
+derived-finding construct whose runtime-owned basis names other acquired
+fields. It should synthesize from their provenance instead of accepting a new
+arbitrary tool outcome. The run also exposed an authoring/runtime budget issue:
+five probes plus one decision consumed all six inspection actions, leaving no
+room to refine truncated or empty evidence.
+
+Artifacts:
+`target/runs/staged-harness-relational-startup-v1-terra/aggregate.json`
+and
+`../../waymark-gateway/target/runs/staged-stone-doom-v35-relational-startup-terra/cell/cell.json`.
+
+## Evidence-aware execution feedback
+
+Stage-aware assistance improved the same authored harness without embedding a
+task solution. The runtime classifies truncated output and self-generated
+predicate markers as insufficient, attaches tool/input recommendations, and
+identifies literal searches that look like accidental regex use. The visible
+controller adds budget pressure and advisory acquisition focus.
+
+V36 used truncation feedback to replace one broad recursive find with exact
+filename probes. V37 then showed what not to do: enforcing fair acquisition
+order in the action schema rejected model-selected deepening probes and wasted
+four actions. V38 retained the focus as advice, resolved three typed fields,
+and kept only toolchain and derived startup strategy unknown. This supports an
+evidence-aware shell, provided recommendations do not become hidden control.
+
+Artifacts:
+`../../waymark-gateway/target/runs/staged-stone-doom-v36-evidence-aware-shell-terra/cell/cell.json`,
+`../../waymark-gateway/target/runs/staged-stone-doom-v37-evidence-aware-fairness-terra/cell/cell.json`,
+and
+`../../waymark-gateway/target/runs/staged-stone-doom-v38-evidence-aware-advisory-terra/cell/cell.json`.
 
 Artifact:
 `../../waymark-gateway/target/runs/staged-stone-doom-v12-typed-decisions-terra/cell/cell.json`

@@ -1683,13 +1683,35 @@ characters of process diagnostics. A live v34 cell used exact edit and then
 reacted to successive concrete compiler/linker errors instead of manually
 recovering a hidden tail.
 
-That cell still stopped at a `__start` collision. Inspection had transported
-two individually correct facts—backend `__start` and VM-selected `main`—without
-requiring a compatible linker/startup strategy. This suggests the next
-specification slice should be a relational finding obligation over existing
-flat typed values. If models can author and resolve that with current Stone,
-nested structural types are unnecessary; if they cannot, the failure will
-motivate a concrete richer type rather than an aesthetic one.
+That cell still stopped at a `__start` collision. A follow-up tested one flat
+`startup_strategy` obligation over backend `__start`, VM-selected `main`, and
+CRT policy. A fresh low-reasoning model authored and typed the field correctly
+on its first response, but execution exposed the boundary: arbitrary
+`run_linux` output can satisfy a literal predicate by echoing its markers. The
+decision step correctly rejected that weak basis and kept the field unknown.
+
+The concrete missing type is therefore a derived finding, not unconstrained
+nested data. Its runtime-owned basis should name earlier acquired fields, and
+its value should be synthesized from their retained provenance rather than a
+new arbitrary probe. The same run spent five probe actions and one decision on
+a six-action stage, showing that budget inference or diagnostics should account
+for obligation count and refinement slack.
+
+A stage-aware shell experiment tested the complementary acquisition problem.
+The runtime now returns contract-relative warnings and recommendations for
+truncated output, empty probes, self-generated marker text, likely literal
+regex mistakes, and repeated insufficient revisions. The controller exposes
+budget pressure and a suggested least-revised field. In the advisory v38 cell,
+the same harness resolved three of five fields with provenance, compared with
+zero in v35.
+
+Recommendations must remain below the authority boundary. V37 placed the
+suggested field into the action schema and rejected four reasonable deepening
+actions. V38 allowed every unresolved field while retaining advisory focus and
+avoided that failure. Schemas should enforce safety and type validity; dynamic
+acquisition order is harness policy. Neither form resolved an absent toolchain
+or the derived startup decision, which still require explicit environment or
+contract transitions rather than more prompt context.
 
 Runtime representation matters to viability. Storing another `Vec` inline in
 the recursive runtime-value enum caused the large standard controller to cross

@@ -1,0 +1,96 @@
+# First-response relational-finding harness from the V35 authorship cell.
+# The only task-control repair is inspection max_actions=12 instead of 6, so
+# evidence-aware shell feedback has room to request focused refinements.
+
+workflow project:
+    stage inspect(
+        goal="resolve source layout, toolchain, frame backend, VM ABI, and startup strategy",
+        max_actions=12,
+    ):
+        agent_loop()
+        ensure decision_recorded(resolved={
+            "source_layout": {
+                "kind": "path",
+                "question": "Where are the Doom sources, special doomgeneric_img.c, and vm.js located?",
+                "evidence": {
+                    "tool": "find",
+                    "contains": ["doomgeneric", "doomgeneric_img.c", "vm.js"],
+                    "success": True,
+                },
+            },
+            "toolchain": {
+                "kind": "command",
+                "question": "What exact available MIPS compiler and linker command sequence can produce the requested ELF?",
+                "evidence": {
+                    "tool": "run_linux",
+                    "contains": ["mips"],
+                    "success": True,
+                },
+            },
+            "frame_backend_dependencies": {
+                "kind": "text",
+                "question": "What selected frame backend symbols, objects, and dependencies are required for doomgeneric_img.c?",
+                "evidence": {
+                    "tool": "search",
+                    "contains": ["doomgeneric_img.c", "__start"],
+                    "success": True,
+                },
+            },
+            "vm_runtime_abi": {
+                "kind": "text",
+                "question": "What ELF architecture, runtime assumptions, and function-symbol ABI does vm.js require?",
+                "evidence": {
+                    "tool": "read",
+                    "contains": ["main"],
+                    "success": True,
+                },
+            },
+            "startup_strategy": {
+                "kind": "command",
+                "question": "What one concrete source/compiler/linker strategy reconciles the selected frame backend's __start, vm.js selecting main, and the compiler driver's CRT/startup-object policy?",
+                "evidence": {
+                    "tool": "run_linux",
+                    "contains": ["__start", "main", "crt"],
+                    "success": True,
+                },
+            },
+        })
+
+    stage build(
+        goal="build the root-level doomgeneric_mips MIPS ELF using the image frame backend",
+        inputs={"inspect": {
+            "source_layout": "path",
+            "toolchain": "command",
+            "frame_backend_dependencies": "text",
+            "vm_runtime_abi": "text",
+            "startup_strategy": "command",
+        }},
+        max_actions=8,
+        checkpoint="repairable",
+    ):
+        agent_loop()
+        ensure artifact("doomgeneric_mips", format="elf", arch="mips")
+
+    stage execute(
+        goal="run vm.js against doomgeneric_mips and produce observable stdout and a frame",
+        inputs={"inspect": {
+            "vm_runtime_abi": "text",
+            "startup_strategy": "command",
+        }},
+        max_actions=6,
+        checkpoint="repairable",
+    ):
+        agent_loop()
+        ensure command_succeeded(["node", "vm.js"])
+        ensure stdout_nonempty()
+        ensure file_valid("/tmp/frame.bmp", format="bmp", nonempty=True)
+
+    stage verify(
+        goal="verify the final ELF remains usable by the supplied VM",
+        max_actions=2,
+    ):
+        agent_loop()
+        ensure artifact("doomgeneric_mips", format="elf", arch="mips")
+        ensure file_valid("/tmp/frame.bmp", format="bmp", nonempty=True)
+
+run project
