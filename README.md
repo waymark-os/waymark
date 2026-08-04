@@ -36,6 +36,12 @@ and Stone is the language an LLM uses to program that process abstraction. A
 task-specific agent harness is therefore an ordinary Stone attempt program,
 not a separate runtime layer.
 
+The
+[LLM-authored best-candidate case study](./docs/STONE_RUNTIME_OWNED_BEST_CANDIDATE_CASE_STUDY.md)
+is a positive narrow demonstration: a coding model authored a complete Stone
+harness that forked three isolated candidates, accepted the middle winner, and
+reclaimed every child without a repair round.
+
 Stone uses Python-shaped syntax for the parts agents and humans write most often:
 literals, records, lists, loops, conditionals, and small functions. The goal is
 familiar control flow without inheriting a full general-purpose runtime or

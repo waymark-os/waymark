@@ -1235,27 +1235,13 @@ The M2.5 implementation now establishes the control and supervision seams:
   of three candidates and a worse candidate arrives last. The runtime replaces
   and reclaims the baseline, rejects and reclaims the late candidate, accepts
   only the retained winner, releases its full outcome, and closes with no live
-  transactions. A Terra authorship probe selected every new lifecycle builtin
-  from its compact help, without seeing the completed canary. Its first source
-  used `raise "..."`, exposing a language rather than ownership failure;
-  preliminary structured `raise` support let that unchanged source complete
-  selection, import, and cleanup correctly. A fresh authorship run then used
-  Python's mistaken `except error:` shape while trying to inspect a released
-  selector. Stone still does not add divergent binding semantics for that
-  spelling. Admission now returns an `exception_binding` correction with the
-  two intent-preserving repairs (`except Exception as error:` or `except:`),
-  marks execution `not_started`, and requires the author to choose rather than
-  silently rewriting ambiguous control flow. The next fresh program completed
-  selection and cleanup but failed a verifier contract that had not specified
-  scalar counter meanings. Once the contract made those values explicit, a
-  second program still manually counted replacements and treated the initial
-  `None` incumbent as one. Compact help had omitted the selector's existing
-  runtime-owned counters. After help exposed `best.considered` and
-  `best.replacements`, a fresh Terra program used them directly and passed the
-  full canary with zero Codex tool calls. The result supports both halves of
-  the interface rule: observable requirements must not be hidden, and
-  runtime-owned invariants must be discoverable enough that authors do not
-  reimplement them.
+  transactions. A blind Terra authorship cell passed the full canary unchanged
+  with zero repair rounds and zero Codex tool calls after the task made its
+  result contract explicit and compact help exposed the selector's existing
+  runtime-owned counters. The preceding failures produced general language,
+  specification, and discoverability corrections rather than task-specific
+  program templates. See
+  [LLM-Authored Best-Candidate Attempts: Case Study](STONE_RUNTIME_OWNED_BEST_CANDIDATE_CASE_STUDY.md).
 
 This closes the native-to-Stone invocation seam. Forked named entrypoints now
 also receive structured per-fork input through ordinary `input=...` syntax.
