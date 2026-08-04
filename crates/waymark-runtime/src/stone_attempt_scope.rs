@@ -87,4 +87,12 @@ impl AttemptScopeValue {
         }
         Ok(())
     }
+
+    pub(super) fn owns_joined(&self, attempt: &str) -> Result<bool, ShellError> {
+        let state = self.lock()?;
+        Ok(state
+            .children
+            .iter()
+            .any(|child| child.attempt == attempt && child.joined && !child.resolved))
+    }
 }

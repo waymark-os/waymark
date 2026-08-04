@@ -46,6 +46,7 @@ pub enum Stmt {
         handlers: Vec<ExceptHandler>,
     },
     FunctionDef(FunctionDef),
+    Raise(Option<Expr>),
     Return(Option<Expr>),
     Break,
     Continue,
@@ -87,6 +88,7 @@ pub struct FunctionParam {
 pub enum StoneType {
     Any,
     AttemptAcceptance,
+    AttemptBest,
     AttemptHandle,
     AttemptOutcome,
     AttemptScope,
@@ -706,6 +708,7 @@ fn lower_stmt(statement: py::Stmt) -> Result<Stmt, ShellError> {
             &import.names,
         )),
         py::Stmt::Pass(_) => Ok(Stmt::Pass),
+        py::Stmt::Raise(raise_stmt) => lower_raise(raise_stmt),
         py::Stmt::Return(return_stmt) => lower_return(return_stmt),
         py::Stmt::Try(try_stmt) => lower_try(try_stmt),
         py::Stmt::While(while_stmt) => lower_while(while_stmt),
@@ -892,11 +895,24 @@ fn lower_return(return_stmt: py::StmtReturn) -> Result<Stmt, ShellError> {
     ))
 }
 
+fn lower_raise(raise_stmt: py::StmtRaise) -> Result<Stmt, ShellError> {
+    if raise_stmt.cause.is_some() {
+        return Err(unsupported_message(
+            "raise statement",
+            "raise ... from ... is not supported; raise a string or structured error record directly",
+        ));
+    }
+    Ok(Stmt::Raise(
+        raise_stmt.exc.map(|value| lower_expr(*value)).transpose()?,
+    ))
+}
+
 fn lower_type_annotation(annotation: &py::Expr) -> Result<StoneType, ShellError> {
     match annotation {
         py::Expr::Name(name) => match name.id.as_str() {
             "Any" | "any" => Ok(StoneType::Any),
             "attempt_acceptance" => Ok(StoneType::AttemptAcceptance),
+            "attempt_best" => Ok(StoneType::AttemptBest),
             "attempt_handle" => Ok(StoneType::AttemptHandle),
             "attempt_outcome" => Ok(StoneType::AttemptOutcome),
             "attempt_scope" => Ok(StoneType::AttemptScope),
@@ -2145,6 +2161,40 @@ total = sum(int(x) for x in values if x)
     }
 
     #[test]
+    fn lowers_string_record_and_bare_raise() {
+        let program = lower_source(
+            r#"raise "plain failure"
+raise {"message": "structured failure", "code": "bad_candidate"}
+try:
+    fail("inner")
+except Exception:
+    raise
+"#,
+        )
+        .expect("lower preliminary raise forms");
+
+        assert!(matches!(
+            &program.statements[0],
+            Stmt::Raise(Some(Expr::String(message))) if message == "plain failure"
+        ));
+        assert!(matches!(
+            &program.statements[1],
+            Stmt::Raise(Some(Expr::Record(_)))
+        ));
+        assert!(matches!(
+            &program.statements[2],
+            Stmt::Try { handlers, .. }
+                if matches!(handlers[0].body.as_slice(), [Stmt::Raise(None)])
+        ));
+    }
+
+    #[test]
+    fn rejects_raise_with_explicit_cause() {
+        let error = lower_source("raise error from cause").expect_err("raise cause unsupported");
+        assert!(format!("{error:?}").contains("raise ... from ... is not supported"));
+    }
+
+    #[test]
     fn accepts_for_augassign_and_method_calls() {
         let program = lower_source(
             r#"total = 0
@@ -2614,6 +2664,7 @@ value = normalize("01/02/2024")
             r#"def select(
     frontier: semantic_frontier,
     scope: attempt_scope,
+    best: attempt_best,
     child: attempt_handle,
     outcome: attempt_outcome,
     accepted: attempt_acceptance,
@@ -2635,6 +2686,7 @@ value = normalize("01/02/2024")
             vec![
                 StoneType::SemanticFrontier,
                 StoneType::AttemptScope,
+                StoneType::AttemptBest,
                 StoneType::AttemptHandle,
                 StoneType::AttemptOutcome,
                 StoneType::AttemptAcceptance,

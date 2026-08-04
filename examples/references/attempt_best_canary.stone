@@ -1,0 +1,124 @@
+# Behavioral canary for the runtime-owned best-candidate selector.
+#
+# Three isolated children are evaluated in a deliberately adversarial order:
+# a baseline, the actual winner, then a worse late candidate. The selector must
+# replace and reclaim the baseline, reject and reclaim the late candidate, and
+# accept the retained winner without the Stone program manually tracking child
+# ownership.
+
+
+def worker(input):
+    write_file("answer.txt", input.answer + "\n")
+    return {
+        "name": input.name,
+        "answer": input.answer,
+        "score": input.score,
+        "evidence": ["canary:score:" + input.name],
+        "artifacts": ["answer.txt"],
+    }
+
+
+def main(input):
+    root = attempt_info()
+    scope = attempt_scope(join_timeout_ms=60000)
+    best = attempt_best(scope, objective="max")
+    decisions = []
+    children = []
+    for candidate in [
+        {"name": "baseline", "answer": "alpha", "score": 0.50},
+        {"name": "winner", "answer": "beta", "score": 0.90},
+        {"name": "late-worse", "answer": "gamma", "score": 0.70},
+    ]:
+        child = attempt_fork(
+            program=current_program(),
+            entrypoint="worker",
+            input=candidate,
+            start=True,
+            scope=scope,
+        )
+        outcome = attempt_join(child, timeout_ms=60000)
+        if not outcome.succeeded:
+            fail(
+                "best-candidate child did not return a usable outcome",
+                code="attempt_best_canary_child_failed",
+                detail=outcome,
+            )
+        result = outcome.result.value
+        decision = attempt_best_consider(
+            best,
+            outcome,
+            score=result.score,
+            summary="independent canary score for " + result.name,
+            evidence=result.evidence,
+            artifacts=result.artifacts,
+        )
+        decisions.append(decision)
+        children.append(outcome.attempt)
+
+    if (
+        best.status != "retaining"
+        or best.attempt != children[1]
+        or best.score != 0.90
+        or best.outcome.result.value.answer != "beta"
+        or best.considered != 3
+        or best.replacements != 1
+    ):
+        fail(
+            "selector did not retain the highest-scored outcome",
+            code="attempt_best_canary_selection_failed",
+            detail={"best_attempt": best.attempt, "decisions": decisions},
+        )
+
+    accepted = attempt_best_accept(best, parent=root)
+    cleanup = attempt_scope_close(scope)
+    if not cleanup.clean:
+        fail(
+            "best-candidate scope did not close cleanly",
+            code="attempt_best_canary_cleanup_failed",
+            detail=cleanup,
+        )
+    imported = read_file("answer.txt").strip()
+    released_outcome = False
+    try:
+        best.outcome
+    except Exception:
+        released_outcome = True
+    if (
+        imported != "beta"
+        or accepted.attempt != children[1]
+        or best.status != "accepted"
+        or not released_outcome
+    ):
+        fail(
+            "accepted selection did not import and release the winner",
+            code="attempt_best_canary_accept_failed",
+            detail={
+                "imported": imported,
+                "accepted": accepted,
+                "best_status": best.status,
+                "released_outcome": released_outcome,
+            },
+        )
+    return {
+        "answer": imported,
+        "winner": accepted.attempt,
+        "score": best.score,
+        "status": best.status,
+        "considered": best.considered,
+        "replacements": best.replacements,
+        "released_outcome": released_outcome,
+        "children": children,
+        "decisions": decisions,
+        "clean": cleanup.clean,
+    }
+
+
+control = attempt_info()
+entrypoint = get(control.metadata, "program_entrypoint", "main")
+result = worker(task_input()) if entrypoint == "worker" else main(task_input())
+attempt_report(
+    status="succeeded",
+    result=result,
+    metadata={"control": "attempt_best_canary_v1"},
+)
+emit(result)

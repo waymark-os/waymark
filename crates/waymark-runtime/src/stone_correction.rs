@@ -63,6 +63,20 @@ const KEYWORD_SCHEMAS: &[(&str, &[&str])] = &[
     ("workflow_run", &[]),
     ("semantic_frontier", &["checkpoint", "owner"]),
     ("semantic_frontier_release", &["frontier"]),
+    ("attempt_best", &["scope", "objective"]),
+    (
+        "attempt_best_consider",
+        &[
+            "best",
+            "outcome",
+            "score",
+            "summary",
+            "evidence",
+            "artifacts",
+        ],
+    ),
+    ("attempt_best_accept", &["best", "parent"]),
+    ("attempt_best_discard", &["best", "reason"]),
     (
         "attempt_branch",
         &[

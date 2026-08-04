@@ -328,6 +328,24 @@ Supported handlers are `except:`, `except Exception:`, and
 `kind`, `code`, and `message` fields. I/O errors also include `path` and
 `operation` when available.
 
+Preliminary `raise` support intentionally keeps the same structured failure
+model rather than introducing Python exception classes:
+
+```python
+raise "candidate failed"
+raise {
+    "message": "candidate failed its evidence gate",
+    "code": "candidate_failed",
+    "detail": {"candidate": candidate.name},
+}
+```
+
+A string receives declared code `stone_raised`. A record requires `message`
+and may carry `code` and `detail`. Bare `raise` is valid only inside an active
+`except` handler and rethrows its bounded structured error. `raise ... from
+...` and arbitrary exception classes remain unsupported. Prefer `fail(...)`
+when the harness already knows the stable policy/evidence failure code.
+
 ## Core Builtins
 
 - `emit(value)`: return a structured success value.

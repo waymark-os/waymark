@@ -26,6 +26,7 @@ mod server;
 mod stone_admission;
 mod stone_agent_control;
 mod stone_ast;
+mod stone_attempt_best;
 mod stone_attempt_scope;
 mod stone_attempt_value;
 mod stone_builtins;

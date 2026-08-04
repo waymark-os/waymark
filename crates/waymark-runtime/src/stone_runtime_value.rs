@@ -12,6 +12,7 @@ use super::stone_json_view::{
     materialize_jsonl_rows, JsonArrayView, JsonObjectView, JsonScalarView, JsonlRows,
 };
 use crate::stone_agent_control::AgentControlValue;
+use crate::stone_attempt_best::AttemptBestValue;
 use crate::stone_attempt_scope::AttemptScopeValue;
 use crate::stone_attempt_value::{
     AttemptAcceptanceValue, AttemptHandleValue, AttemptOutcomeValue, SemanticFrontierValue,
@@ -32,6 +33,7 @@ pub(super) enum RuntimeValue {
     WorkflowStage(WorkflowStageValue),
     Workflow(WorkflowValue),
     AgentControl(AgentControlValue),
+    AttemptBest(AttemptBestValue),
     AttemptScope(AttemptScopeValue),
     AttemptHandle(AttemptHandleValue),
     AttemptOutcome(AttemptOutcomeValue),
@@ -54,6 +56,7 @@ pub(super) enum RuntimeValueTag {
     WorkflowStage,
     Workflow,
     AgentControl,
+    AttemptBest,
     AttemptScope,
     AttemptHandle,
     AttemptOutcome,
@@ -83,6 +86,7 @@ impl RuntimeValueTag {
             RuntimeValueTag::WorkflowEvidenceSource => 16,
             RuntimeValueTag::SemanticFrontier => 17,
             RuntimeValueTag::AttemptAcceptance => 18,
+            RuntimeValueTag::AttemptBest => 19,
         }
     }
 }
@@ -114,6 +118,7 @@ impl RuntimeValue {
             RuntimeValue::WorkflowStage(stage) => stage.is_session_persistable(),
             RuntimeValue::Workflow(workflow) => workflow.is_session_persistable(),
             RuntimeValue::AgentControl(_) => true,
+            RuntimeValue::AttemptBest(_) => false,
             RuntimeValue::AttemptScope(_) => false,
             RuntimeValue::AttemptHandle(_) => false,
             RuntimeValue::AttemptOutcome(_) => true,
@@ -139,6 +144,7 @@ impl RuntimeValue {
             RuntimeValue::WorkflowStage(_) => RuntimeValueTag::WorkflowStage,
             RuntimeValue::Workflow(_) => RuntimeValueTag::Workflow,
             RuntimeValue::AgentControl(_) => RuntimeValueTag::AgentControl,
+            RuntimeValue::AttemptBest(_) => RuntimeValueTag::AttemptBest,
             RuntimeValue::AttemptScope(_) => RuntimeValueTag::AttemptScope,
             RuntimeValue::AttemptHandle(_) => RuntimeValueTag::AttemptHandle,
             RuntimeValue::AttemptOutcome(_) => RuntimeValueTag::AttemptOutcome,
@@ -203,6 +209,13 @@ impl RuntimeValue {
                     control.control_id
                 ),
             )),
+            RuntimeValue::AttemptBest(best) => Err(stone_error(
+                context,
+                format!(
+                    "attempt_best #{} is a task-owned selection value and cannot cross this boundary",
+                    best.selection_id
+                ),
+            )),
             RuntimeValue::AttemptScope(scope) => Err(stone_error(
                 context,
                 format!(
@@ -250,6 +263,7 @@ mod tests {
         assert_eq!(RuntimeValueTag::WorkflowEvidenceSource.id(), 16);
         assert_eq!(RuntimeValueTag::SemanticFrontier.id(), 17);
         assert_eq!(RuntimeValueTag::AttemptAcceptance.id(), 18);
+        assert_eq!(RuntimeValueTag::AttemptBest.id(), 19);
     }
 
     #[test]

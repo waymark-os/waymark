@@ -183,11 +183,17 @@ pub(super) struct AttemptOutcomeValue {
 }
 
 impl AttemptOutcomeValue {
+    pub(super) fn succeeded(&self) -> bool {
+        self.joined
+            && attempt_metadata_string(&self.record, "controller_result_status").as_deref()
+                == Some("succeeded")
+    }
+
     pub(super) fn materialize(&self) -> Value {
         let span = Span::unknown();
         let result_status = attempt_metadata_string(&self.record, "controller_result_status")
             .unwrap_or_else(|| "unreported".to_string());
-        let succeeded = self.joined && result_status == "succeeded";
+        let succeeded = self.succeeded();
         let mut outcome = Record::new();
         outcome.push("attempt", Value::string(self.attempt.clone(), span));
         outcome.push("joined", Value::bool(self.joined, span));

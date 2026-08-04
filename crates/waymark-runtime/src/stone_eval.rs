@@ -44,6 +44,9 @@ use crate::stone_ast::{
     AssignTarget, AugOp, BoolOp, Call, CompareOp, ComprehensionClause, ExceptHandler, Expr,
     FormattedStringPart, FunctionDef, Program, StageDecorator, Stmt, StoneFormatSpec, StoneType,
 };
+use crate::stone_attempt_best::{
+    AttemptBestCandidate, AttemptBestObjective, AttemptBestPlan, AttemptBestValue,
+};
 use crate::stone_attempt_scope::AttemptScopeValue;
 use crate::stone_attempt_value::{
     AttemptAcceptanceValue, AttemptHandleValue, AttemptOutcomeValue, SemanticFrontierMode,
@@ -141,6 +144,7 @@ pub struct EvalState {
     active_transition_hook: bool,
     active_workflow_run: bool,
     active_async_depth: usize,
+    caught_errors: Vec<Value>,
     async_functions_entered: u64,
     async_await_count: u64,
     async_run_await_count: u64,
@@ -636,6 +640,7 @@ fn eval_program_with_source_options(
             active_transition_hook: false,
             active_workflow_run: false,
             active_async_depth: 0,
+            caught_errors: Vec::new(),
             async_functions_entered: 0,
             async_await_count: 0,
             async_run_await_count: 0,
@@ -1080,6 +1085,7 @@ impl Evaluator<'_> {
                 };
                 Ok(EvalFlow::Return(value))
             }
+            Stmt::Raise(value) => self.eval_raise_stmt(value.as_ref()),
             Stmt::For {
                 targets,
                 iter,
@@ -1541,14 +1547,29 @@ impl Evaluator<'_> {
                 self.state.push_scope();
                 if let Some(name) = &handler.name {
                     self.state
-                        .set_local(name.clone(), RuntimeValue::Nu(error_record));
+                        .set_local(name.clone(), RuntimeValue::Nu(error_record.clone()));
                 }
+                self.state.caught_errors.push(error_record);
                 let result = self.eval_block(&handler.body, PipelineData::empty(), false);
+                self.state.caught_errors.pop();
                 self.state
                     .pop_scope_merging_nu_locals(handler.name.as_deref())?;
                 result
             }
         }
+    }
+
+    fn eval_raise_stmt(&mut self, expression: Option<&Expr>) -> Result<EvalFlow, ShellError> {
+        let value = match expression {
+            Some(expression) => self
+                .eval_expr_value(expression, PipelineData::empty())?
+                .into_nu_value("raise")?,
+            None => self.state.caught_errors.last().cloned().ok_or_else(|| {
+                stone_error("raise", "bare raise is only valid inside an except handler")
+            })?,
+        };
+        let (message, code, detail) = raised_error_parts(value)?;
+        Err(task_failure_error(message, Some(code), detail))
     }
 
     fn assign_value(
@@ -2390,6 +2411,10 @@ impl Evaluator<'_> {
             "attempt_wait_any" => self.eval_attempt_wait_set_call(call, false),
             "attempt_wait_all" => self.eval_attempt_wait_set_call(call, true),
             "attempt_terminate" => self.eval_attempt_terminate_call(call),
+            "attempt_best" => self.eval_attempt_best_call(call),
+            "attempt_best_consider" => self.eval_attempt_best_consider_call(call),
+            "attempt_best_accept" => self.eval_attempt_best_accept_call(call),
+            "attempt_best_discard" => self.eval_attempt_best_discard_call(call),
             "attempt_scope" => self.eval_attempt_scope_call(call),
             "attempt_scope_add" => self.eval_attempt_scope_add_call(call),
             "attempt_scope_close" => self.eval_attempt_scope_close_call(call),
@@ -2704,6 +2729,12 @@ impl Evaluator<'_> {
                 }
             };
             return Ok(RuntimeValue::Nu(value));
+        }
+        if let RuntimeValue::AttemptBest(best) = receiver {
+            if attr == "outcome" {
+                return best.typed_outcome().map(RuntimeValue::AttemptOutcome);
+            }
+            return best.attribute(attr).map(RuntimeValue::Nu);
         }
         if let RuntimeValue::AttemptHandle(handle) = receiver {
             return handle.attribute(attr).map(RuntimeValue::Nu);
@@ -3173,21 +3204,7 @@ impl Evaluator<'_> {
             }
         }
 
-        let mut error =
-            GenericError::new("Task failure", message, Span::unknown()).with_code("task_failure");
-        if let Some(code) = code {
-            error = error.with_help(format!("code={code}"));
-        }
-        if let Some(detail) = detail {
-            error = error.with_inner(vec![ShellError::Generic(
-                GenericError::new_internal(
-                    "Task failure detail",
-                    nu_to_json_value(&detail).to_string(),
-                )
-                .with_code("task_failure_detail"),
-            )]);
-        }
-        Err(ShellError::Generic(error))
+        Err(task_failure_error(message, code, detail))
     }
 
     fn eval_help_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -8451,6 +8468,358 @@ impl Evaluator<'_> {
         gateway_env::attempt_terminate(attempt).map(RuntimeValue::Nu)
     }
 
+    fn eval_attempt_best_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if call.positional.len() > 2 {
+            return Err(stone_error(
+                "attempt_best",
+                "attempt_best() accepts scope and objective arguments",
+            ));
+        }
+        let mut scope = call
+            .positional
+            .first()
+            .map(|expression| self.eval_attempt_scope_expr(expression, "attempt_best scope"))
+            .transpose()?;
+        let mut objective = call
+            .positional
+            .get(1)
+            .map(|expression| {
+                self.eval_expr_value(expression, PipelineData::empty())?
+                    .into_nu_value("attempt_best objective")
+                    .and_then(|value| value_to_string(&value, "attempt_best objective"))
+            })
+            .transpose()?
+            .unwrap_or_else(|| "max".to_string());
+        for (name, expression) in &call.named {
+            match name.as_str() {
+                "scope" => {
+                    if scope.is_some() {
+                        return Err(stone_error(
+                            "attempt_best",
+                            "scope may be supplied only once",
+                        ));
+                    }
+                    scope = Some(self.eval_attempt_scope_expr(expression, "attempt_best scope")?);
+                }
+                "objective" => {
+                    let value = self
+                        .eval_expr_value(expression, PipelineData::empty())?
+                        .into_nu_value("attempt_best objective")?;
+                    objective = value_to_string(&value, "attempt_best objective")?;
+                }
+                _ => {
+                    return Err(stone_error(
+                        "attempt_best",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        let scope = scope.ok_or_else(|| {
+            stone_error(
+                "attempt_best",
+                "attempt_best() requires an attempt_scope ownership argument",
+            )
+        })?;
+        if scope.lock()?.closed {
+            return Err(stone_error(
+                "attempt_best",
+                "cannot bind a best-candidate selector to a closed attempt_scope",
+            ));
+        }
+        let objective = AttemptBestObjective::parse(&objective)?;
+        Ok(RuntimeValue::AttemptBest(AttemptBestValue::new(
+            self.state.next_callable_id(),
+            scope,
+            objective,
+        )))
+    }
+
+    fn eval_attempt_best_consider_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if call.positional.len() < 2 || call.positional.len() > 3 {
+            return Err(stone_error(
+                "attempt_best_consider",
+                "attempt_best_consider() requires best, outcome, and score arguments",
+            ));
+        }
+        let best = self.eval_attempt_best_expr(&call.positional[0], "attempt_best_consider")?;
+        let outcome = match self.eval_expr_value(&call.positional[1], PipelineData::empty())? {
+            RuntimeValue::AttemptOutcome(outcome) => outcome,
+            other => {
+                return Err(stone_error(
+                    "attempt_best_consider",
+                    format!(
+                        "outcome must be an attempt_outcome, got {}",
+                        runtime_type_name(&other)
+                    ),
+                ));
+            }
+        };
+        let mut score = call
+            .positional
+            .get(2)
+            .map(|expression| {
+                self.eval_expr_value(expression, PipelineData::empty())?
+                    .into_nu_value("attempt_best_consider score")
+                    .and_then(|value| value_to_f64(&value, "attempt_best_consider score"))
+            })
+            .transpose()?;
+        let mut summary = String::new();
+        let mut evidence = Vec::new();
+        let mut artifacts = Vec::new();
+        for (name, expression) in &call.named {
+            let value = self
+                .eval_expr_value(expression, PipelineData::empty())?
+                .into_nu_value("attempt_best_consider")?;
+            match name.as_str() {
+                "score" => score = Some(value_to_f64(&value, "attempt_best_consider score")?),
+                "summary" => summary = value_to_string(&value, "attempt_best_consider summary")?,
+                "evidence" => {
+                    evidence =
+                        attempt_best_bounded_strings(&value, "attempt_best_consider evidence")?
+                }
+                "artifacts" => {
+                    artifacts =
+                        attempt_best_bounded_strings(&value, "attempt_best_consider artifacts")?
+                }
+                _ => {
+                    return Err(stone_error(
+                        "attempt_best_consider",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        let score = score.ok_or_else(|| {
+            stone_error(
+                "attempt_best_consider",
+                "attempt_best_consider() requires a numeric score",
+            )
+        })?;
+        if !score.is_finite() {
+            return Err(stone_error(
+                "attempt_best_consider",
+                "score must be a finite number",
+            ));
+        }
+        if summary.is_empty() || summary.len() > 1024 {
+            return Err(stone_error(
+                "attempt_best_consider",
+                "summary must contain 1..1024 bytes",
+            ));
+        }
+        if evidence.is_empty() {
+            return Err(stone_error(
+                "attempt_best_consider",
+                "evidence must contain at least one bounded reference",
+            ));
+        }
+        if best.scope.lock()?.closed {
+            return Err(stone_error(
+                "attempt_best_consider",
+                "cannot consider a candidate after its attempt_scope has closed",
+            ));
+        }
+        if !outcome.succeeded() {
+            return Err(stone_error(
+                "attempt_best_consider",
+                "only a joined child that reported succeeded can be considered",
+            ));
+        }
+        if !best.scope.owns_joined(&outcome.attempt)? {
+            return Err(stone_error(
+                "attempt_best_consider",
+                format!(
+                    "attempt {} is not an unresolved joined child owned by scope #{}",
+                    outcome.attempt, best.scope.scope_id
+                ),
+            ));
+        }
+        let candidate = AttemptBestCandidate {
+            outcome,
+            score,
+            summary,
+            evidence,
+            artifacts,
+        };
+        let plan = best.plan(score)?;
+        match plan {
+            AttemptBestPlan::Retain => {
+                best.retain(candidate.clone(), false)?;
+                best.decision_record(&candidate, true, None, None)
+                    .map(RuntimeValue::Nu)
+            }
+            AttemptBestPlan::Replace(current) => {
+                if current.outcome.attempt == candidate.outcome.attempt {
+                    return Err(stone_error(
+                        "attempt_best_consider",
+                        "the retained candidate cannot be considered twice",
+                    ));
+                }
+                gateway_env::attempt_discard(
+                    current.outcome.attempt.clone(),
+                    "replaced by a better scored candidate".to_string(),
+                )?;
+                for scope in &self.state.attempt_scopes {
+                    scope.mark_resolved(&current.outcome.attempt)?;
+                }
+                best.retain(candidate.clone(), true)?;
+                best.decision_record(
+                    &candidate,
+                    true,
+                    Some(&current.outcome.attempt),
+                    Some(&current.outcome.attempt),
+                )
+                .map(RuntimeValue::Nu)
+            }
+            AttemptBestPlan::Reject(current) => {
+                if current.outcome.attempt == candidate.outcome.attempt {
+                    return Err(stone_error(
+                        "attempt_best_consider",
+                        "the retained candidate cannot be considered twice",
+                    ));
+                }
+                gateway_env::attempt_discard(
+                    candidate.outcome.attempt.clone(),
+                    "not better than the retained scored candidate".to_string(),
+                )?;
+                for scope in &self.state.attempt_scopes {
+                    scope.mark_resolved(&candidate.outcome.attempt)?;
+                }
+                best.record_rejected()?;
+                best.decision_record(&candidate, false, None, Some(&candidate.outcome.attempt))
+                    .map(RuntimeValue::Nu)
+            }
+        }
+    }
+
+    fn eval_attempt_best_accept_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if call.positional.is_empty() || call.positional.len() > 2 {
+            return Err(stone_error(
+                "attempt_best_accept",
+                "attempt_best_accept() requires best and accepts an optional parent",
+            ));
+        }
+        let best = self.eval_attempt_best_expr(&call.positional[0], "attempt_best_accept")?;
+        let mut parent = call
+            .positional
+            .get(1)
+            .map(|expression| {
+                self.eval_expr_value(expression, PipelineData::empty())?
+                    .into_nu_value("attempt_best_accept parent")
+                    .and_then(|value| attempt_id_from_value(&value, "attempt_best_accept parent"))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        for (name, expression) in &call.named {
+            match name.as_str() {
+                "parent" => {
+                    let value = self
+                        .eval_expr_value(expression, PipelineData::empty())?
+                        .into_nu_value("attempt_best_accept parent")?;
+                    parent = attempt_id_from_value(&value, "attempt_best_accept parent")?;
+                }
+                _ => {
+                    return Err(stone_error(
+                        "attempt_best_accept",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        if best.scope.lock()?.closed {
+            return Err(stone_error(
+                "attempt_best_accept",
+                "accept the retained candidate before closing its attempt_scope",
+            ));
+        }
+        let candidate = best.current("attempt_best_accept")?;
+        let child = candidate.outcome.attempt.clone();
+        if !best.scope.owns_joined(&child)? {
+            return Err(stone_error(
+                "attempt_best_accept",
+                "the retained child was resolved outside its selector and can no longer be accepted",
+            ));
+        }
+        let accepted = gateway_env::attempt_accept(parent, child.clone())?;
+        for scope in &self.state.attempt_scopes {
+            scope.mark_resolved(&child)?;
+        }
+        best.mark_accepted(&candidate)?;
+        Ok(RuntimeValue::AttemptAcceptance(
+            AttemptAcceptanceValue::new(child, accepted)?,
+        ))
+    }
+
+    fn eval_attempt_best_discard_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if call.positional.is_empty() || call.positional.len() > 2 {
+            return Err(stone_error(
+                "attempt_best_discard",
+                "attempt_best_discard() requires best and accepts an optional reason",
+            ));
+        }
+        let best = self.eval_attempt_best_expr(&call.positional[0], "attempt_best_discard")?;
+        let mut reason = call
+            .positional
+            .get(1)
+            .map(|expression| {
+                self.eval_expr_value(expression, PipelineData::empty())?
+                    .into_nu_value("attempt_best_discard reason")
+                    .and_then(|value| value_to_string(&value, "attempt_best_discard reason"))
+            })
+            .transpose()?
+            .unwrap_or_else(|| "best-candidate selection abandoned".to_string());
+        for (name, expression) in &call.named {
+            match name.as_str() {
+                "reason" => {
+                    let value = self
+                        .eval_expr_value(expression, PipelineData::empty())?
+                        .into_nu_value("attempt_best_discard reason")?;
+                    reason = value_to_string(&value, "attempt_best_discard reason")?;
+                }
+                _ => {
+                    return Err(stone_error(
+                        "attempt_best_discard",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        let candidate = best.current_optional()?;
+        let result = if let Some(candidate) = candidate.as_ref() {
+            let discarded =
+                gateway_env::attempt_discard(candidate.outcome.attempt.clone(), reason)?;
+            for scope in &self.state.attempt_scopes {
+                scope.mark_resolved(&candidate.outcome.attempt)?;
+            }
+            discarded
+        } else {
+            json_to_nu_value(
+                json!({
+                    "attempt": null,
+                    "already_empty": true,
+                }),
+                Span::unknown(),
+            )
+        };
+        best.mark_discarded(candidate.as_ref())?;
+        Ok(RuntimeValue::Nu(result))
+    }
+
+    fn eval_attempt_best_expr(
+        &mut self,
+        expression: &Expr,
+        context: &str,
+    ) -> Result<AttemptBestValue, ShellError> {
+        match self.eval_expr_value(expression, PipelineData::empty())? {
+            RuntimeValue::AttemptBest(best) => Ok(best),
+            other => Err(stone_error(
+                context,
+                format!("expected attempt_best, got {}", runtime_type_name(&other)),
+            )),
+        }
+    }
+
     fn eval_attempt_scope_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let (positional, named) = self.eval_call_values(call)?;
         if positional.len() > 1 {
@@ -10798,6 +11167,10 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "echo",
     "emit",
     "attempt_branch",
+    "attempt_best",
+    "attempt_best_accept",
+    "attempt_best_consider",
+    "attempt_best_discard",
     "attempt_finish",
     "attempt_fork",
     "attempt_accept",
@@ -11169,6 +11542,7 @@ fn ensure_runtime_type(
     }
     let nominal_match = match expected {
         StoneType::AttemptAcceptance => Some(matches!(value, RuntimeValue::AttemptAcceptance(_))),
+        StoneType::AttemptBest => Some(matches!(value, RuntimeValue::AttemptBest(_))),
         StoneType::AttemptHandle => Some(matches!(value, RuntimeValue::AttemptHandle(_))),
         StoneType::AttemptOutcome => Some(matches!(value, RuntimeValue::AttemptOutcome(_))),
         StoneType::AttemptScope => Some(matches!(value, RuntimeValue::AttemptScope(_))),
@@ -11196,6 +11570,7 @@ fn ensure_type(value: &Value, expected: StoneType, context: &str) -> Result<(), 
     let ok = match expected {
         StoneType::Any => true,
         StoneType::AttemptAcceptance
+        | StoneType::AttemptBest
         | StoneType::AttemptHandle
         | StoneType::AttemptOutcome
         | StoneType::AttemptScope
@@ -11238,6 +11613,61 @@ fn apply_aug_op(op: AugOp, left: &Value, right: &Value) -> Result<Value, ShellEr
     }
 }
 
+fn task_failure_error(message: String, code: Option<String>, detail: Option<Value>) -> ShellError {
+    let mut error =
+        GenericError::new("Task failure", message, Span::unknown()).with_code("task_failure");
+    if let Some(code) = code {
+        error = error.with_help(format!("code={code}"));
+    }
+    if let Some(detail) = detail {
+        error = error.with_inner(vec![ShellError::Generic(
+            GenericError::new_internal(
+                "Task failure detail",
+                nu_to_json_value(&detail).to_string(),
+            )
+            .with_code("task_failure_detail"),
+        )]);
+    }
+    ShellError::Generic(error)
+}
+
+fn raised_error_parts(value: Value) -> Result<(String, String, Option<Value>), ShellError> {
+    match &value {
+        Value::String { .. } | Value::Glob { .. } => Ok((
+            value_to_string(&value, "raise")?,
+            "stone_raised".to_string(),
+            None,
+        )),
+        Value::Record { val, .. } => {
+            let message = val
+                .get("message")
+                .ok_or_else(|| stone_error("raise", "error record requires string field `message`"))
+                .and_then(|value| value_to_string(value, "raise message"))?;
+            let code = val
+                .get("declared_code")
+                .or_else(|| val.get("code"))
+                .map(|value| value_to_string(value, "raise code"))
+                .transpose()?
+                .filter(|code| !code.is_empty())
+                .unwrap_or_else(|| "stone_raised".to_string());
+            let detail = val.get("detail").cloned().or_else(|| {
+                // A record bound by `except Exception as error` carries
+                // diagnostic fields rather than an explicit detail. Preserve
+                // that bounded record when users write `raise error`.
+                val.contains("kind").then(|| value.clone())
+            });
+            Ok((message, code, detail))
+        }
+        _ => Err(stone_error(
+            "raise",
+            format!(
+                "raise expects a string or record with message/code/detail, got {}",
+                value.get_type()
+            ),
+        )),
+    }
+}
+
 fn shell_error_record(err: &ShellError) -> Value {
     let span = Span::unknown();
     let mut record = Record::new();
@@ -11251,6 +11681,9 @@ fn shell_error_record(err: &ShellError) -> Value {
                     "suggested_next_action",
                     Value::string(help.to_string(), span),
                 );
+                if let Some(code) = help.strip_prefix("code=").filter(|code| !code.is_empty()) {
+                    record.push("declared_code", Value::string(code, span));
+                }
             }
         }
         ShellError::Io(io) => {
@@ -11279,6 +11712,7 @@ fn stone_type_name(ty: StoneType) -> &'static str {
     match ty {
         StoneType::Any => "Any",
         StoneType::AttemptAcceptance => "attempt_acceptance",
+        StoneType::AttemptBest => "attempt_best",
         StoneType::AttemptHandle => "attempt_handle",
         StoneType::AttemptOutcome => "attempt_outcome",
         StoneType::AttemptScope => "attempt_scope",
@@ -13671,6 +14105,7 @@ fn runtime_type_name(value: &RuntimeValue) -> &'static str {
         RuntimeValue::WorkflowStage(_) => "workflow_stage",
         RuntimeValue::Workflow(_) => "workflow",
         RuntimeValue::AgentControl(_) => "agent_control",
+        RuntimeValue::AttemptBest(_) => "attempt_best",
         RuntimeValue::AttemptScope(_) => "attempt_scope",
         RuntimeValue::AttemptHandle(_) => "attempt_handle",
         RuntimeValue::AttemptOutcome(_) => "attempt_outcome",
@@ -13899,6 +14334,13 @@ fn value_to_iter_values(value: &RuntimeValue) -> Result<Vec<Value>, ShellError> 
                 "cannot iterate agent control {}#{}",
                 control.name(),
                 control.control_id
+            ),
+        )),
+        RuntimeValue::AttemptBest(best) => Err(stone_error(
+            "iteration",
+            format!(
+                "cannot iterate attempt_best #{}; inspect its typed attributes",
+                best.selection_id
             ),
         )),
         RuntimeValue::AttemptScope(scope) => Err(stone_error(
@@ -14859,6 +15301,10 @@ fn agent_session_value_at(
             "attempt_inspect",
             "attempt_wait",
             "attempt_join",
+            "attempt_best",
+            "attempt_best_consider",
+            "attempt_best_accept",
+            "attempt_best_discard",
             "attempt_wait_any",
             "attempt_wait_all",
             "attempt_report",
@@ -15011,6 +15457,20 @@ fn value_to_string_list(value: &Value, context: &str) -> Result<Vec<String>, She
     vals.iter()
         .map(|value| value_to_string(value, context))
         .collect()
+}
+
+fn attempt_best_bounded_strings(value: &Value, context: &str) -> Result<Vec<String>, ShellError> {
+    let values = value_to_string_list(value, context)?;
+    if values.len() > 16 {
+        return Err(stone_error(context, "expected at most 16 references"));
+    }
+    if values
+        .iter()
+        .any(|value| value.is_empty() || value.len() > 512)
+    {
+        return Err(stone_error(context, "references must contain 1..512 bytes"));
+    }
+    Ok(values)
 }
 
 fn value_to_string_pairs(
@@ -15548,6 +16008,54 @@ mod tests {
         let error = ensure_runtime_type(&value, StoneType::AttemptHandle, "argument `repaired`")
             .expect_err("acceptance must not satisfy attempt_handle");
         assert!(format!("{error:?}").contains("expected attempt_handle, got attempt_acceptance"));
+    }
+
+    #[test]
+    fn creates_typed_scope_bound_best_candidate_selector() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("attempt-best")?;
+        let program = lower_source(
+            r#"def identity(value: attempt_best) -> attempt_best:
+    return value
+
+scope = attempt_scope()
+best = identity(attempt_best(scope, objective="min"))
+emit({
+    "type": best.type,
+    "objective": best.objective,
+    "status": best.status,
+    "empty": best.empty,
+    "considered": best.considered,
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, Span::unknown())?,
+            json_value!({
+                "type": "attempt_best",
+                "objective": "min",
+                "status": "open",
+                "empty": true,
+                "considered": 0,
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unknown_best_candidate_objective() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("attempt-best-objective")?;
+        let program = lower_source(
+            r#"scope = attempt_scope()
+attempt_best(scope, objective="largest")
+"#,
+        )?;
+        let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("unknown objective must fail");
+        assert!(format!("{error:?}").contains("objective must be either"));
+        cleanup_dir(&root);
+        Ok(())
     }
 
     #[test]
@@ -19886,6 +20394,7 @@ emit({
 unsupported = "\n".join(help("unsupported")["bullets"])
 emit({
     "syntax_mentions_try": "try/except catches runtime evaluation errors" in syntax,
+    "syntax_mentions_raise": "raise \"message\" is shorthand" in syntax,
     "syntax_mentions_conditional": "value if condition else fallback" in syntax,
     "syntax_mentions_defaults": "immutable default values are supported" in syntax,
     "syntax_mentions_split": "default whitespace splitting" in syntax,
@@ -19902,6 +20411,7 @@ emit({
             json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
             json_value!({
                 "syntax_mentions_try": true,
+                "syntax_mentions_raise": true,
                 "syntax_mentions_conditional": true,
                 "syntax_mentions_defaults": true,
                 "syntax_mentions_split": true,
@@ -20179,6 +20689,69 @@ emit({
             })
         );
 
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn evaluates_structured_and_bare_raise() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("raise-compat")?;
+        let program = lower_source(
+            r#"try:
+    raise "candidate failed"
+except Exception as string_error:
+    string_result = {
+        "code": string_error.code,
+        "declared_code": string_error.declared_code,
+        "message": string_error.message,
+    }
+
+try:
+    try:
+        raise {
+            "message": "evidence gate failed",
+            "code": "candidate_failed",
+            "detail": {"candidate": "baseline"},
+        }
+    except Exception:
+        raise
+except Exception as record_error:
+    record_result = {
+        "code": record_error.code,
+        "declared_code": record_error.declared_code,
+        "message": record_error.message,
+    }
+
+emit({"string": string_result, "record": record_result})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, Span::unknown())?,
+            json_value!({
+                "string": {
+                    "code": "task_failure",
+                    "declared_code": "stone_raised",
+                    "message": "candidate failed",
+                },
+                "record": {
+                    "code": "task_failure",
+                    "declared_code": "candidate_failed",
+                    "message": "evidence gate failed",
+                },
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_bare_raise_outside_except() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("bare-raise")?;
+        let program = lower_source("raise")?;
+        let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("bare raise outside except must fail");
+        assert!(format!("{error:?}").contains("only valid inside an except handler"));
         cleanup_dir(&root);
         Ok(())
     }

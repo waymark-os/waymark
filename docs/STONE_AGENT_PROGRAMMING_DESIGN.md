@@ -1187,6 +1187,16 @@ The M2.5 implementation now establishes the control and supervision seams:
   `outcome.result.value` or `outcome.result.error`. Ordinary info/list records
   omit report bodies, so comparison is explicit without making every lifecycle
   observation carry child payloads.
+- `attempt_best(scope, objective="max" | "min")` is a task-owned selection
+  capability layered over those outcomes. `attempt_best_consider` admits only
+  a joined successful child owned by the same scope, retains at most one full
+  outcome, immediately rolls back a rejected candidate or replaced incumbent,
+  and keeps evidence/artifact references separate from its numeric selection
+  score. `attempt_best_accept` transfers the retained workspace through the
+  existing parent/child accept operation; finalization drops the full outcome
+  and leaves only bounded identity/score diagnostics. This makes the runtime,
+  rather than model-written bookkeeping, own the common “best observed so
+  far” invariant and cleanup obligation.
 - `attempt_accept` returns nominal `attempt_acceptance`, not an untyped import
   record. It preserves the structured parent/child diff report, exposes the
   selected attempt id directly, and keeps `accepted.selected` as a nominal
@@ -1220,6 +1230,16 @@ The M2.5 implementation now establishes the control and supervision seams:
   library into a complete parent/child portfolio: negative spawn baseline,
   two typed-view forks, retained child inspection, deterministic selection,
   accept/discard, and post-cleanup reclamation checks.
+- `examples/references/attempt_best_canary.stone` recreates the late-search
+  failure shape observed in the FastText experiment: the winner is the middle
+  of three candidates and a worse candidate arrives last. The runtime replaces
+  and reclaims the baseline, rejects and reclaims the late candidate, accepts
+  only the retained winner, releases its full outcome, and closes with no live
+  transactions. A Terra authorship probe selected every new lifecycle builtin
+  from its compact help, without seeing the completed canary. Its first source
+  used `raise "..."`, exposing a language rather than ownership failure;
+  preliminary structured `raise` support let that unchanged source complete
+  selection, import, and cleanup correctly.
 
 This closes the native-to-Stone invocation seam. Forked named entrypoints now
 also receive structured per-fork input through ordinary `input=...` syntax.

@@ -99,10 +99,10 @@ fn validate_statements(statements: &[Stmt], names: &AdmissionNames) -> Result<()
                 function_names.async_context = function.is_async;
                 validate_statements(&function.body, &function_names)?;
             }
-            Stmt::Return(Some(value)) | Stmt::Expr(value) => {
+            Stmt::Raise(Some(value)) | Stmt::Return(Some(value)) | Stmt::Expr(value) => {
                 validate_expr(value, names)?;
             }
-            Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Pass => {}
+            Stmt::Raise(None) | Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Pass => {}
         }
     }
     Ok(())
@@ -366,10 +366,10 @@ fn collect_statement_bindings(statements: &[Stmt], names: &mut HashSet<String>) 
                 }
                 collect_statement_bindings(&function.body, names);
             }
-            Stmt::Return(Some(value)) | Stmt::Expr(value) => {
+            Stmt::Raise(Some(value)) | Stmt::Return(Some(value)) | Stmt::Expr(value) => {
                 collect_expr_bindings(value, names);
             }
-            Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Pass => {}
+            Stmt::Raise(None) | Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Pass => {}
         }
     }
 }
