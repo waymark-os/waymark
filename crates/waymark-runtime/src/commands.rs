@@ -1283,8 +1283,8 @@ else:
     StoneHelpEntry {
         name: "attempt_best",
         signature: r#"attempt_best(scope: attempt_scope, objective: "max" | "min" = "max") -> attempt_best"#,
-        use_when: "Gateway mode only. Create a scope-bound, task-owned selector that retains at most one joined successful child outcome while comparing candidates by a finite numeric score.",
-        examples: &[r#"best = attempt_best(scope, objective="max")"#],
+        use_when: "Gateway mode only. Create a scope-bound, task-owned selector that retains at most one joined successful child outcome while comparing candidates by a finite numeric score. Read best.status, best.attempt, best.score, best.considered, and best.replacements instead of reimplementing selector bookkeeping; best.outcome is available only while a candidate is retained.",
+        examples: &[r#"best = attempt_best(scope, objective="max")"#, r#"emit({"considered": best.considered, "replacements": best.replacements})"#],
         avoid: &[
             "Do not create a selector without an attempt_scope; the scope is the cleanup owner for its retained child.",
             "Do not close the scope before accepting or discarding its retained candidate.",
@@ -1294,7 +1294,7 @@ else:
     StoneHelpEntry {
         name: "attempt_best_consider",
         signature: r#"attempt_best_consider(best: attempt_best, outcome: attempt_outcome, score: float, summary: str, evidence: list[str], artifacts: list[str] = []) -> record"#,
-        use_when: "Gateway mode only. Compare one successfully joined child owned by best's scope. The runtime retains it if better, discards it if worse, and discards the previous incumbent when replaced. The decision reports selected, best_attempt, best_score, and discarded_attempt.",
+        use_when: "Gateway mode only. Compare one successfully joined child owned by best's scope. The runtime retains it if better, discards it if worse, and discards the previous incumbent when replaced. The decision reports selected, best_attempt, best_score, discarded_attempt, replaced_attempt, and the cumulative considered and replacements counters. A first incumbent and a rejected candidate are not replacements.",
         examples: &[r#"decision = attempt_best_consider(
     best,
     outcome,

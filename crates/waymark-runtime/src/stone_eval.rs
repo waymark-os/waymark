@@ -17333,6 +17333,7 @@ edit = help("edit_file")
 session = help("session")
 agent_control = help("agent_control")
 agent_session = help("agent_session")
+attempt_best = help("attempt_best")
 missing = help("not_a_builtin")
 emit({
     "language": overview["language"],
@@ -17345,6 +17346,7 @@ emit({
     "session_mentions_binding_ack": "bound names" in session["bullets"][2],
     "agent_control_mentions_builtin": "optimized AgentControl" in agent_control["bullets"][6],
     "agent_session_signature": agent_session["signature"],
+    "attempt_best_mentions_counters": "best.considered" in attempt_best["use_when"] and "best.replacements" in attempt_best["use_when"],
     "write_signature": write["signature"],
     "write_example": write["examples"][0],
     "edit_signature": edit["signature"],
@@ -17367,6 +17369,7 @@ emit({
                 "session_mentions_binding_ack": true,
                 "agent_control_mentions_builtin": true,
                 "agent_session_signature": "agent_session() -> record",
+                "attempt_best_mentions_counters": true,
                 "write_signature": "write_file(path: str, text: str, append: bool = False) -> record",
                 "write_example": "write_file(\"/app/report.txt\", \"ok\\n\")",
                 "edit_signature": "edit(path: str, old: str, new: str, all: bool = False) -> record",

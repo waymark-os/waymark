@@ -1245,7 +1245,17 @@ The M2.5 implementation now establishes the control and supervision seams:
   spelling. Admission now returns an `exception_binding` correction with the
   two intent-preserving repairs (`except Exception as error:` or `except:`),
   marks execution `not_started`, and requires the author to choose rather than
-  silently rewriting ambiguous control flow.
+  silently rewriting ambiguous control flow. The next fresh program completed
+  selection and cleanup but failed a verifier contract that had not specified
+  scalar counter meanings. Once the contract made those values explicit, a
+  second program still manually counted replacements and treated the initial
+  `None` incumbent as one. Compact help had omitted the selector's existing
+  runtime-owned counters. After help exposed `best.considered` and
+  `best.replacements`, a fresh Terra program used them directly and passed the
+  full canary with zero Codex tool calls. The result supports both halves of
+  the interface rule: observable requirements must not be hidden, and
+  runtime-owned invariants must be discoverable enough that authors do not
+  reimplement them.
 
 This closes the native-to-Stone invocation seam. Forked named entrypoints now
 also receive structured per-fork input through ordinary `input=...` syntax.
