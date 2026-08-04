@@ -1,6 +1,6 @@
 # LLM-Authored Best-Candidate Attempts: Case Study
 
-Status: positive narrow demonstration, 2026-08-03.
+Status: two positive narrow demonstrations, 2026-08-03.
 
 ## Question
 
@@ -92,6 +92,31 @@ baseline was replaced, the worse late candidate was rejected, the winning
 workspace was imported, the selector released its full retained outcome, and
 every child ended rolled back after its resources were reclaimed.
 
+## Transfer: Derived-Cost Minimization
+
+A second blind-authorship task reused the exact Attempt/Stone interfaces but
+changed the selection semantics:
+
+- the selector minimized rather than maximized;
+- candidate records contained separate setup and run costs, not a score;
+- each isolated worker derived its total cost and returned it with the
+  candidate artifact; and
+- the parent had to select from child-produced measurements while continuing
+  to rely on runtime-owned lifecycle counters.
+
+The candidates cost 1.50, 0.90, and 1.20 in declared order, so the winner was
+again in the middle and the late candidate tested that the selector did not
+degrade after finding the minimum. A fresh `gpt-5.6-terra` response authored
+the complete 2,661-byte program. It used `objective="min"`, computed
+`input.setup_cost + input.run_cost` inside the worker, and passed unchanged
+with zero Codex tool calls and zero repair rounds. The end-to-end cell took
+33.18 seconds, reclaimed all three children, and left no open transaction.
+
+No Stone syntax, runtime behavior, or builtin help changed for this transfer.
+Only the task contract and benchmark case changed. This is useful evidence
+that the positive result is not limited to maximizing a parent-supplied score,
+though both tasks still share the same small three-candidate lifecycle shape.
+
 ## What The Failed Iterations Taught
 
 The demonstration became positive through general interface corrections, not
@@ -116,10 +141,10 @@ state makes the program more robust and easier to write.
 
 It does not establish general task success, transfer to unrelated workflows,
 or superiority over other agent-control representations. The candidates and
-scoring policy were fixed, the worker itself was simple, and only one model
-configuration produced the final positive cell. The next evidence should come
-from transferring the same interfaces to a different task shape without
-task-specific language additions.
+scoring policies were fixed, both workers were simple, and only one model
+configuration produced the positive cells. The next evidence should come from
+a real workload where candidate evaluation can fail, take substantial time,
+or produce imperfect evidence.
 
 ## Reproduction
 
@@ -138,3 +163,11 @@ python3 host/bench/eval_stone_attempt_best_authorship.py \
   --run-root target/runs/stone-attempt-best-authorship-case-study
 ```
 
+Run the minimizing derived-cost transfer:
+
+```sh
+python3 host/bench/eval_stone_attempt_best_authorship.py \
+  --case min-derived-cost \
+  --model gpt-5.6-terra \
+  --run-root target/runs/stone-attempt-best-min-cost-authorship
+```

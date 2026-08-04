@@ -1240,7 +1240,9 @@ The M2.5 implementation now establishes the control and supervision seams:
   result contract explicit and compact help exposed the selector's existing
   runtime-owned counters. The preceding failures produced general language,
   specification, and discoverability corrections rather than task-specific
-  program templates. See
+  program templates. The unchanged interface then passed a fresh minimizing
+  transfer in which each worker derived its candidate cost rather than
+  receiving a parent-supplied score. See
   [LLM-Authored Best-Candidate Attempts: Case Study](STONE_RUNTIME_OWNED_BEST_CANDIDATE_CASE_STUDY.md).
 
 This closes the native-to-Stone invocation seam. Forked named entrypoints now
