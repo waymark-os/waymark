@@ -73,7 +73,7 @@ class CompletionCritiqueCanaryTests(unittest.TestCase):
                 "rolled_back": True,
                 "controller_report": {
                     "_control": {
-                        "name": "stone.standard_action_v12",
+                        "name": "stone.standard_action_v13",
                         "model_calls": 6,
                         "actions": 4,
                         "completion_critiques": 2,

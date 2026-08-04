@@ -1,4 +1,4 @@
-# Standard visible Stone action controller, V12.
+# Standard visible Stone action controller, V13.
 #
 # Everything below is ordinary admitted Stone source. The runtime contributes
 # model_infer and resource effects, but it does not hide this loop, dispatcher,
@@ -29,11 +29,19 @@ def standard_clamp(value, lower, upper):
     return max(lower, min(value, upper))
 
 
+def standard_optional_limit(value, upper, name):
+    if value < 0:
+        fail(name + " must be zero or positive", code="invalid_action_limit")
+    if value == 0:
+        return 0
+    return min(value, upper)
+
+
 def standard_agent_options(input):
     options = {
-        "max_rounds": 16,
-        "max_actions": 16,
-        "max_model_calls": 16,
+        "max_rounds": 0,
+        "max_actions": 0,
+        "max_model_calls": 0,
         "max_messages": 12,
         "max_action_context_characters": 32768,
         "max_task_context_characters": 6144,
@@ -65,14 +73,20 @@ def standard_agent_options(input):
     }
     if input is None:
         return options
-    options["max_rounds"] = standard_clamp(
-        get(input, "max_rounds", options.max_rounds), 1, 32
+    options["max_rounds"] = standard_optional_limit(
+        get(input, "max_rounds", options.max_rounds),
+        10000,
+        "max_rounds",
     )
-    options["max_actions"] = standard_clamp(
-        get(input, "max_turns", options.max_actions), 1, 64
+    options["max_actions"] = standard_optional_limit(
+        get(input, "max_turns", options.max_actions),
+        10000,
+        "max_turns",
     )
-    options["max_model_calls"] = standard_clamp(
-        get(input, "max_turns", options.max_model_calls), 1, 64
+    options["max_model_calls"] = standard_optional_limit(
+        get(input, "max_turns", options.max_model_calls),
+        10000,
+        "max_turns",
     )
     options["max_messages"] = standard_clamp(
         get(input, "max_messages", options.max_messages), 4, 32
@@ -612,7 +626,16 @@ def standard_bounded_payload(label, value, max_characters):
     )
 
 
-def standard_prepare_action_context(messages, options, required_keys):
+def standard_current_time_budget():
+    return get(agent_session(), "time_budget", None)
+
+
+def standard_prepare_action_context(
+    messages,
+    options,
+    required_keys,
+    time_budget,
+):
     projection = context_project(
         focus=(
             "current public requirement, latest completion audit, recent "
@@ -624,7 +647,12 @@ def standard_prepare_action_context(messages, options, required_keys):
     )
     projection_message = {
         "role": "user",
-        "content": "Active bounded attempt memory:\n" + projection.text,
+        "content": (
+            "Active bounded attempt memory:\n"
+            + projection.text
+            + "\nCurrent attempt time budget:\n"
+            + json_dumps(time_budget)
+        ),
     }
     recent_budget = max(
         options.max_task_context_characters + 1024,
@@ -654,6 +682,8 @@ def standard_prepare_action_context(messages, options, required_keys):
 
 
 def standard_available_retries(options, state, reserved_after):
+    if options.max_model_calls == 0:
+        return options.repair_retries
     remaining = (
         options.max_model_calls
         - state.model_calls
@@ -938,7 +968,7 @@ def standard_record_active_runs(state, options):
             "runs": state.active_runs,
         },
         status=status,
-        evidence=["control:stone.standard_action_v12"],
+        evidence=["control:stone.standard_action_v13"],
     )
 
 
@@ -1261,6 +1291,7 @@ def standard_model_outcome(outcome, options):
     result = {
         "ok": get(outcome, "ok", False),
         "kind": get(outcome, "kind", ""),
+        "time_budget": get(outcome, "time_budget", None),
     }
     compacted_field_count = 0
     for field in [
@@ -1339,7 +1370,7 @@ def standard_verify_finish(candidate, session, state):
 
 
 def standard_record_progress(event):
-    evidence = ["control:stone.standard_action_v12"]
+    evidence = ["control:stone.standard_action_v13"]
     transition_id = get(event, "transition_id", "")
     if len(transition_id) > 0:
         evidence.append("transition:" + transition_id)
@@ -1356,7 +1387,7 @@ def standard_record_progress(event):
 def standard_result(candidate, state):
     result = candidate
     result["_control"] = {
-        "name": "stone.standard_action_v12",
+        "name": "stone.standard_action_v13",
         "rounds": state.rounds,
         "actions": state.actions,
         "model_calls": state.model_calls,
@@ -1409,6 +1440,9 @@ def standard_result(candidate, state):
         ),
         "validation_retries": state.validation_retries,
         "last_transition_id": state.last_transition_id,
+        "time_budget_phase": state.time_budget_phase,
+        "time_budget_warnings": state.time_budget_warnings,
+        "last_time_remaining_ms": state.last_time_remaining_ms,
     }
     return result
 
@@ -1474,6 +1508,9 @@ def standard_agent_control(
         "validation_retries": 0,
         "last_transition_id": "",
         "last_tool": "",
+        "time_budget_phase": "unbounded",
+        "time_budget_warnings": 0,
+        "last_time_remaining_ms": None,
     }
     standard_record_task_requirement(session, options, "pending")
     state = standard_reconcile_active_runs(state, options)
@@ -1484,11 +1521,34 @@ def standard_agent_control(
         "actions": 0,
     })
 
-    for round in range(options.max_rounds):
+    round = 0
+    limit_reason = "round_limit"
+    while options.max_rounds == 0 or round < options.max_rounds:
+        time_budget = standard_current_time_budget()
+        if time_budget is not None:
+            state["last_time_remaining_ms"] = time_budget.remaining_ms
+            if time_budget.phase != state.time_budget_phase:
+                state["time_budget_phase"] = time_budget.phase
+                if time_budget.should_finalize:
+                    state["time_budget_warnings"] += 1
+                    messages.append({
+                        "role": "user",
+                        "content": json_dumps({
+                            "kind": "time_budget_warning",
+                            "time_budget": time_budget,
+                            "instruction": time_budget.message,
+                        }),
+                    })
+            if time_budget.expired:
+                limit_reason = "time_budget"
+                break
+        round += 1
         checkpoint_at = (
             options.max_model_calls - options.finalization_window
         )
         should_checkpoint = (
+            options.max_model_calls > 0
+            and
             options.completion_critique
             and options.proactive_completion_checkpoint
             and not state.budget_checkpoint_done
@@ -1544,9 +1604,13 @@ def standard_agent_control(
             })
 
         reserved_calls = 1 if options.completion_critique else 0
-        if state.model_calls + 1 + reserved_calls > options.max_model_calls:
+        if (
+            options.max_model_calls > 0
+            and state.model_calls + 1 + reserved_calls > options.max_model_calls
+        ):
+            limit_reason = "model_call_limit"
             break
-        state["rounds"] = round + 1
+        state["rounds"] = round
         initial_projection = state.memory_projections == 0
         required_keys = (
             state.initial_action_memory_required_keys
@@ -1557,6 +1621,7 @@ def standard_agent_control(
             messages,
             options,
             required_keys,
+            time_budget,
         )
         if initial_projection:
             state["initial_action_memory_projection_keys"] = (
@@ -1590,7 +1655,7 @@ def standard_agent_control(
         state["last_transition_id"] = inference.response.transition_id
         action = inference.value.actions[0]
         state["actions"] += 1
-        if state.actions > options.max_actions:
+        if options.max_actions > 0 and state.actions > options.max_actions:
             fail(
                 "agent exceeded max_actions " + str(options.max_actions),
                 code="agent_action_limit",
@@ -1745,6 +1810,7 @@ def standard_agent_control(
                     "kind": "tool_error",
                     "message": str(error),
                 }
+        outcome["time_budget"] = standard_current_time_budget()
         if not get(outcome, "ok", False):
             state["failed_tools"] += 1
         state = standard_track_owned_run(action, outcome, state, options)
@@ -1781,7 +1847,7 @@ def standard_agent_control(
     record_progress({
         "stage": "blocked",
         "status": "pending",
-        "reason": "round_limit",
+        "reason": limit_reason,
         "rounds": state.rounds,
         "actions": state.actions,
         "model_calls": state.model_calls,
@@ -1794,9 +1860,21 @@ def standard_agent_control(
             {
                 "answer": "budget-exhausted-with-best-effort",
                 "complete": False,
-                "completion": "round_limit",
+                "completion": limit_reason,
             },
             state,
+        )
+    if limit_reason == "time_budget":
+        fail(
+            "agent attempt time budget expired",
+            code="agent_time_budget_expired",
+            detail=state,
+        )
+    if limit_reason == "model_call_limit":
+        fail(
+            "agent exhausted max_model_calls " + str(options.max_model_calls),
+            code="agent_model_call_limit",
+            detail=state,
         )
     fail(
         "agent exhausted max_rounds " + str(options.max_rounds),

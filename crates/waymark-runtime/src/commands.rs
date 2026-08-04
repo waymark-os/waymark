@@ -406,7 +406,7 @@ emit({"input": input})"#],
     StoneHelpEntry {
         name: "agent_session",
         signature: "agent_session() -> record",
-        use_when: "Gateway mode only. Build the standard structured session argument for a Stone AgentControl function from the attached task, input, attempt, limits, fresh time_budget, and available Shell tool families. session.time_budget includes elapsed_ms and remaining_ms when the attempt declares a wall-time limit or deadline. Calling agent_session() again refreshes that snapshot. session.context_prompt_view carries typed child-admission projection policy independently from task input; session.attempt includes typed controller_run_count, controller_restarted, and controller_phase fields.",
+        use_when: "Gateway mode only. Build the standard structured session argument for a Stone AgentControl function from the attached task, input, attempt, limits, fresh time_budget, and available Shell tool families. session.time_budget includes elapsed_ms, remaining_ms, phase, should_finalize, and an actionable message when the attempt declares a wall-time limit or deadline. Calling agent_session() again refreshes that snapshot. session.context_prompt_view carries typed child-admission projection policy independently from task input; session.attempt includes typed controller_run_count, controller_restarted, and controller_phase fields.",
         examples: &[r#"def control(session):
     return {"attempt": session.attempt.attempt, "objective": session.task.objective}
 emit(control(agent_session()))"#],
@@ -429,8 +429,8 @@ emit(control(agent_session()))"#],
     },
     StoneHelpEntry {
         name: "react_control",
-        signature: r#"react_control(model: str = "", max_rounds: int = 16, max_turns: int = 16, max_tool_ms: int? = None, completion_path: str = "") -> agent_control"#,
-        use_when: "Gateway mode only. Create the optimized builtin JSON-action ReAct control as a first-class callable Stone value, then invoke it with an agent_session() record.",
+        signature: r#"react_control(model: str = "", max_rounds: int = 0, max_turns: int = 0, max_tool_ms: int? = None, completion_path: str = "") -> agent_control"#,
+        use_when: "Gateway mode only. Create the optimized builtin JSON-action ReAct control as a first-class callable Stone value, then invoke it with an agent_session() record. Zero leaves the corresponding action-count limit disabled; deadlines and parent cancellation remain authoritative.",
         examples: &[r#"control = react_control(max_rounds=4, max_turns=8)
 emit(control(agent_session()))"#],
         avoid: &[
@@ -441,7 +441,7 @@ emit(control(agent_session()))"#],
     },
     StoneHelpEntry {
         name: "scripted_control",
-        signature: r#"scripted_control(actions: list[record], max_turns: int = 16, max_tool_ms: int? = None, completion_path: str = "") -> agent_control"#,
+        signature: r#"scripted_control(actions: list[record], max_turns: int = 0, max_tool_ms: int? = None, completion_path: str = "") -> agent_control"#,
         use_when: "Use for deterministic fixtures or pre-authored action sequences through the same first-class AgentControl callable contract as optimized model controls.",
         examples: &[r#"control = scripted_control([{"final": {"answer": "ok"}}])
 session = {"task": {"objective": "fixture"}, "input": None}
@@ -1250,9 +1250,9 @@ else:
     },
     StoneHelpEntry {
         name: "attempt_spawn",
-        signature: r#"attempt_spawn(task: str = "", workspace: str = "", task_spec: record = {}, task_input: Any = None, context_prompt_view: {"required_keys": [str, ...]}? = None, program: record = {}, entrypoint: str = "", workspace_source: record = {}, context_source: record = {}, capabilities: record = {}, start: bool = false, scope: attempt_scope? = None, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", parent_attempt: str = "", resource_limits: record = {}, metadata: record = {}) -> attempt_handle"#,
-        use_when: "Use in Gateway mode when a controller needs to create a new top-level task attempt with its own transaction and explicit task/control-flow definition.",
-        examples: &[r#"child = attempt_spawn(task_spec={"id": "task-debug", "objective": "write hello.txt"}, workspace_source={"workspace": "repo"}, program={"kind": "stone", "source": "write_file(\"hello.txt\", \"hello\")"})"#],
+        signature: r#"attempt_spawn(task: str = "", workspace: str = "", task_spec: record = {}, task_input: Any = None, context_prompt_view: {"required_keys": [str, ...]}? = None, program: record = {}, entrypoint: str = "", workspace_source: record = {}, context_source: record = {}, capabilities: record = {}, start: bool = false, scope: attempt_scope? = None, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", parent_attempt: str = "", time_budget_ms: int? = None, resource_limits: record = {}, metadata: record = {}) -> attempt_handle"#,
+        use_when: "Use in Gateway mode when a controller needs to create a new top-level task attempt with its own transaction and explicit task/control-flow definition. time_budget_ms is a convenient typed spelling of the authoritative child wall-time limit.",
+        examples: &[r#"child = attempt_spawn(task_spec={"id": "task-debug", "objective": "write hello.txt"}, workspace_source={"workspace": "repo"}, program={"kind": "stone", "source": "write_file(\"hello.txt\", \"hello\")"}, time_budget_ms=120000)"#],
         avoid: &["Do not spawn attempts for ordinary file edits inside the current attempt; use workspace builtins directly."],
         aliases: &[],
     },
@@ -1394,12 +1394,12 @@ emit(attempt_scope_close(scope).clean)"#],
     },
     StoneHelpEntry {
         name: "attempt_fork",
-        signature: r#"attempt_fork(parent_attempt: attempt_handle | str | record = "", checkpoint: str = "", task: str = "", input: Any = None, context_prompt_view: {"required_keys": [str, ...]}? = None, program: record? = None, entrypoint: str = "", start: bool = False, scope: attempt_scope? = None, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", resource_limits: record = {}, metadata: record = {}) -> attempt_handle"#,
+        signature: r#"attempt_fork(parent_attempt: attempt_handle | str | record = "", checkpoint: str = "", task: str = "", input: Any = None, context_prompt_view: {"required_keys": [str, ...]}? = None, program: record? = None, entrypoint: str = "", start: bool = False, scope: attempt_scope? = None, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", time_budget_ms: int? = None, resource_limits: record = {}, metadata: record = {}) -> attempt_handle"#,
         use_when: "Use in Gateway mode to create an isolated child from the current parent frontier, or from an opaque verified stage checkpoint owned by that parent.",
         examples: &[
             r#"branch = attempt_fork(task="try-alt-fix", metadata={"strategy": "alternate"})"#,
             r#"branch = attempt_fork(checkpoint=report.stages[0].checkpoint.reference, input={"strategy": "alternate"})"#,
-            r#"branch = attempt_fork(input={"strategy": "alternate"}, context_prompt_view={"required_keys": ["requirement.target"]}, program=current_program(), entrypoint="worker", start=True, scope=scope)"#,
+            r#"branch = attempt_fork(input={"strategy": "alternate"}, context_prompt_view={"required_keys": ["requirement.target"]}, program=current_program(), entrypoint="worker", start=True, scope=scope, time_budget_ms=120000)"#,
         ],
         avoid: &[
             "Do not assume a fork mutates the parent attempt; it returns a separate attempt and transaction.",
@@ -1428,11 +1428,11 @@ emit(attempt_scope_close(scope).clean)"#],
     },
     StoneHelpEntry {
         name: "attempt_branch",
-        signature: r#"attempt_branch(frontier: semantic_frontier, task: str = "", input: Any = None, context_prompt_view: {"required_keys": [str, ...]}? = None, program: record? = None, entrypoint: str = "", start: bool = False, scope: attempt_scope? = None, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", resource_limits: record = {}, metadata: record = {}) -> attempt_handle"#,
+        signature: r#"attempt_branch(frontier: semantic_frontier, task: str = "", input: Any = None, context_prompt_view: {"required_keys": [str, ...]}? = None, program: record? = None, entrypoint: str = "", start: bool = False, scope: attempt_scope? = None, controller: str = "", capability_profile: str = "", container: str = "", workspace_mount: str = "", time_budget_ms: int? = None, resource_limits: record = {}, metadata: record = {}) -> attempt_handle"#,
         use_when: "Gateway mode only. Create a child from a semantic frontier without deciding whether the checkpoint is owned by the current parent or retained by a failed owner. The runtime lowers to the authoritative fork or repair-restore operation and preserves the same supervision interface.",
         examples: &[r#"frontier = semantic_frontier(report.stages[0].checkpoint)
 scope = attempt_scope()
-child = attempt_branch(frontier, input={"strategy": "alternate"}, program=current_program(), entrypoint="worker", start=True, scope=scope)"#],
+child = attempt_branch(frontier, input={"strategy": "alternate"}, program=current_program(), entrypoint="worker", start=True, scope=scope, time_budget_ms=120000)"#],
         avoid: &[
             "Do not pass raw checkpoint ids or workspace_source records; construct a semantic_frontier once and reuse it.",
             "Do not omit scope for started branches unless another bounded cleanup owner is explicit.",

@@ -181,8 +181,8 @@ impl AgentSession {
     pub fn new(tools: TaskTools) -> Self {
         Self {
             tools,
-            max_rounds: 16,
-            max_turns: 16,
+            max_rounds: 0,
+            max_turns: 0,
             trace: Vec::new(),
             next_seq: 0,
             completion_path: None,
@@ -264,7 +264,7 @@ impl AgentSession {
         let mut rounds = 0;
         let mut turns = 0;
         loop {
-            if rounds >= self.max_rounds {
+            if self.max_rounds > 0 && rounds >= self.max_rounds {
                 return self.round_limit_result(rounds, turns);
             }
             rounds += 1;
@@ -302,7 +302,7 @@ impl AgentSession {
 
             let mut saw_tool = false;
             for action in actions {
-                if turns >= self.max_turns {
+                if self.max_turns > 0 && turns >= self.max_turns {
                     return self.turn_limit_result(rounds, turns);
                 }
 
@@ -395,7 +395,7 @@ impl AgentSession {
     ) -> AgentRunResult {
         let mut turns = 0;
         for action in actions {
-            if turns >= self.max_turns {
+            if self.max_turns > 0 && turns >= self.max_turns {
                 return self.turn_limit_result(0, turns);
             }
 
@@ -1040,6 +1040,17 @@ mod tests {
         assert!(system.contains("discard every rejected child"));
         assert_eq!(request["messages"][1]["role"], json!("user"));
         assert_eq!(request["messages"][1]["content"], json!("write hello"));
+    }
+
+    #[test]
+    fn action_counters_are_unlimited_by_default() {
+        let root = temp_root("unlimited-agent-defaults");
+        let agent = AgentSession::new(TaskTools::for_host_root(&root));
+
+        assert_eq!(agent.max_rounds(), 0);
+        assert_eq!(agent.max_turns(), 0);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

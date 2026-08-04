@@ -6949,8 +6949,8 @@ impl Evaluator<'_> {
             .map(|value| value_to_string(value, "react_control model"))
             .transpose()?
             .filter(|value| !value.is_empty());
-        let mut max_rounds = 16;
-        let mut max_turns = 16;
+        let mut max_rounds = 0;
+        let mut max_turns = 0;
         let mut max_tool_ms = None;
         let mut completion_path = None;
         for (name, value) in named {
@@ -6979,12 +6979,6 @@ impl Evaluator<'_> {
                     ));
                 }
             }
-        }
-        if max_rounds == 0 || max_turns == 0 {
-            return Err(stone_error(
-                "react_control",
-                "max_rounds and max_turns must be greater than zero",
-            ));
         }
         Ok(RuntimeValue::AgentControl(AgentControlValue {
             control_id: self.state.next_callable_id(),
@@ -7067,7 +7061,7 @@ impl Evaluator<'_> {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut max_turns = 16;
+        let mut max_turns = 0;
         let mut max_tool_ms = None;
         let mut completion_path = None;
         for (name, expression) in &call.named {
@@ -7094,12 +7088,6 @@ impl Evaluator<'_> {
                     ));
                 }
             }
-        }
-        if max_turns == 0 {
-            return Err(stone_error(
-                "scripted_control",
-                "max_turns must be greater than zero",
-            ));
         }
         Ok(RuntimeValue::AgentControl(AgentControlValue {
             control_id: self.state.next_callable_id(),
@@ -7436,6 +7424,7 @@ impl Evaluator<'_> {
         let mut workspace_mount = String::new();
         let mut parent_attempt = String::new();
         let mut resource_limits = Vec::new();
+        let mut time_budget_ms = None;
         let mut metadata = Vec::new();
         let mut entrypoint = String::new();
         let mut spawn_v1 = gateway_env::AttemptSpawnV1::default();
@@ -7460,6 +7449,9 @@ impl Evaluator<'_> {
                 "resource_limits" | "limits" => {
                     resource_limits =
                         value_to_string_pairs(&value, "attempt_spawn resource_limits")?
+                }
+                "time_budget_ms" => {
+                    time_budget_ms = Some(value_to_u64(&value, "attempt_spawn time_budget_ms")?)
                 }
                 "metadata" | "meta" => {
                     metadata = value_to_string_pairs(&value, "attempt_spawn metadata")?
@@ -7529,6 +7521,7 @@ impl Evaluator<'_> {
             &entrypoint,
             "attempt_spawn entrypoint",
         )?;
+        apply_attempt_time_budget(&mut resource_limits, time_budget_ms, "attempt_spawn")?;
         let child = gateway_env::attempt_spawn(
             task,
             workspace,
@@ -7904,6 +7897,7 @@ impl Evaluator<'_> {
         let mut container = String::new();
         let mut workspace_mount = String::new();
         let mut resource_limits = Vec::new();
+        let mut time_budget_ms = None;
         let mut metadata = Vec::new();
         let mut context_prompt_required_keys = None;
         let mut task_input_json = String::new();
@@ -7925,6 +7919,9 @@ impl Evaluator<'_> {
                 "resource_limits" | "limits" => {
                     resource_limits =
                         value_to_string_pairs(&value, "attempt_branch resource_limits")?
+                }
+                "time_budget_ms" => {
+                    time_budget_ms = Some(value_to_u64(&value, "attempt_branch time_budget_ms")?)
                 }
                 "metadata" | "meta" => {
                     metadata = value_to_string_pairs(&value, "attempt_branch metadata")?
@@ -7956,6 +7953,7 @@ impl Evaluator<'_> {
             }
         }
         apply_stone_entrypoint(&mut program, &entrypoint, "attempt_branch entrypoint")?;
+        apply_attempt_time_budget(&mut resource_limits, time_budget_ms, "attempt_branch")?;
         metadata.push((
             "semantic_frontier_id".to_string(),
             frontier.frontier_id.to_string(),
@@ -8046,6 +8044,7 @@ impl Evaluator<'_> {
         let mut container = String::new();
         let mut workspace_mount = String::new();
         let mut resource_limits = Vec::new();
+        let mut time_budget_ms = None;
         let mut metadata = Vec::new();
         let mut context_prompt_required_keys = None;
         let mut task_input_json = String::new();
@@ -8069,6 +8068,9 @@ impl Evaluator<'_> {
                 }
                 "resource_limits" | "limits" => {
                     resource_limits = value_to_string_pairs(&value, "attempt_fork resource_limits")?
+                }
+                "time_budget_ms" => {
+                    time_budget_ms = Some(value_to_u64(&value, "attempt_fork time_budget_ms")?)
                 }
                 "metadata" | "meta" => {
                     metadata = value_to_string_pairs(&value, "attempt_fork metadata")?
@@ -8100,6 +8102,7 @@ impl Evaluator<'_> {
             }
         }
         apply_stone_entrypoint(&mut program, &entrypoint, "attempt_fork entrypoint")?;
+        apply_attempt_time_budget(&mut resource_limits, time_budget_ms, "attempt_fork")?;
         let child = gateway_env::attempt_fork(
             parent_attempt,
             checkpoint,
@@ -15194,6 +15197,19 @@ fn agent_time_budget_value(attempt: &Value, now_ms: u64, span: Span) -> Value {
         .and_then(|metadata| metadata.get("time_budget_source"))
         .and_then(JsonValue::as_str)
         .unwrap_or("attempt-resource-limit");
+    let remaining_ms = deadline_ms.saturating_sub(now_ms);
+    let warning_threshold_ms = total_ms
+        .map(|total| 300_000_u64.max(total / 5))
+        .unwrap_or(300_000);
+    let expired = remaining_ms == 0;
+    let should_finalize = expired || remaining_ms <= warning_threshold_ms;
+    let phase = if expired {
+        "expired"
+    } else if should_finalize {
+        "finalize"
+    } else {
+        "work"
+    };
     let mut budget = Record::new();
     budget.push("source", Value::string(source, span));
     budget.push("clock", Value::string(agent_time_clock_source(), span));
@@ -15216,13 +15232,31 @@ fn agent_time_budget_value(attempt: &Value, now_ms: u64, span: Span) -> Value {
     );
     budget.push(
         "remaining_ms",
-        Value::int(time_u64_to_i64(deadline_ms.saturating_sub(now_ms)), span),
+        Value::int(time_u64_to_i64(remaining_ms), span),
     );
     budget.push(
         "total_ms",
         total_ms
             .map(|value| Value::int(time_u64_to_i64(value), span))
             .unwrap_or_else(|| Value::nothing(span)),
+    );
+    budget.push(
+        "warning_threshold_ms",
+        Value::int(time_u64_to_i64(warning_threshold_ms), span),
+    );
+    budget.push("phase", Value::string(phase, span));
+    budget.push("should_finalize", Value::bool(should_finalize, span));
+    budget.push("expired", Value::bool(expired, span));
+    budget.push(
+        "message",
+        if should_finalize {
+            Value::string(
+                "Reserve time for verification and attempt publication; cancel or replan work that cannot finish within the remaining budget.",
+                span,
+            )
+        } else {
+            Value::nothing(span)
+        },
     );
     Value::record(budget, span)
 }
@@ -15486,6 +15520,33 @@ fn value_to_string_pairs(
     val.iter()
         .map(|(key, value)| value_to_string(value, context).map(|value| (key.clone(), value)))
         .collect()
+}
+
+fn apply_attempt_time_budget(
+    resource_limits: &mut Vec<(String, String)>,
+    time_budget_ms: Option<u64>,
+    context: &str,
+) -> Result<(), ShellError> {
+    let Some(time_budget_ms) = time_budget_ms else {
+        return Ok(());
+    };
+    if time_budget_ms == 0 {
+        return Err(stone_error(
+            context,
+            "time_budget_ms must be greater than zero; omit it for no child deadline",
+        ));
+    }
+    if resource_limits
+        .iter()
+        .any(|(name, _)| name == "wall_time_ms")
+    {
+        return Err(stone_error(
+            context,
+            "time_budget_ms conflicts with resource_limits.wall_time_ms; specify only one",
+        ));
+    }
+    resource_limits.push(("wall_time_ms".to_string(), time_budget_ms.to_string()));
+    Ok(())
 }
 
 fn context_prompt_required_keys_from_value(
@@ -15944,8 +16005,8 @@ mod tests {
     #[cfg(not(target_os = "hermit"))]
     use super::cleanup_stale_run_temp_files;
     use super::{
-        agent_session_value_at, context_prompt_required_keys_from_value, ensure_runtime_type,
-        eval_program, eval_program_with_options, eval_program_with_output,
+        agent_session_value_at, apply_attempt_time_budget, context_prompt_required_keys_from_value,
+        ensure_runtime_type, eval_program, eval_program_with_options, eval_program_with_output,
         eval_program_with_output_and_session, match_fused_map_update_if,
         semantic_frontier_guidance, transition_id_for_scope, workflow_publication_audit,
         EvalHotLoopDiagnostics, EvalOptions, RuntimeValue, StoneSession, TextLines,
@@ -17430,6 +17491,9 @@ emit({
         assert_eq!(session["time_budget"]["total_ms"], json_value!(4000));
         assert_eq!(session["time_budget"]["elapsed_ms"], json_value!(500));
         assert_eq!(session["time_budget"]["remaining_ms"], json_value!(3500));
+        assert_eq!(session["time_budget"]["phase"], json_value!("finalize"));
+        assert_eq!(session["time_budget"]["should_finalize"], json_value!(true));
+        assert_eq!(session["time_budget"]["expired"], json_value!(false));
         assert!(session["tools"]["model"]
             .as_array()
             .unwrap()
@@ -17446,6 +17510,30 @@ emit({
             .as_array()
             .unwrap()
             .contains(&json_value!("attempt_fork")));
+    }
+
+    #[test]
+    fn typed_attempt_time_budget_lowers_without_ambiguity() {
+        let mut limits = vec![("memory".to_string(), "1GiB".to_string())];
+        apply_attempt_time_budget(&mut limits, Some(120_000), "attempt_fork").unwrap();
+        assert!(limits.contains(&("wall_time_ms".to_string(), "120000".to_string())));
+
+        let zero = apply_attempt_time_budget(&mut Vec::new(), Some(0), "attempt_fork").unwrap_err();
+        let ShellError::Generic(zero) = zero else {
+            panic!("expected a structured Stone error")
+        };
+        assert!(zero.msg.contains("must be greater than zero"));
+
+        let conflict = apply_attempt_time_budget(
+            &mut vec![("wall_time_ms".to_string(), "60000".to_string())],
+            Some(120_000),
+            "attempt_fork",
+        )
+        .unwrap_err();
+        let ShellError::Generic(conflict) = conflict else {
+            panic!("expected a structured Stone error")
+        };
+        assert!(conflict.msg.contains("specify only one"));
     }
 
     #[test]

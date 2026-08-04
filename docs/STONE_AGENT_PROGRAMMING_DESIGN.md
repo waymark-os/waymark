@@ -644,6 +644,27 @@ Further combinators may include `map_observation`, `with_verifier`,
 `with_critic`, `then`, and `fallback`. These are library policies. A task may
 also write a direct loop and call the same tools without using `AgentControl`.
 
+Action counters are optional containment, not the normal liveness mechanism.
+For standard and builtin controls, zero means no round/action limit and a
+positive value is an explicit parent or benchmark ceiling. Attempt wall time
+and parent cancellation remain authoritative. A child can declare the common
+case directly:
+
+```stone
+child = attempt_fork(
+    program=current_program(entrypoint="worker"),
+    start=True,
+    scope=scope,
+    time_budget_ms=120000,
+)
+```
+
+This lowers to the Gateway's existing `wall_time_ms` resource policy. Within a
+timed controller, repeated `agent_session()` calls return a fresh
+`time_budget` containing remaining time and runtime-derived finalization
+guidance, so the harness can inject the fact at individual action-state
+transitions without teaching the model clock arithmetic.
+
 ### Shell Resource Tool Families
 
 Both builtin and Stone-defined controls receive capability-scoped tools from

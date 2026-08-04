@@ -2084,8 +2084,8 @@ fn control_task_value(config: &GatewayRuntimeConfig) -> Result<JsonValue, ShellE
                 .unwrap_or_else(|| control_task_prompt(task_spec));
             let mut agent = json!({
                 "task": task,
-                "max_turns": json_u64(&args, "max_turns").unwrap_or(16),
-                "max_rounds": json_u64(&args, "max_rounds").unwrap_or(16),
+                "max_turns": json_u64(&args, "max_turns").unwrap_or(0),
+                "max_rounds": json_u64(&args, "max_rounds").unwrap_or(0),
             });
             if let Some(model) = args.get("model").and_then(JsonValue::as_str) {
                 if !model.is_empty() {

@@ -93,6 +93,7 @@ const KEYWORD_SCHEMAS: &[(&str, &[&str])] = &[
             "capability_profile",
             "container",
             "workspace_mount",
+            "time_budget_ms",
             "resource_limits",
             "limits",
             "metadata",

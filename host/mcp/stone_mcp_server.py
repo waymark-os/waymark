@@ -303,9 +303,9 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
     },
     "attempt_spawn": {
         "name": "attempt_spawn",
-        "signature": "attempt_spawn(task: str = '', workspace: str = '', task_spec: record = {}, task_input: Any = None, program: record = {}, entrypoint: str = '', workspace_source: record = {}, context_source: record = {}, capabilities: record = {}, start: bool = false, scope: attempt_scope? = None, controller: str = '', capability_profile: str = '', container: str = '', workspace_mount: str = '', parent_attempt: str = '', resource_limits: record = {}, metadata: record = {}) -> attempt_handle",
+        "signature": "attempt_spawn(task: str = '', workspace: str = '', task_spec: record = {}, task_input: Any = None, program: record = {}, entrypoint: str = '', workspace_source: record = {}, context_source: record = {}, capabilities: record = {}, start: bool = false, scope: attempt_scope? = None, controller: str = '', capability_profile: str = '', container: str = '', workspace_mount: str = '', parent_attempt: str = '', time_budget_ms: int? = None, resource_limits: record = {}, metadata: record = {}) -> attempt_handle",
         "effects": ["write_file"],
-        "example": 'child = attempt_spawn(task_spec={"id": "task-debug", "objective": "write hello.txt"}, workspace_source={"workspace": "repo"}, program={"kind": "stone", "source": "write_file(\\"hello.txt\\", \\"hello\\")"})',
+        "example": 'child = attempt_spawn(task_spec={"id": "task-debug", "objective": "write hello.txt"}, workspace_source={"workspace": "repo"}, program={"kind": "stone", "source": "write_file(\\"hello.txt\\", \\"hello\\")"}, time_budget_ms=120000)',
     },
     "attempt_start": {
         "name": "attempt_start",
@@ -363,7 +363,7 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
     },
     "attempt_fork": {
         "name": "attempt_fork",
-        "signature": "attempt_fork(parent_attempt: attempt_handle | str | record = '', task: str = '', program: record? = None, entrypoint: str = '', start: bool = False, scope: attempt_scope? = None, controller: str = '', capability_profile: str = '', container: str = '', workspace_mount: str = '', resource_limits: record = {}, metadata: record = {}) -> attempt_handle",
+        "signature": "attempt_fork(parent_attempt: attempt_handle | str | record = '', task: str = '', program: record? = None, entrypoint: str = '', start: bool = False, scope: attempt_scope? = None, controller: str = '', capability_profile: str = '', container: str = '', workspace_mount: str = '', time_budget_ms: int? = None, resource_limits: record = {}, metadata: record = {}) -> attempt_handle",
         "effects": ["write_file"],
         "example": 'branch = attempt_fork(task="try-alt-fix", controller="codex")',
     },

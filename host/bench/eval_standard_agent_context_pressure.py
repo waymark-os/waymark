@@ -163,7 +163,7 @@ def gate(
         violations.append("V7 control report is missing")
     else:
         expected = {
-            "name": "stone.standard_action_v12",
+            "name": "stone.standard_action_v13",
             "actions": PROBE_COUNT + 1,
             "tool_calls": PROBE_COUNT,
             "model_calls": PROBE_COUNT + 1,

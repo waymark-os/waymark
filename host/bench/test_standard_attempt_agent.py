@@ -65,7 +65,7 @@ class StandardAttemptAgentTests(unittest.TestCase):
         self.assertIn('source = "controller_default"', self.source)
         self.assertIn('"initial_action_memory_policy_source":', self.source)
         self.assertIn(
-            "def standard_prepare_action_context(messages, options, required_keys)",
+            "def standard_prepare_action_context(",
             self.source,
         )
         self.assertIn("required_keys=required_keys", self.source)
@@ -159,6 +159,17 @@ class StandardAttemptAgentTests(unittest.TestCase):
             self.source,
         )
         self.assertIn('"completion_critique": True', self.source)
+        self.assertIn('"max_rounds": 0', self.source)
+        self.assertIn('"max_actions": 0', self.source)
+        self.assertIn('"max_model_calls": 0', self.source)
+        self.assertIn(
+            "while options.max_rounds == 0 or round < options.max_rounds:",
+            self.source,
+        )
+        self.assertIn(
+            "if options.max_actions > 0 and state.actions > options.max_actions:",
+            self.source,
+        )
         self.assertIn('"max_completion_critiques": 2', self.source)
         self.assertIn('"finalization_window": 6', self.source)
         self.assertIn('"proactive_completion_checkpoint": True', self.source)
@@ -169,7 +180,11 @@ class StandardAttemptAgentTests(unittest.TestCase):
             "state.model_calls + 1 + reserved_calls > options.max_model_calls",
             self.source,
         )
-        self.assertIn('"name": "stone.standard_action_v12"', self.source)
+        self.assertIn('"name": "stone.standard_action_v13"', self.source)
+        self.assertIn("def standard_current_time_budget():", self.source)
+        self.assertIn('"kind": "time_budget_warning"', self.source)
+        self.assertIn('"time_budget": get(outcome, "time_budget", None)', self.source)
+        self.assertIn('outcome["time_budget"] = standard_current_time_budget()', self.source)
         self.assertIn('"stage": "budget_checkpoint"', self.source)
         self.assertIn('"kind": "budget_completion_checkpoint"', self.source)
         self.assertIn(
@@ -184,7 +199,7 @@ class StandardAttemptAgentTests(unittest.TestCase):
         self.assertIn('"status": "pending"', self.source)
         self.assertNotIn('"status": "blocked"', self.source)
         self.assertIn('"report_partial_on_limit": False', self.source)
-        self.assertIn('"completion": "round_limit"', self.source)
+        self.assertIn('"completion": limit_reason', self.source)
         self.assertIn(
             '"result": standard_model_outcome(outcome, options)',
             self.source,

@@ -362,7 +362,7 @@ def gate_cell(
         violations.append(f"{cell['name']} control provenance is missing")
     else:
         expected = {
-            "name": "stone.standard_action_v12",
+            "name": "stone.standard_action_v13",
             "model_calls": expected_calls,
             "actions": expected_actions,
             "completion_critiques": expected_critiques,

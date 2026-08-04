@@ -25,14 +25,17 @@ call-local decision hooks while preserving the bounded decision loop. Construct
 the latter with `transition_hooks(pre=..., post=...)`; the resulting value can
 be bound and passed through ordinary Stone functions.
 
-V12 provides the accumulated controls below. The combined controller provides:
+V13 provides the accumulated controls below. The combined controller provides:
 
 - exactly one schema-validated action per model transition;
 - a compact model-facing action contract with the complete schema retained as
   runtime validation authority;
 - bounded repair through `model_infer`;
-- bounded conversation history, file reads, Linux output, time, rounds, and
-  action count;
+- bounded conversation history, file reads, Linux output, and tool duration;
+- optional round, action, and model-call containment limits, with zero meaning
+  no counter limit;
+- a fresh runtime-owned attempt deadline view in every decision context and
+  tool observation;
 - recoverable structured tool errors;
 - one bounded public-task requirement;
 - a fixed-size ring of bounded tool evidence;
@@ -288,6 +291,24 @@ waits; it finished in 14 model calls, cut total tokens from 132,395 to 68,497,
 and earned official reward `1.0`. This is one stochastic matched pair, not a
 broad task-level estimate. See
 [Stone Runtime-owned Run Await](STONE_RUNTIME_OWNED_RUN_AWAIT.md).
+
+V13 separates containment from liveness. `max_rounds`, `max_actions`, and
+`max_model_calls` now default to zero (disabled); a positive value remains an
+explicit parent or benchmark ceiling. Exploratory benchmark drivers resolve
+that policy to 200 rather than asking a small guessed budget to stand in for
+task completion. The attempt deadline and parent cancellation remain
+authoritative.
+
+For a timed attempt, `agent_session().time_budget` is a fresh structured view
+with elapsed and remaining milliseconds, a runtime-derived `work`, `finalize`,
+or `expired` phase, and an actionable finalization reminder. The standard
+controller refreshes the view before every decision and after every tool
+outcome. The reminder is inserted when the phase changes, while the compact
+budget remains visible on every transition. Child authors can write
+`time_budget_ms=120000` on `attempt_spawn`, `attempt_fork`, or
+`attempt_branch`; Stone lowers it to the existing Gateway-authoritative
+`wall_time_ms` resource limit. Supplying both spellings is rejected instead of
+silently choosing one.
 
 The next PL slice is now available independently of this generic ReAct loop:
 typed Stone workflows encode deterministic stages with explicit evidence,

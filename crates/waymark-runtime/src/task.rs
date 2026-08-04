@@ -299,8 +299,8 @@ impl Default for AgentSpec {
             actions: Some(json!([])),
             task: None,
             model: None,
-            max_rounds: 16,
-            max_turns: 16,
+            max_rounds: 0,
+            max_turns: 0,
             max_tool_ms: None,
             completion_path: None,
         }
@@ -474,7 +474,7 @@ impl TaskSpec {
         let max_turns = match agent.get("max_turns").and_then(JsonValue::as_u64) {
             Some(value) => usize::try_from(value)
                 .map_err(|_| format!("agent.max_turns is too large: {value}"))?,
-            None => 16,
+            None => 0,
         };
         let max_rounds = match agent.get("max_rounds").and_then(JsonValue::as_u64) {
             Some(value) => usize::try_from(value)
