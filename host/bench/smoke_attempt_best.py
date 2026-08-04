@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
+import lzma
 import os
 import subprocess
 import tempfile
@@ -21,6 +23,11 @@ SANDBOX = ROOT.parent
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--case",
+        choices=("score", "process-compression"),
+        default="score",
+    )
     parser.add_argument("--waymark-bin", type=Path, default=ROOT / "target/debug/waymark")
     parser.add_argument(
         "--gateway-bin",
@@ -37,15 +44,59 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def assert_result(payload: dict[str, Any]) -> tuple[str, list[str]]:
+def compression_fixture() -> bytes:
+    return "".join(
+        json.dumps(
+            {
+                "event": "request.complete",
+                "route": f"/api/items/{index % 17}",
+                "status": 200 if index % 13 else 503,
+                "tenant": f"tenant-{index % 9}",
+                "message": "bounded repeated workload for candidate compression",
+            },
+            sort_keys=True,
+        )
+        + "\n"
+        for index in range(5000)
+    ).encode("utf-8")
+
+
+def assert_result(
+    payload: dict[str, Any],
+    *,
+    case: str = "score",
+    fixture: bytes | None = None,
+) -> tuple[str, list[str]]:
     if payload.get("ok") is not True:
         raise AssertionError(f"best-candidate controller failed: {payload}")
     value = payload.get("value") or {}
-    children = [str(item) for item in value.get("children") or []]
+    raw_children = value.get("children") or []
+    if not isinstance(raw_children, list) or not all(
+        isinstance(item, str) for item in raw_children
+    ):
+        received = [type(item).__name__ for item in raw_children]
+        raise AssertionError(
+            "children must be list[str] of attempt ids; "
+            f"received element types {received}; append child.attempt directly"
+        )
+    children = raw_children
     decisions = value.get("decisions") or []
+    expected_answer = "beta"
+    expected_score: float | int = 0.9
+    expected_decision_scores: list[float | int] | None = None
+    if case == "process-compression":
+        if fixture is None:
+            raise AssertionError("compression result requires fixture bytes")
+        lzma_size = len(lzma.compress(fixture, preset=9))
+        gzip_size = len(gzip.compress(fixture, compresslevel=9, mtime=0))
+        if lzma_size >= gzip_size:
+            raise AssertionError("compression fixture does not prefer lzma")
+        expected_answer = "lzma"
+        expected_score = lzma_size
+        expected_decision_scores = [1_000_000_000, lzma_size, gzip_size]
     if (
-        value.get("answer") != "beta"
-        or value.get("score") != 0.9
+        value.get("answer") != expected_answer
+        or value.get("score") != expected_score
         or value.get("status") != "accepted"
         or value.get("considered") != 3
         or value.get("replacements") != 1
@@ -72,6 +123,12 @@ def assert_result(payload: dict[str, Any]) -> tuple[str, list[str]]:
     ]
     if observed != expected:
         raise AssertionError(f"replacement/rejection decisions changed: {value}")
+    if expected_decision_scores is not None:
+        decision_scores = [decision.get("score") for decision in decisions]
+        if decision_scores != expected_decision_scores:
+            raise AssertionError(
+                f"candidate process scores changed: {decision_scores}"
+            )
     return children[1], children
 
 
@@ -89,6 +146,7 @@ def main() -> int:
             raise SystemExit(f"{label} not found: {path}")
 
     source = args.program.read_text(encoding="utf-8")
+    fixture = compression_fixture() if args.case == "process-compression" else None
     with tempfile.TemporaryDirectory(prefix="waymark-attempt-best-", dir="/tmp") as root_text:
         root = Path(root_text)
         data_root = root / "gateway-data"
@@ -98,6 +156,8 @@ def main() -> int:
         (workspace_source / "README.md").write_text(
             "attempt best fixture base\n", encoding="utf-8"
         )
+        if fixture is not None:
+            (workspace_source / "input.txt").write_bytes(fixture)
         smoke.gateway(
             args.gateway_bin,
             data_root,
@@ -146,7 +206,7 @@ def main() -> int:
             base.wait_for_socket(socket_path, server)
             spawn_source = "emit(attempt_spawn(" + ",".join(
                 [
-                    'task_spec={"id":"attempt-best-smoke","objective":"retain the highest-scored isolated candidate"}',
+                    'task_spec={"id":"attempt-best-smoke","objective":"select one measured isolated candidate"}',
                     'task_input={}',
                     'workspace_source={"workspace":"repo"}',
                     "program=" + json.dumps(
@@ -193,7 +253,35 @@ def main() -> int:
             payload = base.response_payload(subprocess.CompletedProcess([], 0, logs, ""))
             if not isinstance(payload, dict):
                 raise AssertionError(f"controller logs had no Stone response: {logs}")
-            winner, children = assert_result(payload)
+            winner, children = assert_result(
+                payload,
+                case=args.case,
+                fixture=fixture,
+            )
+            if fixture is not None:
+                root_info = smoke.parse_info(
+                    smoke.gateway(
+                        args.gateway_bin,
+                        data_root,
+                        "attempt",
+                        "info",
+                        attempt,
+                        env=client_env,
+                    ).stdout
+                )
+                tx_path = Path(
+                    smoke.gateway(
+                        args.gateway_bin,
+                        data_root,
+                        "tx",
+                        "path",
+                        root_info["tx"],
+                        env=client_env,
+                    ).stdout.strip()
+                )
+                archive = (tx_path / "archive.bin").read_bytes()
+                if lzma.decompress(archive) != fixture:
+                    raise AssertionError("accepted archive does not round-trip")
             for child in children:
                 info = smoke.parse_info(
                     smoke.gateway(
@@ -214,6 +302,8 @@ def main() -> int:
                 raise AssertionError("trace does not contain exactly three candidate forks")
             if trace.count('"op":"attempt.accept"') != 1:
                 raise AssertionError("trace does not contain exactly one candidate acceptance")
+            if fixture is not None and trace.count('"op":"linux.exec"') < 4:
+                raise AssertionError("compression case did not execute four real processes")
         finally:
             if attempt:
                 smoke.gateway(

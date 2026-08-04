@@ -1,6 +1,6 @@
 # LLM-Authored Best-Candidate Attempts: Case Study
 
-Status: two positive narrow demonstrations, 2026-08-03.
+Status: three positive narrow demonstrations, 2026-08-03.
 
 ## Question
 
@@ -117,6 +117,50 @@ Only the task contract and benchmark case changed. This is useful evidence
 that the positive result is not limited to maximizing a parent-supplied score,
 though both tasks still share the same small three-candidate lifecycle shape.
 
+## Transfer: Process-Backed Compression
+
+The third task moved candidate evaluation across the POSIX process boundary.
+Each child received the same 792,058-byte structured-log fixture and evaluated
+one codec in an isolated workspace:
+
+| Candidate | Evaluation | Measured score |
+|---|---|---:|
+| missing codec | deliberate failed Python import | 1,000,000,000 penalty |
+| LZMA | successful compression | 2,608 bytes |
+| gzip | successful compression | 8,739 bytes |
+
+Workers used `run_complete` for bounded Python processes, checked the returned
+process outcome, measured successful `archive.bin` files with `stat`, and
+returned that child-owned measurement to the minimizing selector. A failed
+evaluator became a visible invalid candidate with a declared penalty rather
+than crashing the child controller. After acceptance, the parent ran a fourth
+process that decompressed the selected archive and compared it byte-for-byte
+with the original input. The host gate independently repeated the binary
+round-trip check.
+
+A fresh Terra response authored the 4,067-byte Stone program with zero Codex
+tool calls. The generated program executed the expected failure and both valid
+evaluators, retained the middle LZMA child, imported its binary artifact,
+verified it, reclaimed all three children, and left no open transaction. It
+required no generated-program repair and no Stone language/runtime/help change.
+
+Two evaluation defects were kept distinct from program behavior:
+
+1. The first prompt said to append child ids but later ambiguously described
+   both output lists as records. The otherwise successful program returned
+   `{attempt: id}` records. The contract now states `children: list[str]`, and
+   the verifier reports that exact type mismatch and local repair.
+2. The second program passed the full workload, but a source-text gate accepted
+   only `score=outcome.result.value.cost`. The program had equivalently bound
+   `candidate_result = outcome.result.value` and used
+   `score=candidate_result.cost`. The semantic execution evidence already
+   proved the measured scores; the gate now accepts the ordinary local alias,
+   and the unchanged source passed an independent replay.
+
+This is stronger than the arithmetic transfers because candidate work was a
+real fallible effect and the selected state contained a verified binary
+artifact. It remains a controlled workload, not an external task benchmark.
+
 ## What The Failed Iterations Taught
 
 The demonstration became positive through general interface corrections, not
@@ -141,10 +185,10 @@ state makes the program more robust and easier to write.
 
 It does not establish general task success, transfer to unrelated workflows,
 or superiority over other agent-control representations. The candidates and
-scoring policies were fixed, both workers were simple, and only one model
-configuration produced the positive cells. The next evidence should come from
-a real workload where candidate evaluation can fail, take substantial time,
-or produce imperfect evidence.
+scoring policies were fixed, the workers were small, and only one model
+configuration produced the positive cells. The process-backed case exercises
+failure and measured artifacts, but not long-running or model-generated
+candidates. Those are the next useful transfer boundaries.
 
 ## Reproduction
 
@@ -170,4 +214,13 @@ python3 host/bench/eval_stone_attempt_best_authorship.py \
   --case min-derived-cost \
   --model gpt-5.6-terra \
   --run-root target/runs/stone-attempt-best-min-cost-authorship
+```
+
+Run the process-backed compression transfer:
+
+```sh
+python3 host/bench/eval_stone_attempt_best_authorship.py \
+  --case process-compression \
+  --model gpt-5.6-terra \
+  --run-root target/runs/stone-attempt-best-process-compression
 ```

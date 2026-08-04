@@ -20,6 +20,40 @@ class AttemptBestAuthorshipTests(unittest.TestCase):
         self.assertIn('objective="min"', prompt)
         self.assertIn("without putting a precomputed total cost", prompt)
 
+    def test_process_case_runs_measures_and_handles_one_failure(self) -> None:
+        prompt = experiment.authorship_prompt({}, "process-compression")
+        self.assertIn("run_complete", prompt)
+        self.assertIn("definitely_missing_waymark_codec", prompt)
+        self.assertIn("measure the actual `/app/archive.bin` bytes", prompt)
+        self.assertIn('objective="min"', prompt)
+        self.assertIn("list of the three child attempt id strings", prompt)
+
+        source = """best = attempt_best(scope, objective="min")
+result = run_complete(["python3", "-c", "import definitely_missing_waymark_codec"])
+cost = stat("/app/archive.bin").size
+decision = attempt_best_consider(best, outcome, score=outcome.result.value.cost)
+penalty = 1000000000
+"""
+        features = experiment.source_features(source, "process-compression")
+        for key in (
+            "case_objective",
+            "case_outcome_score",
+            "case_process_execution",
+            "case_measured_archive",
+            "case_failed_evaluation",
+        ):
+            self.assertTrue(features[key], key)
+
+        aliased = source.replace(
+            "score=outcome.result.value.cost",
+            "candidate_result=outcome.result.value\nscore=candidate_result.cost",
+        )
+        self.assertTrue(
+            experiment.source_features(aliased, "process-compression")[
+                "case_outcome_score"
+            ]
+        )
+
     def test_transfer_case_requires_minimizing_selector(self) -> None:
         minimizing = """best = attempt_best(scope, objective = "min")
 cost = input.setup_cost + input.run_cost

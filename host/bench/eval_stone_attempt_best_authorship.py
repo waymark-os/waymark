@@ -30,6 +30,8 @@ TOPICS = (
     "task_input",
     "write_file",
     "read_file",
+    "stat",
+    "run_complete",
     "fail",
 )
 
@@ -38,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--case",
-        choices=("max-score", "min-derived-cost"),
+        choices=("max-score", "min-derived-cost", "process-compression"),
         default="max-score",
         help="authorship task shape to execute",
     )
@@ -73,7 +75,18 @@ def authorship_prompt(
     topics: dict[str, dict[str, Any]], case: str = "max-score"
 ) -> str:
     interface = json.dumps(topics, separators=(",", ":"), sort_keys=True)
-    if case == "min-derived-cost":
+    if case == "process-compression":
+        contract = """Program contract:
+1. Define `worker(input)` for a real compression candidate. Every child sees `/app/input.txt`. For codec `lzma`, use `run_complete` with `python3 -c` to read that file and write `/app/archive.bin` with `lzma.compress(data, preset=9)`. For codec `gzip`, do the same with `gzip.compress(data, compresslevel=9, mtime=0)`. Codec `missing` must deliberately execute a Python import of `definitely_missing_waymark_codec` so its evaluator returns nonzero. Use a 30000 ms timeout and inspect the process result.
+2. A failed compression process is an evaluated but invalid candidate, not a controller crash: write `input.answer + "\\n"` to `answer.txt` and return name, answer, valid=false, cost=1000000000, evidence `["compression:failed:" + input.codec]`, and artifacts `["answer.txt"]`. On success, measure the actual `/app/archive.bin` bytes with `stat`, write `answer.txt`, and return valid=true, the measured integer cost, evidence `["compression:ok:" + input.codec]`, and artifacts `["answer.txt", "archive.bin"]`.
+3. Define `main(input)`. Capture the current root attempt, create one attempt scope, and create a minimizing attempt_best bound to that scope with `objective="min"`.
+4. In declared order, explore exactly these candidate records, with no parent-supplied score: missing/alpha, lzma/lzma, gzip/gzip. For each candidate fork an isolated child that runs this same program at entrypoint `worker`, starts immediately under the scope, and join it with a 60000 ms timeout. A child controller that does not report succeeded is a `candidate_failed` task failure.
+5. Consider every successful child outcome through the selector using the worker's returned cost, a nonempty summary, evidence, and artifacts. Append each decision and child id. Do not manually accept or discard candidates; selector policy owns that. The failed evaluator should be retained initially with its penalty, replaced by lzma, and the later larger gzip archive should be rejected.
+6. Accept the retained minimum-size child into the unchanged root, then close the scope. Require clean cleanup and imported `answer.txt` equal to `lzma`. Independently run a bounded Python command that decompresses `/app/archive.bin` with lzma and exits nonzero unless it exactly equals `/app/input.txt`; fail with code `archive_verification_failed` unless that command succeeds.
+7. Return a record with exactly these observable fields and meanings: answer is `"lzma"`; winner is the retained child attempt id string; score is the runtime-owned measured archive byte count; status is `"accepted"`; considered is integer `3`; replacements is integer `1`; released_outcome is boolean true; children is a list of the three child attempt id strings in declared order; decisions is a list of the three selector decision records in declared order; and clean is boolean true. Read the selector's score and counters rather than recomputing them in the parent. Prove released_outcome with try/except after acceptance.
+8. At top level, dispatch to `worker(task_input())` when attempt metadata's program_entrypoint is `worker`; otherwise call `main(task_input())`. Report succeeded with attempt_report and emit the result. Keep process failure, measurement, selection, verification, lifecycle, and cleanup visible in Stone. Do not use hidden helpers, model calls, shell commands, imports, semantic frontiers, or copy a reference program.
+"""
+    elif case == "min-derived-cost":
         contract = """Program contract:
 1. Define `worker(input)`. Compute `cost = input.setup_cost + input.run_cost` inside the worker, write `input.answer + "\\n"` to `answer.txt`, and return name, answer, cost, evidence `["canary:cost:" + input.name]`, and artifacts `["answer.txt"]`.
 2. Define `main(input)`. Capture the current root attempt, create one attempt scope, and create a minimizing attempt_best bound to that scope with `objective="min"`.
@@ -118,6 +131,7 @@ def output_schema() -> dict[str, Any]:
 
 def source_features(source: str, case: str = "max-score") -> dict[str, bool]:
     compact = "".join(source.split())
+    minimizing = case in ("min-derived-cost", "process-compression")
     features = {
         "worker": "def worker(" in source,
         "main": "def main(" in source,
@@ -134,7 +148,7 @@ def source_features(source: str, case: str = "max-score") -> dict[str, bool]:
         or "\nfrom " in "\n" + source,
     }
     features["case_objective"] = (
-        'objective="min"' in compact if case == "min-derived-cost" else True
+        'objective="min"' in compact if minimizing else True
     )
     features["case_worker_cost"] = (
         "input.setup_cost+input.run_cost" in compact
@@ -142,8 +156,28 @@ def source_features(source: str, case: str = "max-score") -> dict[str, bool]:
         else True
     )
     features["case_outcome_score"] = (
-        "score=outcome.result.value.cost" in compact
-        if case == "min-derived-cost"
+        (
+            "score=outcome.result.value.cost" in compact
+            or (
+                "=outcome.result.value" in compact
+                and "score=" in compact
+                and ".cost" in compact
+            )
+        )
+        if minimizing
+        else True
+    )
+    features["case_process_execution"] = (
+        "run_complete(" in source if case == "process-compression" else True
+    )
+    features["case_measured_archive"] = (
+        "stat(" in source and "archive.bin" in source
+        if case == "process-compression"
+        else True
+    )
+    features["case_failed_evaluation"] = (
+        "1000000000" in compact and "definitely_missing_waymark_codec" in source
+        if case == "process-compression"
         else True
     )
     return features
@@ -193,6 +227,8 @@ def main() -> int:
             "--program",
             str(authored),
         ]
+        if args.case == "process-compression":
+            smoke_command.extend(["--case", "process-compression"])
         smoke_completed = base.run_capture(
             smoke_command, cwd=ROOT, timeout=max(args.timeout, 360.0)
         )
