@@ -1256,6 +1256,17 @@ The M2.5 implementation now establishes the control and supervision seams:
   inference with replaceable dispatch, verification, and progress adapters,
   bounded observations/history/resources, recoverable tool errors, same-key
   memory, and compact result provenance.
+- V14 treats that generic loop as a small online exploration/exploitation
+  controller. The attempt is the episode, tool effects are actions, outcomes
+  are observations, operational evidence novelty supplies a coarse
+  `better`/`unchanged`/`worse` signal, and the independent evidence critic gates
+  completion. Runtime feedback is reduced to one replaceable control frame per
+  decision rather than accumulated as instruction messages. Exact repeated
+  action-state pairs and exhausted critique produce a structured
+  `needs_review` handoff with the latest blocker and audit. This is runtime
+  search policy, not learned model weights and not proof that a novel outcome
+  improved the task objective; typed stages remain the stronger controller
+  when the workflow and evidence transitions are known in advance.
 - `examples/references/standard_attempt_fork_portfolio.stone` composes that
   library into a complete parent/child portfolio: negative spawn baseline,
   two typed-view forks, retained child inspection, deterministic selection,

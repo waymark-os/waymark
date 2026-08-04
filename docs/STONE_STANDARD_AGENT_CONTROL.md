@@ -25,7 +25,7 @@ call-local decision hooks while preserving the bounded decision loop. Construct
 the latter with `transition_hooks(pre=..., post=...)`; the resulting value can
 be bound and passed through ordinary Stone functions.
 
-V13 provides the accumulated controls below. The combined controller provides:
+V14 provides the accumulated controls below. The combined controller provides:
 
 - exactly one schema-validated action per model transition;
 - a compact model-facing action contract with the complete schema retained as
@@ -37,6 +37,13 @@ V13 provides the accumulated controls below. The combined controller provides:
 - a fresh runtime-owned attempt deadline view in every decision context and
   tool observation;
 - recoverable structured tool errors;
+- an exact-replacement `edit` action for localized file changes;
+- one replaceable runtime control frame rather than accumulated guidance
+  messages;
+- simple `explore`, `exploit`, and `verify` modes driven by typed operational
+  progress;
+- structured `needs_review` results for repeated unchanged action-state pairs
+  and exhausted completion critique;
 - one bounded public-task requirement;
 - a fixed-size ring of bounded tool evidence;
 - a same-key semantic requirement audit and same-key progress retention;
@@ -89,13 +96,13 @@ contract; it is not an authoritative task verifier.
 
 ## Current Packaging
 
-Stone does not yet have a module import mechanism. Consequently V12 is a
+Stone does not yet have a module import mechanism. Consequently V14 is a
 checked-in source bundle containing the library functions and a small default
 adapter invocation. The complete source is included in the admitted program
 digest. This keeps policy visible while leaving module loading as a separate
 language-design decision.
 
-The default dispatcher supports `read`, `write`, short synchronous
+The default dispatcher supports `read`, exact-replacement `edit`, `write`, short synchronous
 `run_linux`, runtime-owned `run_complete`, the four manual owned-task lifecycle
 actions, and `finish`. Task-specific controls may replace it with another named
 function without changing `standard_agent_control`.
@@ -303,12 +310,39 @@ For a timed attempt, `agent_session().time_budget` is a fresh structured view
 with elapsed and remaining milliseconds, a runtime-derived `work`, `finalize`,
 or `expired` phase, and an actionable finalization reminder. The standard
 controller refreshes the view before every decision and after every tool
-outcome. The reminder is inserted when the phase changes, while the compact
-budget remains visible on every transition. Child authors can write
+outcome. The control reducer selects finalization when the phase changes, while
+the compact budget remains visible in every decision frame and tool outcome.
+Child authors can write
 `time_budget_ms=120000` on `attempt_spawn`, `attempt_fork`, or
 `attempt_branch`; Stone lowers it to the existing Gateway-authoritative
 `wall_time_ms` resource limit. Supplying both spellings is rejected instead of
 silently choosing one.
+
+V14 adds a small runtime exploration/exploitation policy without hiding the
+ordinary Stone loop. Before each model decision the controller synthesizes one
+ephemeral `runtime_control` frame containing one mode, one objective, at most
+one blocker, the latest progress class, the unchanged streak, and the current
+time budget. The frame is rebuilt for the next decision and is not appended to
+conversation history. Full outcomes, audits, and progress remain available in
+the bounded trajectory, memory, and trace, so feedback producers do not become
+competing prompt instructions.
+
+The current progress signal is intentionally operational rather than a task
+reward. A new successful action/outcome signature is `better`, a new failed
+outcome is `worse`, an exact repeated action/outcome signature is `unchanged`,
+and the initial state is `unknown`. Success still requires the independent
+completion evidence gate. Three consecutive repeats after the first observed
+pair switch the loop to exploration and return a structured `needs_review`
+result; reaching the completion-critic ceiling does the same while retaining
+the latest audit and active blocker. Both paths reap owned runs before return.
+`max_stagnant_actions` may be raised for a deliberately repetitive harness.
+
+V14 also reuses Stone's existing guarded `edit(path, old, new, all=False)`
+primitive in the generic action schema. The fixture canary exercised a real
+write/edit/read trajectory, a four-write stagnation trajectory, and repeated
+unsupported completion. All three returned the expected V14 result and rolled
+back cleanly. Artifact:
+`target/runs/stone-standard-runtime-learning-v14/aggregate.json`.
 
 The next PL slice is now available independently of this generic ReAct loop:
 typed Stone workflows encode deterministic stages with explicit evidence,
@@ -333,6 +367,7 @@ Run the source checks with:
 
 ```sh
 python3 host/bench/test_standard_attempt_agent.py
+python3 host/bench/eval_standard_agent_runtime_learning.py --warm-build 1
 python3 host/bench/test_eval_standard_agent_completion_critique.py
 python3 host/bench/test_eval_standard_agent_context_pressure.py
 python3 host/bench/test_eval_standard_agent_run_cleanup.py

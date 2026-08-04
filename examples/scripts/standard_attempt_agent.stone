@@ -1,4 +1,4 @@
-# Standard visible Stone action controller, V13.
+# Standard visible Stone action controller, V14.
 #
 # Everything below is ordinary admitted Stone source. The runtime contributes
 # model_infer and resource effects, but it does not hide this loop, dispatcher,
@@ -18,7 +18,7 @@
 # can replace adapters and pass reusable call-local policy through this control.
 
 def standard_schema_prompt_text():
-    return "Return {\"actions\":[A]} with one A: read(path); write(path,content); run_linux(C); run_complete(L); run_start(B); run_status(run_id); run_wait(run_id,timeout_ms?); run_terminate(run_id); finish(answer); or final(answer). Encode each tool as {\"tool\":name,\"input\":object}, final as {\"final\":{\"answer\":string}}. C/L/B contain argv:[string,...], optional cwd,stdin,max_stdout_bytes,max_stderr_bytes; C/L may include timeout_ms, B may not. argv 1..64; C timeout <=120000; L timeout <=1800000; stdout <=65536; stderr <=32768. Prefer run_complete for a bounded command that must finish; use run_start only to interleave work or manage a service, then status/wait/terminate its run_id. Never use shell &, nohup, or finish with active runs. No unlisted fields."
+    return "Return {\"actions\":[A]} with one A: read(path); edit(path,old,new,all?); write(path,content); run_linux(C); run_complete(L); run_start(B); run_status(run_id); run_wait(run_id,timeout_ms?); run_terminate(run_id); finish(answer); or final(answer). Encode each tool as {\"tool\":name,\"input\":object}, final as {\"final\":{\"answer\":string}}. C/L/B contain argv:[string,...], optional cwd,stdin,max_stdout_bytes,max_stderr_bytes; C/L may include timeout_ms, B may not. Prefer exact edit for a localized change and write for a new file or complete rewrite. Prefer run_complete for bounded work; use run_start only for overlap or a service, then manage its run_id. Never use shell &, nohup, or finish with active runs. No unlisted fields."
 
 
 def standard_critique_schema_prompt_text():
@@ -54,6 +54,7 @@ def standard_agent_options(input):
         "max_output_tokens": 512,
         "critic_max_output_tokens": 768,
         "max_completion_critiques": 2,
+        "max_stagnant_actions": 3,
         "finalization_window": 6,
         "max_evidence_items": 8,
         "max_evidence_characters": 2048,
@@ -181,6 +182,15 @@ def standard_agent_options(input):
         ),
         1,
         4,
+    )
+    options["max_stagnant_actions"] = standard_clamp(
+        get(
+            input,
+            "max_stagnant_actions",
+            options.max_stagnant_actions,
+        ),
+        1,
+        16,
     )
     options["finalization_window"] = standard_clamp(
         get(input, "finalization_window", options.finalization_window),
@@ -327,6 +337,17 @@ def standard_action_schema():
         "required": ["path", "content"],
         "additionalProperties": False,
     }
+    edit_input = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "minLength": 1},
+            "old": {"type": "string", "minLength": 1},
+            "new": {"type": "string"},
+            "all": {"type": "boolean"},
+        },
+        "required": ["path", "old", "new"],
+        "additionalProperties": False,
+    }
     run_input = {
         "type": "object",
         "properties": {
@@ -436,6 +457,15 @@ def standard_action_schema():
                 "properties": {
                     "tool": {"const": "read"},
                     "input": read_input,
+                },
+                "required": ["tool", "input"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "tool": {"const": "edit"},
+                    "input": edit_input,
                 },
                 "required": ["tool", "input"],
                 "additionalProperties": False,
@@ -630,11 +660,65 @@ def standard_current_time_budget():
     return get(agent_session(), "time_budget", None)
 
 
+def standard_set_control(
+    state,
+    mode,
+    objective,
+    blocker,
+    progress,
+    reason,
+):
+    state["control_mode"] = mode
+    state["control_objective"] = objective
+    state["control_blocker"] = blocker
+    state["progress_class"] = progress
+    state["control_reason"] = reason
+    state["control_updates"] += 1
+    return state
+
+
+def standard_control_instruction(state, time_budget):
+    if time_budget is not None and time_budget.should_finalize:
+        return (
+            "Do not start broad new work. Resolve the active blocker if one "
+            "is shown; otherwise verify the strongest result and finish."
+        )
+    if state.control_mode == "explore":
+        return (
+            "Choose one materially different, reversible probe or repair "
+            "action; do not repeat an unchanged action-state pair."
+        )
+    if state.control_mode == "verify":
+        return (
+            "Acquire any final missing evidence, then submit finish only when "
+            "the public requirement is supported."
+        )
+    return (
+        "Continue the current objective with one evidence-producing action, "
+        "then reassess from its recorded outcome."
+    )
+
+
+def standard_control_frame(state, time_budget):
+    return {
+        "kind": "runtime_control",
+        "mode": state.control_mode,
+        "objective": state.control_objective,
+        "blocker": state.control_blocker,
+        "progress": state.progress_class,
+        "unchanged_streak": state.unchanged_streak,
+        "reason": state.control_reason,
+        "instruction": standard_control_instruction(state, time_budget),
+        "time_budget": time_budget,
+    }
+
+
 def standard_prepare_action_context(
     messages,
     options,
     required_keys,
     time_budget,
+    state,
 ):
     projection = context_project(
         focus=(
@@ -647,28 +731,25 @@ def standard_prepare_action_context(
     )
     projection_message = {
         "role": "user",
-        "content": (
-            "Active bounded attempt memory:\n"
-            + projection.text
-            + "\nCurrent attempt time budget:\n"
-            + json_dumps(time_budget)
-        ),
+        "content": "Active bounded attempt memory:\n" + projection.text,
+    }
+    control = standard_control_frame(state, time_budget)
+    control_message = {
+        "role": "user",
+        "content": "Current runtime control frame:\n" + json_dumps(control),
     }
     recent_budget = max(
         options.max_task_context_characters + 1024,
         options.max_action_context_characters
-        - len(projection_message.content),
+        - len(projection_message.content)
+        - len(control_message.content),
     )
     bounded = standard_bounded_messages(
         messages,
         options.max_messages,
         recent_budget,
     )
-    prepared = (
-        bounded[:-1]
-        + [projection_message]
-        + bounded[-1:]
-    )
+    prepared = bounded + [projection_message, control_message]
     return {
         "history": bounded,
         "messages": prepared,
@@ -678,6 +759,7 @@ def standard_prepare_action_context(
         "projection_truncated": projection.truncated,
         "projection_keys": map(lambda item: item.key, projection.items),
         "projection_required_keys": projection.required_keys,
+        "control_frame": control,
     }
 
 
@@ -697,7 +779,7 @@ def standard_initial_messages(session, options):
     return [
         {
             "role": "system",
-            "content": "Choose exactly one next action from visible evidence and wrap it as {\"actions\":[...]}. Never invent tool outcomes. Prefer run_complete for a bounded build, install, test, download, benchmark, or data-processing command that must finish. Use run_start only when work should overlap or a service must stay live; manage that run_id with status/wait/terminate. Never use shell backgrounding. Finish is rejected while an owned run remains active. A fresh completion critic rejects claims without recorded evidence.",
+            "content": "Choose exactly one next action from visible evidence and wrap it as {\"actions\":[...]}. Treat the current runtime control frame as the sole active guidance: explore when an action-state pair is unchanged, exploit novel successful evidence, and verify before finish. Never invent tool outcomes. Prefer edit for localized changes and write for new files or complete rewrites. Prefer run_complete for bounded work. Use run_start only for overlap or a live service; manage its run_id with status/wait/terminate. Never use shell backgrounding. Finish is rejected while an owned run remains active, and a fresh completion critic rejects unsupported claims.",
         },
         {
             "role": "user",
@@ -783,6 +865,21 @@ def standard_shell_dispatch(action, options):
             "kind": "read",
             "path": args.path,
             "content": read_file(args.path, max_bytes=options.max_read_bytes),
+        }
+    if tool == "edit":
+        result = edit(
+            args.path,
+            args.old,
+            args.new,
+            all=get(args, "all", False),
+        )
+        return {
+            "ok": True,
+            "kind": "edit",
+            "path": args.path,
+            "replacements": result.replacements,
+            "matched": result.matched,
+            "all": result.all,
         }
     if tool == "write":
         write_text(args.path, args.content)
@@ -946,6 +1043,16 @@ def standard_action_summary(action):
             "path": args.path,
             "content_characters": len(args.content),
         }
+    if tool == "edit":
+        return {
+            "tool": tool,
+            "path": args.path,
+            "old_characters": len(args.old),
+            "old_sha256": sha256(args.old),
+            "new_characters": len(args.new),
+            "new_sha256": sha256(args.new),
+            "all": get(args, "all", False),
+        }
     if tool in ["run_linux", "run_complete", "run_start"]:
         return {"tool": tool, "argv": args.argv, "cwd": get(args, "cwd", None)}
     if tool in ["run_status", "run_wait", "run_terminate"]:
@@ -955,6 +1062,97 @@ def standard_action_summary(action):
             "timeout_ms": get(args, "timeout_ms", None),
         }
     return {"tool": tool, "path": get(args, "path", None)}
+
+
+def standard_text_signature(value):
+    if value is None:
+        return None
+    text = str(value)
+    return {"characters": len(text), "sha256": sha256(text)}
+
+
+def standard_action_outcome_signature(action, outcome):
+    return sha256(json_dumps({
+        "action": standard_action_summary(action),
+        "result": {
+            "ok": get(outcome, "ok", False),
+            "kind": get(outcome, "kind", ""),
+            "exit_code": get(outcome, "exit_code", None),
+            "timed_out": get(outcome, "timed_out", None),
+            "still_running": get(outcome, "still_running", None),
+            "done": get(outcome, "done", None),
+            "path": get(outcome, "path", None),
+            "run_id": get(outcome, "run_id", None),
+            "replacements": get(outcome, "replacements", None),
+            "matched": get(outcome, "matched", None),
+            "content": standard_text_signature(
+                get(outcome, "content", None)
+            ),
+            "stdout": standard_text_signature(get(outcome, "stdout", None)),
+            "stderr": standard_text_signature(get(outcome, "stderr", None)),
+            "message": standard_text_signature(
+                get(outcome, "message", None)
+            ),
+        },
+    }))
+
+
+def standard_update_progress(action, outcome, state):
+    signature = standard_action_outcome_signature(action, outcome)
+    repeated = (
+        len(state.last_action_outcome_signature) > 0
+        and signature == state.last_action_outcome_signature
+    )
+    state["last_action_outcome_signature"] = signature
+    if repeated:
+        state["unchanged_streak"] += 1
+        return standard_set_control(
+            state,
+            "explore",
+            state.control_objective,
+            {
+                "kind": "unchanged_action_state",
+                "action": standard_action_summary(action),
+                "repetitions": state.unchanged_streak,
+            },
+            "unchanged",
+            "repeated_action_state",
+        )
+    state["unchanged_streak"] = 0
+    if not get(outcome, "ok", False):
+        return standard_set_control(
+            state,
+            "explore",
+            state.control_objective,
+            {
+                "kind": "tool_failure",
+                "action": standard_action_summary(action),
+                "outcome_kind": get(outcome, "kind", "tool_error"),
+                "message": standard_bounded_evidence_text(
+                    get(outcome, "message", get(outcome, "stderr", "")),
+                    512,
+                ),
+            },
+            "worse",
+            "failed_action",
+        )
+    blocker = state.control_blocker
+    if (
+        blocker is not None
+        and get(blocker, "kind", "") in [
+            "tool_failure",
+            "unchanged_action_state",
+        ]
+    ):
+        blocker = None
+    return standard_set_control(
+        state,
+        "exploit",
+        state.control_objective,
+        blocker,
+        "better",
+        "novel_successful_evidence",
+    )
 
 
 def standard_record_active_runs(state, options):
@@ -968,7 +1166,7 @@ def standard_record_active_runs(state, options):
             "runs": state.active_runs,
         },
         status=status,
-        evidence=["control:stone.standard_action_v13"],
+        evidence=["control:stone.standard_action_v14"],
     )
 
 
@@ -1101,6 +1299,9 @@ def standard_outcome_evidence(action, outcome, state, options):
         "completion_waits",
         "requested_timeout_ms",
         "truncated",
+        "replacements",
+        "matched",
+        "all",
         "path",
         "run_id",
     ]:
@@ -1270,6 +1471,19 @@ def standard_completion_critique(candidate, session, state, options):
     )
 
 
+def standard_critique_blocker(critique):
+    for requirement in critique.requirements:
+        if requirement.status != "satisfied":
+            return {
+                "kind": "unsupported_requirement",
+                "id": requirement.id,
+                "requirement": requirement.requirement,
+                "reason": requirement.reason,
+                "evidence": requirement.evidence,
+            }
+    return None
+
+
 def standard_budget_checkpoint(session, state, options):
     return standard_requirement_critique(
         {
@@ -1301,6 +1515,9 @@ def standard_model_outcome(outcome, options):
         "still_running",
         "done",
         "truncated",
+        "replacements",
+        "matched",
+        "all",
         "path",
         "run_id",
     ]:
@@ -1370,7 +1587,7 @@ def standard_verify_finish(candidate, session, state):
 
 
 def standard_record_progress(event):
-    evidence = ["control:stone.standard_action_v13"]
+    evidence = ["control:stone.standard_action_v14"]
     transition_id = get(event, "transition_id", "")
     if len(transition_id) > 0:
         evidence.append("transition:" + transition_id)
@@ -1387,7 +1604,7 @@ def standard_record_progress(event):
 def standard_result(candidate, state):
     result = candidate
     result["_control"] = {
-        "name": "stone.standard_action_v13",
+        "name": "stone.standard_action_v14",
         "rounds": state.rounds,
         "actions": state.actions,
         "model_calls": state.model_calls,
@@ -1443,8 +1660,52 @@ def standard_result(candidate, state):
         "time_budget_phase": state.time_budget_phase,
         "time_budget_warnings": state.time_budget_warnings,
         "last_time_remaining_ms": state.last_time_remaining_ms,
+        "control_mode": state.control_mode,
+        "control_reason": state.control_reason,
+        "control_updates": state.control_updates,
+        "progress_class": state.progress_class,
+        "unchanged_streak": state.unchanged_streak,
+        "needs_review_count": state.needs_review_count,
     }
     return result
+
+
+def standard_needs_review(reason, state, options, record_progress):
+    state = standard_reap_active_runs(state, options)
+    state["needs_review_count"] += 1
+    record_progress({
+        "stage": "needs_review",
+        "status": "pending",
+        "reason": reason,
+        "mode": state.control_mode,
+        "objective": state.control_objective,
+        "blocker": state.control_blocker,
+        "progress": state.progress_class,
+        "unchanged_streak": state.unchanged_streak,
+        "rounds": state.rounds,
+        "actions": state.actions,
+        "model_calls": state.model_calls,
+        "tool_calls": state.tool_calls,
+        "failed_tools": state.failed_tools,
+        "transition_id": state.last_transition_id,
+    })
+    return standard_result(
+        {
+            "answer": "attempt requires review",
+            "complete": False,
+            "completion": "needs_review",
+            "review": {
+                "reason": reason,
+                "mode": state.control_mode,
+                "objective": state.control_objective,
+                "blocker": state.control_blocker,
+                "progress": state.progress_class,
+                "unchanged_streak": state.unchanged_streak,
+                "latest_completion_audit": state.last_completion_audit,
+            },
+        },
+        state,
+    )
 
 
 def standard_agent_control(
@@ -1511,6 +1772,18 @@ def standard_agent_control(
         "time_budget_phase": "unbounded",
         "time_budget_warnings": 0,
         "last_time_remaining_ms": None,
+        "control_mode": "explore",
+        "control_objective": (
+            "Advance the public requirement with visible, reusable evidence."
+        ),
+        "control_blocker": None,
+        "control_reason": "initial_orientation",
+        "control_updates": 0,
+        "progress_class": "unknown",
+        "unchanged_streak": 0,
+        "last_action_outcome_signature": "",
+        "last_completion_audit": None,
+        "needs_review_count": 0,
     }
     standard_record_task_requirement(session, options, "pending")
     state = standard_reconcile_active_runs(state, options)
@@ -1531,14 +1804,18 @@ def standard_agent_control(
                 state["time_budget_phase"] = time_budget.phase
                 if time_budget.should_finalize:
                     state["time_budget_warnings"] += 1
-                    messages.append({
-                        "role": "user",
-                        "content": json_dumps({
-                            "kind": "time_budget_warning",
-                            "time_budget": time_budget,
-                            "instruction": time_budget.message,
-                        }),
-                    })
+                    if state.control_blocker is None:
+                        state = standard_set_control(
+                            state,
+                            "verify",
+                            (
+                                "Verify the strongest current result and "
+                                "finish if its evidence is sufficient."
+                            ),
+                            None,
+                            state.progress_class,
+                            "time_budget_finalize",
+                        )
             if time_budget.expired:
                 limit_reason = "time_budget"
                 break
@@ -1566,6 +1843,7 @@ def standard_agent_control(
             state["last_transition_id"] = critique.transition_id
             state["budget_checkpoints"] += 1
             state["budget_checkpoint_done"] = True
+            state["last_completion_audit"] = critique
             if not critique.approved:
                 state["checkpoint_rejections"] += 1
             standard_record_completion_audit(critique, "pending")
@@ -1582,26 +1860,24 @@ def standard_agent_control(
                 "checkpoint_rejections": state.checkpoint_rejections,
                 "transition_id": state.last_transition_id,
             })
-            next_instruction = (
-                "The visible evidence appears complete. Submit an explicit "
-                "finish action next."
-            )
-            if not critique.approved:
-                next_instruction = (
-                    "Use the remaining budget to perform the repair objective, "
-                    "record its outcome, and then submit an explicit finish."
+            if critique.approved:
+                state = standard_set_control(
+                    state,
+                    "verify",
+                    "Submit an explicit finish action.",
+                    None,
+                    "better",
+                    "budget_checkpoint_ready",
                 )
-            messages.append({
-                "role": "user",
-                "content": json_dumps({
-                    "kind": "budget_completion_checkpoint",
-                    "ready_to_finish": critique.approved,
-                    "summary": critique.summary,
-                    "repair_objective": critique.repair_objective,
-                    "requirements": critique.requirements,
-                    "instruction": next_instruction,
-                }),
-            })
+            else:
+                state = standard_set_control(
+                    state,
+                    "exploit",
+                    critique.repair_objective,
+                    standard_critique_blocker(critique),
+                    "unknown",
+                    "budget_checkpoint_repair",
+                )
 
         reserved_calls = 1 if options.completion_critique else 0
         if (
@@ -1622,6 +1898,7 @@ def standard_agent_control(
             options,
             required_keys,
             time_budget,
+            state,
         )
         if initial_projection:
             state["initial_action_memory_projection_keys"] = (
@@ -1693,18 +1970,20 @@ def standard_agent_control(
                     "tool_calls": state.tool_calls,
                     "transition_id": state.last_transition_id,
                 })
-                messages.append({
-                    "role": "user",
-                    "content": json_dumps({
-                        "kind": "finish_blocked",
-                        "reason": (
-                            "Owned runs remain active. Observe each with "
-                            "run_status or run_wait, or terminate it if stale, "
-                            "before finishing."
-                        ),
-                        "active_runs": state.active_runs,
-                    }),
-                })
+                state = standard_set_control(
+                    state,
+                    "exploit",
+                    (
+                        "Observe each owned run with run_status or run_wait, "
+                        "or terminate it if stale, before finishing."
+                    ),
+                    {
+                        "kind": "active_owned_runs",
+                        "runs": state.active_runs,
+                    },
+                    "unknown",
+                    "finish_blocked",
+                )
                 continue
             candidate = verify_finish(final, session, state)
             if options.completion_critique:
@@ -1712,10 +1991,11 @@ def standard_agent_control(
                     state.completion_critiques
                     >= options.max_completion_critiques
                 ):
-                    fail(
-                        "agent exhausted completion critique budget",
-                        code="agent_critic_limit",
-                        detail=state,
+                    return standard_needs_review(
+                        "completion_critic_exhausted",
+                        state,
+                        options,
+                        record_progress,
                     )
                 critique = standard_completion_critique(
                     candidate,
@@ -1727,6 +2007,7 @@ def standard_agent_control(
                 state["validation_retries"] += critique.validation_retries
                 state["last_transition_id"] = critique.transition_id
                 state["completion_critiques"] += 1
+                state["last_completion_audit"] = critique
                 if not critique.approved:
                     state["critic_rejections"] += 1
                     standard_record_completion_audit(critique, "pending")
@@ -1747,16 +2028,14 @@ def standard_agent_control(
                         "critic_rejections": state.critic_rejections,
                         "transition_id": state.last_transition_id,
                     })
-                    messages.append({
-                        "role": "user",
-                        "content": json_dumps({
-                            "kind": "completion_critique",
-                            "approved": False,
-                            "summary": critique.summary,
-                            "repair_objective": critique.repair_objective,
-                            "requirements": critique.requirements,
-                        }),
-                    })
+                    state = standard_set_control(
+                        state,
+                        "exploit",
+                        critique.repair_objective,
+                        standard_critique_blocker(critique),
+                        "unknown",
+                        "completion_critique_repair",
+                    )
                     continue
                 standard_record_completion_audit(critique, "verified")
                 standard_record_task_requirement(
@@ -1815,6 +2094,7 @@ def standard_agent_control(
             state["failed_tools"] += 1
         state = standard_track_owned_run(action, outcome, state, options)
         standard_record_evidence(action, outcome, state, options)
+        state = standard_update_progress(action, outcome, state)
         record_progress({
             "stage": "tool_outcome",
             "status": "active",
@@ -1825,8 +2105,18 @@ def standard_agent_control(
             "failed_tools": state.failed_tools,
             "last_tool": state.last_tool,
             "last_tool_ok": get(outcome, "ok", False),
+            "mode": state.control_mode,
+            "progress": state.progress_class,
+            "unchanged_streak": state.unchanged_streak,
             "transition_id": state.last_transition_id,
         })
+        if state.unchanged_streak >= options.max_stagnant_actions:
+            return standard_needs_review(
+                "repeated_unchanged_action_state",
+                state,
+                options,
+                record_progress,
+            )
         observation = standard_observation_message(
             action,
             outcome,

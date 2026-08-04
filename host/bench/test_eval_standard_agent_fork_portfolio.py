@@ -31,7 +31,7 @@ def child_entry(
                 "candidate_output": output,
                 "passed": passed,
                 "_control": {
-                    "name": "stone.standard_action_v13",
+                    "name": "stone.standard_action_v14",
                     "model_calls": 1,
                     "initial_action_memory_policy_source": "attempt_admission",
                     "initial_action_memory_required_keys": [

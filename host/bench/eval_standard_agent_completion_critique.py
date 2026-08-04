@@ -189,6 +189,7 @@ def cell_command(
     finalization_window: int = 4,
     report_partial: bool = False,
     expected_answer: str = ANSWER,
+    max_stagnant_actions: int = 3,
 ) -> list[str]:
     budget = model_budget if model_budget is not None else len(sequence)
     task_input = {
@@ -198,6 +199,7 @@ def cell_command(
         "proactive_completion_checkpoint": proactive_checkpoint,
         "finalization_window": finalization_window,
         "max_completion_critiques": 2,
+        "max_stagnant_actions": max_stagnant_actions,
         "report_partial_on_limit": report_partial,
     }
     return [
@@ -282,6 +284,7 @@ def evaluate_cell(
     finalization_window: int = 4,
     report_partial: bool = False,
     expected_answer: str = ANSWER,
+    max_stagnant_actions: int = 3,
 ) -> dict[str, Any]:
     out_dir = args.run_root.resolve() / name
     command = cell_command(
@@ -294,6 +297,7 @@ def evaluate_cell(
         finalization_window=finalization_window,
         report_partial=report_partial,
         expected_answer=expected_answer,
+        max_stagnant_actions=max_stagnant_actions,
     )
     completed = run_capture(command, GATEWAY_ROOT)
     sequence_path = out_dir / "fixture-sequence.json"
@@ -362,7 +366,7 @@ def gate_cell(
         violations.append(f"{cell['name']} control provenance is missing")
     else:
         expected = {
-            "name": "stone.standard_action_v13",
+            "name": "stone.standard_action_v14",
             "model_calls": expected_calls,
             "actions": expected_actions,
             "completion_critiques": expected_critiques,
@@ -508,6 +512,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         model_budget=8,
         report_partial=True,
         expected_answer="budget-exhausted-with-best-effort",
+        max_stagnant_actions=16,
     )
 
     violations = []

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -35,9 +36,8 @@ class StandardAttemptAgentTests(unittest.TestCase):
         self.assertIn(
             "critique = standard_budget_checkpoint(", self.source
         )
-        self.assertIn(
-            '"kind": "completion_critique"', self.source
-        )
+        self.assertIn('"completion_critique_repair"', self.source)
+        self.assertIn("standard_needs_review(", self.source)
         self.assertNotIn("react_control(", self.source)
 
     def test_control_bounds_decisions_observations_and_progress(self) -> None:
@@ -110,6 +110,9 @@ class StandardAttemptAgentTests(unittest.TestCase):
         self.assertIsNotNone(critique_prompt)
         self.assertLess(len(critique_prompt.group(1)), 1024)
         self.assertIn("read_file(args.path, max_bytes=", self.source)
+        self.assertIn('"tool": {"const": "edit"}', self.source)
+        self.assertIn("result = edit(", self.source)
+        self.assertIn('"replacements": result.replacements', self.source)
         self.assertIn("max_stdout_bytes=min(", self.source)
         self.assertIn("max_stderr_bytes=min(", self.source)
         self.assertIn("def standard_terminate_and_reap(", self.source)
@@ -171,6 +174,7 @@ class StandardAttemptAgentTests(unittest.TestCase):
             self.source,
         )
         self.assertIn('"max_completion_critiques": 2', self.source)
+        self.assertIn('"max_stagnant_actions": 3', self.source)
         self.assertIn('"finalization_window": 6', self.source)
         self.assertIn('"proactive_completion_checkpoint": True', self.source)
         self.assertIn('"max_evidence_items": 8', self.source)
@@ -180,13 +184,15 @@ class StandardAttemptAgentTests(unittest.TestCase):
             "state.model_calls + 1 + reserved_calls > options.max_model_calls",
             self.source,
         )
-        self.assertIn('"name": "stone.standard_action_v13"', self.source)
+        self.assertIn('"name": "stone.standard_action_v14"', self.source)
         self.assertIn("def standard_current_time_budget():", self.source)
-        self.assertIn('"kind": "time_budget_warning"', self.source)
+        self.assertIn("def standard_control_frame(", self.source)
+        self.assertIn('"kind": "runtime_control"', self.source)
+        self.assertIn('"time_budget_finalize"', self.source)
         self.assertIn('"time_budget": get(outcome, "time_budget", None)', self.source)
         self.assertIn('outcome["time_budget"] = standard_current_time_budget()', self.source)
         self.assertIn('"stage": "budget_checkpoint"', self.source)
-        self.assertIn('"kind": "budget_completion_checkpoint"', self.source)
+        self.assertIn('"budget_checkpoint_repair"', self.source)
         self.assertIn(
             "state.model_calls >= checkpoint_at",
             self.source,
@@ -204,6 +210,13 @@ class StandardAttemptAgentTests(unittest.TestCase):
             '"result": standard_model_outcome(outcome, options)',
             self.source,
         )
+        self.assertIn("standard_action_outcome_signature(", self.source)
+        self.assertIn('"repeated_unchanged_action_state"', self.source)
+        self.assertIn('"completion": "needs_review"', self.source)
+        self.assertEqual(self.source.count('"kind": "runtime_control"'), 1)
+        self.assertNotIn('"kind": "time_budget_warning"', self.source)
+        self.assertNotIn('"kind": "budget_completion_checkpoint"', self.source)
+        self.assertNotIn('"kind": "completion_critique"', self.source)
         self.assertNotIn('"instruction": "Choose exactly one next action.', self.source)
 
     def test_checked_in_program_is_admitted_before_gateway_context(self) -> None:
@@ -225,6 +238,54 @@ class StandardAttemptAgentTests(unittest.TestCase):
         )
         self.assertNotIn("stone_parse_error", response_text)
         self.assertNotIn("stone_admission_error", response_text)
+
+    def test_progress_reducer_executes_as_ordinary_stone(self) -> None:
+        if not WAYMARK.is_file():
+            self.skipTest(f"Waymark binary not built: {WAYMARK}")
+        library, marker, _ = self.source.partition("\nsession = agent_session()")
+        self.assertTrue(marker)
+        probe = r'''
+state = {
+    "control_mode": "explore",
+    "control_objective": "test objective",
+    "control_blocker": None,
+    "control_reason": "initial",
+    "control_updates": 0,
+    "progress_class": "unknown",
+    "unchanged_streak": 0,
+    "last_action_outcome_signature": "",
+}
+action = {"tool": "read", "input": {"path": "sample.txt"}}
+outcome = {"ok": True, "kind": "read", "path": "sample.txt", "content": "READY\n"}
+state = standard_update_progress(action, outcome, state)
+first = standard_control_frame(state, None)
+state = standard_update_progress(action, outcome, state)
+state = standard_update_progress(action, outcome, state)
+state = standard_update_progress(action, outcome, state)
+emit({
+    "first": first,
+    "repeated": standard_control_frame(state, None),
+})
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            program = Path(directory) / "probe.stone"
+            program.write_text(library + probe, encoding="utf-8")
+            completed = subprocess.run(
+                [str(WAYMARK), "eval", str(program)],
+                cwd=directory,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        payload = json.loads(completed.stdout or completed.stderr)
+        self.assertTrue(payload["ok"], payload)
+        value = payload["value"]
+        self.assertEqual(value["first"]["mode"], "exploit")
+        self.assertEqual(value["first"]["progress"], "better")
+        self.assertEqual(value["repeated"]["mode"], "explore")
+        self.assertEqual(value["repeated"]["progress"], "unchanged")
+        self.assertEqual(value["repeated"]["unchanged_streak"], 3)
 
 
 if __name__ == "__main__":

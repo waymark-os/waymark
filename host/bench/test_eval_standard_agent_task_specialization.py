@@ -75,7 +75,7 @@ class StandardAgentTaskSpecializationTests(unittest.TestCase):
                 "verified_bytes": len(EXPERIMENT.EXPECTED_OUTPUT.encode()),
                 "verified_round": 4,
                 "_control": {
-                    "name": "stone.standard_action_v13",
+                    "name": "stone.standard_action_v14",
                     "rounds": 4,
                     "actions": 4,
                     "tool_calls": 3,

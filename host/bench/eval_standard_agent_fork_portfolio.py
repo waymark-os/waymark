@@ -219,7 +219,7 @@ def gate_result(result: dict[str, Any]) -> list[str]:
             violations.append(f"{strategy} observed post-fork parent memory")
         if entry.get("fork_memory_revision") != 1:
             violations.append(f"{strategy} forked from the wrong memory revision")
-        if control.get("name") != "stone.standard_action_v13":
+        if control.get("name") != "stone.standard_action_v14":
             violations.append(f"{strategy} did not use standard controller V8")
         if control.get("initial_action_memory_policy_source") != "attempt_admission":
             violations.append(f"{strategy} did not use admission-owned boot policy")

@@ -228,7 +228,7 @@ def gate_result(result: dict[str, Any]) -> list[str]:
         violations.append("child did not inherit the uncommitted workspace prefix")
     if agent.get("answer") != TARGET:
         violations.append("child did not return the projected opaque target")
-    if control.get("name") != "stone.standard_action_v13":
+    if control.get("name") != "stone.standard_action_v14":
         violations.append("child did not use standard controller V8")
     if control.get("model_calls") != 1 or control.get("actions") != 1:
         violations.append("child did not decide in exactly one first-context call")
