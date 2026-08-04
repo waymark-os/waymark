@@ -328,6 +328,11 @@ Supported handlers are `except:`, `except Exception:`, and
 `kind`, `code`, and `message` fields. I/O errors also include `path` and
 `operation` when available.
 
+The common generated form `except error:` does not bind `error` in Python or
+Stone. Stone rejects it before execution with a targeted correction offering
+`except Exception as error:` when the handler uses the record, or `except:`
+when it does not. The runtime does not guess between these two intents.
+
 Preliminary `raise` support intentionally keeps the same structured failure
 model rather than introducing Python exception classes:
 

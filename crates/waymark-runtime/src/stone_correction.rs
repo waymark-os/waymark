@@ -183,6 +183,21 @@ pub(crate) fn correction_for_error(err: &ShellError, source: &str) -> Option<Jso
         ));
     }
 
+    if code == "stone_script_unsupported" {
+        if let Some(name) = exception_handler_binding_error(&detail) {
+            return Some(repair_envelope_owned(
+                source,
+                phase,
+                "exception_binding",
+                &format!("except {name}:"),
+                vec![format!("except Exception as {name}:"), "except:".to_string()],
+                &format!(
+                    "`except {name}:` names an exception type in Python; it does not bind the caught error. Use `except Exception as {name}:` when the handler reads `{name}`, or use bare `except:` when it does not. Then explicitly evaluate the repaired source again."
+                ),
+            ));
+        }
+    }
+
     if code == "stone_script_unsupported" && contains_identifier(source, "global") {
         return Some(repair_envelope(
             source,
@@ -252,6 +267,24 @@ fn repair_envelope(
     class: &str,
     received: &str,
     expected: Vec<&str>,
+    guidance: &str,
+) -> JsonValue {
+    repair_envelope_owned(
+        source,
+        phase,
+        class,
+        received,
+        expected.into_iter().map(str::to_string).collect(),
+        guidance,
+    )
+}
+
+fn repair_envelope_owned(
+    source: &str,
+    phase: &str,
+    class: &str,
+    received: &str,
+    expected: Vec<String>,
     guidance: &str,
 ) -> JsonValue {
     json!({
@@ -507,6 +540,12 @@ fn message_role_error(detail: &str) -> Option<(String, Vec<&str>)> {
             .to_string(),
         vec!["system", "user", "assistant"],
     ))
+}
+
+fn exception_handler_binding_error(detail: &str) -> Option<String> {
+    let received = backticked_after(detail, "unsupported exception handler `")?;
+    let name = received.strip_prefix("except ")?.strip_suffix(':')?.trim();
+    is_identifier(name).then(|| name.to_string())
 }
 
 fn backticked_after(detail: &str, prefix: &str) -> Option<String> {
@@ -855,6 +894,32 @@ mod tests {
         .expect("role correction");
         assert_eq!(role["class"], json!("message_role"));
         assert_eq!(role["safety"], json!("requires_repair"));
+    }
+
+    #[test]
+    fn exception_handler_name_gets_binding_specific_repair() {
+        let correction = correction_for_error(
+            &error(
+                "stone_script_unsupported",
+                "unsupported exception handler `except error:`; Stone does not treat a handler name as an error binding",
+            ),
+            "try:\n    best.outcome\nexcept error:\n    emit(error.message)\n",
+        )
+        .expect("exception binding correction");
+        assert_eq!(correction["class"], json!("exception_binding"));
+        assert_eq!(correction["phase"], json!("admission"));
+        assert_eq!(correction["execution_state"], json!("not_started"));
+        assert_eq!(correction["safety"], json!("requires_repair"));
+        assert_eq!(correction["received"], json!("except error:"));
+        assert_eq!(
+            correction["expected"],
+            json!(["except Exception as error:", "except:"])
+        );
+        assert_eq!(correction["candidates"], json!([]));
+        assert!(correction["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("does not bind the caught error"));
     }
 
     #[test]

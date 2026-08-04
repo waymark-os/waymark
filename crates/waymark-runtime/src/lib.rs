@@ -1499,6 +1499,23 @@ emit(preview)"#,
             json!("not_started")
         );
 
+        let except_binding = guest.command_response(
+            "try:\n    read_file(\"missing.txt\")\nexcept error:\n    emit(error.message)",
+        );
+        assert_eq!(except_binding["ok"], json!(false));
+        assert_eq!(
+            except_binding["error"]["correction"]["class"],
+            json!("exception_binding")
+        );
+        assert_eq!(
+            except_binding["error"]["correction"]["expected"],
+            json!(["except Exception as error:", "except:"])
+        );
+        assert_eq!(
+            except_binding["error"]["correction"]["execution_state"],
+            json!("not_started")
+        );
+
         let field = guest.command_response(
             r#"def transition_id(step):
     return step.id

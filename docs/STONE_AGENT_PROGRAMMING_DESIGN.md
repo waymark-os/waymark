@@ -1239,7 +1239,13 @@ The M2.5 implementation now establishes the control and supervision seams:
   from its compact help, without seeing the completed canary. Its first source
   used `raise "..."`, exposing a language rather than ownership failure;
   preliminary structured `raise` support let that unchanged source complete
-  selection, import, and cleanup correctly.
+  selection, import, and cleanup correctly. A fresh authorship run then used
+  Python's mistaken `except error:` shape while trying to inspect a released
+  selector. Stone still does not add divergent binding semantics for that
+  spelling. Admission now returns an `exception_binding` correction with the
+  two intent-preserving repairs (`except Exception as error:` or `except:`),
+  marks execution `not_started`, and requires the author to choose rather than
+  silently rewriting ambiguous control flow.
 
 This closes the native-to-Stone invocation seam. Forked named entrypoints now
 also receive structured per-fork input through ordinary `input=...` syntax.

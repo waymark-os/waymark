@@ -1059,10 +1059,19 @@ fn lower_try(try_stmt: py::StmtTry) -> Result<Stmt, ShellError> {
         match handler.type_.as_deref() {
             None => {}
             Some(py::Expr::Name(name)) if name.id.as_str() == "Exception" => {}
+            Some(py::Expr::Name(name)) => {
+                let name = name.id.as_str();
+                return Err(unsupported_message(
+                    "try statement",
+                    format!(
+                        "unsupported exception handler `except {name}:`; Stone does not treat a handler name as an error binding; use `except Exception as {name}:` to bind the error or `except:` when no binding is needed",
+                    ),
+                ));
+            }
             Some(_) => {
                 return Err(unsupported_message(
                     "try statement",
-                    "only bare except and except Exception handlers are supported",
+                    "only bare `except:`, `except Exception:`, and `except Exception as error:` handlers are supported",
                 ));
             }
         }
@@ -2865,6 +2874,18 @@ else:
         ] {
             assert_unsupported(source);
         }
+    }
+
+    #[test]
+    fn exception_name_as_handler_gets_binding_specific_guidance() {
+        let error = lower_source(
+            "try:\n    read_file(\"missing\")\nexcept error:\n    emit(error.message)",
+        )
+        .expect_err("except name is not an error binding");
+        let detail = format!("{error:?}");
+        assert!(detail.contains("unsupported exception handler `except error:`"));
+        assert!(detail.contains("`except Exception as error:`"));
+        assert!(detail.contains("`except:`"));
     }
 
     #[test]
