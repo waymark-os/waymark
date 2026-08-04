@@ -121,10 +121,12 @@ def main(input):
         attempt=setup,
         reason="injected late failure after verified repairable frontier",
     )
+    failed_outcome = attempt_join(setup, timeout_ms=30000)
+    failed = attempt_retain_failure(scope, failed_outcome)
 
     retained_frontier = semantic_frontier(
         setup_outcome.result.value.checkpoint,
-        owner=setup,
+        owner=failed,
     )
     repaired = attempt_branch(
         retained_frontier,
@@ -166,7 +168,7 @@ def main(input):
             code="semantic_frontier_cleanup_failed",
             detail=cleanup,
         )
-    owner_inspection = attempt_inspect(setup)
+    owner_inspection = failed.inspect()
     if not owner_inspection.resources_reclaimed:
         fail(
             "failed checkpoint owner retained live execution resources",
@@ -200,6 +202,8 @@ def main(input):
         },
         "accepted": read_text("branch.txt").strip(),
         "acceptance_type": type(acceptance),
+        "failed_attempt_type": type(failed),
+        "failed_attempt_status": failed.status,
         "owner_resource_state": owner_inspection.resource_state,
         "clean": cleanup.clean,
     }
@@ -216,6 +220,6 @@ else:
 attempt_report(
     status="succeeded",
     result=result,
-    metadata={"control": "semantic_frontier_canary_v1"},
+    metadata={"control": "semantic_frontier_canary_v2"},
 )
 emit(result)

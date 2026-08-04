@@ -316,9 +316,19 @@ For a retained checkpoint owned by a failed child, the author supplies the
 owner once:
 
 ```stone
-frontier = semantic_frontier(checkpoint, owner=failed_child)
+failed = attempt_retain_failure(scope, attempt_join(failed_child))
+inspection = failed.inspect(include_details=True, trace_limit=40)
+frontier = semantic_frontier(checkpoint, owner=failed)
 child = attempt_branch(frontier, input={"strategy": "repaired"})
 ```
+
+The retained object keeps the failed outcome and cleanup obligation together
+during diagnosis. It does not decide that missing evidence is dispensable. A
+parent may pass `inspection` and the public evidence contract to a critic and
+propose a relaxation, but requirement mutation remains an explicit
+harness-authorized transition. Discarding the failure or closing its scope
+reclaims the child and drops the in-memory full outcome; the archived trace
+remains available for bounded inspection.
 
 `attempt_branch` selects the authorized parent fork or repair restoration
 without exposing raw workspace-source records. Gateway still validates the

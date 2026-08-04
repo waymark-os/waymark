@@ -180,6 +180,7 @@ Stone recognizes nominal attempt-control annotations:
 def choose(
     frontier: semantic_frontier,
     scope: attempt_scope,
+    failed: attempt_failure,
     child: attempt_handle,
     outcome: attempt_outcome,
     accepted: attempt_acceptance,
@@ -191,6 +192,22 @@ The interpreter checks these types at function boundaries without flattening
 the control value to a record. Their compact runtime tags are also a stable
 input to future whole-function analysis and JIT specialization; Stone does not
 yet claim static inference across arbitrary assignments.
+
+A joined failed child can be coupled to its cleanup owner without flattening
+either value:
+
+```python
+outcome = attempt_join(child)
+failed = attempt_retain_failure(scope, outcome)
+inspection = failed.inspect(include_details=True, trace_limit=40)
+```
+
+`attempt_failure` accepts only an unresolved joined failure owned by the same
+scope. Its full typed `outcome` remains available during review. Calling
+`failed.discard(...)`, accepting/resolving the child, or closing the scope
+drops that full outcome while the archived trace remains available through
+`failed.inspect(...)`. The object is lifecycle ownership, not permission to
+weaken evidence or publish failed state.
 
 Nominal attempt resources support lexical ownership:
 

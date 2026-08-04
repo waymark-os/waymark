@@ -325,6 +325,12 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "effects": ["read_env", "process"],
         "example": "outcome = attempt_join(child, timeout_ms=30000)",
     },
+    "attempt_retain_failure": {
+        "name": "attempt_retain_failure",
+        "signature": "attempt_retain_failure(scope: attempt_scope, outcome: attempt_outcome) -> attempt_failure",
+        "effects": [],
+        "example": "failed = attempt_retain_failure(scope, outcome)",
+    },
     "attempt_wait_any": {
         "name": "attempt_wait_any",
         "signature": "attempt_wait_any(children: attempt_scope | list[attempt_handle | str | record], timeout_ms: int? = None) -> attempt_outcome",

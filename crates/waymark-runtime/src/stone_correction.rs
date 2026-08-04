@@ -77,6 +77,7 @@ const KEYWORD_SCHEMAS: &[(&str, &[&str])] = &[
     ),
     ("attempt_best_accept", &["best", "parent"]),
     ("attempt_best_discard", &["best", "reason"]),
+    ("attempt_retain_failure", &["scope", "outcome"]),
     (
         "attempt_branch",
         &[

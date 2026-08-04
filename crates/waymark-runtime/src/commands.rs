@@ -1281,6 +1281,22 @@ else:
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "attempt_retain_failure",
+        signature: r#"attempt_retain_failure(scope: attempt_scope, outcome: attempt_outcome) -> attempt_failure"#,
+        use_when: "Gateway mode only. Bind one joined failed child to its supervision scope as an inspectable task-owned object. Read failure.outcome while retained, call failure.inspect(...) for bounded trace detail, construct a semantic frontier with owner=failure when a repairable checkpoint exists, then call failure.discard(...) or close the scope. The runtime drops the full outcome when lifecycle ownership resolves.",
+        examples: &[r#"outcome = attempt_join(child)
+failed = attempt_retain_failure(scope, outcome)
+inspection = failed.inspect(include_details=True, trace_limit=40)
+frontier = semantic_frontier(outcome.result.value.checkpoint, owner=failed)
+failed.discard(reason="review complete")"#],
+        avoid: &[
+            "Do not retain a successful, unjoined, timed-out, already resolved, or differently scoped child.",
+            "Retention does not relax evidence or publish the child; a parent review must explicitly authorize any requirement change.",
+            "Do not close the scope before constructing a needed retained repair frontier.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "attempt_best",
         signature: r#"attempt_best(scope: attempt_scope, objective: "max" | "min" = "max") -> attempt_best"#,
         use_when: "Gateway mode only. Create a scope-bound, task-owned selector that retains at most one joined successful child outcome while comparing candidates by a finite numeric score. Read best.status, best.attempt, best.score, best.considered, and best.replacements instead of reimplementing selector bookkeeping; best.outcome is available only while a candidate is retained.",
@@ -1410,7 +1426,7 @@ emit(attempt_scope_close(scope).clean)"#],
     },
     StoneHelpEntry {
         name: "semantic_frontier",
-        signature: r#"semantic_frontier(checkpoint: workflow_checkpoint, owner: attempt_handle | attempt_outcome | record? = None) -> semantic_frontier"#,
+        signature: r#"semantic_frontier(checkpoint: workflow_checkpoint, owner: attempt_handle | attempt_outcome | attempt_failure | record? = None) -> semantic_frontier"#,
         use_when: "Gateway mode only. Turn a successfully sealed forkable or repairable workflow checkpoint into a nominal task-owned branch capability. Omit owner for a checkpoint owned by the current attempt; pass the joined failed owner for a retained repair checkpoint. The value carries cost guidance and hides raw checkpoint ownership and restoration ABI.",
         examples: &[
             r#"frontier = semantic_frontier(report.stages[0].checkpoint)"#,
@@ -1785,7 +1801,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "Record fields can be read as row[\"name\"] or row.name when the field name is identifier-shaped.",
             "Operators: +, -, *, /, //, &, |, <<, >>, comparisons, and/or/not, membership, is None.",
             "Conditional expressions use Python's value if condition else fallback shape.",
-            "Functions: def name(arg) works; omitted parameter and return annotations mean Any, optional annotations like def name(arg: str) -> str are checked, and immutable default values are supported. Attempt controls also support attempt_handle, attempt_outcome, attempt_scope, semantic_frontier, and attempt_acceptance annotations. Named functions are first-class callable values and may be passed to another function. Use -> None for a checked procedure. @stage(...) is the one supported declaration decorator.",
+            "Functions: def name(arg) works; omitted parameter and return annotations mean Any, optional annotations like def name(arg: str) -> str are checked, and immutable default values are supported. Attempt controls also support attempt_handle, attempt_outcome, attempt_failure, attempt_scope, semantic_frontier, and attempt_acceptance annotations. Named functions are first-class callable values and may be passed to another function. Use -> None for a checked procedure. @stage(...) is the one supported declaration decorator.",
             "try/except catches runtime evaluation errors; supported handlers are except:, except Exception:, and except Exception as e:. The common mistaken form except e: receives a targeted correction to except Exception as e: or except: before execution starts.",
             "raise \"message\" is shorthand for an intentional structured failure with declared code stone_raised. raise {\"message\": ..., \"code\": ..., \"detail\": ...} carries an explicit contract, and bare raise inside except rethrows the bound structured error. Use fail(...) when authoring a stable evidence or policy code directly.",
             "with follows Python block visibility: targets and body assignments remain visible after exit. For files, attempt_scope, and semantic_frontier values it performs checked cleanup on fallthrough, return, or error. Nominal lifecycle methods include scope.branch/wait_any/wait_all, child.wait/inspect/discard, root.accept, and frontier.release.",

@@ -15,7 +15,8 @@ use crate::stone_agent_control::AgentControlValue;
 use crate::stone_attempt_best::AttemptBestValue;
 use crate::stone_attempt_scope::AttemptScopeValue;
 use crate::stone_attempt_value::{
-    AttemptAcceptanceValue, AttemptHandleValue, AttemptOutcomeValue, SemanticFrontierValue,
+    AttemptAcceptanceValue, AttemptFailureValue, AttemptHandleValue, AttemptOutcomeValue,
+    SemanticFrontierValue,
 };
 
 #[derive(Clone)]
@@ -34,6 +35,7 @@ pub(super) enum RuntimeValue {
     Workflow(WorkflowValue),
     AgentControl(AgentControlValue),
     AttemptBest(AttemptBestValue),
+    AttemptFailure(AttemptFailureValue),
     AttemptScope(AttemptScopeValue),
     AttemptHandle(AttemptHandleValue),
     AttemptOutcome(AttemptOutcomeValue),
@@ -57,6 +59,7 @@ pub(super) enum RuntimeValueTag {
     Workflow,
     AgentControl,
     AttemptBest,
+    AttemptFailure,
     AttemptScope,
     AttemptHandle,
     AttemptOutcome,
@@ -87,6 +90,7 @@ impl RuntimeValueTag {
             RuntimeValueTag::SemanticFrontier => 17,
             RuntimeValueTag::AttemptAcceptance => 18,
             RuntimeValueTag::AttemptBest => 19,
+            RuntimeValueTag::AttemptFailure => 20,
         }
     }
 }
@@ -119,6 +123,7 @@ impl RuntimeValue {
             RuntimeValue::Workflow(workflow) => workflow.is_session_persistable(),
             RuntimeValue::AgentControl(_) => true,
             RuntimeValue::AttemptBest(_) => false,
+            RuntimeValue::AttemptFailure(_) => false,
             RuntimeValue::AttemptScope(_) => false,
             RuntimeValue::AttemptHandle(_) => false,
             RuntimeValue::AttemptOutcome(_) => true,
@@ -145,6 +150,7 @@ impl RuntimeValue {
             RuntimeValue::Workflow(_) => RuntimeValueTag::Workflow,
             RuntimeValue::AgentControl(_) => RuntimeValueTag::AgentControl,
             RuntimeValue::AttemptBest(_) => RuntimeValueTag::AttemptBest,
+            RuntimeValue::AttemptFailure(_) => RuntimeValueTag::AttemptFailure,
             RuntimeValue::AttemptScope(_) => RuntimeValueTag::AttemptScope,
             RuntimeValue::AttemptHandle(_) => RuntimeValueTag::AttemptHandle,
             RuntimeValue::AttemptOutcome(_) => RuntimeValueTag::AttemptOutcome,
@@ -216,6 +222,7 @@ impl RuntimeValue {
                     best.selection_id
                 ),
             )),
+            RuntimeValue::AttemptFailure(failure) => failure.materialize(),
             RuntimeValue::AttemptScope(scope) => Err(stone_error(
                 context,
                 format!(
@@ -264,6 +271,7 @@ mod tests {
         assert_eq!(RuntimeValueTag::SemanticFrontier.id(), 17);
         assert_eq!(RuntimeValueTag::AttemptAcceptance.id(), 18);
         assert_eq!(RuntimeValueTag::AttemptBest.id(), 19);
+        assert_eq!(RuntimeValueTag::AttemptFailure.id(), 20);
     }
 
     #[test]

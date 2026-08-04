@@ -1208,6 +1208,15 @@ The M2.5 implementation now establishes the control and supervision seams:
   `outcome.result.value` or `outcome.result.error`. Ordinary info/list records
   omit report bodies, so comparison is explicit without making every lifecycle
   observation carry child payloads.
+- `attempt_retain_failure(scope, outcome)` couples a joined failed snapshot to
+  its unresolved supervision owner as a nominal `attempt_failure`. The object
+  supports the ordinary `inspect(...)` and `discard(...)` methods and can be
+  supplied as a retained semantic-frontier owner. It keeps the full outcome
+  only while review/repair ownership is live; resolution drops that payload,
+  while Gateway's bounded archived trace remains inspectable. Retention alone
+  cannot relax evidence or publish the child. A parent model may review the
+  visible failure and propose a requirement change, but the enclosing harness
+  must authorize and apply it explicitly.
 - `attempt_best(scope, objective="max" | "min")` is a task-owned selection
   capability layered over those outcomes. `attempt_best_consider` admits only
   a joined successful child owned by the same scope, retains at most one full
@@ -1222,7 +1231,7 @@ The M2.5 implementation now establishes the control and supervision seams:
   record. It preserves the structured parent/child diff report, exposes the
   selected attempt id directly, and keeps `accepted.selected` as a nominal
   `attempt_handle`. User functions may annotate `attempt_handle`,
-  `attempt_outcome`, `attempt_scope`, `semantic_frontier`, and
+  `attempt_outcome`, `attempt_failure`, `attempt_scope`, `semantic_frontier`, and
   `attempt_acceptance`; mismatching acceptance and handle values fails at the
   function boundary with lifecycle-specific repair guidance. The compact
   runtime tags are intentionally suitable for later JIT specialization.

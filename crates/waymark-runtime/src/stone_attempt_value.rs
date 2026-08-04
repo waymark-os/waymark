@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use nu_protocol::{Record, ShellError, Span, Value};
 use serde_json::{json, Value as JsonValue};
 
+use crate::stone_attempt_scope::AttemptScopeValue;
 use crate::stone_eval::stone_error;
 
 #[derive(Clone)]
@@ -189,6 +190,10 @@ impl AttemptOutcomeValue {
                 == Some("succeeded")
     }
 
+    pub(super) fn failed(&self) -> bool {
+        self.joined && (self.state == "failed" || !self.succeeded())
+    }
+
     pub(super) fn materialize(&self) -> Value {
         let span = Span::unknown();
         let result_status = attempt_metadata_string(&self.record, "controller_result_status")
@@ -268,6 +273,116 @@ impl AttemptOutcomeValue {
             return Ok(Value::string("attempt_outcome", Span::unknown()));
         }
         record_attribute(&self.materialize(), attr, "attempt_outcome")
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct AttemptFailureValue {
+    pub(super) failure_id: u64,
+    pub(super) attempt: String,
+    pub(super) scope: AttemptScopeValue,
+    inner: Arc<Mutex<AttemptFailureState>>,
+}
+
+struct AttemptFailureState {
+    outcome: Option<AttemptOutcomeValue>,
+    resolution: Option<String>,
+}
+
+impl AttemptFailureValue {
+    pub(super) fn new(
+        failure_id: u64,
+        scope: AttemptScopeValue,
+        outcome: AttemptOutcomeValue,
+    ) -> Self {
+        Self {
+            failure_id,
+            attempt: outcome.attempt.clone(),
+            scope,
+            inner: Arc::new(Mutex::new(AttemptFailureState {
+                outcome: Some(outcome),
+                resolution: None,
+            })),
+        }
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, AttemptFailureState>, ShellError> {
+        self.inner.lock().map_err(|_| {
+            stone_error(
+                "attempt_failure",
+                "retained failed-attempt state is unavailable",
+            )
+        })
+    }
+
+    pub(super) fn is_retained(&self) -> Result<bool, ShellError> {
+        Ok(self.lock()?.outcome.is_some())
+    }
+
+    pub(super) fn typed_outcome(&self) -> Result<AttemptOutcomeValue, ShellError> {
+        self.lock()?.outcome.clone().ok_or_else(|| {
+            stone_error(
+                "attempt_failure outcome",
+                "the full failed outcome was released after lifecycle resolution; use inspect() for the archived trace",
+            )
+        })
+    }
+
+    pub(super) fn mark_resolved(&self, resolution: &str) -> Result<(), ShellError> {
+        let mut state = self.lock()?;
+        state.outcome = None;
+        state.resolution = Some(resolution.to_string());
+        Ok(())
+    }
+
+    fn status(&self, state: &AttemptFailureState) -> Result<&'static str, ShellError> {
+        if state.outcome.is_some() {
+            if self.scope.lock()?.closed {
+                Ok("scope_closed")
+            } else {
+                Ok("retained")
+            }
+        } else {
+            Ok("resolved")
+        }
+    }
+
+    pub(super) fn materialize(&self) -> Result<Value, ShellError> {
+        let state = self.lock()?;
+        let span = Span::unknown();
+        let mut value = Record::new();
+        value.push("type", Value::string("attempt_failure", span));
+        value.push("id", Value::int(self.failure_id as i64, span));
+        value.push("attempt", Value::string(self.attempt.clone(), span));
+        value.push("scope_id", Value::int(self.scope.scope_id as i64, span));
+        value.push("status", Value::string(self.status(&state)?, span));
+        value.push(
+            "resolution",
+            state
+                .resolution
+                .as_ref()
+                .map(|resolution| Value::string(resolution, span))
+                .unwrap_or_else(|| Value::nothing(span)),
+        );
+        value.push(
+            "outcome",
+            state
+                .outcome
+                .as_ref()
+                .map(AttemptOutcomeValue::materialize)
+                .unwrap_or_else(|| Value::nothing(span)),
+        );
+        Ok(Value::record(value, span))
+    }
+
+    pub(super) fn attribute(&self, attr: &str) -> Result<Value, ShellError> {
+        if attr == "outcome" {
+            return Err(stone_error(
+                "attribute",
+                "attempt_failure.outcome is a typed value and must be read through the evaluator",
+            ));
+        }
+        record_attribute(&self.materialize()?, attr, "attempt_failure")
     }
 }
 
@@ -353,6 +468,39 @@ fn record_attribute(value: &Value, attr: &str, kind: &str) -> Result<Value, Shel
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_failure_drops_full_outcome_when_resolved() {
+        let scope = AttemptScopeValue::new(7, "cancel_then_join".to_string(), 1000);
+        scope.register("attempt-failed".to_string()).unwrap();
+        scope.mark_joined("attempt-failed").unwrap();
+        let outcome = AttemptOutcomeValue {
+            attempt: "attempt-failed".to_string(),
+            joined: true,
+            timed_out: false,
+            state: "failed".to_string(),
+            controller_state: "failed".to_string(),
+            record: Value::record(Record::new(), Span::unknown()),
+        };
+        assert!(outcome.failed());
+        let failure = AttemptFailureValue::new(9, scope, outcome);
+
+        assert_eq!(
+            failure.attribute("status").unwrap().as_str().unwrap(),
+            "retained"
+        );
+        assert!(failure.typed_outcome().is_ok());
+        failure.mark_resolved("discarded").unwrap();
+        assert_eq!(
+            failure.attribute("status").unwrap().as_str().unwrap(),
+            "resolved"
+        );
+        assert_eq!(
+            failure.attribute("resolution").unwrap().as_str().unwrap(),
+            "discarded"
+        );
+        assert!(failure.typed_outcome().is_err());
+    }
 
     #[test]
     fn semantic_frontier_release_state_is_shared_across_capability_clones() {

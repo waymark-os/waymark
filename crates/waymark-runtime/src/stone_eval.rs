@@ -49,8 +49,8 @@ use crate::stone_attempt_best::{
 };
 use crate::stone_attempt_scope::AttemptScopeValue;
 use crate::stone_attempt_value::{
-    AttemptAcceptanceValue, AttemptHandleValue, AttemptOutcomeValue, SemanticFrontierMode,
-    SemanticFrontierValue,
+    AttemptAcceptanceValue, AttemptFailureValue, AttemptHandleValue, AttemptOutcomeValue,
+    SemanticFrontierMode, SemanticFrontierValue,
 };
 use crate::stone_builtins::{
     add_values, bitwise_int_values, compare_values, div_values, enumerate_builtin,
@@ -150,6 +150,7 @@ pub struct EvalState {
     async_run_await_count: u64,
     transition_events: Vec<JsonValue>,
     attempt_scopes: Vec<AttemptScopeValue>,
+    retained_failures: Vec<AttemptFailureValue>,
     semantic_frontiers: Vec<SemanticFrontierValue>,
     semantic_frontier_diagnostics_dropped: u64,
     next_semantic_frontier_id: u64,
@@ -646,6 +647,7 @@ fn eval_program_with_source_options(
             async_run_await_count: 0,
             transition_events: Vec::new(),
             attempt_scopes: Vec::new(),
+            retained_failures: Vec::new(),
             semantic_frontiers: Vec::new(),
             semantic_frontier_diagnostics_dropped: 0,
             next_semantic_frontier_id: 0,
@@ -2411,6 +2413,7 @@ impl Evaluator<'_> {
             "attempt_wait_any" => self.eval_attempt_wait_set_call(call, false),
             "attempt_wait_all" => self.eval_attempt_wait_set_call(call, true),
             "attempt_terminate" => self.eval_attempt_terminate_call(call),
+            "attempt_retain_failure" => self.eval_attempt_retain_failure_call(call),
             "attempt_best" => self.eval_attempt_best_call(call),
             "attempt_best_consider" => self.eval_attempt_best_consider_call(call),
             "attempt_best_accept" => self.eval_attempt_best_accept_call(call),
@@ -2735,6 +2738,12 @@ impl Evaluator<'_> {
                 return best.typed_outcome().map(RuntimeValue::AttemptOutcome);
             }
             return best.attribute(attr).map(RuntimeValue::Nu);
+        }
+        if let RuntimeValue::AttemptFailure(failure) = receiver {
+            if attr == "outcome" {
+                return failure.typed_outcome().map(RuntimeValue::AttemptOutcome);
+            }
+            return failure.attribute(attr).map(RuntimeValue::Nu);
         }
         if let RuntimeValue::AttemptHandle(handle) = receiver {
             return handle.attribute(attr).map(RuntimeValue::Nu);
@@ -7643,18 +7652,30 @@ impl Evaluator<'_> {
             "semantic_frontier current attempt",
         )?;
 
-        let owner_attempt = match owner {
-            None | Some(RuntimeValue::Nu(Value::Nothing { .. })) => current_attempt.clone(),
-            Some(RuntimeValue::AttemptHandle(handle)) => handle.attempt,
-            Some(RuntimeValue::AttemptOutcome(outcome)) => outcome.attempt,
-            Some(RuntimeValue::Nu(value)) => {
-                attempt_id_from_value(&value, "semantic_frontier owner")?
+        let (owner_attempt, owner_is_retained_failure) = match owner {
+            None | Some(RuntimeValue::Nu(Value::Nothing { .. })) => {
+                (current_attempt.clone(), false)
             }
+            Some(RuntimeValue::AttemptHandle(handle)) => (handle.attempt, false),
+            Some(RuntimeValue::AttemptOutcome(outcome)) => (outcome.attempt, false),
+            Some(RuntimeValue::AttemptFailure(failure)) => {
+                if !failure.is_retained()? {
+                    return Err(stone_error(
+                        "semantic_frontier",
+                        "the attempt_failure is already resolved; its archived trace remains inspectable but it no longer carries repair authority",
+                    ));
+                }
+                (failure.attempt, true)
+            }
+            Some(RuntimeValue::Nu(value)) => (
+                attempt_id_from_value(&value, "semantic_frontier owner")?,
+                false,
+            ),
             Some(other) => {
                 return Err(stone_error(
                     "semantic_frontier",
                     format!(
-                        "owner must be an attempt_handle, attempt_outcome, or attempt record, got {}",
+                        "owner must be an attempt_handle, attempt_outcome, attempt_failure, or attempt record, got {}",
                         runtime_type_name(&other)
                     ),
                 ));
@@ -7679,10 +7700,10 @@ impl Evaluator<'_> {
             }
             let state =
                 required_record_string(owner_record, "state", "semantic_frontier owner attempt")?;
-            if state == "active" {
+            if state == "active" && !owner_is_retained_failure {
                 return Err(stone_error(
                     "semantic_frontier",
-                    "the foreign owner attempt is still active; join its failure before constructing a retained frontier",
+                    "the foreign owner attempt is still active; pass an attempt_failure created by attempt_retain_failure after joining its failed controller",
                 ));
             }
             SemanticFrontierMode::RetainedRepair
@@ -8471,6 +8492,107 @@ impl Evaluator<'_> {
         gateway_env::attempt_terminate(attempt).map(RuntimeValue::Nu)
     }
 
+    fn eval_attempt_retain_failure_call(
+        &mut self,
+        call: &Call,
+    ) -> Result<RuntimeValue, ShellError> {
+        if call.positional.len() > 2 {
+            return Err(stone_error(
+                "attempt_retain_failure",
+                "attempt_retain_failure() requires scope and outcome arguments",
+            ));
+        }
+        let mut scope = call
+            .positional
+            .first()
+            .map(|expression| {
+                self.eval_attempt_scope_expr(expression, "attempt_retain_failure scope")
+            })
+            .transpose()?;
+        let mut outcome = call
+            .positional
+            .get(1)
+            .map(|expression| self.eval_expr_value(expression, PipelineData::empty()))
+            .transpose()?;
+        for (name, expression) in &call.named {
+            match name.as_str() {
+                "scope" if scope.is_none() => {
+                    scope = Some(
+                        self.eval_attempt_scope_expr(expression, "attempt_retain_failure scope")?,
+                    )
+                }
+                "outcome" if outcome.is_none() => {
+                    outcome = Some(self.eval_expr_value(expression, PipelineData::empty())?)
+                }
+                "scope" | "outcome" => {
+                    return Err(stone_error(
+                        "attempt_retain_failure",
+                        format!("`{name}` was supplied more than once"),
+                    ));
+                }
+                _ => {
+                    return Err(stone_error(
+                        "attempt_retain_failure",
+                        format!("unexpected keyword argument `{name}`"),
+                    ));
+                }
+            }
+        }
+        let scope = scope.ok_or_else(|| {
+            stone_error("attempt_retain_failure", "missing scope ownership argument")
+        })?;
+        if scope.lock()?.closed {
+            return Err(stone_error(
+                "attempt_retain_failure",
+                "cannot retain a failed child in a closed attempt_scope",
+            ));
+        }
+        let outcome = match outcome {
+            Some(RuntimeValue::AttemptOutcome(outcome)) => outcome,
+            Some(other) => {
+                return Err(stone_error(
+                    "attempt_retain_failure",
+                    format!(
+                        "outcome must be an attempt_outcome, got {}",
+                        runtime_type_name(&other)
+                    ),
+                ));
+            }
+            None => {
+                return Err(stone_error(
+                    "attempt_retain_failure",
+                    "missing outcome argument",
+                ));
+            }
+        };
+        if !outcome.failed() {
+            return Err(stone_error(
+                "attempt_retain_failure",
+                "only a joined child with a failed attempt state or non-succeeded report can be retained as an attempt_failure",
+            ));
+        }
+        if !scope.owns_joined(&outcome.attempt)? {
+            return Err(stone_error(
+                "attempt_retain_failure",
+                format!(
+                    "attempt {} is not an unresolved joined child owned by scope #{}",
+                    outcome.attempt, scope.scope_id
+                ),
+            ));
+        }
+        for failure in &self.state.retained_failures {
+            if failure.attempt == outcome.attempt && failure.is_retained()? {
+                return Err(stone_error(
+                    "attempt_retain_failure",
+                    "the same failed child is already retained",
+                ));
+            }
+        }
+        let failure = AttemptFailureValue::new(self.state.next_callable_id(), scope, outcome);
+        self.state.retained_failures.push(failure.clone());
+        Ok(RuntimeValue::AttemptFailure(failure))
+    }
+
     fn eval_attempt_best_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         if call.positional.len() > 2 {
             return Err(stone_error(
@@ -9030,11 +9152,13 @@ impl Evaluator<'_> {
                         discarded = true;
                         state_name = "rolled_back".to_string();
                         scope.mark_resolved(&child.attempt)?;
+                        self.resolve_retained_failures(&child.attempt, "discarded")?;
                     }
                     Err(error) => errors.push(format!("discard: {error}")),
                 }
             } else if state_name != "unknown" {
                 scope.mark_resolved(&child.attempt)?;
+                self.resolve_retained_failures(&child.attempt, &state_name)?;
             }
             let child_clean =
                 errors.is_empty() && state_name != "active" && state_name != "unknown";
@@ -9065,6 +9189,15 @@ impl Evaluator<'_> {
             }),
             Span::unknown(),
         ))
+    }
+
+    fn resolve_retained_failures(&self, attempt: &str, resolution: &str) -> Result<(), ShellError> {
+        for failure in &self.state.retained_failures {
+            if failure.attempt == attempt {
+                failure.mark_resolved(resolution)?;
+            }
+        }
+        Ok(())
     }
 
     fn close_attempt_scope_checked(
@@ -9224,6 +9357,7 @@ impl Evaluator<'_> {
         for scope in &self.state.attempt_scopes {
             scope.mark_resolved(&child)?;
         }
+        self.resolve_retained_failures(&child, "accepted")?;
         Ok(RuntimeValue::AttemptAcceptance(
             AttemptAcceptanceValue::new(child, accepted)?,
         ))
@@ -9263,6 +9397,7 @@ impl Evaluator<'_> {
         for scope in &self.state.attempt_scopes {
             scope.mark_resolved(&attempt)?;
         }
+        self.resolve_retained_failures(&attempt, "discarded")?;
         Ok(RuntimeValue::Nu(discarded))
     }
 
@@ -11182,6 +11317,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "attempt_list",
     "attempt_publish",
     "attempt_report",
+    "attempt_retain_failure",
     "attempt_run_process",
     "attempt_spawn",
     "semantic_frontier",
@@ -11546,6 +11682,7 @@ fn ensure_runtime_type(
     let nominal_match = match expected {
         StoneType::AttemptAcceptance => Some(matches!(value, RuntimeValue::AttemptAcceptance(_))),
         StoneType::AttemptBest => Some(matches!(value, RuntimeValue::AttemptBest(_))),
+        StoneType::AttemptFailure => Some(matches!(value, RuntimeValue::AttemptFailure(_))),
         StoneType::AttemptHandle => Some(matches!(value, RuntimeValue::AttemptHandle(_))),
         StoneType::AttemptOutcome => Some(matches!(value, RuntimeValue::AttemptOutcome(_))),
         StoneType::AttemptScope => Some(matches!(value, RuntimeValue::AttemptScope(_))),
@@ -11574,6 +11711,7 @@ fn ensure_type(value: &Value, expected: StoneType, context: &str) -> Result<(), 
         StoneType::Any => true,
         StoneType::AttemptAcceptance
         | StoneType::AttemptBest
+        | StoneType::AttemptFailure
         | StoneType::AttemptHandle
         | StoneType::AttemptOutcome
         | StoneType::AttemptScope
@@ -11716,6 +11854,7 @@ fn stone_type_name(ty: StoneType) -> &'static str {
         StoneType::Any => "Any",
         StoneType::AttemptAcceptance => "attempt_acceptance",
         StoneType::AttemptBest => "attempt_best",
+        StoneType::AttemptFailure => "attempt_failure",
         StoneType::AttemptHandle => "attempt_handle",
         StoneType::AttemptOutcome => "attempt_outcome",
         StoneType::AttemptScope => "attempt_scope",
@@ -14109,6 +14248,7 @@ fn runtime_type_name(value: &RuntimeValue) -> &'static str {
         RuntimeValue::Workflow(_) => "workflow",
         RuntimeValue::AgentControl(_) => "agent_control",
         RuntimeValue::AttemptBest(_) => "attempt_best",
+        RuntimeValue::AttemptFailure(_) => "attempt_failure",
         RuntimeValue::AttemptScope(_) => "attempt_scope",
         RuntimeValue::AttemptHandle(_) => "attempt_handle",
         RuntimeValue::AttemptOutcome(_) => "attempt_outcome",
@@ -14346,6 +14486,9 @@ fn value_to_iter_values(value: &RuntimeValue) -> Result<Vec<Value>, ShellError> 
                 best.selection_id
             ),
         )),
+        RuntimeValue::AttemptFailure(failure) => {
+            value_to_iter_values(&RuntimeValue::Nu(failure.materialize()?))
+        }
         RuntimeValue::AttemptScope(scope) => Err(stone_error(
             "iteration",
             format!(
@@ -15335,6 +15478,7 @@ fn agent_session_value_at(
             "attempt_inspect",
             "attempt_wait",
             "attempt_join",
+            "attempt_retain_failure",
             "attempt_best",
             "attempt_best_consider",
             "attempt_best_accept",
@@ -16009,8 +16153,8 @@ mod tests {
         ensure_runtime_type, eval_program, eval_program_with_options, eval_program_with_output,
         eval_program_with_output_and_session, match_fused_map_update_if,
         semantic_frontier_guidance, transition_id_for_scope, workflow_publication_audit,
-        EvalHotLoopDiagnostics, EvalOptions, RuntimeValue, StoneSession, TextLines,
-        STONE_BUILTIN_NAMES,
+        AttemptOutcomeValue, AttemptScopeValue, EvalHotLoopDiagnostics, EvalOptions, RuntimeValue,
+        StoneSession, TextLines, STONE_BUILTIN_NAMES,
     };
     use crate::{
         commands::{
@@ -16098,6 +16242,75 @@ emit({
                 "status": "open",
                 "empty": true,
                 "considered": 0,
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn retains_a_joined_failed_outcome_as_a_typed_owned_object() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("attempt-failure")?;
+        let scope = AttemptScopeValue::new(7, "cancel_then_join".to_string(), 1000);
+        scope.register("attempt-failed".to_string())?;
+        scope.mark_joined("attempt-failed")?;
+        let span = Span::unknown();
+        let outcome = AttemptOutcomeValue {
+            attempt: "attempt-failed".to_string(),
+            joined: true,
+            timed_out: false,
+            state: "active".to_string(),
+            controller_state: "failed".to_string(),
+            record: json::json_to_nu_value(
+                json_value!({
+                    "attempt": "attempt-failed",
+                    "metadata": {
+                        "controller_result_status": "failed",
+                        "controller_result_reason": "missing evidence"
+                    }
+                }),
+                span,
+            ),
+        };
+        let mut session = StoneSession::default();
+        session
+            .locals
+            .insert("scope".to_string(), RuntimeValue::AttemptScope(scope));
+        session
+            .locals
+            .insert("outcome".to_string(), RuntimeValue::AttemptOutcome(outcome));
+        let source = r#"def identity(value: attempt_failure) -> attempt_failure:
+    return value
+
+failed = identity(attempt_retain_failure(scope, outcome))
+emit({
+    "type": failed.type,
+    "status": failed.status,
+    "attempt": failed.attempt,
+    "scope_id": failed.scope_id,
+    "outcome_type": failed.outcome.type,
+    "result_status": failed.outcome.result.status,
+})
+"#;
+        let program = lower_source(source)?;
+        let output = eval_program_with_output_and_session(
+            &engine_state,
+            &mut stack,
+            &program,
+            PipelineData::empty(),
+            Some(&mut session),
+            Some(source),
+            None,
+        )?;
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, span)?,
+            json_value!({
+                "type": "attempt_failure",
+                "status": "retained",
+                "attempt": "attempt-failed",
+                "scope_id": 7,
+                "outcome_type": "attempt_outcome",
+                "result_status": "failed",
             })
         );
         cleanup_dir(&root);

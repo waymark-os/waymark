@@ -84,6 +84,11 @@ def assert_result(
         raise AssertionError(f"retained branch was not accepted cleanly: {value}")
     if value.get("owner_resource_state") != "reclaimed":
         raise AssertionError(f"failed owner resources were not reclaimed: {value}")
+    if expected_interface == "typed" and (
+        value.get("failed_attempt_type") != "attempt_failure"
+        or value.get("failed_attempt_status") != "resolved"
+    ):
+        raise AssertionError(f"failed owner was not retained and resolved: {value}")
     parent = value.get("parent") or {}
     retained = value.get("retained") or {}
     expected_type = (
