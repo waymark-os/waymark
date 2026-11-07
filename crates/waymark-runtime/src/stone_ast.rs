@@ -754,7 +754,7 @@ fn lower_function_def(function: py::StmtFunctionDef) -> Result<Stmt, ShellError>
         };
         let default = parameter
             .default
-            .map(|default| lower_function_default(*default))
+            .map(|default| lower_function_default(&name, *default))
             .transpose()?;
         params.push(FunctionParam { name, ty, default });
     }
@@ -877,15 +877,33 @@ fn lower_function_stage_decorator(
     Ok(None)
 }
 
-fn lower_function_default(default: py::Expr) -> Result<Expr, ShellError> {
-    match default {
-        py::Expr::List(_) | py::Expr::Dict(_) | py::Expr::Set(_) => Err(unsupported_message(
-            "function definition",
-            "mutable default parameter values are not supported",
-        )),
-        other => lower_expr(other),
-    }
+fn lower_function_default(name: &str, default: py::Expr) -> Result<Expr, ShellError> {
+    let literal = match &default {
+        py::Expr::List(list) if list.elts.is_empty() => "[]",
+        py::Expr::List(_) => "[...]",
+        py::Expr::Dict(dict) if dict.items.is_empty() => "{}",
+        py::Expr::Dict(_) => "{...}",
+        py::Expr::Set(_) => "{...}",
+        _ => return lower_expr(default),
+    };
+    Err(unsupported_message(
+        "function definition",
+        mutable_default_message(name, literal),
+    ))
 }
+
+/// Prescriptive rejection of `def f(name=[])`. Python evaluates a default once
+/// and shares it across calls, which models rarely intend.
+pub(crate) fn mutable_default_message(name: &str, literal: &str) -> String {
+    format!(
+        "mutable default parameter value `{name}={literal}` is not supported: Python creates the default once and shares it across calls. Use `{name}=None` and create the value inside the function: `if {name} is None: {name} = {literal}`"
+    )
+}
+
+/// Prescriptive rejection of `finally`. Runtime resources are released by the
+/// host when an attempt ends, so cleanup code is only needed for the program's
+/// own state; Joe-E's catch-clean-reraise form covers that.
+pub(crate) const FINALLY_UNSUPPORTED: &str = "`finally` is not part of Stone: the host releases runtime resources (attempts, daemons, open files) when an attempt ends. For your own cleanup, use `except Exception as error:` with the cleanup followed by `raise error`, and repeat the cleanup after the try statement for the success path";
 
 fn lower_return(return_stmt: py::StmtReturn) -> Result<Stmt, ShellError> {
     Ok(Stmt::Return(
@@ -1044,10 +1062,7 @@ fn lower_try(try_stmt: py::StmtTry) -> Result<Stmt, ShellError> {
         ));
     }
     if !try_stmt.finalbody.is_empty() {
-        return Err(unsupported_message(
-            "try statement",
-            "finally is not supported yet",
-        ));
+        return Err(unsupported_message("try statement", FINALLY_UNSUPPORTED));
     }
     if try_stmt.handlers.is_empty() {
         return Err(unsupported_message(
@@ -2878,6 +2893,51 @@ else:
         ] {
             assert_unsupported(source);
         }
+    }
+
+    #[test]
+    fn mutable_default_names_parameter_and_none_idiom() {
+        for (source, received, init) in [
+            ("def f(acc=[]):\n    return acc", "`acc=[]`", "acc = []"),
+            ("def f(seen={}):\n    return seen", "`seen={}`", "seen = {}"),
+            (
+                "def f(xs=[1, 2]):\n    return xs",
+                "`xs=[...]`",
+                "xs = [...]",
+            ),
+        ] {
+            let detail = format!("{:?}", lower_source(source).expect_err("mutable default"));
+            assert!(detail.contains(received), "{detail}");
+            assert!(detail.contains("shares it across calls"), "{detail}");
+            assert!(
+                detail.contains(&format!(
+                    "`{}=None`",
+                    &received[1..received.find('=').unwrap()]
+                )),
+                "{detail}"
+            );
+            assert!(detail.contains(init), "{detail}");
+        }
+    }
+
+    #[test]
+    fn finally_explains_host_cleanup_and_reraise_form() {
+        let detail = format!(
+            "{:?}",
+            lower_source(
+                "try:\n    x = 1\nexcept Exception as error:\n    x = 2\nfinally:\n    x = 3"
+            )
+            .expect_err("finally")
+        );
+        assert!(
+            detail.contains("`finally` is not part of Stone"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("host releases runtime resources"),
+            "{detail}"
+        );
+        assert!(detail.contains("`raise error`"), "{detail}");
     }
 
     #[test]

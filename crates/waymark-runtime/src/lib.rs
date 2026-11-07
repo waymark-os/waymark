@@ -1516,6 +1516,25 @@ emit(preview)"#,
             json!("not_started")
         );
 
+        let mutable_default = guest.command_response("def f(acc=[]):\n    return acc");
+        assert_eq!(mutable_default["ok"], json!(false));
+        assert_eq!(
+            mutable_default["error"]["correction"]["class"],
+            json!("mutable_default")
+        );
+        assert_eq!(
+            mutable_default["error"]["correction"]["expected"],
+            json!(["acc=None"])
+        );
+
+        let finally = guest.command_response("try:\n    x = 1\nfinally:\n    x = 2");
+        assert_eq!(finally["ok"], json!(false));
+        assert_eq!(finally["error"]["correction"]["class"], json!("finally"));
+        assert_eq!(
+            finally["error"]["correction"]["execution_state"],
+            json!("not_started")
+        );
+
         let field = guest.command_response(
             r#"def transition_id(step):
     return step.id

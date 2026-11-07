@@ -1261,8 +1261,15 @@ your go-ahead and model access.
 
 - **Models**: Qwen3.6-27B and Claude Haiku 5.5 (from review). GPT-6 Luna as
   an optional third if we have access.
-- **Tasks**: the existing standard-agent task suites behind
-  `host/bench/eval_standard_agent_*.py`, so results compare with V14.
+- **Tasks**: the pilot's 14 tasks (11.2).
+  - **This deviates from review** (which named the standard-agent suites
+    behind `host/bench/eval_standard_agent_*.py`, for comparison with V14).
+    Those suites need the Gateway, and they need `expect=` in the Stone
+    controller, which is item 7 (M3).
+  - The harness-level ablation runs now, like the pilot. The standard-agent
+    comparison follows once item 7 lands.
+  - Only the two synthetic tasks have protected paths (`/app/tests`,
+    `/app/input.txt`), so tier-2 numbers come from them.
 - **Arms**, one controller with two action schemas. Both run with D-1's
   tiers: tier-1 reports, protected `tests/`, and no network.
   - A. Tiers only: `Run` has no `expect`.
@@ -1281,9 +1288,21 @@ your go-ahead and model access.
   substitution, not the review's metric.
 - **Prediction from the review** (restated for the two arms): B wins on raw
   success for 27B+ models; A wins on cost-adjusted success for smaller ones.
-- **Script**: `host/bench/eval_stone_outcome_prediction_ablation.py`, following
-  the existing `eval_*` pattern, with a `--dry-run` that validates arms and
-  schemas without model calls.
+- **Oracle**: the task verifier is shown only when the model finishes
+  (`--oracle finish`, the default). A rejected finish shows it once, and
+  the loop continues, as `check.verify` does in 6.1. The base harness shows
+  the verifier after every step, which would make outcome prediction
+  redundant.
+- **Script**: `host/bench/eval_stone_outcome_prediction_ablation.py` (M1,
+  2026-11-07). It reuses the pilot's sandbox, adds tier-2 read-only mounts
+  and the arm-B expectation checker, and reports, per model and arm:
+  - expectation mismatches;
+  - repeats after a failure;
+  - steps to recovery;
+  - read-only and network errors.
+  
+  `--dry-run` passes on all 14 tasks. It checks the tiers, both schemas, and
+  the expectation checker, with no model calls.
 
 ### 11.2 Write-Prediction Pilot
 
@@ -1313,9 +1332,15 @@ ReAct loop (JSON actions: `stone_eval`, `escape_linux`, `stone_help`,
   artifact, `$HOME` cache, `/tmp`, task path); overly broad declarations
   (`/app`, `/work`); rollbacks; format errors; tokens.
 
-Limits: outcome prediction is not in the pilot, and the prompt
-re-sends a long Stone guide every turn, so token counts are high in absolute
-terms.
+Limits:
+
+- Outcome prediction is not in the pilot.
+- The prompt re-sends a long Stone guide every turn, so token counts are
+  high in absolute terms.
+- Inherited from the base harness, every observation includes the task
+  verifier's verdict. That is a per-step oracle, so absolute success rates
+  are inflated. The oracle is the same in every arm, so comparisons between
+  arms hold.
 
 **Pilot v1 (2026-11-06, one repeat, 14 tasks): format confound.** v1 placed
 `writes` beside the nested `input` object.
@@ -1553,16 +1578,16 @@ in the last column and for the compatibility measurement.
 |---|---|---|---|---|---|
 | 1 | Bare `except:` is a parse error; the correction engine, AST hints, CLI help, and `STONE_LANGUAGE.md` stop suggesting it (9.5) | New | **Yes**: accepted and recommended today | Joe-E §4.3; PEP 352; Ren et al. 2023 | P1 |
 | 2 | `pass`-only handler for `Exception`/`ToolError` is an admission error | New | **Yes**: legal today | Ren et al. 2023; Seeker 2024 | P1 |
-| 3 | Swallowed-`ToolError` counter in trace and `last_result()` | New | Additive field | — | P1 |
+| 3 | Swallowed-`ToolError` counter in trace and `last_result()` | New | Additive field | — | P1, M2 (needs L6 typed `ToolError`; moved from M1) |
 | 4 | `except BaseException`, `except PolicyViolation`, `except BudgetExhausted` rejected | New | No (names do not exist) | Trio cancellation docs | P1 |
-| 5 | `ExpectationFailed` fields `.expected/.observed/.diff/.result` | Was "carries the full observation" | No | — | P1 |
+| 5 | `ExpectationFailed` fields `.expected/.observed/.diff/.result` | Was "carries the full observation" | No | — | P1, M3 (needs item 7 `expect=`; moved from M1) |
 | 6 | Three effect tiers per syscall: observed effects on every result as `r.effects` (tier 1); protected paths in the grant, read-only for `Exec` (tier 2); `Exec` declares tier-3 effects (`network`, `irreversible`, `background`), denied otherwise with `UndeclaredEffect` | Was mandatory `Run.writes` with discard (draft v3, D-1 provisional); replaced after the pilot | No (new API) | D-1; pilot 11.2 | P1 (tiers 1-2, tier-3 vocabulary) / P3 (eBPF enforcement) |
 | 7 | `expect=` optional on every syscall; exit status in it; RPC/MCP `result` and `status` checks; `Tests` row removed | Was part of every action, and for `Exec` only | No | PreAct | P1 |
 | 8 | `with budget(...) as b:` with Trio semantics; `grace=`; `model.reserve` removed | Was `limit` + `reserve`, exhaustion propagating | No (new API) | Trio "Cancellation semantics"; bpo-32528 thread | P1 |
-| 9 | `finally` stays absent; error becomes prescriptive | Was unaddressed | Message only | Joe-E §4.3 | P1 |
-| 10 | Mutable default argument error becomes prescriptive | Was unaddressed | Message only | — | P1 |
+| 9 | `finally` stays absent; error becomes prescriptive | Was unaddressed | Message only | Joe-E §4.3 | P1, **done in M1** (message plus `finally` repair envelope) |
+| 10 | Mutable default argument error becomes prescriptive | Was unaddressed | Message only | — | P1, **done in M1** (message plus `mutable_default` repair envelope) |
 | 11 | L9 module values deep-frozen at import | New | No (no modules yet) | Joe-E §4.2 | P1 |
-| 12 | Ablation harness `host/bench/eval_stone_outcome_prediction_ablation.py`, two arms (tiers, tiers plus `expect`), dry-run only | Was four write-declaration arms | No | PreAct; Lee 2026 | P1 |
+| 12 | Ablation harness `host/bench/eval_stone_outcome_prediction_ablation.py`, two arms (tiers, tiers plus `expect`), dry-run only | Was four write-declaration arms | No | PreAct; Lee 2026 | P1, **done in M1** (dry-run passes; not run) |
 | 13 | `Verified` as a sealed box with value, verifier id, claim, nonce; verifier in its own read-only attempt; no `critic=` | Was an opaque tag minted with an optional critic | No (new type) | Morris 1973 §6-7 | P2 |
 | 14 | Boundary walk component with five call sites | New | No | Taly et al. 2011 §II.B, §V | P2 |
 | 15 | Pass-style `scope.start(f, **args)`: copy data, share handles, closure rule | Was "capability arguments", no copy rule | No (attempts start by id today) | Agoric "Far, Remotable, and Marshaling" | P2 |

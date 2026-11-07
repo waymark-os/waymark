@@ -200,6 +200,34 @@ pub(crate) fn correction_for_error(err: &ShellError, source: &str) -> Option<Jso
         }
     }
 
+    if code == "stone_script_unsupported" {
+        if let Some((name, literal)) = mutable_default_error(&detail) {
+            return Some(repair_envelope_owned(
+                source,
+                phase,
+                "mutable_default",
+                &format!("{name}={literal}"),
+                vec![format!("{name}=None")],
+                &format!(
+                    "Python creates a default value once and shares it across calls, so a list or dict default leaks state between calls. Use `{name}=None` and add `if {name} is None: {name} = {literal}` at the top of the function body, keeping the original initial value. Then explicitly evaluate the repaired source again."
+                ),
+            ));
+        }
+        if detail.contains("`finally` is not part of Stone") {
+            return Some(repair_envelope(
+                source,
+                phase,
+                "finally",
+                "finally:",
+                vec![
+                    "except Exception as error: <cleanup>; raise error",
+                    "<cleanup> after the try statement",
+                ],
+                "Stone has no `finally`. The host releases runtime resources (attempts, daemons, open files) when an attempt ends, so cleanup is only needed for your own state. Move the cleanup into `except Exception as error:` followed by `raise error`, and repeat it after the try statement for the success path. Then explicitly evaluate the repaired source again.",
+            ));
+        }
+    }
+
     if code == "stone_script_unsupported" && contains_identifier(source, "global") {
         return Some(repair_envelope(
             source,
@@ -550,6 +578,12 @@ fn exception_handler_binding_error(detail: &str) -> Option<String> {
     is_identifier(name).then(|| name.to_string())
 }
 
+fn mutable_default_error(detail: &str) -> Option<(String, String)> {
+    let received = backticked_after(detail, "mutable default parameter value `")?;
+    let (name, literal) = received.split_once('=')?;
+    is_identifier(name).then(|| (name.to_string(), literal.to_string()))
+}
+
 fn backticked_after(detail: &str, prefix: &str) -> Option<String> {
     let rest = detail.split_once(prefix)?.1;
     let (value, _) = rest.split_once('`')?;
@@ -734,7 +768,7 @@ mod tests {
     use nu_protocol::{shell_error::generic::GenericError, ShellError};
     use serde_json::json;
 
-    use super::{apply_correction, correction_for_error, damerau_levenshtein};
+    use super::{apply_correction, contains_identifier, correction_for_error, damerau_levenshtein};
 
     fn error(code: &'static str, detail: &str) -> ShellError {
         ShellError::Generic(
@@ -922,6 +956,56 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("does not bind the caught error"));
+    }
+
+    #[test]
+    fn mutable_default_gets_none_idiom_repair() {
+        let source = "def f(acc=[]):\n    return acc\n";
+        let correction = correction_for_error(
+            &error(
+                "stone_script_unsupported",
+                &crate::stone_ast::mutable_default_message("acc", "[]"),
+            ),
+            source,
+        )
+        .expect("mutable default correction");
+        assert_eq!(correction["class"], json!("mutable_default"));
+        assert_eq!(correction["safety"], json!("requires_repair"));
+        assert_eq!(correction["received"], json!("acc=[]"));
+        assert_eq!(correction["expected"], json!(["acc=None"]));
+        assert!(correction["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("`if acc is None: acc = []`"));
+    }
+
+    #[test]
+    fn finally_gets_reraise_repair_not_global_guidance() {
+        // The source contains the identifier `global` (in a comment) to check
+        // that the finally repair wins over the generic `global` guidance.
+        let source = "# no global state\ntry:\n    x = 1\nexcept Exception as error:\n    raise error\nfinally:\n    x = 2\n";
+        assert!(contains_identifier(source, "global"));
+        let correction = correction_for_error(
+            &error(
+                "stone_script_unsupported",
+                crate::stone_ast::FINALLY_UNSUPPORTED,
+            ),
+            source,
+        )
+        .expect("finally correction");
+        assert_eq!(correction["class"], json!("finally"));
+        assert_eq!(correction["received"], json!("finally:"));
+        assert_eq!(
+            correction["expected"],
+            json!([
+                "except Exception as error: <cleanup>; raise error",
+                "<cleanup> after the try statement"
+            ])
+        );
+        assert!(correction["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("host releases runtime resources"));
     }
 
     #[test]
