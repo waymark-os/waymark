@@ -147,12 +147,12 @@ The review's two cross-cutting conclusions, both adopted **from review**:
 | ID | Decision | Marking | Section |
 |---|---|---|---|
 | R1 | Confinement comes from the reference graph. Close the leak channels in R2-R8. | From review (RQ1) | 5.1 |
-| R2 | Exceptions carry data only. A raise whose payload reaches a capability is an error at the raise site. Host errors never embed a handle. | From review (RQ1, Joe-E). Stricter than Agoric, whose errors may carry other passables (12.1). | 5.5 |
+| R2 | Exceptions carry data only. A raise whose payload reaches a capability is an error at the raise site. Host errors never embed a handle. | From review (RQ1, Joe-E). Stricter than Agoric, whose errors may carry other passables (12.1). **Narrowed by D-3:** no walk at `raise`; walks only at child start and return. | 5.5 |
 | R3 | No frame, traceback, locals, or globals object is ever reified. Tracebacks are strings. | From review (RQ1). Already true today. | 5.5 |
 | R4 | The builtin table is frozen and shared read-only. No attempt, helper, or session binding can change what a builtin name means for anyone else. | From review (RQ1) | 5.1 |
 | R4a | Shadowing a builtin name in your own lexical scope stays legal (`id = ...`, `type = ...`). | **Deviates from review** ("no attempt can rebind `read_text`") **because** the threat is cross-boundary sharing, which R4 plus R7 and per-attempt namespaces remove. Rejecting local shadowing would reject common Python. | 5.1 |
 | R5 | No mutable module-level state crosses a trust boundary. Values defined at the top level of an L9 module are deep-frozen at import. | From review (RQ1, Joe-E) | 7 (L9) |
-| R6 | The session is a vat with a ceiling the host fixes at session start. Bindings, `last_result()`, and `state()` stay within it. A child gets session bindings only if passed, never by lookup. | From review (RQ1). Replaces draft v2's "capabilities are not session-persistable". | 8 (Q4) |
+| R6 | The session is a vat with a ceiling the host fixes at session start. Bindings, `last_result()`, and `state()` stay within it. A child gets session bindings only if passed, never by lookup. | From review (RQ1). Replaces draft v2's "capabilities are not session-persistable". **Narrowed by D-3:** capabilities are not persisted in sessions; grants are made fresh per attempt. | 8 (Q4) |
 | R7 | Host callbacks (helpers, hooks) sit behind a membrane. Helpers run in their own evaluator, receive data or attenuated handles, never raw capabilities, and return data that enters only through the ceiling. | From review (RQ1) | 9.3 |
 | R7a | In the controlled profile, helpers are not loaded from directories inside the agent's write grant. | Not in the review; my concretization of R7 after finding that cwd helpers are agent-writable (9.3) | 9.3 |
 | R8 | A child's initial reference graph is exactly its arguments (loader isolation). | From review (RQ1) | 5.7 |
@@ -166,14 +166,14 @@ The review's two cross-cutting conclusions, both adopted **from review**:
 | R15 | Bare `except:` is a parse error. `BaseException` does not exist in Stone, so no spelling catches a control error. | From review (RQ3, RQ4) | 5.5 |
 | R16 | `PolicyViolation` has Joe-E `Error` semantics. Agent code cannot catch it, no agent code runs after it, the host cleans up, the attempt is dead, and the parent sees the violation as data. | From review (RQ4) | 5.5 |
 | R16a | `ContractViolation` (for example, returning a bare `Report` where `Verified[Report]` is required) gets the same semantics as R16. | Not covered by the review. My choice: it is an attempt to claim an outcome the attempt does not hold. | 5.5 |
-| R17 | `BudgetExhausted` has Trio cancel-scope semantics. It is raised inside a `with budget(...) as b:` scope, cannot be caught by inner code, is absorbed by the scope that owns the exhausted budget, and is exposed as `b.exhausted`. | From review (RQ4) | 5.3 |
-| R17a | `model.reserve(...)` is dropped. Room to verify comes from running the loop in a budget scope that holds some budget back (`grace=`). `model.limit(...)` stays, for passing a narrowed `Model` to a child. | Simplification of R17; not in the review | 5.3 |
-| R18 | `finally` stays absent. Code after the budget scope plays the role of the review's grace-budget `finally`. | **Deviates from review** (whose table lets `finally` run under a grace budget) **because** Stone has no `finally` today, Joe-E bans it, host compensation (R19) removes the resource-cleanup reason for it, and code after the scope gives the same best-effort result without code running during unwinding. | 5.3 |
+| R17 | `BudgetExhausted` has Trio cancel-scope semantics. It is raised inside a `with budget(...) as b:` scope, cannot be caught by inner code, is absorbed by the scope that owns the exhausted budget, and is exposed as `b.exhausted`. | From review (RQ4). **Replaced by D-3:** the budget is checked at model and tool calls, and exhaustion ends the attempt with a host-built `Unfinished`. | 5.3 |
+| R17a | `model.reserve(...)` is dropped. Room to verify comes from running the loop in a budget scope that holds some budget back (`grace=`). `model.limit(...)` stays, for passing a narrowed `Model` to a child. | Simplification of R17; not in the review **`grace=` dropped by D-3**; `model.limit` stays. | 5.3 |
+| R18 | `finally` stays absent. The host builds `Unfinished` when a budget runs out, which covers the review's grace-budget `finally` (5.3, D-3). | **Deviates from review** (whose table lets `finally` run under a grace budget) **because** Stone has no `finally` today, Joe-E bans it, host compensation (R19) removes the resource-cleanup reason for it, and code after the scope gives the same best-effort result without code running during unwinding. | 5.3 |
 | R19 | The host is the compensation stack. It releases every resource an attempt opened on any exit. Agent code never cleans up resources. | From review (RQ4, Weimer & Necula). **Only partly true of the host today** (9.1). | 5.4, 9.1 |
 | R20 | `Verified[T]` is a sealed box holding a frozen copy of the value, the verifier id, the claim checked, and the attempt nonce. | From review (RQ5, Morris 1973) | 5.2 |
 | R21 | Verifiers are host-minted only, run in their own attempt on a read-only snapshot, and take no evidence argument. An LLM judge, if ever used, says so in its claim. | From review (RQ5). Drops draft v2's `critic=` argument to `verify`. | 5.2 |
 | R22 | A `Verified` value is accepted only by the parent of the attempt that minted it (nonce check). | From review (RQ5) | 5.2 |
-| R23 | A 0-CFA reachability check at admission catches bad returns and spawn arguments before any budget is spent. The runtime check stays the guarantee. | From review (RQ1, RQ5), **scoped because** L12 requires per-command admission to stay a linear pass. It runs on delegated bodies and library loops, not on every one-line command, and ships in P3. | 7 (L12) |
+| R23 | A 0-CFA reachability check at admission catches bad returns and spawn arguments before any budget is spent. The runtime check stays the guarantee. | From review (RQ1, RQ5), **scoped because** L12 requires per-command admission to stay a linear pass. It runs on delegated bodies and library loops, not on every one-line command, and ships in P3. **Dropped by D-3.** | 7 (L12) |
 | R24 | One reachability-walk component, used at child start, return, and host callbacks. | From review. Two more call sites are mine: `raise` (R2) and session injection or restore (R6). | 5.1 |
 | R25 | ~~Declared writes are mandatory and enforced at the capability layer.~~ Replaced by R25a-R25c. | **Deviates from review** (RQ6, the brief's Q6 directive) **because** the pilot (11.2) found that per-path write declarations caught no drift. Every rollback was a toolchain by-product or a legitimate edit, and the capable models over-declared (`/app`), which defeats enforcement. Each declaration is also an escalation with a cost (D-1). | 5.8 |
 | R25a | Effects fall into three tiers. (1) Recoverable effects are not declared; they are observed and reported on every result. (2) Critical recoverable paths are protected by the grant and enforced by the Gateway. (3) Irreversible effects are denied unless granted and declared. | Mine (D-1), decided with you after the pilot. Keeps the review's point that declarations are policy, applied only where a declaration buys safety. | 3.1, 5.8 |
@@ -269,6 +269,78 @@ repository):
 
 A per-command overlay is no longer needed. Tier 1 does not discard per call.
 The pilot (11.2) emulated items 1 and 2 at harness level with bubblewrap.
+
+**D-3. Speed and simplicity review. Decided with you, 2026-11-07.**
+The runtime is Rust, and it needs a fast interpreter and a JIT. A feature
+is rejected if it adds per-operation cost, blocks compile-time name
+resolution, or adds runtime machinery that could weaken a contract.
+
+Kept, because they cost nothing at runtime or make Stone faster:
+
+- Lexical scoping (L1). Dynamic scoping forces runtime name lookup and
+  blocks a JIT, so fixing it is a speed win.
+- Frozen builtins (L18). Builtin calls bind at compile time.
+- The `or`/`and`, `str()`, and `round()` fixes.
+- Handler rules checked at admission (bare `except:`, `pass`-only
+  handlers).
+- Typed exceptions (L6). Handler matching is a tag compare.
+- Prescriptive errors.
+- Effect tiers. The Gateway enforces them outside the interpreter.
+- `expect=` checks. They run only at tool calls.
+
+Simplified:
+
+- **Closures read but do not rebind captured variables.** There is no
+  `nonlocal`, and rebinding a captured name is a prescriptive error. Only
+  captured variables need cells; every other local stays a fixed slot.
+  Lambdas such as `key=lambda r: r[field]` work.
+- **Shared lists and dicts (L2)** become one rewrite of the Rust value
+  representation. Lists and dicts move out of Nu `Value`, so they can be
+  shared and can hold functions and capabilities (R9). Sharing also
+  removes today's copy on every assignment.
+- **Budgets (R17, R17a)** are checked only at model and tool calls. When a
+  budget runs out, the attempt ends: no agent code runs afterward, and the
+  parent receives an `Unfinished` result built by the host from the
+  attempt's trace. This replaces the scoped `with budget(...)` block, its
+  uncatchable exception, and `grace=`.
+
+Dropped:
+
+- **The reachability walk at every `raise` (R2, item 19).** It costs
+  something on a common path. Walks stay at child start and return, which
+  are rare. Host errors still never embed a handle.
+- **The admission-time 0-CFA analysis (R23, item 23).** It is complex, and
+  the runtime check is the guarantee.
+- **Capabilities persisted in sessions (R6, item 20).** Grants are made
+  fresh for each attempt. A session keeps data bindings only.
+
+Kept and redirected: **information-flow control, aimed mainly at
+provenance** (where data came from), and also at secrecy.
+
+- Labels are attached where data enters (tool results, file reads, model
+  replies, fetches).
+- Labels live on strings and containers, not on scalars, so the JIT's
+  numeric path is untouched. They are joined only by operations that
+  already allocate.
+- One floating label per attempt covers flows through control and through
+  scalars.
+- Checks run only at sinks (tool calls, sends, writes).
+- Types reject mismatches at admission where they can.
+- Models can read provenance (`provenance(x)`, notes in observations).
+- The label slot is designed into the shared-value rewrite above.
+- The detailed design is revisited later, against type-based and
+  Rust-based IFC work and Elba's IFC section.
+
+**User-defined error types** (part of L6). Models may declare their own
+errors as field-only classes deriving from a builtin error:
+
+```python
+class ConfigError(Exception):
+    path: str
+```
+
+Such a class has no methods. It matches handlers by tag along a fixed,
+single-inheritance chain, so it is as cheap as a builtin error.
 
 ## 4. The Problem In The Current Stone Loop
 
@@ -407,44 +479,40 @@ child's `Verified` only if its verifier is one the parent passed to that child
 results) and carry provenance. A model can quote evidence but cannot create
 it.
 
-### 5.3 Resources: Metered Capabilities And Budget Scopes
+### 5.3 Resources: Metered Capabilities And Budgets
 
-Two mechanisms, with different jobs:
+Simplified by D-3. Budgets are checked only at metered calls, so ordinary
+code pays nothing for them.
 
 - **`model.limit(calls=40, output_tokens=60_000)`** returns a narrowed
-  `Model` whose usage the runtime meters. It is how a parent gives a child a
-  budget (6.2).
-- **`with budget(...) as b:`** (R17) bounds everything metered in its dynamic
-  extent: model calls, tokens, tool calls, and wall clock. A budget only
-  restricts, so its dynamic extent grants no authority.
+  `Model` whose usage the runtime meters. It is how a parent gives a child
+  a budget (6.2).
+- **Each attempt has a host-given budget**: model calls, tokens, tool
+  calls, and wall clock. It is checked at model and tool calls only. Those
+  are the metered operations, and they are slow anyway.
+- **When a limit is hit, the attempt ends.** No further agent code runs, as
+  after a policy violation (5.5). The host builds an `Unfinished` result
+  from the attempt's trace (the reason, the last observations, the files
+  changed) and the parent receives it as data. A loop therefore cannot
+  swallow exhaustion, and nothing needs to be uncatchable.
+- **A loop that wants to write its own partial report stops early**, using
+  ordinary code:
 
 ```python
-with budget(calls=20, seconds=600, grace=Usage(calls=2)) as b:
-    for f in files:
-        results.append(summarize(f))
-if b.exhausted:
-    emit({"partial": results, "stopped_at": b.stopped_at})
+while model.remaining.calls > 2:
+    ...                                   # the loop body
+summary = model.ask(log.view(), output=Report)
+return Unfinished(report=summary, reason="budget low")
 ```
 
-Semantics (from review, following Trio's cancel scopes):
+- **Verification needs no reserved budget.** Verifiers run in their own
+  host-funded attempt (R21).
 
-- When a limit is hit, the runtime raises `BudgetExhausted` at the current
-  metered call. Inner code cannot catch it. `except BudgetExhausted` is an
-  admission error that shows this pattern.
-- The scope whose budget ran out absorbs it. Execution continues after the
-  `with` block with `b.exhausted == True`, `b.usage`, and `b.stopped_at`.
-  Nested scopes behave like Trio: the innermost exhausted scope absorbs.
-- With no budget scope, exhaustion of the attempt's host-given budget ends the
-  attempt, and the parent sees `Exhausted` as data.
-- `grace=` holds that amount back from the enclosing budget for the code
-  after the scope. That code is where a loop writes its partial result, and
-  the grace amount keeps it from being starved. `grace` is the review's
-  reserved grace budget, moved from `finally` to the code after the scope
-  (R18).
-
-This replaces draft v2's `model.reserve(calls=4)` (R17a). Running the loop in
-a scope with `grace=Usage(calls=4)` leaves those calls for verification and
-summary, which is the same guarantee with one mechanism instead of two.
+This replaces draft v3's scoped `with budget(...) as b:` block. That block
+needed an exception inner code could not catch, rules for which nested
+scope absorbs it, and a `grace=` allowance. That is a lot of runtime
+machinery for what a `model.remaining` check does. Draft v2's
+`model.reserve(...)` stays removed.
 
 `model.usage` and `model.remaining` are runtime-owned and read-only.
 
@@ -455,7 +523,7 @@ scopes (existing `attempt_scope` semantics: cancel, then join on exit).
 
 The host is the compensation stack (R19). It records every obligation it
 issues (open file, daemon, temp dir, child attempt) and discharges them on
-every exit path, including `PolicyViolation` and `BudgetExhausted`. Agent code
+every exit path, including `PolicyViolation` and budget exhaustion. Agent code
 never cleans up resources. That removes most reasons to want `finally`.
 
 A function may not return while a resource it opened outside a scope is live
@@ -472,7 +540,7 @@ There are three tiers.
 | Tier | Types | Catchable by agent code | What runs afterward |
 |---|---|---|---|
 | Recoverable | `ToolError` and subclasses (`ExpectationFailed`, `UndeclaredEffect`), ordinary errors | Yes | The handler |
-| Budget | `BudgetExhausted` | No; absorbed by the owning `budget` scope (5.3) | Code after the scope |
+| Budget | Budget exhaustion | Never | No agent code. The host builds `Unfinished` from the trace (5.3, D-3) |
 | Fatal | `PolicyViolation`, `ContractViolation` | Never | No agent code. The host cleans up; the parent sees the violation as data |
 
 Rules:
@@ -480,12 +548,15 @@ Rules:
 - Errors are typed: `except ToolError as e:` with fields (`e.kind`,
   `e.detail`). Today `except Exception as e` binds a plain dict
   (`{"code", "kind", "message", ...}`), and `str(e)` renders it as JSON.
-- Exceptions carry data only (R2). `raise ToolError(detail=src)` where `src`
-  is a capability is an error at the raise site that says to return the handle
-  instead.
+- Exceptions carry data. Host errors never embed a handle. The walk at
+  `raise` (R2) is dropped by D-3; a capability carried out in an exception
+  is caught by the walk at child return.
+- Models may define their own error types as field-only classes deriving
+  from a builtin error (D-3): `class ConfigError(Exception): path: str`.
 - Bare `except:` is a parse error (R15). `BaseException` does not exist.
-  `except PolicyViolation`, `except ContractViolation`, and
-  `except BudgetExhausted` are admission errors with the fix in the message.
+  `except PolicyViolation` and `except ContractViolation` are admission
+  errors with the fix in the message. Budget exhaustion has no catchable
+  name.
 - A handler for `Exception` or `ToolError` whose body is only `pass` is an
   admission error (R14): "this handler discards a ToolError such as
   ExpectationFailed; bind it with `as e` and use it, or re-raise".
@@ -564,7 +635,7 @@ The Gateway is the kernel. Every call that crosses it is a syscall:
 - host tools;
 - RPCs;
 - MCP tool calls;
-- model calls, which are metered by budget scopes (5.3).
+- model calls, which are metered against the attempt's budget (5.3).
 
 Capabilities bound what a function *may* do over its whole run. A syscall
 contract states what one call does. It has three parts, all checked at
@@ -757,32 +828,32 @@ def solve(task: str, repo: Dir[Read], src: Dir[Read, Write], shell: Exec,
     log = Transcript(max_chars=40_000)          # std library: bounded history
     log.add("user", task)
     changed = []
-    with budget(grace=Usage(calls=2)) as b:
-        while True:
-            action = model.ask(log.view(), output=Action)
-            try:
-                if isinstance(action, Read):
-                    obs = repo.file(action.path).read_text(max_chars=8_000)
-                elif isinstance(action, Edit):
-                    obs = src.file(action.path).replace(
-                        action.old, action.new, expect=Expect(occurrences=1))
-                    changed.append(action.path)
-                elif isinstance(action, Run):
-                    obs = shell.run(action.argv, cwd=src, expect=action.expect)
-                else:
-                    outcome = check.verify(
-                        Report(summary=action.summary, files_changed=changed))
-                    if isinstance(outcome, Verified):
-                        return outcome
-                    obs = outcome                # Rejected: host evidence of what failed
-            except ToolError as e:               # ExpectationFailed, UndeclaredEffect, ...
-                obs = e
-            log.add_observation(action, obs)
-            if log.stuck(window=4):              # same action, same mismatch
-                log.add_control("Stop repeating; inspect the failing evidence.")
-    # Reached only when the scope absorbed BudgetExhausted; runs on the grace calls.
+    while model.remaining.calls > 2:            # keep two calls for the summary
+        action = model.ask(log.view(), output=Action)
+        try:
+            if isinstance(action, Read):
+                obs = repo.file(action.path).read_text(max_chars=8_000)
+            elif isinstance(action, Edit):
+                obs = src.file(action.path).replace(
+                    action.old, action.new, expect=Expect(occurrences=1))
+                changed.append(action.path)
+            elif isinstance(action, Run):
+                obs = shell.run(action.argv, cwd=src, expect=action.expect)
+            else:
+                outcome = check.verify(
+                    Report(summary=action.summary, files_changed=changed))
+                if isinstance(outcome, Verified):
+                    return outcome
+                obs = outcome                # Rejected: host evidence of what failed
+        except ToolError as e:               # ExpectationFailed, UndeclaredEffect, ...
+            obs = e
+        log.add_observation(action, obs)
+        if log.stuck(window=4):              # same action, same mismatch
+            log.add_control("Stop repeating; inspect the failing evidence.")
+    # Reached when the loop stops early. If the budget runs out mid-loop instead,
+    # the attempt ends and the host builds Unfinished from the trace (5.3).
     summary = model.ask(log.view(), output=Report)
-    return Unfinished(report=summary, reason=f"budget exhausted at {b.stopped_at}")
+    return Unfinished(report=summary, reason="budget low")
 ```
 
 A model action (structured output, validated against `Run`):
@@ -811,8 +882,8 @@ What the runtime guarantees here, where today's controller needs convention:
 | Edits only in `src` | `Edit` goes through `src: Dir[Read, Write]`; `src.file("../tests/x")` fails containment |
 | Tests cannot be "fixed" | `repo` is read-only, and the verifier runs on a read-only snapshot |
 | Success needs evidence | Return type `Verified[Report]`; the box is sealed and frozen |
-| Room to finish | `grace` holds calls back from the loop's budget scope |
-| Budget accounting | Metered; `BudgetExhausted` cannot be caught inside the scope |
+| Room to finish | The loop stops while `model.remaining` covers the summary; exhaustion mid-loop yields a host-built `Unfinished` |
+| Budget accounting | Metered at model and tool calls; exhaustion ends the attempt, so it cannot be swallowed |
 | Malformed actions | `output=Action`, repair charged to the budget |
 | Commands cannot touch tests or the network | Tier 2 protected paths and tier 3 egress denial, enforced by the Gateway on every `Exec`; tier 1 changes reported on every result |
 | The loop notices a failed step | Optional `expect`: `ExpectationFailed` with expected, observed, and diff |
@@ -881,14 +952,14 @@ keeping reference semantics.
 
 | ID | Decision | Recommendation | Why | Perf effect |
 |---|---|---|---|---|
-| L1 | Lexical scoping and real closures | Adopt | Dynamic scope lets a callee use its caller's capabilities, and lets helpers read agent locals (9.3). It is also a silent Python divergence. | Enables register allocation (perf D1) |
+| L1 | Lexical scoping; closures read captured variables but do not rebind them (D-3) | Adopt | Dynamic scope lets a callee use its caller's capabilities, and lets helpers read agent locals (9.3). It is also a silent Python divergence. | Enables register allocation (perf D1) |
 | L2 | List/dict semantics | **Python reference semantics**, with copies at pass-style boundaries (R10) | Copy semantics silently break `def add(items, x): items.append(x)` and `for row in rows: row["k"] = v` | Shared mutable objects, like Lua tables; copying only at boundaries |
 | L3 | `or`/`and` return operands | Adopt Python semantics | `name = x or "default"` currently yields `True` | None |
 | L4 | `str(None)`, `str(True)`, `str(1.0)`, `round()` | Python behavior | Silent divergences today | None |
 | L5 | Records: field-only `class X(Record)`, `Literal`, `A \| B` unions, `T \| None`, defaults, real `list[T]` element types | Adopt | Needed for `output=`, typed state, and contracts | Fixed shapes give slot offsets for the VM |
-| L6 | Typed exceptions; `except Name as e`; three tiers (5.5); exceptions carry data only (R2) | Adopt | Recovery contracts | None |
+| L6 | Typed exceptions: builtin error types plus model-defined field-only error classes (D-3); `except Name as e`; three tiers (5.5) | Adopt | Recovery contracts | None |
 | L6a | Bare `except:` is a parse error; `pass`-only handlers for `Exception`/`ToolError` are admission errors; swallow counter | Adopt (R13-R15) | Makes the remaining exception failure mode visible | Counter is on the handler path only |
-| L6b | `finally` stays absent, with a prescriptive error | Adopt (R18) | Host compensation and budget scopes cover its uses | None |
+| L6b | `finally` stays absent, with a prescriptive error | Adopt (R18) | Host compensation and host-built `Unfinished` cover its uses | None |
 | L7 | Controlled profile and capability types | Adopt as opt-in | Authority contracts (5.1) | Effects are explicit host calls, so pure code is freely optimizable |
 | L8 | Host-defined opaque types (`Verified[T]` as a sealed box, `Evidence`) | Adopt | Outcome contracts (5.2) | Deep copy at seal time, once per verify |
 | L9 | Modules: `from lib import name` for pure Stone modules (top-level `def`, records, and constants only; no effects). Module-level values are deep-frozen (R5). | Adopt | Agent libraries without pasted bundles; pure modules hold no authority | Compiled prototypes and frozen constants can be cached per module |
@@ -899,7 +970,7 @@ keeping reference semantics.
 | L14 | Syscall contracts: Gateway-owned effect signatures for every syscall; models declare only tier-3 effects of `Exec` (`effects=`); `expect=` optional on any syscall | Adopt (R25a-R25c, R26; D-1) | Safeguards each syscall and gives checked feedback with the fewest declarations | Checks run on syscalls only; tier-1 diff cost per command is one diff (Section 12) |
 | L15 | `ExpectationFailed` and `UndeclaredEffect` are `ToolError` subclasses carrying the full result | Adopt (R12) | Loud by default, recoverable, one handler in loops | None |
 | L16 | Custom `check=fn` must be pure | Adopt | Expectation checks cannot have effects | Pure functions are VM-compilable |
-| L17 | `with budget(...) as b:` with Trio scope semantics; `model.limit` for children; no `reserve` | Adopt (R17, R17a) | Budget exhaustion cannot be swallowed inside, and is handled at one place | Metering is on effect calls only |
+| L17 | Budgets checked at model and tool calls; exhaustion ends the attempt with a host-built `Unfinished`; `model.limit` for children (D-3) | Adopt (R17 as replaced by D-3) | Budget exhaustion cannot be swallowed inside, and is handled at one place | Metering is on effect calls only |
 | L18 | Builtin table frozen; one Python namespace for callables and variables; local shadowing follows Python; calling a non-callable that shadows a builtin is a prescriptive error | Adopt (R4, R4a; namespace finding in 9.5) | Confinement without rejecting common code; the shadowing error keeps unification loud | Builtins resolve at compile time unless lexically shadowed (with L1) |
 
 Compatibility: L1-L4, L6a, and L18 change existing behavior. Measure their
@@ -917,8 +988,8 @@ Ship order follows S3; see Section 13.
 
 **Q2. Minimal novel constructs.**
 Capability-typed parameters, field-only record classes, `output=`,
-host-defined opaque types, and `with budget(...)`. `spawn` becomes
-`scope.start` with pass-style arguments. Taint and declassify are deferred.
+host-defined opaque types, and budgets checked at metered calls. `spawn` becomes
+`scope.start` with pass-style arguments. Information-flow control, aimed at provenance, is kept and designed with the shared-value rewrite (D-3).
 Algebraic effects stay internal. Narrowing uses `/` (pathlib prior), not `//`
 (H-5). Per-call effects and expectations add no syntax: they are two record
 types passed as keyword arguments, and model-authored ones arrive as
@@ -974,7 +1045,7 @@ record) and must keep doing so.
 | `str(None)`, `str(True)`, `str(1.0)`, `round(2.5)` | `""`, `"true"`, `"1"`, `3.0` | L4 |
 | Bare `except:` | Accepted | Parse error (R15) |
 | `except Exception: pass` around effects | Swallows silently | Admission error (R14); swallow counter (R13) |
-| `try: ... finally: ...` | "finally is not supported yet" | Prescriptive error naming budget scopes and host cleanup (R18) |
+| `try: ... finally: ...` | "finally is not supported yet" | Prescriptive error naming host cleanup and the catch-clean-reraise form (R18; done in M1) |
 | `def f(x, acc=[])` | Rejected, generic message | Prescriptive message (R11) |
 | Argument mutated by a child attempt | — (no such spawn yet) | Copy at boundary, like `multiprocessing` (R10) |
 | `open("x")`, `os.path.join`, `Path("x")` | Ambient file access | L7: absent, error shows the capability form |
@@ -1096,7 +1167,7 @@ Findings that change the plan:
   `str([1.0])` contains `1.0` and renders `None` as `null`. `format()` and
   `print` share the scalar rules.
 
-**D-2. Does L4 cover `str()` of dicts and records? Open.** Containers render
+**D-2. Does L4 cover `str()` of dicts and records? Decided (2026-11-07): yes, with the proposed split.** `str()` and `repr()` follow Python inside programs; model-facing output stays JSON. Containers render
 as JSON today by design: structured text was judged better for LLMs than plain
 strings. Today's scalars follow neither convention: `str(None)` is `""` and
 `str(True)` is `"true"`.
@@ -1230,10 +1301,9 @@ boundaries), so L2 and R9 are one piece of M4 work, not two.
 - Capability checks are a rights test plus path canonicalization, on
   I/O-bound operations only. The boundary walk (R24) costs time proportional
   to the argument graph, at boundaries only.
-- Budget metering is a counter update on effect calls; budget scopes add a
-  scope-stack check on those calls only.
-- Per-command admission stays a linear pass with no solver (L12). 0-CFA runs
-  only on delegated bodies.
+- Budget metering is a counter check on model and tool calls only (D-3).
+- Per-command admission stays a linear pass with no solver (L12). The 0-CFA
+  pass is dropped (D-3).
 - `output=` schemas compile once per record type, and validation runs in
   Rust.
 
@@ -1247,7 +1317,7 @@ boundaries), so L2 and R9 are one piece of M4 work, not two.
 | H-4 | Dropped (R9). Capabilities are allowed in containers. | — |
 | H-5 | `/` beats `//` and `.sub()` for narrowing on the target models | Authorship eval (`host/bench/` harness) |
 | H-6 | Accepting `BaseModel` as an alias raises the first-pass rate without importing other pydantic habits | Authorship eval |
-| H-7 | Target models write level-A bodies under capability signatures with about 1 repair or fewer, including budget scopes and copy-at-boundary | Authorship eval on 6-10 realistic tasks |
+| H-7 | Target models write level-A bodies under capability signatures with about 1 repair or fewer, including budget checks and copy-at-boundary | Authorship eval on 6-10 realistic tasks |
 | H-8 | Optional outcome prediction, host-diffed, reduces derailing beyond the effect tiers alone | Ablation arm B versus arm A (11.1) |
 | H-9 | Tier-2 protection and tier-3 denial do not lower task success, and tier 2 measurably cuts test tampering | Ablation: attempted writes to protected paths and blocked egress per task, against V14 tampering rates |
 | H-12 | Deferred. Whether models can predict a command's effects. The pilot (11.2) is weak evidence (recall 89-100% on short tasks). Under D-1 this matters only for tier-3 `Exec` declarations. | Revisit if tier-3 `UndeclaredEffect` rates are high |
@@ -1464,8 +1534,6 @@ Not yet tested:
   policy-versus-no-policy only for IFC.
 - The compatibility cost of L1-L4, L6a, and L18 is unmeasured.
 - Whether target models handle copy-at-boundary without confusion (H-7).
-- Whether dynamic-extent budget scopes surprise models that expect budgets
-  to be values (H-7).
 - Model-predicted expectations can be wrong in either direction. A too-weak
   expectation (`exit` in `[0, 1]`) gives false comfort. The verifier
   remains the authority on task success.
@@ -1529,7 +1597,7 @@ evals updated.
   grants (D-1, R25a).
 - Tier-3 `effects=` vocabulary for `Exec`, with the network off unless
   declared (already S2).
-- L17 budget scopes and `model.limit`.
+- L17 budgets checked at metered calls, and `model.limit` (D-3).
 - L9 modules with frozen module values.
 - Ablation harness set up (R27).
 
@@ -1562,8 +1630,7 @@ Exit: measured drop in false "done" claims, test tampering, and stuck loops
   (R25b, R25c); per-call eBPF egress enforcement for `Exec` on Linux.
 - `model.delegate` with explicit grants (level B); 0-CFA admission check for
   delegated bodies (R23).
-- Information-flow control (taint and declassify) reconsidered, with
-  measurements.
+- Information-flow control for provenance and secrecy (D-3): labels at sources, checks at sinks, designed with the shared-value rewrite and measured.
 
 Exit: adversarial delegation and injection tests, plus Gateway mapping for
 `Exec.within`, grants, protected paths, and egress control.
@@ -1579,11 +1646,11 @@ in the last column and for the compatibility measurement.
 | 1 | Bare `except:` is a parse error; the correction engine, AST hints, CLI help, and `STONE_LANGUAGE.md` stop suggesting it (9.5) | New | **Yes**: accepted and recommended today | Joe-E §4.3; PEP 352; Ren et al. 2023 | P1 |
 | 2 | `pass`-only handler for `Exception`/`ToolError` is an admission error | New | **Yes**: legal today | Ren et al. 2023; Seeker 2024 | P1 |
 | 3 | Swallowed-`ToolError` counter in trace and `last_result()` | New | Additive field | — | P1, M2 (needs L6 typed `ToolError`; moved from M1) |
-| 4 | `except BaseException`, `except PolicyViolation`, `except BudgetExhausted` rejected | New | No (names do not exist) | Trio cancellation docs | P1 |
+| 4 | `except BaseException`, `except PolicyViolation`, `except ContractViolation` rejected | New | No (`BaseException` already rejected, 9.6) | PEP 352 | P1 |
 | 5 | `ExpectationFailed` fields `.expected/.observed/.diff/.result` | Was "carries the full observation" | No | — | P1, M3 (needs item 7 `expect=`; moved from M1) |
 | 6 | Three effect tiers per syscall: observed effects on every result as `r.effects` (tier 1); protected paths in the grant, read-only for `Exec` (tier 2); `Exec` declares tier-3 effects (`network`, `irreversible`, `background`), denied otherwise with `UndeclaredEffect` | Was mandatory `Run.writes` with discard (draft v3, D-1 provisional); replaced after the pilot | No (new API) | D-1; pilot 11.2 | P1 (tiers 1-2, tier-3 vocabulary) / P3 (eBPF enforcement) |
 | 7 | `expect=` optional on every syscall; exit status in it; RPC/MCP `result` and `status` checks; `Tests` row removed | Was part of every action, and for `Exec` only | No | PreAct | P1 |
-| 8 | `with budget(...) as b:` with Trio semantics; `grace=`; `model.reserve` removed | Was `limit` + `reserve`, exhaustion propagating | No (new API) | Trio "Cancellation semantics"; bpo-32528 thread | P1 |
+| 8 | Budget checked at model and tool calls; exhaustion ends the attempt with a host-built `Unfinished`; `model.reserve` removed | Was a Trio-style `with budget(...)` scope with `grace=` (dropped by D-3) | No (new API) | — | P1 |
 | 9 | `finally` stays absent; error becomes prescriptive | Was unaddressed | Message only | Joe-E §4.3 | P1, **done in M1** (message plus `finally` repair envelope) |
 | 10 | Mutable default argument error becomes prescriptive | Was unaddressed | Message only | — | P1, **done in M1** (message plus `mutable_default` repair envelope) |
 | 11 | L9 module values deep-frozen at import | New | No (no modules yet) | Joe-E §4.2 | P1 |
@@ -1594,13 +1661,13 @@ in the last column and for the compatibility measurement.
 | 16 | Daemon obligation registry and unforgeable handles; host stops daemons on attempt exit | New | **Yes**: `stop_daemon(pid)` behavior in controlled profile | Weimer & Necula §5-7 | P2 |
 | 17 | Helpers in an isolated evaluator state | New | **Yes**: helpers share scope and function table today | `docs/STONE_HELPERS.md`; Taly et al. §VI.A | P2 |
 | 18 | Builtin table frozen; helper and agent function tables separate; one Python namespace with local shadowing; calling a non-callable that shadows a builtin is a prescriptive error; rename MCP examples (9.5) | New | **Yes**: separate callable namespace today; agent `def` of a builtin name persists in the session | Taly et al. §II.B | P1 (namespace, with L1) / P2 (freeze, helper tables) |
-| 19 | Exceptions carry data only (walk at `raise`) | New, with L6 | No (exceptions are plain dicts today) | Joe-E §4.3, Fig. 6 | P2 |
-| 20 | Session ceiling; capabilities persisted as host-table references; checks at injection, restore, child start | Was "capabilities not session-persistable" | **Yes**: `StoneSession` persistence | Miller 2006 (vats); Agoric docs | P3 |
+| 19 | Exceptions carry data only (walk at `raise`) | New, with L6 | No (exceptions are plain dicts today) | Joe-E §4.3, Fig. 6 | **Dropped by D-3** |
+| 20 | Session ceiling; capabilities persisted as host-table references; checks at injection, restore, child start | Was "capabilities not session-persistable" | **Yes**: `StoneSession` persistence | Miller 2006 (vats); Agoric docs | **Narrowed by D-3:** session ceiling only; no persisted capabilities | P3 |
 | 21 | Helper directories inside the agent's write grant skipped in controlled profile | New | **Yes**: documented search path (controlled profile only) | `docs/STONE_HELPERS.md` | P3 |
 | 22 | `PolicyViolation`/`ContractViolation` fatal, no agent code afterward | Was "outside `Exception`, catchable explicitly" | No (no violations exist yet) | Joe-E §4.3 | P3 |
-| 23 | 0-CFA admission check for delegated bodies | New | No | Taly et al. §V | P3 |
+| 23 | 0-CFA admission check for delegated bodies | New | No | Taly et al. §V | **Dropped by D-3** |
 | 24 | H-4 test dropped; capabilities allowed in containers | Removed | No | — | — |
-| 25 | L4 extended to `str()` of dicts and records (D-2); 11 call sites switched to `json_dumps` | New | **Yes**: `str(dict)` is JSON today | — | P1 |
+| 25 | L4 extended to `str()` of dicts and records (D-2); 11 call sites switched to `json_dumps` | D-2 decided | **Yes**: `str(dict)` is JSON today | — | P1 |
 | 26 | Write-prediction pilot harness (11.2) | New | No | — | P1 (done) |
 | 27 | Syscall effect manifest: Gateway-owned effect signatures for host tools, RPC, and MCP tools, seeded from MCP annotations (R25b, R25c) | New | No | MCP spec, tool annotations | P2 (manifest) / P3 (enforcement) |
 
