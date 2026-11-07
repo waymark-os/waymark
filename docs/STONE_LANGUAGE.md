@@ -374,6 +374,8 @@ Builtin error types, with their parents:
 | `ToolError` | `Exception` | failures from outside the program: commands (`must_run`), Gateway and model calls, files |
 | `OSError` | `ToolError` | file and I/O failures |
 | `FileNotFoundError`, `FileExistsError`, `PermissionError`, `IsADirectoryError`, `NotADirectoryError`, `TimeoutError` | `OSError` | the matching I/O failure; `TimeoutError` also for Gateway and model timeouts |
+| `ExpectationFailed` | `ToolError` | an `expect=` check that was not met, `must_run`, or an `edit` whose old text did not match as required (host only) |
+| `UndeclaredEffect` | `ToolError` | a call that attempted an effect it did not declare (host only; nothing raises it yet) |
 | `ValueError` | `Exception` | bad values, such as `int("x")` |
 | `TypeError` | `Exception` | wrong operand or argument types, such as `1 + "a"` |
 | `LookupError` | `Exception` | |
@@ -390,6 +392,39 @@ that comes from outside the program so one handler covers recoverable effect
 failures. Each builtin type is also a constructor that takes one optional
 string message: `raise ValueError("bad row")` and `raise ValueError` both
 work.
+
+`ExpectationFailed` and `UndeclaredEffect` are host-only. A program can catch
+them, test them with `isinstance`, and re-raise one it caught (`raise` or
+`raise error`, unchanged), but it cannot construct, raise, or subclass them,
+and a modified copy cannot be raised. `isinstance(x, ExpectationFailed)` is
+true only for an error the host raised, never for a dict that merely has
+`type="ExpectationFailed"`. A parent deciding what to do after a failure can
+therefore trust that the failure came from a checked call.
+
+Error types are values. A bare type name evaluates to the type's name, so
+types can be stored in lists and records and passed to functions, and the
+`type` field of a caught error compares equal to it:
+
+```python
+retry_on = [TimeoutError, ExpectationFailed]
+try:
+    must_run(["make", "test"])
+except Exception as error:
+    if not isinstance(error, retry_on):
+        raise
+    if error.type == ExpectationFailed:
+        emit({"diff": error.diff})
+```
+
+`isinstance(value, T)` accepts `str`, `int`, `float`, `bool`, `list`,
+`dict`, an error type, or a tuple or list of these. As in Python,
+`isinstance(True, int)` is true. Stone has no separate tuple or set type, so
+`isinstance(x, tuple)` is an error that suggests `list`. An unknown type name
+is an error, so a misspelled type never silently fails to match. A record is
+an error only if its `type` names a known error type, so
+`isinstance({"type": "user"}, Exception)` is false. A deliberate deviation
+from Python: `ValueError == "ValueError"` is true, because a type's value is
+its name.
 
 Models may define their own error types as field-only classes deriving from an
 error type:
@@ -422,6 +457,18 @@ Rules checked before anything runs:
 - `except error:` (a lowercase name) does not bind `error` in Python or
   Stone. Stone rejects it with a correction to `except Exception as error:`.
 
+Each tool's `help()` entry lists what it raises. `run()` does not raise for
+a failed, timed-out, or missing command (unlike Python's `subprocess`): it
+returns a result with `ok=False`. Before a program runs, Stone works out
+which tool errors each `try` block can raise, from those declarations and the
+bodies of the functions it calls, and reports a handler that can never run in
+`diagnostics.warnings`. Examples are `except OSError:` around pure
+computation, `except ExpectationFailed:` around a call without `expect=`,
+and `except FileNotFoundError:` around `run()`, which does not catch a
+missing command. These are warnings only; no handler is ever required. When
+a block calls something the analysis cannot see through (a function passed in
+a variable, an unknown method, `await`), no warning is given.
+
 At run time, a handler that catches a `ToolError` (or a subclass) without
 binding it and without re-raising it is counted. The count and the last such
 error appear under `diagnostics.errors` in the command response, and so in
@@ -446,6 +493,64 @@ exposes its `detail` field. Bare `raise` is valid only inside an active
 error keeps its type and fields. `raise ... from ...` remains unsupported.
 Prefer `fail(...)` when the harness already knows the stable policy/evidence
 failure code.
+
+### Call Contracts
+
+Calls that cross into the outside world (commands, files, tools) can carry a
+small contract: an optional expectation checked after the call, and, for
+commands, the effects that cannot be undone. Everything else about a call's
+effects is observed, not declared.
+
+**Expectations (`expect=`).** `run`, `run_complete`, and `must_run` accept
+`expect=Expect(...)` (or a dict with the same keys) with these checks:
+`exit` (an int or a list of ints), `stdout_contains`, `stdout_matches` (a
+regular expression), `stderr_empty`, and `max_seconds` (which also sets the
+timeout when `timeout_ms` is not given). `edit` accepts
+`expect=Expect(occurrences=N)`. The keys are a closed set; an unknown key is an
+error that lists them. A met expectation returns the normal result and adds
+nothing to it. An unmet one raises `ExpectationFailed` with:
+
+- `message`: the facts needed for a fix first, for example
+  `exit: expected 0, got 1` and a tail of stdout or stderr;
+- `expected`, `observed`: records with the checked keys;
+- `diff`: the unmet checks, each `{check, expected, observed}`;
+- `result`: the call's full result, so the command never has to be re-run to
+  see its output.
+
+```python
+try:
+    run(["pytest", "tests/test_parser.py", "-x", "-q"],
+        expect=Expect(exit=0, stdout_contains="passed"))
+except ExpectationFailed as error:
+    emit({"diff": error.diff, "stdout": error.result.stdout})
+```
+
+`edit(path, old, new)` requires the old text to match exactly once.
+`all=True` replaces every match (at least one), and
+`expect=Expect(occurrences=N)` requires exactly N matches and replaces them
+all. Otherwise the file is unchanged and `ExpectationFailed` reports the
+match count and the matching lines, or, when the old text is not found, the
+lines where its first line appears.
+
+**Observed effects.** Every finished `run`, `run_complete`, and `must_run`
+result has `result.effects.observed`: the files under the project root (the
+nearest directory with `.git`, else `cwd`) that were created or changed while
+the command ran, collapsed by directory (`"build/ (14 files)"`), with
+`changed_count`. Directories that lost entries without gaining any are listed
+under `entries_removed_in`. Large tool folders (`.git`, `node_modules`,
+`.venv`, caches, and Cargo's `target/`) are not walked and are listed under
+`not_scanned`. The walk is bounded; a cut-short walk has `complete: False`.
+Changes made by other processes at the same time are included, and `/` and
+the home directory are never scanned. Commands that run through the Gateway,
+or are still running in the background, report why nothing was observed.
+
+**Declared effects (`effects=`).** A command declares only what cannot be
+undone: `effects=Effects(network=["pypi.org"], irreversible=["push"],
+background=True)`. `network` is `False` or a list of host names;
+`irreversible` kinds are `push`, `publish`, `send`, `deploy`, and
+`external_write`. The declaration is validated and recorded in
+`result.effects.declared`. In local mode it is not enforced, and the result
+says so with `result.effects.enforced == False`.
 
 ## Core Builtins
 
@@ -525,10 +630,12 @@ failure code.
   `items.sort(key=..., reverse=...)` are also supported.
 - `list(value)` and `tuple(value)`: materialize a list view. In Stone,
   `tuple()` is an agent-compatibility alias for `list()`.
-- `run(argv, cwd=None, stdin=None, timeout_ms=None, env=None, background=False,
-  stdout="capture", stderr="capture", max_stdout_bytes=1048576,
-  max_stderr_bytes=1048576, hooks={})`: Linux command execution with structured stdout,
-  stderr, status, truncation flags, and helper observations. Agent loops should
+- `run(argv, cwd=None, stdin=None, timeout_ms=None, env=None, expect=None,
+  effects=None, background=False, stdout="capture", stderr="capture",
+  max_stdout_bytes=1048576, max_stderr_bytes=1048576, hooks={})`: Linux command
+  execution with structured stdout, stderr, status, truncation flags, observed
+  effects, and helper observations. See "Call Contracts" below for `expect=`,
+  `effects=`, and `result.effects`. Agent loops should
   normally set much smaller output bounds (for example 16 KiB/8 KiB) so one
   noisy command cannot dominate every later model call. Set `stdout` or
   `stderr` to `"suppress"`/`"discard"` when content is not evidence, or set
@@ -537,11 +644,13 @@ failure code.
   A call-local pre hook may veto or replace `argv`; a post hook observes the
   structured success/failure outcome.
 - `must_run(argv, cwd=None, stdin=None, timeout_ms=None, env=None,
-  stdout="capture", stderr="capture", max_stdout_bytes=1048576,
-  max_stderr_bytes=1048576)`: checked Linux command execution for
-  `set -e`-style scripts. It returns the same structured record as `run()` on
-  success, and raises a Stone error with the run record attached when the
-  external process exits nonzero or times out.
+  expect=None, effects=None, stdout="capture", stderr="capture",
+  max_stdout_bytes=1048576, max_stderr_bytes=1048576)`: checked Linux command
+  execution for `set -e`-style scripts. `must_run(argv)` is
+  `run(argv, expect=Expect(exit=0))`: it returns the run record on success and
+  raises `ExpectationFailed`, with the run record in `error.result`, when the
+  process exits nonzero, times out, or cannot start. Extra checks go in
+  `expect=`.
 - `model_call(messages, model_class="agent", hooks={}, ...)`: one explicit Gateway-backed
   model effect. The Stone program supplies the ordered structured messages and
   owns conversation state, retry, tool dispatch, and stopping policy. The

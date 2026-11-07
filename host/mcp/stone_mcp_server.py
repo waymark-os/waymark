@@ -36,7 +36,7 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
     },
     "edit": {
         "name": "edit",
-        "signature": "edit(path: str, old: str, new: str, all: bool = False) -> record",
+        "signature": "edit(path: str, old: str, new: str, all: bool = False, expect: Expect? = None) -> record",
         "effects": ["read_file", "write_file"],
         "example": 'edit("fix.py", "pass\\n", "return 1\\n")',
     },
@@ -213,7 +213,7 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
     },
     "must_run": {
         "name": "must_run",
-        "signature": 'must_run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576) -> record',
+        "signature": 'must_run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, expect: Expect? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576) -> record',
         "effects": ["process", "unknown"],
         "example": 'result = must_run(["printf", "ok"], timeout_ms=5000)',
         "call_form": "stone_call",

@@ -67,8 +67,8 @@ use crate::stone_builtins::{
 };
 use crate::stone_correction;
 use crate::stone_errors::{
-    builtin_error_record, classify_error, error_type_matches, io_error_type, is_builtin_error_type,
-    is_tool_error_type,
+    builtin_error_record, classify_error, error_type_matches, host_only_error_message,
+    io_error_type, is_builtin_error_type, is_host_only_error_type, is_tool_error_type,
 };
 use crate::stone_file_ops::{
     cat_text, create_dir_all, diff_record_for_paths, edit_text_file, file_nonempty_probe,
@@ -97,6 +97,8 @@ use crate::StoneGuest;
 
 #[path = "stone_context.rs"]
 mod stone_context;
+#[path = "stone_expect.rs"]
+mod stone_expect;
 #[path = "stone_functions.rs"]
 mod stone_functions;
 #[path = "stone_json_view.rs"]
@@ -151,6 +153,8 @@ pub struct EvalState {
     caught_errors: Vec<Value>,
     swallowed_tool_errors: u64,
     last_swallowed_tool_error: Option<Value>,
+    host_errors: Vec<Value>,
+    handler_warnings: Vec<String>,
     async_functions_entered: u64,
     async_await_count: u64,
     async_run_await_count: u64,
@@ -650,6 +654,12 @@ fn eval_program_with_source_options(
             caught_errors: Vec::new(),
             swallowed_tool_errors: 0,
             last_swallowed_tool_error: None,
+            host_errors: options
+                .session
+                .as_ref()
+                .map(|session| session.host_errors.clone())
+                .unwrap_or_default(),
+            handler_warnings: Vec::new(),
             async_functions_entered: 0,
             async_await_count: 0,
             async_run_await_count: 0,
@@ -677,6 +687,10 @@ fn eval_program_with_source_options(
             stone_helper_registry,
         },
     };
+    evaluator.state.handler_warnings = crate::stone_raises::unreachable_handler_warnings(
+        &program.statements,
+        &evaluator.state.functions,
+    );
     let pipeline = match entrypoint {
         Some(entrypoint) if !entrypoint.is_empty() => {
             evaluator.eval_entrypoint_program(program, input, entrypoint)
@@ -702,6 +716,7 @@ fn eval_program_with_source_options(
         session.update_functions(&evaluator.state.functions);
         session.update_context(&evaluator.state.context);
         session.update_transition_id(evaluator.state.next_transition_id);
+        session.update_host_errors(&evaluator.state.host_errors);
     }
     let pipeline = match (pipeline, cleanup) {
         (Ok(pipeline), Ok(())) => pipeline,
@@ -720,6 +735,9 @@ fn eval_program_with_source_options(
     }
     if !evaluator.state.transition_events.is_empty() {
         diagnostics["transitions"] = JsonValue::Array(evaluator.state.transition_events.clone());
+    }
+    if !evaluator.state.handler_warnings.is_empty() {
+        diagnostics["warnings"] = json!(evaluator.state.handler_warnings);
     }
     if evaluator.state.swallowed_tool_errors > 0 {
         let last = evaluator
@@ -1093,6 +1111,9 @@ impl Evaluator<'_> {
                                 function.name, function.name, function.name
                             ),
                         ));
+                    }
+                    if is_host_only_error_type(base) {
+                        return Err(stone_error("class", host_only_error_message(base)));
                     }
                     if !self.is_error_type_name(base) {
                         return Err(stone_error(
@@ -1595,6 +1616,9 @@ impl Evaluator<'_> {
                 }) else {
                     return Err(err);
                 };
+                if is_host_only_error_type(&error_type) {
+                    self.remember_host_error(&error_record);
+                }
                 self.state.push_scope();
                 if let Some(name) = &handler.name {
                     self.state
@@ -1618,6 +1642,23 @@ impl Evaluator<'_> {
         }
     }
 
+    /// Record a host-only error the program has received, so re-raising it
+    /// unchanged is allowed. Bounded: old entries fall off.
+    fn remember_host_error(&mut self, record: &Value) {
+        const MAX_HOST_ERRORS: usize = 64;
+        if self.state.host_errors.iter().any(|known| known == record) {
+            return;
+        }
+        if self.state.host_errors.len() >= MAX_HOST_ERRORS {
+            self.state.host_errors.remove(0);
+        }
+        self.state.host_errors.push(record.clone());
+    }
+
+    fn is_genuine_host_error(&self, record: &Value) -> bool {
+        self.state.host_errors.iter().any(|known| known == record)
+    }
+
     fn error_class_base(&self, name: &str) -> Option<String> {
         self.state
             .functions
@@ -1635,6 +1676,9 @@ impl Evaluator<'_> {
 
     fn eval_builtin_error_constructor(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let name = call.name.as_str();
+        if is_host_only_error_type(name) {
+            return Err(stone_error("function call", host_only_error_message(name)));
+        }
         let mut message = None;
         for (key, expression) in &call.named {
             if key != "message" || message.is_some() {
@@ -1708,6 +1752,15 @@ impl Evaluator<'_> {
                 stone_error("raise", "bare raise is only valid inside an except handler")
             })?,
         };
+        let raised_type = error_record_type(&value);
+        if is_host_only_error_type(&raised_type) {
+            // Only a host error this session actually received may be raised
+            // again, and only unchanged.
+            if !self.is_genuine_host_error(&value) {
+                return Err(stone_error("raise", host_only_error_message(&raised_type)));
+            }
+            return Err(host_error(value));
+        }
         let (message, code, detail) = raised_error_parts(value)?;
         Err(task_failure_error(message, Some(code), detail))
     }
@@ -2090,6 +2143,11 @@ impl Evaluator<'_> {
                 Expr::Name(name) => {
                     if let Some(value) = self.state.get_local(name) {
                         Ok(value)
+                    } else if self.is_error_type_name(name) {
+                        // An error type is a value: its name. It can be stored
+                        // in lists and records, compared with `error.type`, sent
+                        // to a child attempt, and passed to isinstance().
+                        Ok(RuntimeValue::Nu(Value::string(name.clone(), span)))
                     } else if let Some(function) = self.state.functions.get(name).cloned() {
                         Ok(RuntimeValue::Callable(CallableValue::named(
                             self.state.next_callable_id(),
@@ -2470,6 +2528,9 @@ impl Evaluator<'_> {
             }
             "md5" | "sha1" | "sha256" => self.eval_hash_call(call),
             "type" => self.eval_type_call(call),
+            "isinstance" => self.eval_isinstance_call(call),
+            "Expect" => self.eval_expect_call(call),
+            "Effects" => self.eval_effects_call(call),
             "any" => self.eval_any_all_call(call, true),
             "all" => self.eval_any_all_call(call, false),
             "enumerate" => self.eval_enumerate_call(call),
@@ -3898,20 +3959,34 @@ impl Evaluator<'_> {
             ));
         };
         let mut replace_all = false;
+        let mut expect = None;
         for (name, argument) in &call.named {
             let value = self
                 .eval_expr_value(argument, PipelineData::empty())?
                 .into_nu_value("edit")?;
             match name.as_str() {
                 "all" => replace_all = value_to_bool(&value, "edit all")?,
+                "expect" => {
+                    expect = stone_expect::expect_from_value(
+                        &value,
+                        "edit",
+                        stone_expect::edit_expect_keys(),
+                    )?
+                }
                 other => {
                     return Err(stone_error(
                         "edit",
-                        format!("unsupported keyword `{other}`; expected all"),
+                        format!("unsupported keyword `{other}`; expected all or expect"),
                     ));
                 }
             }
         }
+        let required = expect
+            .as_ref()
+            .and_then(|expect| match expect.get("occurrences") {
+                Some(Value::Int { val, .. }) => Some(*val),
+                _ => None,
+            });
         let path = self
             .eval_expr_value(path, PipelineData::empty())?
             .into_nu_value("edit")?;
@@ -3925,12 +4000,17 @@ impl Evaluator<'_> {
         let old = value_to_string(&old, "edit old")?;
         let new = value_to_string(&new, "edit new")?;
         let target = self.resolve_script_path(&path)?;
-        Ok(RuntimeValue::Nu(edit_text_file(
-            &target,
-            &old,
-            &new,
-            replace_all,
-        )?))
+        match edit_text_file(&target, &old, &new, replace_all, required)? {
+            Ok(record) => Ok(RuntimeValue::Nu(record)),
+            Err(mismatch) => Err(host_error(stone_expect::edit_expectation_failed(
+                &path,
+                required.unwrap_or(if replace_all { 0 } else { 1 }),
+                mismatch.matched,
+                &mismatch.match_lines,
+                &mismatch.first_line_hits,
+                replace_all,
+            ))),
+        }
     }
 
     fn eval_save_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -6301,6 +6381,7 @@ impl Evaluator<'_> {
             ));
         }
         let (mut positional, named, hooks) = self.eval_call_values_with_transition_hooks(call)?;
+        let (named, expect, declared) = take_run_contract(named, context)?;
         let transition_id = self.state.next_transition_id();
         self.state.record_transition_event(json!({
             "id": transition_id,
@@ -6401,27 +6482,49 @@ impl Evaluator<'_> {
             post_result?;
         }
 
-        result.map(|record| RuntimeValue::Nu(Value::record(record, Span::unknown())))
-    }
-
-    fn eval_must_run_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        let record = self.eval_run_record(call, "must_run")?;
-        if run_record_ok(&record) {
-            Ok(RuntimeValue::Nu(Value::record(record, Span::unknown())))
-        } else {
-            Err(must_run_failure_error(record))
+        let mut record = result?;
+        attach_declared_effects(&mut record, declared);
+        if let Some(expect) = expect.as_ref() {
+            if let Some(failure) =
+                stone_expect::check_process_expectation(context, expect, &record, None)
+            {
+                return Err(host_error(failure));
+            }
         }
+        Ok(RuntimeValue::Nu(Value::record(record, Span::unknown())))
     }
 
-    fn eval_run_record(&mut self, call: &Call, context: &str) -> Result<Record, ShellError> {
+    /// `must_run(argv)` is `run(argv, expect=Expect(exit=0))`: a nonzero exit,
+    /// a timeout, or a command that could not start raises ExpectationFailed
+    /// with the full result attached. Extra checks can be passed with expect=.
+    fn eval_must_run_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         if self.state.active_transition_hook {
             return Err(transition_hook_error(
-                context,
-                format!("{context}() cannot be called from a transition hook"),
+                "must_run",
+                "must_run() cannot be called from a transition hook",
             ));
         }
         let (positional, named) = self.eval_call_values(call)?;
-        self.eval_run_values(&positional, &named, context, false)
+        let (named, expect, declared) = take_run_contract(named, "must_run")?;
+        let mut checks = Record::new();
+        let user_checks = expect.unwrap_or_default();
+        if !user_checks.contains("exit") {
+            checks.push("exit", Value::int(0, Span::unknown()));
+        }
+        for (key, value) in user_checks {
+            checks.push(key, value);
+        }
+        let mut record = self.eval_run_values(&positional, &named, "must_run", false)?;
+        attach_declared_effects(&mut record, declared);
+        match stone_expect::check_process_expectation(
+            "must_run",
+            &checks,
+            &record,
+            Some("next: use run(...) and check result.ok when a nonzero exit is expected"),
+        ) {
+            Some(failure) => Err(host_error(failure)),
+            None => Ok(RuntimeValue::Nu(Value::record(record, Span::unknown()))),
+        }
     }
 
     fn eval_run_values(
@@ -6432,11 +6535,28 @@ impl Evaluator<'_> {
         complete: bool,
     ) -> Result<Record, ShellError> {
         let default_cwd = self.current_cwd_path(context)?;
+        let clock = crate::stone_effects::effect_clock();
         let invocation =
             run_call_values(context, positional, named, default_cwd, complete, |path| {
                 self.resolve_script_path(path)
             })?;
         let mut record = invocation.record;
+        // Tier-1 effects: what changed in the workspace while the command ran.
+        let effects = if crate::gateway_runtime::enabled() {
+            crate::stone_effects::unobserved_effects(
+                "the command ran through the Gateway; use env_diff() for its workspace changes",
+            )
+        } else if matches!(
+            record.get("still_running"),
+            Some(Value::Bool { val: true, .. })
+        ) {
+            crate::stone_effects::unobserved_effects(
+                "the command is still running; its effects are observed when it finishes",
+            )
+        } else {
+            crate::stone_effects::observed_effects(clock, &invocation.cwd)
+        };
+        record.insert("effects", effects);
         #[cfg(not(target_os = "hermit"))]
         self.attach_run_helper_observations(
             &mut record,
@@ -10351,6 +10471,138 @@ impl Evaluator<'_> {
         hash_builtin(name, &text).map(RuntimeValue::Nu)
     }
 
+    /// `Expect(exit=0, stdout_contains="passed")`: a checked record of
+    /// expectations for a call's `expect=` argument.
+    fn eval_expect_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.positional.is_empty() {
+            return Err(stone_error(
+                "Expect",
+                "Expect() takes keyword arguments only, for example Expect(exit=0, stdout_contains=\"passed\")",
+            ));
+        }
+        if call.named.is_empty() {
+            return Err(stone_error(
+                "Expect",
+                format!(
+                    "Expect() needs at least one check: {}",
+                    crate::stone_errors::EXPECT_KEYS.join(", ")
+                ),
+            ));
+        }
+        let mut record = Record::with_capacity(call.named.len());
+        for (key, expression) in &call.named {
+            let value = self
+                .eval_expr_value(expression, PipelineData::empty())?
+                .into_nu_value("Expect")?;
+            stone_expect::validate_expect_field(key, &value)?;
+            record.push(key.clone(), value);
+        }
+        Ok(RuntimeValue::Nu(Value::record(record, Span::unknown())))
+    }
+
+    /// `Effects(network=[...], irreversible=[...], background=False)`: the
+    /// tier-3 effects a command may have, for run()'s `effects=` argument.
+    fn eval_effects_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if !call.positional.is_empty() {
+            return Err(stone_error(
+                "Effects",
+                "Effects() takes keyword arguments only, for example Effects(network=[\"pypi.org\"])",
+            ));
+        }
+        let mut record = Record::with_capacity(call.named.len());
+        for (key, expression) in &call.named {
+            let value = self
+                .eval_expr_value(expression, PipelineData::empty())?
+                .into_nu_value("Effects")?;
+            stone_expect::validate_effect_field(key, &value)?;
+            record.push(key.clone(), value);
+        }
+        Ok(RuntimeValue::Nu(Value::record(record, Span::unknown())))
+    }
+
+    /// `isinstance(value, T)` where `T` is str, int, float, bool, list, dict,
+    /// an error type, or a tuple/list of these. Error types match caught
+    /// error records through the type chain; a host-only type matches only a
+    /// genuine host error, never a dict that merely claims the type.
+    fn eval_isinstance_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let [value, spec] = call.positional.as_slice() else {
+            return Err(stone_error(
+                "isinstance",
+                "isinstance() takes a value and a type, for example isinstance(error, ToolError) or isinstance(x, str)",
+            ));
+        };
+        if !call.named.is_empty() {
+            return Err(stone_error(
+                "isinstance",
+                "isinstance() keyword arguments are not supported",
+            ));
+        }
+        let value = self.eval_expr_value(value, PipelineData::empty())?;
+        let specs = match spec {
+            Expr::Tuple(items) | Expr::List(items) => items.iter().collect::<Vec<_>>(),
+            other => vec![other],
+        };
+        for spec in specs {
+            if self.isinstance_one(&value, spec)? {
+                return Ok(RuntimeValue::Nu(Value::bool(true, Span::unknown())));
+            }
+        }
+        Ok(RuntimeValue::Nu(Value::bool(false, Span::unknown())))
+    }
+
+    fn isinstance_one(&mut self, value: &RuntimeValue, spec: &Expr) -> Result<bool, ShellError> {
+        if let Expr::Name(name) = spec {
+            if self.state.get_local(name).is_none() {
+                if let Some(matches) = builtin_isinstance(name, value)? {
+                    return Ok(matches);
+                }
+            }
+        }
+        match self
+            .eval_expr_value(spec, PipelineData::empty())?
+            .into_nu_value("isinstance")?
+        {
+            Value::String { val, .. } => self.isinstance_error_type(value, &val),
+            Value::List { vals, .. } => {
+                for item in vals {
+                    let Value::String { val, .. } = item else {
+                        return Err(isinstance_type_error(&nu_to_json_value(&item).to_string()));
+                    };
+                    if self.isinstance_error_type(value, &val)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            other => Err(isinstance_type_error(&nu_to_json_value(&other).to_string())),
+        }
+    }
+
+    fn isinstance_error_type(
+        &self,
+        value: &RuntimeValue,
+        type_name: &str,
+    ) -> Result<bool, ShellError> {
+        if !self.is_error_type_name(type_name) {
+            return Err(isinstance_type_error(type_name));
+        }
+        let RuntimeValue::Nu(record @ Value::Record { val, .. }) = value else {
+            return Ok(false);
+        };
+        let Some(Value::String { val: actual, .. }) = val.get("type") else {
+            return Ok(false);
+        };
+        // Only records whose type is a known error type are errors; a JSON
+        // object such as {"type": "message"} is not.
+        if !self.is_error_type_name(actual) {
+            return Ok(false);
+        }
+        if is_host_only_error_type(actual) && !self.is_genuine_host_error(record) {
+            return Ok(false);
+        }
+        Ok(self.error_type_matches(actual, type_name))
+    }
+
     fn eval_type_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let [arg] = call.positional.as_slice() else {
             return Err(stone_error("type", "type() requires exactly one argument"));
@@ -11589,6 +11841,9 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "set",
     "unique",
     "type",
+    "isinstance",
+    "Expect",
+    "Effects",
     "where",
     "json_dumps",
     "json_loads",
@@ -11893,6 +12148,67 @@ fn apply_aug_op(op: AugOp, left: &Value, right: &Value) -> Result<Value, ShellEr
     }
 }
 
+/// Wrap a host-built error record (`ExpectationFailed`, ...) so that a handler
+/// sees exactly that record, with no wrapper fields.
+fn host_error(record: Value) -> ShellError {
+    let message = match &record {
+        Value::Record { val, .. } => match val.get("message") {
+            Some(Value::String { val, .. }) => val.clone(),
+            _ => error_record_type(&record),
+        },
+        _ => error_record_type(&record),
+    };
+    ShellError::Generic(
+        GenericError::new(error_record_type(&record), message, Span::unknown())
+            .with_code("stone_host_error")
+            .with_inner(vec![ShellError::Generic(
+                GenericError::new_internal(
+                    "Host error record",
+                    nu_to_json_value(&record).to_string(),
+                )
+                .with_code("stone_host_error_record"),
+            )]),
+    )
+}
+
+/// The Stone error type of an uncaught error, for the top-level error
+/// envelope, plus the check report of a host error (`expected`, `observed`,
+/// `diff`; the full `result` stays in the debug text).
+pub(crate) fn stone_error_type_and_host_fields(
+    err: &ShellError,
+) -> (String, Vec<(String, JsonValue)>) {
+    let record = shell_error_record(err);
+    let error_type = error_record_type(&record);
+    let mut fields = Vec::new();
+    if host_error_record(err).is_some() {
+        if let Value::Record { val, .. } = &record {
+            for key in ["call", "expected", "observed", "diff"] {
+                if let Some(value) = val.get(key) {
+                    fields.push((key.to_string(), nu_to_json_value(value)));
+                }
+            }
+        }
+    }
+    (error_type, fields)
+}
+
+fn host_error_record(err: &ShellError) -> Option<Value> {
+    let ShellError::Generic(generic) = err else {
+        return None;
+    };
+    if generic.code.to_string() != "stone_host_error" {
+        return None;
+    }
+    generic.inner.iter().find_map(|inner| match inner {
+        ShellError::Generic(inner) if inner.code.to_string() == "stone_host_error_record" => {
+            serde_json::from_str::<JsonValue>(&inner.msg.to_string())
+                .ok()
+                .map(|record| json_to_nu_value(record, Span::unknown()))
+        }
+        _ => None,
+    })
+}
+
 fn task_failure_error(message: String, code: Option<String>, detail: Option<Value>) -> ShellError {
     let mut error =
         GenericError::new("Task failure", message, Span::unknown()).with_code("task_failure");
@@ -11952,6 +12268,9 @@ fn raised_error_parts(value: Value) -> Result<(String, String, Option<Value>), S
 
 fn shell_error_record(err: &ShellError) -> Value {
     let span = Span::unknown();
+    if let Some(record) = host_error_record(err) {
+        return record;
+    }
     let mut record = Record::new();
     let mut io_type = None;
     match err {
@@ -16198,53 +16517,73 @@ fn record_u32_field(record: &Record, field: &str, context: &str) -> Result<u32, 
     }
 }
 
-fn run_record_ok(record: &Record) -> bool {
-    matches!(record.get("ok"), Some(Value::Bool { val: true, .. }))
+/// The run-call contract: `expect=` (checked after the call) and `effects=`
+/// (declared tier-3 effects), split off the keywords that reach the process
+/// runner. `max_seconds` also sets the timeout when `timeout_ms` is not given.
+#[allow(clippy::type_complexity)]
+fn take_run_contract(
+    named: Vec<(String, Value)>,
+    context: &str,
+) -> Result<(Vec<(String, Value)>, Option<Record>, Option<Record>), ShellError> {
+    let mut expect = None;
+    let mut declared = None;
+    let mut rest = Vec::with_capacity(named.len());
+    for (name, value) in named {
+        if name == "expect" {
+            expect = stone_expect::expect_from_value(
+                &value,
+                context,
+                stone_expect::process_expect_keys(),
+            )?;
+        } else if name == "effects" {
+            declared = stone_expect::effects_from_value(&value, context)?;
+        } else {
+            rest.push((name, value));
+        }
+    }
+    if let Some(expect) = expect.as_ref() {
+        let background = rest.iter().any(|(name, value)| {
+            name == "background" && matches!(value, Value::Bool { val: true, .. })
+        });
+        if background {
+            return Err(stone_error(
+                context,
+                format!(
+                    "{context}(..., background=True) returns before the command finishes, so expect= cannot be checked; drop background=True, or check the result of run_wait(run_id) yourself"
+                ),
+            ));
+        }
+        if !rest.iter().any(|(name, _)| name == "timeout_ms") {
+            if let Some(timeout_ms) = stone_expect::expect_timeout_ms(expect) {
+                rest.push((
+                    "timeout_ms".to_string(),
+                    Value::int(timeout_ms.max(1), Span::unknown()),
+                ));
+            }
+        }
+    }
+    Ok((rest, expect, declared))
 }
 
-fn must_run_failure_error(record: Record) -> ShellError {
-    let argv = record
-        .get("argv")
-        .map(|value| nu_to_json_value(value).to_string())
-        .unwrap_or_else(|| "[]".to_owned());
-    let kind = record
-        .get("kind")
-        .and_then(|value| match value {
-            Value::String { val, .. } => Some(val.as_str()),
-            _ => None,
-        })
-        .unwrap_or("failed");
-    let exit_code = record
-        .get("exit_code")
-        .map(|value| nu_to_json_value(value).to_string())
-        .unwrap_or_else(|| "null".to_owned());
-    let summary = record
-        .get("explanation")
-        .and_then(|value| match value {
-            Value::Record { val, .. } => val.get("summary"),
-            _ => None,
-        })
-        .and_then(|value| match value {
-            Value::String { val, .. } => Some(val.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| format!("external command failed with kind `{kind}`"));
-    let detail = Value::record(record, Span::unknown());
-    ShellError::Generic(
-        GenericError::new(
-            "Checked run failed",
-            format!("must_run command failed: argv={argv}, exit_code={exit_code}; {summary}"),
-            Span::unknown(),
-        )
-        .with_code("stone_must_run_failed")
-        .with_help(
-            "Use run(...) instead when a nonzero exit is expected and should be handled as data.",
-        )
-        .with_inner(vec![ShellError::Generic(
-            GenericError::new_internal("must_run result", nu_to_json_value(&detail).to_string())
-                .with_code("stone_must_run_detail"),
-        )]),
-    )
+/// Record declared tier-3 effects on the result next to the observed ones.
+/// Local mode cannot block network or external effects, so the result says
+/// the declaration was not enforced.
+fn attach_declared_effects(record: &mut Record, declared: Option<Record>) {
+    let Some(declared) = declared else {
+        return;
+    };
+    let span = Span::unknown();
+    let mut effects = match record.get("effects") {
+        Some(Value::Record { val, .. }) => val.as_ref().clone(),
+        _ => Record::new(),
+    };
+    effects.insert("declared", Value::record(declared, span));
+    effects.insert("enforced", Value::bool(false, span));
+    record.insert("effects", Value::record(effects, span));
+}
+
+fn run_record_ok(record: &Record) -> bool {
+    matches!(record.get("ok"), Some(Value::Bool { val: true, .. }))
 }
 
 fn wait_for_record(
@@ -16298,13 +16637,52 @@ fn wait_for_record(
     Value::record(record, span)
 }
 
+fn isinstance_type_error(spec: &str) -> ShellError {
+    stone_error(
+        "isinstance",
+        format!(
+            "isinstance() type `{spec}` is not a type Stone knows; use str, int, float, bool, list, dict, an error type such as ToolError or ValueError, or a tuple of these"
+        ),
+    )
+}
+
+/// isinstance() against Python's builtin data types, by the value's runtime
+/// shape. `None` means `name` is not one of them.
+fn builtin_isinstance(name: &str, value: &RuntimeValue) -> Result<Option<bool>, ShellError> {
+    let matches = match name {
+        "str" => matches!(value, RuntimeValue::Nu(Value::String { .. })),
+        // As in Python, bool is a subclass of int.
+        "int" => matches!(
+            value,
+            RuntimeValue::Nu(Value::Int { .. } | Value::Bool { .. })
+        ),
+        "float" => matches!(value, RuntimeValue::Nu(Value::Float { .. })),
+        "bool" => matches!(value, RuntimeValue::Nu(Value::Bool { .. })),
+        "list" => matches!(
+            value,
+            RuntimeValue::Nu(Value::List { .. })
+                | RuntimeValue::TextLines(_)
+                | RuntimeValue::JsonlRows(_)
+                | RuntimeValue::JsonArrayView(_)
+        ),
+        "dict" => matches!(
+            value,
+            RuntimeValue::Nu(Value::Record { .. }) | RuntimeValue::JsonObjectView(_)
+        ),
+        "tuple" | "set" => {
+            return Err(stone_error(
+                "isinstance",
+                format!(
+                    "Stone has no separate {name} type: {name} values are lists. Use isinstance(x, list)"
+                ),
+            ));
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(matches))
+}
+
 fn unknown_stone_call_error(name: &str) -> ShellError {
-    if name == "isinstance" {
-        return stone_error(
-            "function call",
-            "isinstance(value, type) is not supported because Stone has no Python class model; use type(value) == \"list\"/\"str\"/\"int\"/\"float\"/\"record\" or direct structural checks",
-        );
-    }
     stone_error(
         "function call",
         format!("unknown Stone function `{name}`; use help() for available Stone functions"),
@@ -16737,14 +17115,232 @@ emit({
     }
 
     #[test]
-    fn isinstance_error_suggests_stone_type_checks() -> Result<(), ShellError> {
+    fn isinstance_checks_data_types_and_error_chains() -> Result<(), ShellError> {
         let (engine_state, mut stack, root) = test_engine("isinstance-call")?;
-        let program = lower_source(r#"emit(isinstance(["x"], list))"#)?;
+        let program = lower_source(
+            r#"class Flaky(TimeoutError):
+    attempt: int = 0
+
+retry_on = [TimeoutError, KeyError]
+try:
+    raise Flaky("slow", attempt=2)
+except Exception as error:
+    caught = error
+emit({
+    "data": [isinstance(["x"], list), isinstance(True, int), isinstance(1.5, (int, float)), isinstance("x", dict)],
+    "chain": [isinstance(caught, ToolError), isinstance(caught, retry_on), isinstance(caught, ValueError)],
+    "types": [caught.type == Flaky, retry_on],
+    "plain_dict": isinstance({"type": "user", "message": "hi"}, Exception),
+})"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value["data"], json_value!([true, true, true, false]));
+        assert_eq!(value["chain"], json_value!([true, true, false]));
+        assert_eq!(
+            value["types"],
+            json_value!([true, ["TimeoutError", "KeyError"]])
+        );
+        assert_eq!(value["plain_dict"], json_value!(false));
+
+        let program = lower_source(r#"emit(isinstance([1], tuple))"#)?;
         let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
-            .expect_err("isinstance should stay unsupported with a targeted hint");
-        let text = format!("{err:?}");
-        assert!(text.contains("type(value)"), "unexpected error: {text}");
-        assert!(text.contains("list"), "unexpected error: {text}");
+            .expect_err("tuple is not a separate type");
+        assert!(format!("{err:?}").contains("isinstance(x, list)"));
+        let program = lower_source(r#"emit(isinstance(1, "TimeoutEror"))"#)?;
+        let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("unknown type names are errors");
+        assert!(format!("{err:?}").contains("not a type Stone knows"));
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn run_results_report_observed_and_declared_effects() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("run-effects")?;
+        let dir = root.display().to_string();
+        let source = format!(
+            r#"r = run(["sh", "-c", "mkdir -p out && printf x > out/a && printf y > top.txt"], cwd="{dir}")
+d = run(["true"], cwd="{dir}", effects=Effects(network=["pypi.org"], irreversible=["push"]))
+emit({{"observed": r.effects.observed.changed, "complete": r.effects.observed.complete, "declared": d.effects.declared, "enforced": d.effects.enforced, "plain": "declared" in r.effects}})"#
+        );
+        let program = lower_source(&source)?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value["observed"], json_value!(["out/", "out/a", "top.txt"]));
+        assert_eq!(value["complete"], json_value!(true));
+        assert_eq!(
+            value["declared"],
+            json_value!({"network": ["pypi.org"], "irreversible": ["push"]})
+        );
+        assert_eq!(value["enforced"], json_value!(false));
+        assert_eq!(value["plain"], json_value!(false));
+
+        for (source, needle) in [
+            (r#"Effects(network=True)"#, "too broad"),
+            (
+                r#"Effects(network=["https://pypi.org"])"#,
+                "no scheme or path",
+            ),
+            (
+                r#"Effects(irreversible=["delete"])"#,
+                "irreversible kinds are",
+            ),
+            (
+                r#"Effects(writes=["a"])"#,
+                "unexpected Effects keyword argument `writes`",
+            ),
+        ] {
+            let program = lower_source(source)?;
+            let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+                .expect_err(source);
+            assert!(format!("{err:?}").contains(needle), "{source}: {err:?}");
+        }
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn host_only_errors_cannot_be_forged() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("host-only-errors")?;
+        let program = lower_source(
+            r#"try:
+    must_run(["sh", "-c", "printf out; exit 3"])
+except ExpectationFailed as error:
+    caught = error
+forged = caught
+forged["message"] = "all good"
+again = None
+try:
+    raise caught
+except ToolError as error:
+    again = error.type
+emit({
+    "genuine": isinstance(caught, ExpectationFailed),
+    "forged": isinstance(forged, ExpectationFailed),
+    "forged_tool_error": isinstance(forged, ToolError),
+    "claimed": isinstance({"type": "ExpectationFailed", "message": "x"}, ToolError),
+    "again": again,
+    "fields": [caught.expected, caught.observed, caught.diff, caught.result.exit_code, caught.result.stdout],
+})"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value["genuine"], json_value!(true));
+        assert_eq!(value["forged"], json_value!(false));
+        assert_eq!(value["forged_tool_error"], json_value!(false));
+        assert_eq!(value["claimed"], json_value!(false));
+        assert_eq!(value["again"], json_value!("ExpectationFailed"));
+        assert_eq!(
+            value["fields"],
+            json_value!([
+                {"exit": 0},
+                {"exit": 3},
+                [{"check": "exit", "expected": 0, "observed": 3}],
+                3,
+                "out"
+            ])
+        );
+
+        for source in [
+            "raise ExpectationFailed(\"fake\")",
+            "raise UndeclaredEffect",
+            "class Mine(ExpectationFailed):\n    pass\n",
+        ] {
+            let program = lower_source(source)?;
+            let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+                .expect_err(source);
+            assert!(
+                format!("{err:?}").contains("cannot construct, raise, or subclass"),
+                "{source}: {err:?}"
+            );
+        }
+        let program = lower_source(
+            r#"try:
+    must_run(["false"])
+except ExpectationFailed as error:
+    fake = error
+    fake["observed"] = {"exit": 0}
+    raise fake"#,
+        )?;
+        let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("a modified host error cannot be raised");
+        assert!(format!("{err:?}").contains("cannot construct, raise, or subclass"));
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn expect_checks_process_results_and_edits() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("expect-checks")?;
+        let file = root.join("conf.txt");
+        std::fs::write(&file, "a = 1\nb = 2\na = 1\n").expect("write fixture");
+        let path = file.display().to_string();
+        let source = format!(
+            r#"met = run(["printf", "3 passed"], expect=Expect(exit=0, stdout_contains="passed", stderr_empty=True))
+try:
+    run(["sh", "-c", "printf 'FAILED x' ; exit 1"], expect={{"exit": [0, 5], "stdout_matches": "[0-9]+ passed"}})
+    unmet = None
+except ExpectationFailed as error:
+    unmet = error
+try:
+    edit("{path}", "a = 1", "a = 9")
+    ambiguous = None
+except ExpectationFailed as error:
+    ambiguous = error
+both = edit("{path}", "a = 1", "a = 9", expect=Expect(occurrences=2))
+emit({{
+    "met_ok": met.ok,
+    "met_keys": "expect" in met,
+    "unmet_diff": [d.check for d in unmet.diff],
+    "unmet_message": unmet.message,
+    "ambiguous": [ambiguous.expected, ambiguous.observed, ambiguous.result.match_lines],
+    "both": both.replacements,
+    "text": read_text("{path}"),
+}})"#
+        );
+        let program = lower_source(&source)?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value["met_ok"], json_value!(true));
+        assert_eq!(value["met_keys"], json_value!(false));
+        assert_eq!(value["unmet_diff"], json_value!(["exit", "stdout_matches"]));
+        let message = value["unmet_message"].as_str().unwrap_or_default();
+        assert!(message.contains("expectation NOT met"), "{message}");
+        assert!(message.contains("exit: expected [0,5], got 1"), "{message}");
+        assert!(message.contains("FAILED x"), "{message}");
+        assert_eq!(
+            value["ambiguous"],
+            json_value!([{"occurrences": 1}, {"occurrences": 2}, [1, 3]])
+        );
+        assert_eq!(value["both"], json_value!(2));
+        assert_eq!(value["text"], json_value!("a = 9\nb = 2\na = 9\n"));
+
+        for (source, needle) in [
+            (
+                r#"Expect(exitcode=0)"#,
+                "unexpected Expect keyword argument `exitcode`",
+            ),
+            (
+                r#"run(["true"], expect=Expect(occurrences=1))"#,
+                "run() does not support the expectation `occurrences`",
+            ),
+            (
+                r#"run(["true"], background=True, expect=Expect(exit=0))"#,
+                "background=True",
+            ),
+            (
+                r#"Expect(stdout_matches="(")"#,
+                "not a valid regular expression",
+            ),
+        ] {
+            let program = lower_source(source)?;
+            let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+                .expect_err(source);
+            assert!(format!("{err:?}").contains(needle), "{source}: {err:?}");
+        }
 
         cleanup_dir(&root);
         Ok(())
@@ -17848,7 +18444,7 @@ emit({
                 "attempt_best_mentions_counters": true,
                 "write_signature": "write_file(path: str, text: str, append: bool = False) -> record",
                 "write_example": "write_file(\"/app/report.txt\", \"ok\\n\")",
-                "edit_signature": "edit(path: str, old: str, new: str, all: bool = False) -> record",
+                "edit_signature": "edit(path: str, old: str, new: str, all: bool = False, expect: Expect? = None) -> record",
                 "missing_found": false
             })
         );
@@ -23255,8 +23851,8 @@ emit({"ok": ok.ok, "stdout": ok.stdout, "kind": ok.kind})
         let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
             .expect_err("must_run should raise on nonzero process exit");
         let text = format!("{error:?}");
-        assert!(text.contains("stone_must_run_failed"), "{text}");
-        assert!(text.contains("exit_code=7"), "{text}");
+        assert!(text.contains("ExpectationFailed"), "{text}");
+        assert!(text.contains("exit: expected 0, got 7"), "{text}");
         assert!(text.contains("nope"), "{text}");
         Ok(())
     }

@@ -31,6 +31,7 @@ mod stone_attempt_scope;
 mod stone_attempt_value;
 mod stone_builtins;
 mod stone_correction;
+mod stone_effects;
 mod stone_errors;
 mod stone_eval;
 mod stone_file_ops;
@@ -38,6 +39,7 @@ mod stone_frontend;
 mod stone_hash;
 mod stone_helpers;
 mod stone_json_schema;
+mod stone_raises;
 mod stone_vm;
 #[cfg(test)]
 mod stone_vm_tests;

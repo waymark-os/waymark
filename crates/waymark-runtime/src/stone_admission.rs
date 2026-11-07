@@ -9,7 +9,8 @@ use crate::stone_ast::{
 };
 use crate::stone_correction::expected_keywords;
 use crate::stone_errors::{
-    builtin_error_type_list, is_builtin_error_type, rejected_error_type_message,
+    builtin_error_type_list, host_only_error_message, is_builtin_error_type,
+    is_host_only_error_type, rejected_error_type_message,
 };
 use crate::stone_eval::stone_builtin_names;
 
@@ -91,6 +92,13 @@ fn validate_statements(statements: &[Stmt], names: &AdmissionNames) -> Result<()
             }
             Stmt::FunctionDef(function) => {
                 if let Some(base) = &function.error_base {
+                    if is_host_only_error_type(base) {
+                        return Err(admission_error(format!(
+                            "`class {}({base})`: {}",
+                            function.name,
+                            host_only_error_message(base)
+                        )));
+                    }
                     validate_error_type_name(
                         base,
                         names,
@@ -114,6 +122,14 @@ fn validate_statements(statements: &[Stmt], names: &AdmissionNames) -> Result<()
                 let mut function_names = names.clone();
                 function_names.async_context = function.is_async;
                 validate_statements(&function.body, &function_names)?;
+            }
+            Stmt::Raise(Some(Expr::Name(name)))
+                if is_host_only_error_type(name) && !names.schema_shadow.contains(name) =>
+            {
+                return Err(admission_error(format!(
+                    "`raise {name}`: {}",
+                    host_only_error_message(name)
+                )));
             }
             Stmt::Raise(Some(value)) | Stmt::Return(Some(value)) | Stmt::Expr(value) => {
                 validate_expr(value, names)?;
@@ -313,6 +329,13 @@ fn validate_expr(expr: &Expr, names: &AdmissionNames) -> Result<(), ShellError> 
                 return Err(admission_error(format!(
                     "unknown Stone function `{}`; use help() for available Stone functions",
                     call.name
+                )));
+            }
+            if is_host_only_error_type(&call.name) && !names.schema_shadow.contains(&call.name) {
+                return Err(admission_error(format!(
+                    "`{}(...)`: {}",
+                    call.name,
+                    host_only_error_message(&call.name)
                 )));
             }
             if !names.schema_shadow.contains(&call.name) {

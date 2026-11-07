@@ -310,21 +310,67 @@ pub(crate) fn remove_path(path: &Path) -> Result<(), ShellError> {
     }
 }
 
+/// Why an edit did not apply: the old text matched a different number of
+/// times than required. The file is unchanged.
+pub(crate) struct EditMismatch {
+    pub(crate) matched: usize,
+    /// 1-based lines where matches start (at most 5).
+    pub(crate) match_lines: Vec<usize>,
+    /// 1-based lines containing the old text's first non-blank line, when the
+    /// whole old text was not found (at most 3).
+    pub(crate) first_line_hits: Vec<usize>,
+}
+
+/// Replace `old` with `new`. `required` is the exact number of matches the
+/// caller expects (`expect=Expect(occurrences=N)`); every match is then
+/// replaced. Without it, exactly one match is required, or at least one when
+/// `replace_all` is set. A mismatch leaves the file unchanged.
 pub(crate) fn edit_text_file(
     path: &Path,
     old: &str,
     new: &str,
     replace_all: bool,
-) -> Result<Value, ShellError> {
+    required: Option<i64>,
+) -> Result<Result<Value, EditMismatch>, ShellError> {
     if old.is_empty() {
         return Err(stone_error("edit", "old text must not be empty"));
     }
     let text = read_text(path, usize::MAX)?;
-    let matches = text.matches(old).count();
-    if matches == 0 {
-        return Err(stone_error("edit", "old text was not found"));
+    let starts = text
+        .match_indices(old)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let matches = starts.len();
+    let ok = match required {
+        Some(required) => matches as i64 == required,
+        None if replace_all => matches >= 1,
+        None => matches == 1,
+    };
+    if !ok {
+        let line_of = |offset: usize| text[..offset].matches('\n').count() + 1;
+        let match_lines = starts.iter().take(5).map(|start| line_of(*start)).collect();
+        let first_line_hits = if matches == 0 {
+            match old.lines().map(str::trim).find(|line| !line.is_empty()) {
+                Some(first) => text
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| line.contains(first))
+                    .take(3)
+                    .map(|(index, _)| index + 1)
+                    .collect(),
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        return Ok(Err(EditMismatch {
+            matched: matches,
+            match_lines,
+            first_line_hits,
+        }));
     }
-    let replaced = if replace_all {
+    let replace_every = replace_all || required.is_some();
+    let replaced = if replace_every {
         text.replace(old, new)
     } else {
         text.replacen(old, new, 1)
@@ -338,13 +384,13 @@ pub(crate) fn edit_text_file(
     record.push(
         "replacements",
         Value::int(
-            if replace_all { matches as i64 } else { 1 },
+            if replace_every { matches as i64 } else { 1 },
             Span::unknown(),
         ),
     );
     record.push("matched", Value::int(matches as i64, Span::unknown()));
     record.push("all", Value::bool(replace_all, Span::unknown()));
-    Ok(Value::record(record, Span::unknown()))
+    Ok(Ok(Value::record(record, Span::unknown())))
 }
 
 pub(crate) fn save_value_file(

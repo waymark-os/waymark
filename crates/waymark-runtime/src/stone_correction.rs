@@ -12,6 +12,8 @@ const MAX_CANDIDATES: usize = 3;
 const MAX_EXPECTED: usize = 16;
 const MAX_SOURCE_BYTES: usize = 1024 * 1024;
 const KEYWORD_SCHEMAS: &[(&str, &[&str])] = &[
+    ("Expect", crate::stone_errors::EXPECT_KEYS),
+    ("Effects", crate::stone_errors::EFFECT_KEYS),
     (
         "model_call",
         &[

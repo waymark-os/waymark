@@ -296,6 +296,10 @@ pub(crate) struct StoneSession {
     pub(super) functions: HashMap<String, FunctionDef>,
     pub(super) context: ContextState,
     pub(super) next_transition_id: u64,
+    /// Host-only errors (such as `ExpectationFailed`) this session has caught.
+    /// Re-raising one, or `isinstance(x, ExpectationFailed)`, checks the value
+    /// against this list, so a program cannot forge one from a plain dict.
+    pub(super) host_errors: Vec<nu_protocol::Value>,
 }
 
 impl StoneSession {
@@ -337,5 +341,9 @@ impl StoneSession {
 
     pub(super) fn update_transition_id(&mut self, next_transition_id: u64) {
         self.next_transition_id = next_transition_id;
+    }
+
+    pub(super) fn update_host_errors(&mut self, host_errors: &[nu_protocol::Value]) {
+        self.host_errors = host_errors.to_vec();
     }
 }

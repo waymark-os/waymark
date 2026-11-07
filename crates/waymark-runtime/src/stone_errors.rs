@@ -24,6 +24,8 @@ pub(crate) const BUILTIN_ERROR_TYPES: &[(&str, Option<&str>)] = &[
     ("IsADirectoryError", Some("OSError")),
     ("NotADirectoryError", Some("OSError")),
     ("TimeoutError", Some("OSError")),
+    ("ExpectationFailed", Some("ToolError")),
+    ("UndeclaredEffect", Some("ToolError")),
     ("ValueError", Some("Exception")),
     ("TypeError", Some("Exception")),
     ("LookupError", Some("Exception")),
@@ -65,6 +67,169 @@ pub(crate) const REJECTED_ERROR_TYPES: &[(&str, &str)] = &[
         "EnvironmentError",
         "`EnvironmentError` is spelled `OSError` in Stone (as in Python 3). Use `except OSError as error:`, or `except ToolError as error:` for any tool, file, command, or model failure",
     ),
+];
+
+/// Error types only the host creates. A program can catch them, test them
+/// with `isinstance`, and re-raise one it caught, but it cannot construct,
+/// raise, or subclass them. A parent deciding what to do after a child's
+/// failure can therefore trust that an `ExpectationFailed` really came from a
+/// checked call and not from the child's own code.
+pub(crate) const HOST_ONLY_ERROR_TYPES: &[&str] = &["ExpectationFailed", "UndeclaredEffect"];
+
+pub(crate) fn is_host_only_error_type(name: &str) -> bool {
+    HOST_ONLY_ERROR_TYPES.contains(&name)
+}
+
+pub(crate) fn host_only_error_message(name: &str) -> String {
+    let made_by = match name {
+        "ExpectationFailed" => "a call whose `expect=` check failed (or must_run/edit)",
+        _ => "the host when a call attempts an effect it did not declare",
+    };
+    format!(
+        "`{name}` is raised only by {made_by}, so programs cannot construct, raise, or subclass it. Re-raise one you caught with `raise`, or define your own type: `class CheckFailed(ToolError):` with fields"
+    )
+}
+
+/// The tool errors each builtin syscall can raise, for `help()` and for the
+/// unreachable-handler warning. `None` from [`builtin_call_raises`] means the
+/// call is not described here and the analysis must assume anything.
+/// Builtins that never raise a tool error are in [`PURE_BUILTINS`].
+const FILE_READ_RAISES: &[&str] = &[
+    "FileNotFoundError",
+    "PermissionError",
+    "IsADirectoryError",
+    "NotADirectoryError",
+];
+const FILE_WRITE_RAISES: &[&str] = &[
+    "FileNotFoundError",
+    "FileExistsError",
+    "PermissionError",
+    "IsADirectoryError",
+    "NotADirectoryError",
+];
+const EDIT_RAISES: &[&str] = &[
+    "FileNotFoundError",
+    "PermissionError",
+    "IsADirectoryError",
+    "NotADirectoryError",
+    "ExpectationFailed",
+];
+const RUN_RAISES: &[&str] = &["FileNotFoundError", "NotADirectoryError"];
+const RUN_EXPECT_RAISES: &[&str] = &[
+    "FileNotFoundError",
+    "NotADirectoryError",
+    "ExpectationFailed",
+];
+const SERVICE_RAISES: &[&str] = &["ToolError"];
+
+pub(crate) const PURE_BUILTINS: &[&str] = &[
+    "abs",
+    "all",
+    "any",
+    "bool",
+    "dict",
+    "echo",
+    "emit",
+    "enumerate",
+    "fail",
+    "first",
+    "float",
+    "format",
+    "from_json",
+    "get",
+    "help",
+    "int",
+    "isinstance",
+    "items",
+    "join",
+    "json_dumps",
+    "json_loads",
+    "keys",
+    "last",
+    "len",
+    "list",
+    "max",
+    "min",
+    "parse_float",
+    "parse_int",
+    "print",
+    "pwd",
+    "range",
+    "repr",
+    "reversed",
+    "round",
+    "set",
+    "slice",
+    "split",
+    "starts_with",
+    "startswith",
+    "str",
+    "sum",
+    "to_json",
+    "to_jsonl",
+    "tuple",
+    "type",
+    "unique",
+    "values",
+    "zip",
+    "Expect",
+    "Effects",
+];
+
+/// Builtins that take callables; a call is only analyzable when no argument
+/// is a bare name (which could be a function doing I/O).
+pub(crate) const HIGHER_ORDER_BUILTINS: &[&str] = &[
+    "map", "filter", "where", "sort", "sorted", "max", "min", "any", "all",
+];
+
+pub(crate) fn builtin_call_raises(name: &str, has_expect: bool) -> Option<&'static [&'static str]> {
+    let raises: &'static [&'static str] = match name {
+        "cat" | "open" | "read_text" | "read_file" | "read_json" | "read_csv" | "read_jsonl"
+        | "stat" | "ls" | "list_dir" | "cd" => FILE_READ_RAISES,
+        "write_text" | "write_file" | "write_json" | "write_csv" | "write_jsonl" | "save"
+        | "mkdir" | "rm" => FILE_WRITE_RAISES,
+        "edit" | "edit_file" => EDIT_RAISES,
+        "run" | "run_complete" if has_expect => RUN_EXPECT_RAISES,
+        "run" | "run_complete" => RUN_RAISES,
+        "must_run" => RUN_EXPECT_RAISES,
+        "model_call" | "model_infer" | "start_daemon" | "stop_daemon" | "daemon_status"
+        | "wait_port" | "wait_for" => SERVICE_RAISES,
+        _ if name.starts_with("attempt")
+            || name.starts_with("env_")
+            || name.starts_with("semantic_frontier")
+            || name.starts_with("context_") =>
+        {
+            SERVICE_RAISES
+        }
+        _ if PURE_BUILTINS.contains(&name) || is_builtin_error_type(name) => &[],
+        _ => return None,
+    };
+    Some(raises)
+}
+
+/// The `expect=` vocabulary, per kind of call. It is closed: an unknown key is
+/// an error that lists these.
+pub(crate) const PROCESS_EXPECT_KEYS: &[&str] = &[
+    "exit",
+    "stdout_contains",
+    "stdout_matches",
+    "stderr_empty",
+    "max_seconds",
+];
+pub(crate) const EDIT_EXPECT_KEYS: &[&str] = &["occurrences"];
+
+/// Declared effects (tier 3): what a command may do that cannot be undone.
+/// Everything else is observed, not declared.
+pub(crate) const EFFECT_KEYS: &[&str] = &["network", "irreversible", "background"];
+pub(crate) const IRREVERSIBLE_KINDS: &[&str] =
+    &["push", "publish", "send", "deploy", "external_write"];
+pub(crate) const EXPECT_KEYS: &[&str] = &[
+    "exit",
+    "stdout_contains",
+    "stdout_matches",
+    "stderr_empty",
+    "max_seconds",
+    "occurrences",
 ];
 
 pub(crate) fn builtin_error_parent(name: &str) -> Option<Option<&'static str>> {
@@ -138,6 +303,30 @@ pub(crate) fn builtin_error_record(type_name: &str, message: String) -> Value {
     Value::record(record, span)
 }
 
+/// The record a handler sees for a failed `expect=` check. `message` is the
+/// model-facing rendering with the fix-relevant facts first; `expected`,
+/// `observed`, and `diff` are the structured form; `result` is the call's full
+/// result, so a handler never re-runs the call to see its output.
+pub(crate) fn expectation_failed_record(
+    call: &str,
+    message: String,
+    expected: Value,
+    observed: Value,
+    diff: Value,
+    result: Value,
+) -> Value {
+    let span = Span::unknown();
+    let mut record = Record::with_capacity(7);
+    record.push("type", Value::string("ExpectationFailed", span));
+    record.push("message", Value::string(message, span));
+    record.push("call", Value::string(call, span));
+    record.push("expected", expected);
+    record.push("observed", observed);
+    record.push("diff", diff);
+    record.push("result", result);
+    Value::record(record, span)
+}
+
 /// Classify a runtime error record that has no explicit `type` field. The
 /// record comes from `shell_error_record`, so only `kind`, `code`, and
 /// `message` are inspected. Runtime errors from the evaluator are all
@@ -180,12 +369,24 @@ pub(crate) fn classify_error(kind: &str, code: &str, message: &str) -> &'static 
         .strip_prefix("stone ")
         .and_then(|rest| rest.strip_suffix(" error"))
         .unwrap_or(lower_kind.as_str());
-    if kind.starts_with("gateway") {
+    if kind.starts_with("gateway") || message.starts_with("Gateway runtime") {
         return if mentions_timeout(message) {
             "TimeoutError"
         } else {
             "ToolError"
         };
+    }
+    // Working-directory checks before a process starts.
+    if message.starts_with("cwd `") {
+        if message.contains("does not exist") {
+            return "FileNotFoundError";
+        }
+        if message.contains("is not a directory") {
+            return "NotADirectoryError";
+        }
+    }
+    if message.starts_with("permission denied while accessing cwd") {
+        return "PermissionError";
     }
     if message.contains("by zero") {
         return "ZeroDivisionError";
@@ -227,7 +428,25 @@ pub(crate) fn classify_error(kind: &str, code: &str, message: &str) -> &'static 
     {
         return "TypeError";
     }
+    // JSON parse failures (read_json, json_loads, from_json) are ValueError,
+    // as Python's json.JSONDecodeError is.
+    if kind.contains("json") || is_json_parse_message(message) {
+        return "ValueError";
+    }
     "RuntimeError"
+}
+
+fn is_json_parse_message(message: &str) -> bool {
+    [
+        "expected value at line",
+        "EOF while parsing",
+        "trailing characters at line",
+        "key must be a string at line",
+        "invalid escape at line",
+        "expected `,` or",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 /// Type for a Nu I/O error, from its kind rather than its display text

@@ -584,6 +584,24 @@ As implemented in M2 (`stone_errors.rs`, user docs in
 - Unknown handler types are admission errors. Lowercase handler names
   (`except error:`) stay parse errors with the binding repair.
 
+As implemented in M3 (first-class error types, user decision 2026-11-07):
+
+- A type is represented by its name. A bare error-type name evaluates to that
+  string, so types go into lists, records, and child-attempt arguments with no
+  new value kind, and `error.type == ExpectationFailed` works. Matching is
+  still a short walk on the handler path; interning the names to small ids is
+  a later optimization that does not change behavior.
+- Host-only types are verified by value. The session keeps the last 64
+  host-only errors it caught. `raise` of a host-only type and
+  `isinstance(x, HostOnlyType)` require an identical record in that list, so a
+  forged dict or a modified copy is rejected. Constructing, raising by name,
+  or subclassing a host-only type is an admission error.
+- Declared raises live in a static table next to the type tree
+  (`builtin_call_raises`). The unreachable-handler analysis runs once per
+  program over the AST, follows user functions (depth 8), treats anything it
+  cannot see through as "may raise anything", and only reports handlers for
+  tool errors. It produces warnings in `diagnostics.warnings`, never errors.
+
 The Python precedent is PEP 352 and bpo-32528, which moved
 `KeyboardInterrupt` and then asyncio's `CancelledError` out of `Exception`.
 The known pitfall from that change is code that caught `Exception` to unwind
@@ -1669,9 +1687,9 @@ in the last column and for the compatibility measurement.
 | 2 | `pass`-only handler for `Exception`/`ToolError` is an admission error | New | **Yes**: legal today | Ren et al. 2023; Seeker 2024 | P1, **done in M2** (admission error plus `swallowed_error` repair; narrowed to handlers naming exactly `Exception` or `ToolError`, so a user subclass of either is not covered) |
 | 3 | Swallowed-`ToolError` counter in trace and `last_result()` | New | Additive field | — | P1, **done in M2** (`diagnostics.errors.swallowed_tool_errors` and `last_swallowed`, so also in `last_result()`; the attempt trace is not wired yet) |
 | 4 | `except BaseException`, `except PolicyViolation`, `except ContractViolation` rejected | New | No (`BaseException` already rejected, 9.6) | PEP 352 | P1, **partly done in M2** (`BaseException`, `KeyboardInterrupt`, `SystemExit`, `GeneratorExit` rejected with fixes; `IOError`/`EnvironmentError` point to `OSError`; the violation types wait for P3) |
-| 5 | `ExpectationFailed` fields `.expected/.observed/.diff/.result` | Was "carries the full observation" | No | — | P1, M3 (needs item 7 `expect=`; moved from M1) |
-| 6 | Three effect tiers per syscall: observed effects on every result as `r.effects` (tier 1); protected paths in the grant, read-only for `Exec` (tier 2); `Exec` declares tier-3 effects (`network`, `irreversible`, `background`), denied otherwise with `UndeclaredEffect` | Was mandatory `Run.writes` with discard (draft v3, D-1 provisional); replaced after the pilot | No (new API) | D-1; pilot 11.2 | P1 (tiers 1-2, tier-3 vocabulary) / P3 (eBPF enforcement) |
-| 7 | `expect=` optional on every syscall; exit status in it; RPC/MCP `result` and `status` checks; `Tests` row removed | Was part of every action, and for `Exec` only | No | PreAct | P1 |
+| 5 | `ExpectationFailed` fields `.expected/.observed/.diff/.result` | Was "carries the full observation" | No | — | P1, **done in M3** (`expected`, `observed`, `diff` of unmet checks, full `result`; host-only, so not constructible or raisable by programs) |
+| 6 | Three effect tiers per syscall: observed effects on every result as `r.effects` (tier 1); protected paths in the grant, read-only for `Exec` (tier 2); `Exec` declares tier-3 effects (`network`, `irreversible`, `background`), denied otherwise with `UndeclaredEffect` | Was mandatory `Run.writes` with discard (draft v3, D-1 provisional); replaced after the pilot | No (new API) | D-1; pilot 11.2 | P1 (tiers 1-2, tier-3 vocabulary) / P3 (eBPF enforcement). **Partly done in M3:** tier 1 as `result.effects.observed` on `run`/`run_complete`/`must_run` in local mode (bounded metadata walk; tool folders listed as `not_scanned`); tier-3 `Effects(...)` vocabulary validated and recorded as `result.effects.declared` with `enforced: False`. Tier 2 waits for grants (P2); enforcement and `UndeclaredEffect` raising wait for the Gateway (P3) |
+| 7 | `expect=` optional on every syscall; exit status in it; RPC/MCP `result` and `status` checks; `Tests` row removed | Was part of every action, and for `Exec` only | No | PreAct | P1. **Partly done in M3:** `expect=` on `run`, `run_complete`, `must_run` (exit, stdout_contains, stdout_matches, stderr_empty, max_seconds) and `edit` (occurrences, default exactly 1); `must_run` is `run` with `expect=Expect(exit=0)`. RPC/MCP/model `result`/`status`, File checks, and `check=fn` wait for record types (L5) and the syscall manifest |
 | 8 | Budget checked at model and tool calls; exhaustion ends the attempt with a host-built `Unfinished`; `model.reserve` removed | Was a Trio-style `with budget(...)` scope with `grace=` (dropped by D-3) | No (new API) | — | P1 |
 | 9 | `finally` stays absent; error becomes prescriptive | Was unaddressed | Message only | Joe-E §4.3 | P1, **done in M1** (message plus `finally` repair envelope) |
 | 10 | Mutable default argument error becomes prescriptive | Was unaddressed | Message only | — | P1, **done in M1** (message plus `mutable_default` repair envelope) |
@@ -1692,8 +1710,9 @@ in the last column and for the compatibility measurement.
 | 25 | L4 extended to `str()` of dicts and records (D-2); 11 call sites switched to `json_dumps` | D-2 decided | **Yes**: `str(dict)` was JSON | — | P1, **done in M2** (`str`/`repr`/f-strings/`format()` follow Python; `print` of containers stays JSON; 14 sites in the controllers and canaries switched to `json_dumps` or a `standard_text` helper) |
 | 26 | Write-prediction pilot harness (11.2) | New | No | — | P1 (done) |
 | 27 | Syscall effect manifest: Gateway-owned effect signatures for host tools, RPC, and MCP tools, seeded from MCP annotations (R25b, R25c) | New | No | MCP spec, tool annotations | P2 (manifest) / P3 (enforcement) |
+| 28 | First-class error types for agent control: type names are values (`[TimeoutError, ExpectationFailed]`), `isinstance` for data types and error chains, host-only `ExpectationFailed`/`UndeclaredEffect` (catchable, not forgeable), declared raises per builtin syscall with an unreachable-handler warning (inform, never require), `type` in the top-level error envelope | New (user decision 2026-11-07) | **Yes**: `isinstance` was rejected; `edit` with several matches replaced the first; `must_run` raised `ToolError` with code `stone_must_run_failed` | Joe-E §4.3 (unforgeable failures) | P1, **done in M3**. Cross-attempt trust for host-only types (a parent verifying a child's `ExpectationFailed`) waits for the boundary walk (P2); until then a child-reported error is data and `isinstance` on a host-only type is false for it |
 
-Items 1, 2, 16, 17, 18, 20, 21, and 25 change existing behavior. The
+Items 1, 2, 16, 17, 18, 20, 21, 25, and 28 change existing behavior. The
 compatibility scan (9.5) found almost no executed code that depends on
 L1-L4 or L6a; the cost is concentrated in items 1, 18, and 25. For each, the
 plan is: read the cited sections, measure the impact on examples, help

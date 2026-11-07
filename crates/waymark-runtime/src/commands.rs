@@ -809,10 +809,18 @@ for line in open("/app/input.txt"):
     },
     StoneHelpEntry {
         name: "edit",
-        signature: "edit(path: str, old: str, new: str, all: bool = False) -> record",
-        use_when: "Use for exact text replacement in a UTF-8 file.",
-        examples: &[r#"edit("/app/config.txt", "debug=false", "debug=true")"#],
-        avoid: &["Do not pass empty old text; read a sample first if the replacement is risky."],
+        signature: "edit(path: str, old: str, new: str, all: bool = False, expect: Expect? = None) -> record",
+        use_when: "Use for exact text replacement in a UTF-8 file. The old text must match exactly once; all=True replaces every match (at least one), and expect=Expect(occurrences=N) requires exactly N matches and replaces them all. Otherwise the file is unchanged and ExpectationFailed reports the match count and lines. Raises: FileNotFoundError, PermissionError, IsADirectoryError, NotADirectoryError, ExpectationFailed.",
+        examples: &[
+            r#"write_text("/tmp/edit_example.txt", "debug=false\n")
+edit("/tmp/edit_example.txt", "debug=false", "debug=true")"#,
+            r#"write_text("/tmp/edit_example.txt", "x = 1\ny = 1\n")
+edit("/tmp/edit_example.txt", " = 1", " = 2", expect=Expect(occurrences=2))"#,
+        ],
+        avoid: &[
+            "Do not pass empty old text; read a sample first if the replacement is risky.",
+            "If the old text matches several times, add surrounding lines so it matches once instead of replacing every match blindly.",
+        ],
         aliases: &["edit_file"],
     },
     StoneHelpEntry {
@@ -956,6 +964,60 @@ ok = type(scope) == "attempt_scope""#,
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "isinstance",
+        signature: "isinstance(value: Any, type: type | tuple[type, ...]) -> bool",
+        use_when: "Use to test a value against str, int, float, bool, list, or dict, or a caught error against an error type through its type chain (isinstance(error, ToolError) is true for a FileNotFoundError). Error types are values: they can be stored in lists and records and passed to functions.",
+        examples: &[
+            r#"ok = isinstance("x", str)"#,
+            r#"ok = isinstance(3, (int, float))"#,
+            r#"retry_on = [TimeoutError, ExpectationFailed]
+try:
+    must_run(["false"])
+except Exception as error:
+    retryable = isinstance(error, retry_on)"#,
+        ],
+        avoid: &[
+            "Stone has no tuple or set type (they are lists); use isinstance(x, list).",
+            "isinstance(x, ExpectationFailed) is true only for an error the host raised, never for a dict that merely has type=\"ExpectationFailed\".",
+            "Use error.type == \"FileNotFoundError\" only for an exact match; isinstance also matches subclasses.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "Expect",
+        signature: "Expect(exit: int | list[int]?, stdout_contains: str?, stdout_matches: str?, stderr_empty: bool?, max_seconds: number?, occurrences: int?) -> record",
+        use_when: "Use to state what a call should do, as expect= on run, run_complete, must_run (exit, stdout_contains, stdout_matches, stderr_empty, max_seconds) or edit (occurrences). A met expectation returns the normal result; an unmet one raises ExpectationFailed with expected, observed, diff, and the full result, so the command never needs to be re-run to see its output.",
+        examples: &[
+            r#"result = run(["printf", "3 passed"], expect=Expect(exit=0, stdout_contains="passed"))"#,
+            r#"try:
+    run(["sh", "-c", "exit 1"], expect=Expect(exit=0))
+except ExpectationFailed as error:
+    emit({"diff": error.diff, "exit": error.result.exit_code})"#,
+            r#"result = run(["printf", "ok"], expect=Expect(exit=[0, 1], max_seconds=30))"#,
+        ],
+        avoid: &[
+            "Keys are a closed set; an unknown key is an error that lists them.",
+            "max_seconds also sets the timeout when timeout_ms is not given.",
+            "Do not use expect= with background=True; the command has not finished when run() returns.",
+            "A passing test run is not proof the task is done; expect= checks one call.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "Effects",
+        signature: "Effects(network: False | list[str]?, irreversible: list[str]?, background: bool?) -> record",
+        use_when: "Use as effects= on run, run_complete, or must_run to declare what a command may do that cannot be undone: reach network hosts, make an irreversible change (push, publish, send, deploy, external_write), or leave a process running. File changes in the workspace are never declared; every run result reports them in result.effects.observed. The declaration is checked and recorded in result.effects.declared; in local mode it is not enforced (result.effects.enforced is False).",
+        examples: &[
+            r#"result = run(["printf", "fetched"], effects=Effects(network=["pypi.org", "files.pythonhosted.org"]))"#,
+            r#"result = run(["printf", "pushed"], effects=Effects(network=["github.com"], irreversible=["push"]))"#,
+        ],
+        avoid: &[
+            "Do not declare file writes; they are observed.",
+            "network=True is rejected; list the hosts.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "first",
         signature: "first(values: list, count: int? = None) -> Any | list",
         use_when: "Use to inspect or keep the first item(s) of a list.",
@@ -1050,11 +1112,12 @@ if starts_with(line, "ERROR"):
     },
     StoneHelpEntry {
         name: "run",
-        signature: r#"run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, background: bool = False, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> record"#,
-        use_when: "Use only when the task explicitly needs a POSIX program. Nonzero exits return ok=false with stdout, stderr, and an explanation record. Use run_complete for a bounded task command that must finish before the program continues; use background=True when the program intentionally manages a live run_id.",
+        signature: r#"run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, expect: Expect? = None, effects: Effects? = None, background: bool = False, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> record"#,
+        use_when: "Use only when the task explicitly needs a POSIX program. Nonzero exits, timeouts, and missing commands return ok=false with stdout, stderr, and an explanation record; run() does not raise for them (unlike Python's subprocess). Pass expect=Expect(exit=0, ...) to raise ExpectationFailed when the result is not what you expect. Every finished result has effects.observed: the files under the project that changed while it ran (collapsed by directory; tool folders such as .git and node_modules are listed under not_scanned). Raises: FileNotFoundError or NotADirectoryError for a bad cwd; ExpectationFailed with expect=. Use run_complete for a bounded task command that must finish before the program continues; use background=True when the program intentionally manages a live run_id.",
         examples: &[
             r#"result = run(["wc", "-l", "/app/input.txt"])"#,
             r#"result = run(["printf", "ok"], timeout_ms=5000)"#,
+            r#"result = run(["printf", "2 passed"], expect=Expect(exit=0, stdout_contains="passed"))"#,
             r#"result = run(["printf", "ok"], hooks={"pre": lambda step: {"argv": step.input.argv}})"#,
             r#"result = run(["printf", "not executed"], hooks={"pre": lambda step: {"allow": False, "reason": "command denied"}})"#,
             r#"async def build():
@@ -1089,10 +1152,11 @@ result = run(["sh", "-c", "printf failed >&2; exit 7"], hooks={"post": record_ru
     },
     StoneHelpEntry {
         name: "must_run",
-        signature: r#"must_run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576) -> record"#,
-        use_when: "Use for set -e style process steps: it returns the same run record on success and raises a Stone error when the external process exits nonzero or times out.",
+        signature: r#"must_run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, expect: Expect? = None, effects: Effects? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576) -> record"#,
+        use_when: "Use for set -e style process steps. must_run(argv) is run(argv, expect=Expect(exit=0)): it returns the run record on success and raises ExpectationFailed (a ToolError) with expected, observed, diff, and the full result when the process exits nonzero, times out, or cannot start. Add checks with expect=Expect(stdout_contains=...).",
         examples: &[
             r#"must_run(["mkdir", "-p", "target/out"])"#,
+            r#"must_run(["printf", "3 passed"], expect=Expect(stdout_contains="passed"))"#,
             r#"step = must_run(["printf", "ok"], timeout_ms=5000)"#,
             r#"must_run(["sh", "-c", "printf input"], stdout="suppress", stderr="capture", max_stderr_bytes=12000)"#,
         ],
@@ -1105,7 +1169,7 @@ result = run(["sh", "-c", "printf failed >&2; exit 7"], hooks={"post": record_ru
     },
     StoneHelpEntry {
         name: "run_complete",
-        signature: r#"run_complete(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> record"#,
+        signature: r#"run_complete(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, expect: Expect? = None, effects: Effects? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> record"#,
         use_when: "Use for a bounded task command that may outlive one Gateway observation window but must reach a terminal result before the Stone program continues. It lowers to run plus bounded waits, owns the run_id, and terminates the process if the total timeout expires.",
         examples: &[
             r#"built = run_complete(["sh", "-c", "printf built"], cwd="/app", timeout_ms=360000, max_stdout_bytes=4096, max_stderr_bytes=8192)"#,
@@ -1823,7 +1887,6 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
         summary: "Common Python habits that fail in Stone, with replacements.",
         bullets: &[
             "No imports/modules/os/pathlib/glob/json; use find/read_json/json_loads/json_dumps.",
-            "No isinstance(value, type); use type(value) == \"list\"/\"str\"/\"int\"/\"float\"/\"record\" or direct structural checks.",
             "Lambda is expression-only; use explicit loops when callback logic needs statements or mutation.",
             "No general classes, async, nested functions, or general Python decorators; the only classes are field-only error types (class ConfigError(Exception): path: str), and the only decorator is Stone's @stage(...). Use records for plain data.",
             "No mutable default args: write def f(items=None) and `if items is None: items = []` in the body. No *args, **kwargs, or keyword calls to user functions.",
@@ -1841,6 +1904,9 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "Every handler names a type: except FileNotFoundError as error:, except (KeyError, IndexError) as error:, except Exception as error:. Handlers are tried in order; an unmatched error keeps propagating.",
             "A caught error is a record with type, kind, code, and message (plus path/operation for I/O errors and your own fields for model-defined errors).",
             "Exception > ToolError > OSError > FileNotFoundError, FileExistsError, PermissionError, IsADirectoryError, NotADirectoryError, TimeoutError. ToolError covers failures from outside the program: commands (must_run), Gateway and model calls, and files.",
+            "ToolError > ExpectationFailed (an expect= check, must_run, or edit did not match; fields expected, observed, diff, result) and UndeclaredEffect (a call tried an effect it did not declare). Only the host raises these: programs can catch, test, and re-raise them unchanged, but not construct, raise, or subclass them.",
+            "Error types are values: retry_on = [TimeoutError, ExpectationFailed] then isinstance(error, retry_on); error.type == \"FileNotFoundError\" for an exact match. A caught error's type field is the type's name.",
+            "Each tool's help lists what it raises. run() does not raise for a failed or missing command (it returns ok=False), so except FileNotFoundError around run() does not catch a missing command. A handler that nothing in its try block can raise is reported in diagnostics.warnings.",
             "Exception > ValueError, TypeError, NameError, AttributeError, AssertionError; LookupError > KeyError, IndexError; ArithmeticError > ZeroDivisionError; RuntimeError > NotImplementedError.",
             "raise ValueError(\"bad row\") or raise ValueError; builtin error constructors take one optional string message.",
             "Define your own: class ConfigError(ValueError): then indented typed fields such as path: str or retries: int = 0. Construct with ConfigError(\"message\", path=\"/etc/app.toml\"). No methods; the class persists in the session like a function.",

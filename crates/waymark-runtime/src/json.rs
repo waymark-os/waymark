@@ -180,6 +180,14 @@ fn shell_error_json(err: &ShellError) -> JsonValue {
     map.insert("kind".into(), JsonValue::String(kind.into()));
     map.insert("code".into(), JsonValue::String(code));
     map.insert("message".into(), JsonValue::String(err.to_string()));
+    // The Stone error type (FileNotFoundError, ExpectationFailed, ...), so a
+    // caller or parent attempt can branch on the kind of failure. A host
+    // error also carries its structured check report.
+    let (error_type, host_fields) = crate::stone_eval::stone_error_type_and_host_fields(err);
+    map.insert("type".into(), JsonValue::String(error_type));
+    for (key, value) in host_fields {
+        map.insert(key, value);
+    }
     map.insert("debug".into(), JsonValue::String(format!("{err:?}")));
 
     match err {
@@ -246,11 +254,18 @@ fn shell_error_json(err: &ShellError) -> JsonValue {
                     map.insert("location".into(), JsonValue::String(location.clone()));
                 }
             }
-            if !err.inner.is_empty() {
-                map.insert(
-                    "related".into(),
-                    JsonValue::Array(err.inner.iter().map(shell_error_json).collect()),
-                );
+            // A host error's record travels as an inner error; its fields
+            // are already at the top level, so it is not repeated here.
+            let related = err
+                .inner
+                .iter()
+                .filter(|inner| {
+                    !matches!(inner, ShellError::Generic(generic) if generic.code.to_string() == "stone_host_error_record")
+                })
+                .map(shell_error_json)
+                .collect::<Vec<_>>();
+            if !related.is_empty() {
+                map.insert("related".into(), JsonValue::Array(related));
             }
             if let Some(source) = &err.source {
                 map.insert("source".into(), JsonValue::String(source.to_string()));
