@@ -65,6 +65,26 @@ pub struct FunctionDef {
     /// Set when this function is the constructor of a model-defined error
     /// class (`class ConfigError(Exception): path: str`); holds the base type.
     pub error_base: Option<String>,
+    /// Filled by the scope resolver (`stone_scope`) after lowering.
+    pub scope: std::sync::Arc<FunctionScope>,
+}
+
+/// What lexical scope resolution found for one function.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FunctionScope {
+    /// Parameters and every name the body binds, sorted.
+    pub locals: Vec<String>,
+    /// Free names that are locals of an enclosing function, sorted. These are
+    /// shared with the enclosing call as read-only cells.
+    pub captures: Vec<String>,
+}
+
+impl FunctionScope {
+    pub fn declares(&self, name: &str) -> bool {
+        self.locals
+            .binary_search_by(|local| local.as_str().cmp(name))
+            .is_ok()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -218,6 +238,9 @@ pub enum Expr {
     Lambda {
         params: Vec<String>,
         body: Box<Expr>,
+        /// Filled by the scope resolver: enclosing-function locals the body
+        /// reads.
+        captures: Vec<String>,
     },
     MethodCall {
         receiver: Box<Expr>,
@@ -697,7 +720,9 @@ fn lower_module(module: py::ModModule) -> Result<Program, ShellError> {
         statements.push(lower_stmt(statement)?);
     }
 
-    Ok(Program { statements })
+    let mut program = Program { statements };
+    crate::stone_scope::resolve_program(&mut program)?;
+    Ok(program)
 }
 
 fn lower_stmt(statement: py::Stmt) -> Result<Stmt, ShellError> {
@@ -722,6 +747,14 @@ fn lower_stmt(statement: py::Stmt) -> Result<Stmt, ShellError> {
         py::Stmt::While(while_stmt) => lower_while(while_stmt),
         py::Stmt::With(with_stmt) => lower_with(with_stmt),
         py::Stmt::Expr(expr) => Ok(Stmt::Expr(lower_expr(*expr.value)?)),
+        py::Stmt::Global(_) => Err(unsupported_message(
+            "global",
+            "Stone has no `global`: functions read module variables but do not rebind them. Return the new value and assign it at module level (`total = add(total, x)`), or keep shared state in a dict (`state[\"total\"] += x`)",
+        )),
+        py::Stmt::Nonlocal(_) => Err(unsupported_message(
+            "nonlocal",
+            "Stone has no `nonlocal`: closures read enclosing variables but do not rebind them. Keep the state in a list or dict (`count = [0]`, then `count[0] += 1`), or return the new value",
+        )),
         unsupported => Err(unsupported_error("statement", &unsupported)),
     }
 }
@@ -777,6 +810,7 @@ fn lower_function_def(function: py::StmtFunctionDef) -> Result<Stmt, ShellError>
         body: lower_stmt_block(function.body)?,
         stage: stage.map(Box::new),
         error_base: None,
+        scope: Default::default(),
     }))
 }
 
@@ -1009,6 +1043,7 @@ fn lower_error_class(class: py::StmtClassDef) -> Result<Stmt, ShellError> {
         body: vec![Stmt::Return(Some(Expr::Record(fields)))],
         stage: None,
         error_base: Some(base),
+        scope: Default::default(),
     }))
 }
 
@@ -1485,6 +1520,7 @@ fn lower_lambda(lambda: py::ExprLambda) -> Result<Expr, ShellError> {
         return Ok(Expr::Lambda {
             params: Vec::new(),
             body: Box::new(lower_expr(*lambda.body)?),
+            captures: Vec::new(),
         });
     };
     if parameters.vararg.is_some()
@@ -1516,6 +1552,7 @@ fn lower_lambda(lambda: py::ExprLambda) -> Result<Expr, ShellError> {
     Ok(Expr::Lambda {
         params,
         body: Box::new(lower_expr(*lambda.body)?),
+        captures: Vec::new(),
     })
 }
 

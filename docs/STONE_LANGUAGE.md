@@ -27,7 +27,7 @@ controller may inspect the edit, apply it deliberately, and evaluate it in the
 appropriate transaction.
 
 Name, keyword, and structured-field mistakes can receive local edit
-suggestions. Semantic mismatches such as Python `global` or an unsupported
+suggestions. Semantic mismatches such as Python `global`/`nonlocal` or an unsupported
 model message role are marked `requires_repair` and provide guidance without a
 mechanical replacement.
 
@@ -322,6 +322,42 @@ def verify(candidate):
 
 emit(apply(verify, {"ok": True}))
 ```
+
+### Names And Scope
+
+Name lookup follows Python. A function sees its own variables, then the
+variables of the functions it is written inside (closures), then module
+variables and builtins. It never sees its caller's variables.
+
+```python
+def make_counter():
+    count = [0]
+    def inc():
+        count[0] += 1
+        return count[0]
+    return inc
+
+counter = make_counter()
+counter()
+emit(counter())  # 2
+```
+
+- A name that a function assigns anywhere in its body belongs to the whole
+  body. Reading it before the assignment is an error; it does not fall back to
+  a module variable with the same name.
+- A closure reads the enclosing function's variables and sees assignments the
+  enclosing function makes later. A lambda reads module variables when it
+  runs, not when it is created.
+- A closure cannot rebind an enclosing variable, and a function cannot rebind
+  a module variable. `count += 1` inside `inc` above (with `count = 0`) is
+  rejected before the script runs, with the fix: keep the state in a list or
+  dict, or return the new value. Stone has no `global` or `nonlocal`.
+- A `def` inside a function is a local value of that function, not a module
+  function.
+- Variables, functions, and builtins share one namespace. A variable hides a
+  function or builtin with the same name, so `len = 5` followed by
+  `len(items)` is an error that names the hidden builtin and suggests
+  renaming the variable.
 
 `transition_hooks(pre=..., post=...)` creates a first-class call-local policy
 value. It may be assigned and passed through Stone functions before being used

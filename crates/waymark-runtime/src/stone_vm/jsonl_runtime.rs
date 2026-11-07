@@ -856,11 +856,11 @@ impl Evaluator<'_> {
         };
         let addend = i64::try_from(row_count)
             .map_err(|_| stone_error("hot loop", "row count is too large"))?;
-        let value = self
+        let mut value = self
             .state
             .get_local_mut(local)
             .ok_or_else(|| stone_error("hot loop", format!("unknown name `{local}`")))?;
-        let RuntimeValue::Nu(value) = value else {
+        let RuntimeValue::Nu(value) = &mut *value else {
             return Err(stone_error(
                 "hot loop",
                 format!("{local} is not an integer counter"),

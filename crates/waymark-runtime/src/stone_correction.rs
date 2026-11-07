@@ -278,14 +278,31 @@ pub(crate) fn correction_for_error(err: &ShellError, source: &str) -> Option<Jso
         }
     }
 
-    if code == "stone_script_unsupported" && contains_identifier(source, "global") {
+    if code == "stone_script_unsupported"
+        && detail.starts_with("Stone has no `global`")
+        && contains_identifier(source, "global")
+    {
         return Some(repair_envelope(
             source,
             phase,
             "unsupported_construct",
             "global",
-            vec!["explicit function parameters", "authoritative state accessor"],
-            "Stone has no mutable Python global declaration. Pass state explicitly or read authoritative state through a function such as attempt_info().",
+            vec!["return the new value", "state held in a dict"],
+            "Stone has no `global`: functions read module variables but do not rebind them. Return the new value and assign it at module level (`total = add(total, x)`), or keep shared state in a dict (`state[\"total\"] += x`). Then explicitly evaluate the repaired source again.",
+        ));
+    }
+
+    if code == "stone_script_unsupported"
+        && detail.starts_with("Stone has no `nonlocal`")
+        && contains_identifier(source, "nonlocal")
+    {
+        return Some(repair_envelope(
+            source,
+            phase,
+            "unsupported_construct",
+            "nonlocal",
+            vec!["return the new value", "state held in a list or dict"],
+            "Stone has no `nonlocal`: closures read enclosing variables but do not rebind them. Keep the state in a list or dict (`count = [0]`, then `count[0] += 1`), or return the new value. Then explicitly evaluate the repaired source again.",
         ));
     }
 
@@ -906,7 +923,10 @@ mod tests {
         );
 
         let semantic = correction_for_error(
-            &error("stone_script_unsupported", "unsupported statement"),
+            &error(
+                "stone_script_unsupported",
+                "Stone has no `global`: functions read module variables but do not rebind them",
+            ),
             "def update():\n    global mode\n",
         )
         .expect("semantic correction");
@@ -971,7 +991,10 @@ mod tests {
     #[test]
     fn semantic_constructs_require_repair_without_an_edit() {
         let global = correction_for_error(
-            &error("stone_script_unsupported", "unsupported statement"),
+            &error(
+                "stone_script_unsupported",
+                "Stone has no `global`: functions read module variables but do not rebind them",
+            ),
             "def update():\n    global mode\n",
         )
         .expect("global correction");

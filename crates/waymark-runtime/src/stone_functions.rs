@@ -1,11 +1,21 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::stone_ast::{Expr, FunctionDef};
 
 use super::stone_runtime_value::RuntimeValue;
 use super::{ContextState, Scope};
+
+/// A variable shared between a function call and the closures it created.
+/// Only variables that some closure reads become cells (the scope resolver
+/// says which); every other local stays a plain slot. Closures never rebind
+/// a cell, but the defining function may assign it after the closure is
+/// made, and the closure sees that (Python's late binding). Empty means
+/// "not assigned yet".
+pub(super) type Cell = Rc<RefCell<Option<RuntimeValue>>>;
 
 #[derive(Clone)]
 pub(super) enum CallableValue {
@@ -13,12 +23,15 @@ pub(super) enum CallableValue {
         function_id: u64,
         params: Vec<String>,
         body: Box<Expr>,
-        captures: Vec<(String, RuntimeValue)>,
+        captures: Vec<(String, Cell)>,
     },
     Named {
         function_id: u64,
         // Boxed so a callable does not inflate every RuntimeValue.
         function: Box<FunctionDef>,
+        /// Cells for the enclosing-function variables the body reads; empty
+        /// for module-level functions.
+        captures: Vec<(String, Cell)>,
     },
 }
 
@@ -239,7 +252,7 @@ impl CallableValue {
         function_id: u64,
         params: Vec<String>,
         body: Box<Expr>,
-        captures: Vec<(String, RuntimeValue)>,
+        captures: Vec<(String, Cell)>,
     ) -> Self {
         Self::Lambda {
             function_id,
@@ -250,9 +263,18 @@ impl CallableValue {
     }
 
     pub(super) fn named(function_id: u64, function: FunctionDef) -> Self {
+        Self::closure(function_id, function, Vec::new())
+    }
+
+    pub(super) fn closure(
+        function_id: u64,
+        function: FunctionDef,
+        captures: Vec<(String, Cell)>,
+    ) -> Self {
         Self::Named {
             function_id,
             function: Box::new(function),
+            captures,
         }
     }
 
@@ -262,6 +284,7 @@ impl CallableValue {
             Self::Named {
                 function_id,
                 function,
+                ..
             } => format!("{}#{function_id}", function.name),
         }
     }
@@ -282,10 +305,13 @@ impl CallableValue {
 
     pub(super) fn captures_are_persistable(&self) -> bool {
         match self {
-            Self::Lambda { captures, .. } => captures
-                .iter()
-                .all(|(_, value)| value.is_session_persistable()),
-            Self::Named { .. } => true,
+            Self::Lambda { captures, .. } | Self::Named { captures, .. } => {
+                captures.iter().all(|(_, cell)| {
+                    cell.borrow()
+                        .as_ref()
+                        .is_none_or(RuntimeValue::is_session_persistable)
+                })
+            }
         }
     }
 }
@@ -318,7 +344,7 @@ impl StoneSession {
     pub(super) fn root_scope(&self) -> Scope {
         Scope {
             locals: self.locals.clone(),
-            files: HashMap::new(),
+            ..Scope::default()
         }
     }
 

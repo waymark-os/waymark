@@ -280,7 +280,7 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "name": "attempt_state",
         "signature": "attempt_state(attempt: str = '', sample_limit: int = 100) -> record",
         "effects": ["read_env", "read_file"],
-        "example": "state = attempt_state(sample_limit=50)",
+        "example": "snapshot = attempt_state(sample_limit=50)",
     },
     "attempt_logs": {
         "name": "attempt_logs",
@@ -335,7 +335,7 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "name": "attempt_wait_any",
         "signature": "attempt_wait_any(children: attempt_scope | list[attempt_handle | str | record], timeout_ms: int? = None) -> attempt_outcome",
         "effects": ["read_env", "process"],
-        "example": "first = attempt_wait_any(scope, timeout_ms=30000)",
+        "example": "winner = attempt_wait_any(scope, timeout_ms=30000)",
     },
     "attempt_wait_all": {
         "name": "attempt_wait_all",
@@ -383,7 +383,7 @@ HELP_TABLE: dict[str, dict[str, Any]] = {
         "name": "attempt_run_process",
         "signature": "attempt_run_process(attempt: str = '', argv: list[str], env: record = {}) -> record",
         "effects": ["process", "write_file", "unknown"],
-        "example": 'run = attempt_run_process(child.attempt, ["/path/to/controller"], env={"HELIX_ROOT": "/path/to/helix"})',
+        "example": 'proc = attempt_run_process(child.attempt, ["/path/to/controller"], env={"HELIX_ROOT": "/path/to/helix"})',
     },
     "env_state": {
         "name": "env_state",

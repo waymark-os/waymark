@@ -302,7 +302,10 @@ mod tests {
             Box::new(Expr::None),
             vec![(
                 "answer".to_string(),
-                RuntimeValue::Nu(Value::int(42, Span::unknown())),
+                std::rc::Rc::new(std::cell::RefCell::new(Some(RuntimeValue::Nu(Value::int(
+                    42,
+                    Span::unknown(),
+                ))))),
             )],
         ));
         assert!(persistable.is_session_persistable());
@@ -314,10 +317,12 @@ mod tests {
             Box::new(Expr::None),
             vec![(
                 "file".to_string(),
-                RuntimeValue::File(FileHandle {
-                    scope_index: 0,
-                    file_id: 7,
-                }),
+                std::rc::Rc::new(std::cell::RefCell::new(Some(RuntimeValue::File(
+                    FileHandle {
+                        scope_index: 0,
+                        file_id: 7,
+                    },
+                )))),
             )],
         ));
         assert!(!non_persistable.is_session_persistable());

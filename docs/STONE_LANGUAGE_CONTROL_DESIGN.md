@@ -1232,6 +1232,33 @@ After M2, the probes read: L3 6/6, L4 11/11, D-2 4/4 (the `print` probe now
 expects JSON, per D-2), L6a 3/3, item 4 1/1. The corpus diff shows no
 behavior change outside `help()` text.
 
+After M4's scoping step (L1 and the namespace part of L18), the probes read:
+L1 7/8 and L18 4/4. The remaining L1 probe (`late_binding`) builds a list of
+functions, which waits for callables in containers (R9, the next M4 step).
+The corpus diff against the M3 build shows 0 of 224 units changed.
+
+As implemented (`stone_scope.rs`, `Scope` in `stone_eval.rs`):
+
+- A resolver runs once after parsing. For each function it records the
+  locals (parameters and every name bound in the body) and the captures
+  (free names that are locals of an enclosing function). Lambdas get
+  captures too. Comprehension targets are local to the comprehension.
+- Only captured variables become shared cells (`Rc<RefCell<Option<_>>>`);
+  every other local stays a plain hash-map slot. Name lookup stops at the
+  current call's frame and then reads module variables. A static local read
+  before assignment is an error instead of a module-variable read.
+- `x += 1` on a name the function does not otherwise bind is rejected at
+  parse time with the fix, as are `global` and `nonlocal`.
+- A nested `def` binds a local closure instead of entering the module
+  function table. `@stage` functions and error classes stay module-level.
+- Calls look up a variable first. A callable variable is called. A
+  non-callable variable that shares a name with a builtin or function is a
+  prescriptive error. A `@stage` stage value falls through to its function.
+- The loop engine (`stone_vm`) matches some builtins by name. Loops fall back
+  to the general path when a variable hides one of them.
+- Debug-build recursion depth at a 2 MB stack and the time of a
+  50,000-call loop are unchanged from M3.
+
 ### 9.6 M0: Executable Probes And Source Reading (2026-11-07)
 
 `host/check_stone_semantics_compat.py` turns the 9.5 scan into measurements
@@ -1700,7 +1727,7 @@ in the last column and for the compatibility measurement.
 | 15 | Pass-style `scope.start(f, **args)`: copy data, share handles, closure rule | Was "capability arguments", no copy rule | No (attempts start by id today) | Agoric "Far, Remotable, and Marshaling" | P2 |
 | 16 | Daemon obligation registry and unforgeable handles; host stops daemons on attempt exit | New | **Yes**: `stop_daemon(pid)` behavior in controlled profile | Weimer & Necula §5-7 | P2 |
 | 17 | Helpers in an isolated evaluator state | New | **Yes**: helpers share scope and function table today | `docs/STONE_HELPERS.md`; Taly et al. §VI.A | P2 |
-| 18 | Builtin table frozen; helper and agent function tables separate; one Python namespace with local shadowing; calling a non-callable that shadows a builtin is a prescriptive error; rename MCP examples (9.5) | New | **Yes**: separate callable namespace today; agent `def` of a builtin name persists in the session | Taly et al. §II.B | P1 (namespace, with L1) / P2 (freeze, helper tables) |
+| 18 | Builtin table frozen; helper and agent function tables separate; one Python namespace with local shadowing; calling a non-callable that shadows a builtin is a prescriptive error; rename MCP examples (9.5) | New | **Yes**: separate callable namespace today; agent `def` of a builtin name persists in the session | Taly et al. §II.B | P1 (namespace, with L1), **namespace done in M4** (variables before functions and builtins; calling a non-callable that hides a builtin is a prescriptive error; MCP examples renamed) / P2 (freeze, helper tables) |
 | 19 | Exceptions carry data only (walk at `raise`) | New, with L6 | No (exceptions are plain dicts today) | Joe-E §4.3, Fig. 6 | **Dropped by D-3** |
 | 20 | Session ceiling; capabilities persisted as host-table references; checks at injection, restore, child start | Was "capabilities not session-persistable" | **Yes**: `StoneSession` persistence | Miller 2006 (vats); Agoric docs | **Narrowed by D-3:** session ceiling only; no persisted capabilities | P3 |
 | 21 | Helper directories inside the agent's write grant skipped in controlled profile | New | **Yes**: documented search path (controlled profile only) | `docs/STONE_HELPERS.md` | P3 |

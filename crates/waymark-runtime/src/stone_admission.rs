@@ -572,7 +572,7 @@ fn collect_expr_bindings(expr: &Expr, names: &mut HashSet<String>) {
             collect_expr_bindings(left, names);
             collect_expr_bindings(right, names);
         }
-        Expr::Lambda { params, body } => {
+        Expr::Lambda { params, body, .. } => {
             names.extend(params.iter().cloned());
             collect_expr_bindings(body, names);
         }

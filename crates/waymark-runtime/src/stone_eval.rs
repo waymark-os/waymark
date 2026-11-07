@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(not(target_os = "hermit"))]
@@ -42,7 +45,8 @@ use crate::linux_tools::{
 use crate::stone_agent_control::{AgentControlKind, AgentControlValue};
 use crate::stone_ast::{
     AssignTarget, AugOp, BoolOp, Call, CompareOp, ComprehensionClause, ExceptHandler, Expr,
-    FormattedStringPart, FunctionDef, Program, StageDecorator, Stmt, StoneFormatSpec, StoneType,
+    FormattedStringPart, FunctionDef, FunctionScope, Program, StageDecorator, Stmt,
+    StoneFormatSpec, StoneType,
 };
 use crate::stone_attempt_best::{
     AttemptBestCandidate, AttemptBestObjective, AttemptBestPlan, AttemptBestValue,
@@ -116,7 +120,7 @@ mod stone_vm_runtime;
 use stone_context::ContextState;
 pub(crate) use stone_functions::StoneSession;
 use stone_functions::{
-    CallableValue, TransitionHookHandlerValue as TransitionHookHandler,
+    CallableValue, Cell, TransitionHookHandlerValue as TransitionHookHandler,
     TransitionHooksValue as TransitionHooks,
     WorkflowCheckpointPolicyValue as WorkflowCheckpointPolicy,
     WorkflowEvidenceSourceValue as WorkflowEvidenceSource,
@@ -380,6 +384,68 @@ const EVAL_PROFILE_BUCKET_NAMES: [&str; EVAL_PROFILE_BUCKETS] = [
 struct Scope {
     locals: HashMap<String, RuntimeValue>,
     files: HashMap<u64, RuntimeFile>,
+    /// Locals shared with closures. A name lives in `locals` or `cells`,
+    /// never both. Only frame scopes (and the root) hold cells.
+    cells: HashMap<String, Cell>,
+    /// True for the scope a function or lambda call pushes. Name lookup
+    /// stops at the nearest frame and then falls back to the root scope
+    /// (module globals): Stone scoping is lexical, not dynamic.
+    frame: bool,
+    /// The names the running function binds anywhere in its body. Reading
+    /// one before it is assigned is an error rather than a silent read of a
+    /// module variable with the same name.
+    declared: Option<Arc<FunctionScope>>,
+}
+
+/// A mutable borrow of a variable, whether it is a plain slot or a cell
+/// shared with closures.
+enum LocalMut<'a, T = RuntimeValue> {
+    Slot(&'a mut T),
+    Cell(std::cell::RefMut<'a, T>),
+}
+
+impl<'a, T> LocalMut<'a, T> {
+    /// Narrow the borrow to a part of the value, such as `xs[0]` of `xs`.
+    fn try_map<U>(
+        self,
+        f: impl FnOnce(&mut T) -> Result<&mut U, ShellError>,
+    ) -> Result<LocalMut<'a, U>, ShellError> {
+        match self {
+            Self::Slot(value) => f(value).map(LocalMut::Slot),
+            Self::Cell(value) => {
+                let mut error = None;
+                std::cell::RefMut::filter_map(value, |value| match f(value) {
+                    Ok(part) => Some(part),
+                    Err(err) => {
+                        error = Some(err);
+                        None
+                    }
+                })
+                .map(LocalMut::Cell)
+                .map_err(|_| error.unwrap_or_else(|| stone_error("variable", "borrow failed")))
+            }
+        }
+    }
+}
+
+impl<T> std::ops::Deref for LocalMut<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        match self {
+            Self::Slot(value) => value,
+            Self::Cell(value) => value,
+        }
+    }
+}
+
+impl<T> std::ops::DerefMut for LocalMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        match self {
+            Self::Slot(value) => value,
+            Self::Cell(value) => value,
+        }
+    }
 }
 
 struct FusedMapUpdateIf {
@@ -411,15 +477,141 @@ impl EvalState {
         self.scopes.len() - 1
     }
 
-    fn get_local(&self, name: &str) -> Option<RuntimeValue> {
+    /// Index of the innermost frame scope (the running function's call), or
+    /// 0 for module code.
+    fn frame_index(&self) -> usize {
         self.scopes
             .iter()
-            .rev()
-            .find_map(|scope| scope.locals.get(name).cloned())
+            .rposition(|scope| scope.frame)
+            .unwrap_or(0)
+    }
+
+    fn get_local(&self, name: &str) -> Option<RuntimeValue> {
+        // Block scopes (an except handler) down to the current frame, then
+        // module globals.
+        for (index, scope) in self.scopes.iter().enumerate().rev() {
+            if let Some(value) = scope.locals.get(name) {
+                return Some(value.clone());
+            }
+            if let Some(cell) = scope.cells.get(name) {
+                return cell.borrow().clone();
+            }
+            if scope.frame || index == 0 {
+                if index == 0 {
+                    return None;
+                }
+                if scope
+                    .declared
+                    .as_ref()
+                    .is_some_and(|declared| declared.declares(name))
+                {
+                    return None;
+                }
+                let root = &self.scopes[0];
+                return match root.locals.get(name) {
+                    Some(value) => Some(value.clone()),
+                    None => root.cells.get(name).and_then(|cell| cell.borrow().clone()),
+                };
+            }
+        }
+        None
+    }
+
+    /// The prescriptive error for reading a function's own local before it
+    /// is assigned, when a module variable with that name exists (Python
+    /// raises UnboundLocalError; Stone reports it with the fix).
+    fn unbound_local_error(&self, name: &str) -> Option<ShellError> {
+        let frame = &self.scopes[self.frame_index()];
+        if !frame.frame
+            || !frame
+                .declared
+                .as_ref()
+                .is_some_and(|declared| declared.declares(name))
+        {
+            return None;
+        }
+        let shadowed = self
+            .scopes
+            .first()
+            .is_some_and(|root| root.locals.contains_key(name))
+            || self.functions.contains_key(name);
+        let message = if shadowed {
+            format!(
+                "`{name}` is read before it is assigned. It is a local of this function because the function assigns `{name}` somewhere, so it does not see the module `{name}`. Rename the local, or pass the module value in as a parameter"
+            )
+        } else {
+            format!("`{name}` is read before it is assigned in this function; assign it first")
+        };
+        Some(stone_error("name", message))
     }
 
     fn set_local(&mut self, name: String, value: RuntimeValue) {
+        if self.scopes.is_empty() {
+            self.scopes.push(Scope::default());
+        }
+        let frame = self.frame_index();
+        if let Some(cell) = self.scopes[frame].cells.get(&name) {
+            *cell.borrow_mut() = Some(value);
+            return;
+        }
         self.root_scope_mut().locals.insert(name, value);
+    }
+
+    /// Share the named variables of the running call with a closure being
+    /// created. A variable becomes a cell the first time a closure captures
+    /// it; a name not assigned yet gets an empty cell that a later
+    /// assignment fills.
+    fn capture_cells(&mut self, names: &[String]) -> Vec<(String, Cell)> {
+        if names.is_empty() {
+            return Vec::new();
+        }
+        if self.scopes.is_empty() {
+            self.scopes.push(Scope::default());
+        }
+        let frame = self.frame_index();
+        let mut captures = Vec::with_capacity(names.len());
+        for name in names {
+            if let Some(cell) = self.scopes[frame].cells.get(name) {
+                captures.push((name.clone(), cell.clone()));
+                continue;
+            }
+            let value = self.scopes[frame..]
+                .iter_mut()
+                .rev()
+                .find_map(|scope| scope.locals.remove(name));
+            let cell = Rc::new(RefCell::new(value));
+            self.scopes[frame].cells.insert(name.clone(), cell.clone());
+            captures.push((name.clone(), cell));
+        }
+        captures
+    }
+
+    /// Stop sharing a variable with closures already created: later
+    /// assignments in this call get a fresh slot. Used when a comprehension
+    /// restores its loop variable, so a lambda made in the comprehension
+    /// keeps the last value (as in Python).
+    fn detach_cell(&mut self, name: &str) {
+        let frame = self.frame_index();
+        if let Some(scope) = self.scopes.get_mut(frame) {
+            scope.cells.remove(name);
+        }
+    }
+
+    /// Push the frame for a function or lambda call, with the cells it
+    /// captured installed.
+    fn push_frame(&mut self, declared: Option<Arc<FunctionScope>>, captures: &[(String, Cell)]) {
+        if self.scopes.is_empty() {
+            self.scopes.push(Scope::default());
+        }
+        self.scopes.push(Scope {
+            cells: captures
+                .iter()
+                .map(|(name, cell)| (name.clone(), cell.clone()))
+                .collect(),
+            frame: true,
+            declared,
+            ..Scope::default()
+        });
     }
 
     fn record_session_binding(&mut self, name: &str) {
@@ -432,16 +624,41 @@ impl EvalState {
         }
     }
 
-    fn get_local_mut(&mut self, name: &str) -> Option<&mut RuntimeValue> {
-        self.scopes
-            .iter_mut()
-            .rev()
-            .find_map(|scope| scope.locals.get_mut(name))
+    fn get_local_mut(&mut self, name: &str) -> Option<LocalMut<'_>> {
+        let frame = self.frame_index();
+        let root_fallback = frame > 0
+            && !self.scopes[frame]
+                .declared
+                .as_ref()
+                .is_some_and(|declared| declared.declares(name));
+        let index = self.scopes[frame..]
+            .iter()
+            .rposition(|scope| scope.locals.contains_key(name) || scope.cells.contains_key(name))
+            .map(|offset| frame + offset)
+            .or_else(|| {
+                (root_fallback
+                    && (self.scopes[0].locals.contains_key(name)
+                        || self.scopes[0].cells.contains_key(name)))
+                .then_some(0)
+            })?;
+        let scope = &mut self.scopes[index];
+        if let Some(value) = scope.locals.get_mut(name) {
+            return Some(LocalMut::Slot(value));
+        }
+        let cell = scope.cells.get(name)?;
+        std::cell::RefMut::filter_map(cell.borrow_mut(), Option::as_mut)
+            .ok()
+            .map(LocalMut::Cell)
     }
 
     fn remove_local(&mut self, name: &str) {
-        for scope in self.scopes.iter_mut().rev() {
+        let frame = self.frame_index();
+        for scope in self.scopes[frame..].iter_mut().rev() {
             if scope.locals.remove(name).is_some() {
+                return;
+            }
+            if let Some(cell) = scope.cells.get(name) {
+                *cell.borrow_mut() = None;
                 return;
             }
         }
@@ -503,19 +720,6 @@ impl EvalState {
 
     fn record_transition_event(&mut self, event: JsonValue) {
         self.transition_events.push(event);
-    }
-
-    fn capture_locals(&self) -> Vec<(String, RuntimeValue)> {
-        let mut seen = HashSet::new();
-        let mut captures = Vec::new();
-        for scope in self.scopes.iter().rev() {
-            for (name, value) in &scope.locals {
-                if seen.insert(name.clone()) {
-                    captures.push((name.clone(), value.clone()));
-                }
-            }
-        }
-        captures
     }
 
     fn file_mut(&mut self, handle: FileHandle) -> Result<&mut RuntimeFile, ShellError> {
@@ -1133,6 +1337,21 @@ impl Evaluator<'_> {
                 if record_session_bindings {
                     self.state.record_session_binding(&function.name);
                 }
+                if stage.is_none() && function.error_base.is_none() && self.state.frame_index() > 0
+                {
+                    // A def inside a function is a local closure, like any
+                    // other value the function binds; it does not leak into
+                    // the module's function table.
+                    let captures = self.state.capture_cells(&function.scope.captures);
+                    let callable = CallableValue::closure(
+                        self.state.next_callable_id(),
+                        function.clone(),
+                        captures,
+                    );
+                    self.state
+                        .set_local(function.name.clone(), RuntimeValue::Callable(callable));
+                    return Ok(EvalFlow::Output(PipelineData::empty()));
+                }
                 self.state
                     .functions
                     .insert(function.name.clone(), function.clone());
@@ -1219,7 +1438,13 @@ impl Evaluator<'_> {
         iter: &Expr,
         body: &[Stmt],
     ) -> Result<EvalFlow, ShellError> {
-        let hot_loop_plan = if self.state.hot_loop_enabled {
+        // The loop engine recognizes these builtins by name; if a variable
+        // hides one, run the loop on the general path so the variable wins.
+        let hot_loop_enabled = self.state.hot_loop_enabled
+            && !VM_ASSUMED_BUILTINS
+                .iter()
+                .any(|name| self.state.get_local(name).is_some());
+        let hot_loop_plan = if hot_loop_enabled {
             if targets.len() == 1 {
                 self.state.hot_loop_diagnostics.loop_candidates += 1;
             }
@@ -1234,9 +1459,7 @@ impl Evaluator<'_> {
         } else {
             None
         };
-        let generic_loop_plan = self
-            .state
-            .hot_loop_enabled
+        let generic_loop_plan = hot_loop_enabled
             .then(|| try_lower_generic_loop(targets, iter, body))
             .flatten();
         let iterable = self.eval_expr_value(iter, PipelineData::empty())?;
@@ -1479,11 +1702,11 @@ impl Evaluator<'_> {
     }
 
     fn record_contains_key(&mut self, map_name: &str, key: &str) -> Result<bool, ShellError> {
-        let map = self
+        let mut map = self
             .state
             .get_local_mut(map_name)
             .ok_or_else(|| stone_error("membership", format!("unknown name `{map_name}`")))?;
-        let RuntimeValue::Nu(Value::Record { val, .. }) = map else {
+        let RuntimeValue::Nu(Value::Record { val, .. }) = &mut *map else {
             return Err(stone_error(
                 "membership",
                 format!("{map_name} is not a record"),
@@ -1499,11 +1722,11 @@ impl Evaluator<'_> {
         addend: Value,
         exists: bool,
     ) -> Result<(), ShellError> {
-        let map = self
+        let mut map = self
             .state
             .get_local_mut(map_name)
             .ok_or_else(|| stone_error("assignment", format!("unknown name `{map_name}`")))?;
-        let RuntimeValue::Nu(Value::Record { val, .. }) = map else {
+        let RuntimeValue::Nu(Value::Record { val, .. }) = &mut *map else {
             return Err(stone_error(
                 "assignment",
                 format!("{map_name} is not a record"),
@@ -1522,11 +1745,11 @@ impl Evaluator<'_> {
     }
 
     fn append_fused_key(&mut self, list_name: &str, key: Value) -> Result<(), ShellError> {
-        let list = self
+        let mut list = self
             .state
             .get_local_mut(list_name)
             .ok_or_else(|| stone_error("append", format!("unknown name `{list_name}`")))?;
-        let RuntimeValue::Nu(Value::List { vals, .. }) = list else {
+        let RuntimeValue::Nu(Value::List { vals, .. }) = &mut *list else {
             return Err(stone_error("append", format!("{list_name} is not a list")));
         };
         vals.push(key);
@@ -1792,11 +2015,11 @@ impl Evaluator<'_> {
             AssignTarget::Subscript { .. } => {
                 let (name, indices) = self.eval_assign_target_path(target, "assignment")?;
                 let value = value.into_nu_value("assignment")?;
-                let target = self
+                let mut target = self
                     .state
                     .get_local_mut(&name)
                     .ok_or_else(|| stone_error("assignment", format!("unknown name `{name}`")))?;
-                let RuntimeValue::Nu(target) = target else {
+                let RuntimeValue::Nu(target) = &mut *target else {
                     return Err(stone_error(
                         "assignment",
                         format!("{name} does not support item assignment"),
@@ -2036,6 +2259,7 @@ impl Evaluator<'_> {
 
     fn restore_target_values(&mut self, previous: Vec<(String, Option<RuntimeValue>)>) {
         for (target, value) in previous {
+            self.state.detach_cell(&target);
             match value {
                 Some(value) => self.state.set_local(target, value),
                 None => self.state.remove_local(&target),
@@ -2163,6 +2387,8 @@ impl Evaluator<'_> {
                         Ok(RuntimeValue::Nu(Value::bool(false, span)))
                     } else if name == "null" {
                         Ok(RuntimeValue::Nu(Value::nothing(span)))
+                    } else if let Some(error) = self.state.unbound_local_error(name) {
+                        Err(error)
                     } else {
                         Err(stone_error("name", format!("unknown name `{name}`")))
                     }
@@ -2340,31 +2566,47 @@ impl Evaluator<'_> {
                     "generator expression",
                     "generator expressions are only supported inside sum(...), any(...), all(...), join(...), and set(...) for now; use a list comprehension like [expr for x in items] when you need a list",
                 )),
-                Expr::Lambda { params, body } => {
+                Expr::Lambda {
+                    params,
+                    body,
+                    captures,
+                } => {
+                    let captures = self.state.capture_cells(captures);
                     Ok(RuntimeValue::Callable(CallableValue::lambda(
                         self.state.next_callable_id(),
                         params.clone(),
                         body.clone(),
-                        self.state.capture_locals(),
+                        captures,
                     )))
                 }
-                Expr::Call(call) if self.state.functions.contains_key(&call.name) => {
-                    self.eval_user_function_call(call)
-                }
-                Expr::Call(call) if is_builtin_error_type(&call.name) => {
-                    self.eval_builtin_error_constructor(call)
-                }
-                Expr::Call(call) if is_builtin_call(call) => self.eval_builtin_call(call, input),
-                Expr::Call(call) if self.state.get_local(&call.name).is_some() => {
-                    self.eval_named_callable_call(call)
-                }
+                Expr::Call(call) => match self.state.get_local(&call.name) {
+                    // Python's one namespace: a variable in scope (a nested
+                    // def, a lambda, a callable passed in) is what the name
+                    // means, ahead of module functions and builtins.
+                    Some(RuntimeValue::Callable(_) | RuntimeValue::AgentControl(_)) => {
+                        self.eval_named_callable_call(call)
+                    }
+                    // A @stage function also binds a stage value under its
+                    // name; calling the name calls the function.
+                    Some(RuntimeValue::WorkflowStage(_)) | None => {
+                        if self.state.functions.contains_key(&call.name) {
+                            self.eval_user_function_call(call)
+                        } else if is_builtin_error_type(&call.name) {
+                            self.eval_builtin_error_constructor(call)
+                        } else if is_builtin_call(call) {
+                            self.eval_builtin_call(call, input)
+                        } else {
+                            Err(unknown_stone_call_error(&call.name))
+                        }
+                    }
+                    Some(value) => Err(self.not_callable_error(&call.name, &value)),
+                },
                 Expr::MethodCall {
                     receiver,
                     method,
                     positional,
                     named,
                 } => self.eval_method_call(receiver, method, positional, named),
-                Expr::Call(call) => Err(unknown_stone_call_error(&call.name)),
             }
         })();
         self.state.profiler.finish(EvalProfileBucket::Expr, started);
@@ -2684,6 +2926,30 @@ impl Evaluator<'_> {
         result
     }
 
+    /// Calling a variable that holds a non-function value. When the name is
+    /// also a builtin or module function, say that the variable hides it.
+    fn not_callable_error(&self, name: &str, value: &RuntimeValue) -> ShellError {
+        let kind = runtime_type_name(value);
+        let hidden = if self.state.functions.contains_key(name) {
+            Some("function")
+        } else if is_builtin_error_type(name) {
+            Some("error type")
+        } else if STONE_BUILTIN_NAMES.contains(&name) {
+            Some("builtin")
+        } else {
+            None
+        };
+        let message = match hidden {
+            Some(what) => format!(
+                "`{name}` is a variable here (a {kind} value), so `{name}(...)` cannot call the {what} `{name}`: Stone, like Python, has one namespace and the variable hides the {what}. Rename the variable (for example `{name}_value = ...`)"
+            ),
+            None => format!(
+                "`{name}` is a variable here (a {kind} value), not a function, so it cannot be called"
+            ),
+        };
+        stone_error("callable", message)
+    }
+
     fn eval_user_function_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let function = self
             .state
@@ -2731,6 +2997,16 @@ impl Evaluator<'_> {
     fn invoke_user_function_values_with_named(
         &mut self,
         function: &FunctionDef,
+        args: Vec<RuntimeValue>,
+        named: Vec<(String, RuntimeValue)>,
+    ) -> Result<RuntimeValue, ShellError> {
+        self.invoke_function_frame(function, &[], args, named)
+    }
+
+    fn invoke_function_frame(
+        &mut self,
+        function: &FunctionDef,
+        captures: &[(String, Cell)],
         args: Vec<RuntimeValue>,
         named: Vec<(String, RuntimeValue)>,
     ) -> Result<RuntimeValue, ShellError> {
@@ -2803,7 +3079,8 @@ impl Evaluator<'_> {
             bindings.push((param.name.clone(), value));
         }
 
-        self.state.push_scope();
+        self.state
+            .push_frame(Some(function.scope.clone()), captures);
         for (name, value) in bindings {
             self.state.set_local(name, value);
         }
@@ -3019,9 +3296,9 @@ impl Evaluator<'_> {
         named: Vec<(String, RuntimeValue)>,
     ) -> Result<RuntimeValue, ShellError> {
         match callable {
-            CallableValue::Named { function, .. } => {
-                self.invoke_user_function_values_with_named(function, args, named)
-            }
+            CallableValue::Named {
+                function, captures, ..
+            } => self.invoke_function_frame(function, captures, args, named),
             CallableValue::Lambda {
                 function_id,
                 params,
@@ -3075,10 +3352,7 @@ impl Evaluator<'_> {
                     })?;
                     bindings.push((name, value));
                 }
-                self.state.push_scope();
-                for (name, value) in captures {
-                    self.state.set_local(name.clone(), value.clone());
-                }
+                self.state.push_frame(None, captures);
                 for (name, value) in bindings {
                     self.state.set_local(name.clone(), value);
                 }
@@ -6654,7 +6928,7 @@ impl Evaluator<'_> {
         for (name, function) in functions {
             self.state.functions.insert(name.clone(), function.clone());
         }
-        self.state.push_scope();
+        self.state.push_frame(Some(function.scope.clone()), &[]);
         self.state.set_local(
             function.params[0].name.clone(),
             RuntimeValue::Nu(event_value),
@@ -11226,7 +11500,7 @@ impl Evaluator<'_> {
         let value = self
             .eval_expr_value(arg, PipelineData::empty())?
             .into_nu_value("append")?;
-        let target = self.mutable_list_method_target(receiver, "append")?;
+        let mut target = self.mutable_list_method_target(receiver, "append")?;
         target.push(value);
         Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())))
     }
@@ -11247,7 +11521,7 @@ impl Evaluator<'_> {
             .into_iter()
             .map(|value| value.into_nu_value("extend"))
             .collect::<Result<Vec<_>, _>>()?;
-        let target = self.mutable_list_method_target(receiver, "extend")?;
+        let mut target = self.mutable_list_method_target(receiver, "extend")?;
         target.extend(values);
         Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())))
     }
@@ -11294,7 +11568,7 @@ impl Evaluator<'_> {
         let Value::List { vals, .. } = sorted else {
             unreachable!("sort_builtin_values returns a list");
         };
-        let target = self.mutable_list_method_target(receiver, "sort")?;
+        let mut target = self.mutable_list_method_target(receiver, "sort")?;
         *target = vals;
         Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())))
     }
@@ -11311,7 +11585,7 @@ impl Evaluator<'_> {
             .eval_expr_value(arg, PipelineData::empty())?
             .into_nu_value("add")?;
         let key = value_identity_key(&value, "add")?;
-        let vals = self.mutable_list_method_target(receiver, "add")?;
+        let mut vals = self.mutable_list_method_target(receiver, "add")?;
         for existing in vals.iter() {
             if value_identity_key(existing, "add")? == key {
                 return Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())));
@@ -11360,30 +11634,32 @@ impl Evaluator<'_> {
         &mut self,
         receiver: &Expr,
         context: &str,
-    ) -> Result<&mut Vec<Value>, ShellError> {
+    ) -> Result<LocalMut<'_, Vec<Value>>, ShellError> {
         let (name, indices) = self.eval_mutable_expr_path(receiver, context)?;
         let target = self
             .state
             .get_local_mut(&name)
             .ok_or_else(|| stone_error(context, format!("unknown name `{name}`")))?;
-        let RuntimeValue::Nu(target) = target else {
-            return Err(stone_error(
-                context,
-                format!("{name} does not support {context}()"),
-            ));
-        };
-        let target = if indices.is_empty() {
-            target
-        } else {
-            subscript_path_mut(target, &indices, context)?
-        };
-        let Value::List { vals, .. } = target else {
-            return Err(stone_error(
-                context,
-                format!("{} has no {context}()", target.get_type()),
-            ));
-        };
-        Ok(vals)
+        target.try_map(|target| {
+            let RuntimeValue::Nu(target) = target else {
+                return Err(stone_error(
+                    context,
+                    format!("{name} does not support {context}()"),
+                ));
+            };
+            let target = if indices.is_empty() {
+                target
+            } else {
+                subscript_path_mut(target, &indices, context)?
+            };
+            let Value::List { vals, .. } = target else {
+                return Err(stone_error(
+                    context,
+                    format!("{} has no {context}()", target.get_type()),
+                ));
+            };
+            Ok(vals)
+        })
     }
 
     fn eval_map_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -11687,6 +11963,17 @@ impl Evaluator<'_> {
         result
     }
 }
+
+/// Builtins the loop engine (stone_vm) matches by name.
+const VM_ASSUMED_BUILTINS: &[&str] = &[
+    "int",
+    "float",
+    "str",
+    "range",
+    "read_jsonl",
+    "read_csv",
+    "json_loads",
+];
 
 const STONE_BUILTIN_NAMES: &[&str] = &[
     "cat",
@@ -17540,10 +17827,96 @@ emit(inc(5))
         )?;
         let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
 
+        // As in Python, a lambda reads a module variable when it runs, not
+        // when it is created.
         assert_eq!(
             json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
-            json_value!(15)
+            json_value!(105)
         );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn scoping_is_lexical_with_read_only_closures() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("lexical-scope")?;
+        let run = |stack: &mut Stack, source: &str| -> Result<serde_json::Value, ShellError> {
+            let program = lower_source(source)?;
+            let output = eval_program(&engine_state, stack, &program, PipelineData::empty())?;
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())
+        };
+
+        // A closure keeps the variables of the call that made it, and state
+        // kept in a list survives between calls.
+        assert_eq!(
+            run(
+                &mut stack,
+                "def make():\n    c = [0]\n    def inc():\n        c[0] += 1\n        return c[0]\n    return inc\nf = make()\nf()\nemit(f())\n",
+            )?,
+            json_value!(2)
+        );
+        // A closure sees assignments the defining function makes later.
+        assert_eq!(
+            run(
+                &mut stack,
+                "def outer():\n    def g():\n        return v\n    v = 7\n    return g()\nemit(outer())\n",
+            )?,
+            json_value!(7)
+        );
+        // A nested def can call itself.
+        assert_eq!(
+            run(
+                &mut stack,
+                "def outer(n):\n    def fact(k):\n        return 1 if k <= 1 else k * fact(k - 1)\n    return fact(n)\nemit(outer(3))\n",
+            )?,
+            json_value!(6)
+        );
+        // Callers' variables are invisible: no dynamic scoping.
+        let error = run(
+            &mut stack,
+            "def show():\n    return secret\ndef caller():\n    secret = 1\n    return show()\nemit(caller())\n",
+        )
+        .expect_err("dynamic scope");
+        assert!(format!("{error:?}").contains("unknown name `secret`"));
+        // A nested def stays local to its function.
+        let error = run(
+            &mut stack,
+            "def outer():\n    def helper():\n        return 1\n    return helper()\nouter()\nemit(helper())\n",
+        )
+        .expect_err("nested def leaked");
+        assert!(format!("{error:?}").contains("helper"));
+        // Reading a local before assigning it does not fall back to a module
+        // variable of the same name.
+        let error = run(
+            &mut stack,
+            "x = 1\ndef f():\n    y = x\n    x = 2\n    return y\nemit(f())\n",
+        )
+        .expect_err("unbound local");
+        assert!(format!("{error:?}").contains("read before it is assigned"));
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn calls_resolve_variables_before_builtins() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("one-namespace")?;
+        let program = lower_source(
+            "def apply(len, x):\n    return len(x)\nemit(apply(lambda v: v * 2, 4))\n",
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!(8)
+        );
+
+        let program = lower_source("len = 5\nemit(len([1]))\n")?;
+        let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("non-callable shadow");
+        let text = format!("{error:?}");
+        assert!(text.contains("hides the builtin"), "{text}");
+        assert!(text.contains("Rename the variable"), "{text}");
 
         cleanup_dir(&root);
         Ok(())
