@@ -66,6 +66,10 @@ use crate::stone_builtins::{
     where_builtin, where_compare_builtin, zfill_text,
 };
 use crate::stone_correction;
+use crate::stone_errors::{
+    builtin_error_record, classify_error, error_type_matches, io_error_type, is_builtin_error_type,
+    is_tool_error_type,
+};
 use crate::stone_file_ops::{
     cat_text, create_dir_all, diff_record_for_paths, edit_text_file, file_nonempty_probe,
     file_regular_probe, find_records, io_stone_error, list_dir_records, open_runtime_file,
@@ -145,6 +149,8 @@ pub struct EvalState {
     active_workflow_run: bool,
     active_async_depth: usize,
     caught_errors: Vec<Value>,
+    swallowed_tool_errors: u64,
+    last_swallowed_tool_error: Option<Value>,
     async_functions_entered: u64,
     async_await_count: u64,
     async_run_await_count: u64,
@@ -642,6 +648,8 @@ fn eval_program_with_source_options(
             active_workflow_run: false,
             active_async_depth: 0,
             caught_errors: Vec::new(),
+            swallowed_tool_errors: 0,
+            last_swallowed_tool_error: None,
             async_functions_entered: 0,
             async_await_count: 0,
             async_run_await_count: 0,
@@ -712,6 +720,19 @@ fn eval_program_with_source_options(
     }
     if !evaluator.state.transition_events.is_empty() {
         diagnostics["transitions"] = JsonValue::Array(evaluator.state.transition_events.clone());
+    }
+    if evaluator.state.swallowed_tool_errors > 0 {
+        let last = evaluator
+            .state
+            .last_swallowed_tool_error
+            .as_ref()
+            .map(nu_to_json_value)
+            .unwrap_or(JsonValue::Null);
+        diagnostics["errors"] = json!({
+            "swallowed_tool_errors": evaluator.state.swallowed_tool_errors,
+            "last_swallowed": last,
+            "note": "a handler caught a ToolError without binding it (`as error`) or re-raising it; the failure is not visible to the program",
+        });
     }
     if evaluator.state.async_functions_entered > 0 || evaluator.state.async_await_count > 0 {
         diagnostics["async"] = json!({
@@ -1063,6 +1084,26 @@ impl Evaluator<'_> {
             }
             Stmt::Pass => Ok(EvalFlow::Output(PipelineData::empty())),
             Stmt::FunctionDef(function) => {
+                if let Some(base) = &function.error_base {
+                    if is_builtin_error_type(&function.name) {
+                        return Err(stone_error(
+                            "class",
+                            format!(
+                                "`{}` is a builtin error type and cannot be redefined; choose a new name such as `class Config{}({}):`",
+                                function.name, function.name, function.name
+                            ),
+                        ));
+                    }
+                    if !self.is_error_type_name(base) {
+                        return Err(stone_error(
+                            "class",
+                            format!(
+                                "error class `{}` must derive from an error type, but `{base}` is not one; use `class {}(Exception):` or another builtin error such as ValueError or ToolError",
+                                function.name, function.name
+                            ),
+                        ));
+                    }
+                }
                 let stage = function
                     .stage
                     .as_ref()
@@ -1542,10 +1583,18 @@ impl Evaluator<'_> {
         match self.eval_block(body, PipelineData::empty(), false) {
             Ok(flow) => Ok(flow),
             Err(err) => {
-                let Some(handler) = handlers.first() else {
+                let error_record = shell_error_record(&err);
+                let error_type = error_record_type(&error_record);
+                // Handlers are tried in source order; the first whose type
+                // (or one of whose tuple types) is on the error's chain wins.
+                let Some(handler) = handlers.iter().find(|handler| {
+                    handler
+                        .types
+                        .iter()
+                        .any(|handler_type| self.error_type_matches(&error_type, handler_type))
+                }) else {
                     return Err(err);
                 };
-                let error_record = shell_error_record(&err);
                 self.state.push_scope();
                 if let Some(name) = &handler.name {
                     self.state
@@ -1553,16 +1602,105 @@ impl Evaluator<'_> {
                 }
                 self.state.caught_errors.push(error_record);
                 let result = self.eval_block(&handler.body, PipelineData::empty(), false);
-                self.state.caught_errors.pop();
+                let caught = self.state.caught_errors.pop();
                 self.state
                     .pop_scope_merging_nu_locals(handler.name.as_deref())?;
+                if result.is_ok()
+                    && handler.name.is_none()
+                    && is_tool_error_type(&error_type, |name| self.error_class_base(name))
+                {
+                    self.state.swallowed_tool_errors =
+                        self.state.swallowed_tool_errors.saturating_add(1);
+                    self.state.last_swallowed_tool_error = caught;
+                }
                 result
             }
         }
     }
 
+    fn error_class_base(&self, name: &str) -> Option<String> {
+        self.state
+            .functions
+            .get(name)
+            .and_then(|function| function.error_base.clone())
+    }
+
+    fn error_type_matches(&self, actual: &str, handler: &str) -> bool {
+        error_type_matches(actual, handler, |name| self.error_class_base(name))
+    }
+
+    fn is_error_type_name(&self, name: &str) -> bool {
+        is_builtin_error_type(name) || self.error_class_base(name).is_some()
+    }
+
+    fn eval_builtin_error_constructor(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let name = call.name.as_str();
+        let mut message = None;
+        for (key, expression) in &call.named {
+            if key != "message" || message.is_some() {
+                return Err(stone_error(
+                    "function call",
+                    format!(
+                        "{name}() accepts one message argument; builtin errors have no other fields. Define your own error type with fields: `class MyError({name}):` then `path: str`"
+                    ),
+                ));
+            }
+            message = Some(expression);
+        }
+        match call.positional.as_slice() {
+            [] => {}
+            [expression] if message.is_none() => message = Some(expression),
+            _ => {
+                return Err(stone_error(
+                    "function call",
+                    format!(
+                        "{name}() accepts one message argument; format several values into one string with an f-string"
+                    ),
+                ));
+            }
+        }
+        let message = match message {
+            Some(expression) => {
+                let value = self
+                    .eval_expr_value(expression, PipelineData::empty())?
+                    .into_nu_value(name)?;
+                match value {
+                    Value::String { val, .. } => val,
+                    other => {
+                        return Err(stone_error(
+                            "function call",
+                            format!(
+                                "{name}() message must be a string, got {}; use str(value) or an f-string",
+                                other.get_type()
+                            ),
+                        ));
+                    }
+                }
+            }
+            None => String::new(),
+        };
+        Ok(RuntimeValue::Nu(builtin_error_record(name, message)))
+    }
+
     fn eval_raise_stmt(&mut self, expression: Option<&Expr>) -> Result<EvalFlow, ShellError> {
         let value = match expression {
+            // `raise ValueError` without a call raises an instance with an
+            // empty message, as in Python.
+            Some(Expr::Name(name))
+                if self.state.get_local(name).is_none() && self.is_error_type_name(name) =>
+            {
+                let call = Call {
+                    name: name.clone(),
+                    positional: Vec::new(),
+                    named: Vec::new(),
+                };
+                if is_builtin_error_type(name) && !self.state.functions.contains_key(name) {
+                    self.eval_builtin_error_constructor(&call)?
+                } else {
+                    self.eval_user_function_call(&call)?
+                }
+                .into_nu_value("raise")?
+            }
             Some(expression) => self
                 .eval_expr_value(expression, PipelineData::empty())?
                 .into_nu_value("raise")?,
@@ -1885,6 +2023,7 @@ impl Evaluator<'_> {
         match expression {
             Expr::Call(call)
                 if is_builtin_call(call)
+                    || is_builtin_error_type(&call.name)
                     || self.state.functions.contains_key(&call.name)
                     || self.state.get_local(&call.name).is_some() =>
             {
@@ -2153,6 +2292,9 @@ impl Evaluator<'_> {
                 }
                 Expr::Call(call) if self.state.functions.contains_key(&call.name) => {
                     self.eval_user_function_call(call)
+                }
+                Expr::Call(call) if is_builtin_error_type(&call.name) => {
+                    self.eval_builtin_error_constructor(call)
                 }
                 Expr::Call(call) if is_builtin_call(call) => self.eval_builtin_call(call, input),
                 Expr::Call(call) if self.state.get_local(&call.name).is_some() => {
@@ -11795,7 +11937,9 @@ fn raised_error_parts(value: Value) -> Result<(String, String, Option<Value>), S
                 // A record bound by `except Exception as error` carries
                 // diagnostic fields rather than an explicit detail. Preserve
                 // that bounded record when users write `raise error`.
-                val.contains("kind").then(|| value.clone())
+                // Typed records from error constructors (`ValueError(...)`,
+                // model-defined error classes) carry their type and fields.
+                (val.contains("kind") || val.contains("type")).then(|| value.clone())
             });
             Ok((message, code, detail))
         }
@@ -11812,6 +11956,7 @@ fn raised_error_parts(value: Value) -> Result<(String, String, Option<Value>), S
 fn shell_error_record(err: &ShellError) -> Value {
     let span = Span::unknown();
     let mut record = Record::new();
+    let mut io_type = None;
     match err {
         ShellError::Generic(generic) => {
             record.push("kind", Value::string(generic.error.to_string(), span));
@@ -11828,6 +11973,7 @@ fn shell_error_record(err: &ShellError) -> Value {
             }
         }
         ShellError::Io(io) => {
+            io_type = Some(io_error_type(&io.kind));
             record.push("kind", Value::string(io.to_string(), span));
             record.push("code", Value::string("stone_io_error", span));
             let message = match &io.path {
@@ -11846,7 +11992,66 @@ fn shell_error_record(err: &ShellError) -> Value {
             record.push("message", Value::string(other.to_string(), span));
         }
     }
-    Value::record(record, span)
+    if let ShellError::Generic(generic) = err {
+        match task_failure_detail(generic) {
+            // A raised typed or re-raised error: its own fields (type,
+            // message, model-defined fields, original kind/code) win.
+            Some(Value::Record { val, .. }) if val.contains("type") || val.contains("kind") => {
+                for (key, value) in val.into_owned() {
+                    record.insert(key, value);
+                }
+            }
+            Some(detail) => {
+                record.insert("detail", detail);
+            }
+            None => {}
+        }
+    }
+    let error_type = match record.get("type") {
+        Some(Value::String { val, .. }) => val.clone(),
+        _ => match io_type {
+            Some(io_type) => io_type.to_string(),
+            None => {
+                let field = |key: &str| match record.get(key) {
+                    Some(Value::String { val, .. }) => val.as_str(),
+                    _ => "",
+                };
+                classify_error(field("kind"), field("code"), field("message")).to_string()
+            }
+        },
+    };
+    let mut typed = Record::with_capacity(record.len() + 1);
+    typed.push("type", Value::string(error_type, span));
+    for (key, value) in record {
+        if key != "type" {
+            typed.push(key, value);
+        }
+    }
+    Value::record(typed, span)
+}
+
+fn task_failure_detail(error: &GenericError) -> Option<Value> {
+    if error.code.to_string() != "task_failure" {
+        return None;
+    }
+    error.inner.iter().find_map(|inner| match inner {
+        ShellError::Generic(inner) if inner.code.to_string() == "task_failure_detail" => {
+            serde_json::from_str::<JsonValue>(&inner.msg.to_string())
+                .ok()
+                .map(|detail| json_to_nu_value(detail, Span::unknown()))
+        }
+        _ => None,
+    })
+}
+
+fn error_record_type(record: &Value) -> String {
+    match record {
+        Value::Record { val, .. } => match val.get("type") {
+            Some(Value::String { val, .. }) => val.clone(),
+            _ => "Exception".to_string(),
+        },
+        _ => "Exception".to_string(),
+    }
 }
 
 fn stone_type_name(ty: StoneType) -> &'static str {
@@ -20879,6 +21084,138 @@ emit({
     }
 
     #[test]
+    fn typed_errors_match_in_order_and_keep_their_fields() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("typed-errors")?;
+        let source = r#"class ConfigError(ValueError):
+    path: str
+    retries: int = 0
+
+out = {}
+try:
+    raise ConfigError("bad config", path="/etc/app")
+except (KeyError, IndexError) as error:
+    out["wrong"] = error.type
+except ValueError as error:
+    out["config"] = {"type": error.type, "message": error.message, "path": error.path, "retries": error.retries}
+except Exception as error:
+    out["too_broad"] = error.type
+try:
+    try:
+        raise ConfigError("inner", path="p")
+    except Exception as error:
+        raise
+except ConfigError as again:
+    out["reraised"] = [again.type, again.path]
+try:
+    raise NotImplementedError
+except RuntimeError as error:
+    out["bare_name"] = [error.type, error.message]
+try:
+    read_text("missing.txt")
+except FileNotFoundError as error:
+    out["missing"] = [error.type, error.code]
+try:
+    value = {}["k"]
+except LookupError as error:
+    out["key"] = error.type
+try:
+    value = [1][5]
+except IndexError as error:
+    out["index"] = error.type
+try:
+    value = 1 // 0
+except ArithmeticError as error:
+    out["zero"] = error.type
+try:
+    value = int("x")
+except ValueError as error:
+    out["parse"] = error.type
+try:
+    value = 1 + "a"
+except TypeError as error:
+    out["add"] = error.type
+try:
+    try:
+        value = 1 // 0
+    except KeyError as error:
+        out["not_reached"] = True
+except ZeroDivisionError as error:
+    out["propagated"] = error.type
+try:
+    raise {"message": "m", "code": "c", "detail": {"k": 1}}
+except Exception as error:
+    out["record"] = [error.type, error.declared_code, error.detail]
+try:
+    read_text("missing.txt")
+except ToolError:
+    out["swallowed"] = True
+emit(out)
+"#;
+        let program = lower_source(source)?;
+        let mut session = StoneSession::default();
+        let output = eval_program_with_output_and_session(
+            &engine_state,
+            &mut stack,
+            &program,
+            PipelineData::empty(),
+            Some(&mut session),
+            Some(source),
+            None,
+        )?;
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())?,
+            json_value!({
+                "config": {"type": "ConfigError", "message": "bad config", "path": "/etc/app", "retries": 0},
+                "reraised": ["ConfigError", "p"],
+                "bare_name": ["NotImplementedError", ""],
+                "missing": ["FileNotFoundError", "stone_io_error"],
+                "key": "KeyError",
+                "index": "IndexError",
+                "zero": "ZeroDivisionError",
+                "parse": "ValueError",
+                "add": "TypeError",
+                "propagated": "ZeroDivisionError",
+                "record": ["Exception", "c", {"k": 1}],
+                "swallowed": true,
+            })
+        );
+        assert_eq!(
+            output.diagnostics["errors"]["swallowed_tool_errors"],
+            json_value!(1)
+        );
+        assert_eq!(
+            output.diagnostics["errors"]["last_swallowed"]["type"],
+            json_value!("FileNotFoundError")
+        );
+        // The class persists in the session like a function.
+        assert!(session.functions.contains_key("ConfigError"));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn unmatched_typed_handler_lets_error_escape() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("typed-errors-escape")?;
+        let program =
+            lower_source("try:\n    value = 1 // 0\nexcept KeyError as error:\n    value = 0\n")?;
+        let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("ZeroDivisionError is not a KeyError");
+        assert!(
+            format!("{error:?}").contains("division by zero"),
+            "{error:?}"
+        );
+        let program = lower_source("class E(len):\n    pass\n")?;
+        let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+            .expect_err("base must be an error type");
+        assert!(
+            format!("{error:?}").contains("must derive from an error type"),
+            "{error:?}"
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
     fn evaluates_llm_compatibility_features() -> Result<(), ShellError> {
         let (engine_state, mut stack, root) = test_engine("llm-compat-features")?;
         fs::write(root.join("bad.json"), "{not json").expect("write bad json");
@@ -20916,7 +21253,7 @@ except Exception as e:
     missing = {"code": e.code, "message": e.message}
 try:
     parsed = read_json("bad.json")
-except:
+except Exception:
     parsed = {"fallback": True}
 try:
     ok = read_text("bad.json")

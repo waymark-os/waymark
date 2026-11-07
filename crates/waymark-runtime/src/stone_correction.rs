@@ -192,9 +192,57 @@ pub(crate) fn correction_for_error(err: &ShellError, source: &str) -> Option<Jso
                 phase,
                 "exception_binding",
                 &format!("except {name}:"),
-                vec![format!("except Exception as {name}:"), "except:".to_string()],
+                vec![format!("except Exception as {name}:")],
                 &format!(
-                    "`except {name}:` names an exception type in Python; it does not bind the caught error. Use `except Exception as {name}:` when the handler reads `{name}`, or use bare `except:` when it does not. Then explicitly evaluate the repaired source again."
+                    "`except {name}:` names an exception type in Python; it does not bind the caught error. Use `except Exception as {name}:`, or a narrower type such as `except FileNotFoundError as {name}:` when only that error is expected. Then explicitly evaluate the repaired source again."
+                ),
+            ));
+        }
+        if detail.starts_with("bare `except:` is not supported") {
+            return Some(repair_envelope(
+                source,
+                phase,
+                "bare_except",
+                "except:",
+                vec!["except Exception as error:"],
+                "Stone requires every handler to name an error type. Use `except Exception as error:` to handle any error, or a narrower type such as `except FileNotFoundError as error:` when only that error is expected. Then explicitly evaluate the repaired source again.",
+            ));
+        }
+    }
+
+    if code == "stone_admission_error" {
+        if let Some(received) = swallowing_handler_error(&detail) {
+            let bound = received.trim_end_matches(": pass").to_string();
+            return Some(repair_envelope_owned(
+                source,
+                phase,
+                "swallowed_error",
+                &received,
+                vec![
+                    format!("{bound} as error: <use error.message or raise>"),
+                    "except FileNotFoundError: pass".to_string(),
+                ],
+                "A handler for every error whose body is only `pass` hides failed commands, missing files, and failed model calls. Bind the error and act on it (record error.message, return a fallback value, or `raise`), or catch only the specific error you expect. Then explicitly evaluate the repaired source again.",
+            ));
+        }
+        if let Some(received) = backticked_after(&detail, "unknown error type `") {
+            let builtin = crate::stone_errors::BUILTIN_ERROR_TYPES
+                .iter()
+                .map(|(name, _)| (*name).to_string())
+                .collect::<Vec<_>>();
+            let mut expected = rank_candidates(&received, &builtin)
+                .into_iter()
+                .map(|candidate| candidate.replacement)
+                .collect::<Vec<_>>();
+            expected.push(format!("class {received}(Exception):"));
+            return Some(repair_envelope_owned(
+                source,
+                phase,
+                "error_type",
+                &received,
+                expected,
+                &format!(
+                    "`{received}` is not a builtin error type and no error class with that name is defined. Use a builtin type, or define it first with `class {received}(Exception):` and optional typed fields. Then explicitly evaluate the repaired source again."
                 ),
             ));
         }
@@ -572,6 +620,14 @@ fn message_role_error(detail: &str) -> Option<(String, Vec<&str>)> {
     ))
 }
 
+fn swallowing_handler_error(detail: &str) -> Option<String> {
+    let received = backticked_after(detail, "`")?;
+    (received.starts_with("except ")
+        && received.ends_with(": pass")
+        && detail.contains("discards every"))
+    .then_some(received)
+}
+
 fn exception_handler_binding_error(detail: &str) -> Option<String> {
     let received = backticked_after(detail, "unsupported exception handler `")?;
     let name = received.strip_prefix("except ")?.strip_suffix(':')?.trim();
@@ -933,6 +989,49 @@ mod tests {
     }
 
     #[test]
+    fn handler_rules_get_typed_repairs() {
+        let bare = correction_for_error(
+            &error(
+                "stone_script_unsupported",
+                crate::stone_ast::BARE_EXCEPT_UNSUPPORTED,
+            ),
+            "try:\n    x = 1\nexcept:\n    x = 2\n",
+        )
+        .expect("bare except correction");
+        assert_eq!(bare["class"], json!("bare_except"));
+        assert_eq!(bare["expected"], json!(["except Exception as error:"]));
+
+        let swallowed = correction_for_error(
+            &error(
+                "stone_admission_error",
+                "`except Exception: pass` discards every Exception without a trace",
+            ),
+            "try:\n    x = 1\nexcept Exception:\n    pass\n",
+        )
+        .expect("swallowed handler correction");
+        assert_eq!(swallowed["class"], json!("swallowed_error"));
+        assert_eq!(swallowed["received"], json!("except Exception: pass"));
+        assert_eq!(
+            swallowed["expected"][0],
+            json!("except Exception as error: <use error.message or raise>")
+        );
+
+        let unknown = correction_for_error(
+            &error(
+                "stone_admission_error",
+                "`except ValueEror`: unknown error type `ValueEror`. Builtin error types: ...",
+            ),
+            "try:\n    x = 1\nexcept ValueEror:\n    x = 2\n",
+        )
+        .expect("unknown error type correction");
+        assert_eq!(unknown["class"], json!("error_type"));
+        assert_eq!(
+            unknown["expected"],
+            json!(["ValueError", "class ValueEror(Exception):"])
+        );
+    }
+
+    #[test]
     fn exception_handler_name_gets_binding_specific_repair() {
         let correction = correction_for_error(
             &error(
@@ -949,7 +1048,7 @@ mod tests {
         assert_eq!(correction["received"], json!("except error:"));
         assert_eq!(
             correction["expected"],
-            json!(["except Exception as error:", "except:"])
+            json!(["except Exception as error:"])
         );
         assert_eq!(correction["candidates"], json!([]));
         assert!(correction["guidance"]

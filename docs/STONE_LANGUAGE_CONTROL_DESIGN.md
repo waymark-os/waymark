@@ -567,6 +567,23 @@ Rules:
   exceed its authority does not get to run code of its own choosing
   afterward.
 
+As implemented in M2 (`stone_errors.rs`, user docs in
+`STONE_LANGUAGE.md`, "Errors And Handlers"):
+
+- The builtin tree follows Python, with `ToolError` inserted above `OSError`:
+  `Exception > ToolError > OSError > FileNotFoundError, ...`. Python-trained
+  `except OSError` and `except FileNotFoundError` keep working, and one
+  `except ToolError` covers files, commands, Gateway, and model failures.
+- Caught errors stay records. A `type` field is added; runtime errors are
+  classified once, on the handler path, from the existing `kind`/`code`/
+  `message`, and I/O errors from the I/O error kind. Raised typed records and
+  re-raised errors keep their own fields and type.
+- A model-defined error class lowers to its constructor function, so it is
+  checked, persisted, and called like a function. Its base is stored on the
+  constructor; matching walks the chain with string compares.
+- Unknown handler types are admission errors. Lowercase handler names
+  (`except error:`) stay parse errors with the binding repair.
+
 The Python precedent is PEP 352 and bpo-32528, which moved
 `KeyboardInterrupt` and then asyncio's `CancelledError` out of `Exception`.
 The known pitfall from that change is code that caught `Exception` to unwind
@@ -1637,16 +1654,17 @@ Exit: adversarial delegation and injection tests, plus Gateway mapping for
 
 ## 14. What Changes In The Prototype
 
-Compared with the draft v2 plan. Nothing here has started. "Existing" marks
+Compared with the draft v2 plan. Items marked **done** have landed on this
+branch; the rest have not started. "Existing" marks
 items that change current Stone behavior; those wait for the source reading
 in the last column and for the compatibility measurement.
 
 | # | Item | Change from draft v2 | Existing | Read before implementing | Phase |
 |---|---|---|---|---|---|
-| 1 | Bare `except:` is a parse error; the correction engine, AST hints, CLI help, and `STONE_LANGUAGE.md` stop suggesting it (9.5) | New | **Yes**: accepted and recommended today | Joe-E §4.3; PEP 352; Ren et al. 2023 | P1 |
-| 2 | `pass`-only handler for `Exception`/`ToolError` is an admission error | New | **Yes**: legal today | Ren et al. 2023; Seeker 2024 | P1 |
-| 3 | Swallowed-`ToolError` counter in trace and `last_result()` | New | Additive field | — | P1, M2 (needs L6 typed `ToolError`; moved from M1) |
-| 4 | `except BaseException`, `except PolicyViolation`, `except ContractViolation` rejected | New | No (`BaseException` already rejected, 9.6) | PEP 352 | P1 |
+| 1 | Bare `except:` is a parse error; the correction engine, AST hints, CLI help, and `STONE_LANGUAGE.md` stop suggesting it (9.5) | New | **Yes**: accepted and recommended today | Joe-E §4.3; PEP 352; Ren et al. 2023 | P1, **done in M2** (parse error plus `bare_except` repair; lowercase `except name:` keeps its `exception_binding` repair, now without the bare form) |
+| 2 | `pass`-only handler for `Exception`/`ToolError` is an admission error | New | **Yes**: legal today | Ren et al. 2023; Seeker 2024 | P1, **done in M2** (admission error plus `swallowed_error` repair; narrowed to handlers naming exactly `Exception` or `ToolError`, so a user subclass of either is not covered) |
+| 3 | Swallowed-`ToolError` counter in trace and `last_result()` | New | Additive field | — | P1, **done in M2** (`diagnostics.errors.swallowed_tool_errors` and `last_swallowed`, so also in `last_result()`; the attempt trace is not wired yet) |
+| 4 | `except BaseException`, `except PolicyViolation`, `except ContractViolation` rejected | New | No (`BaseException` already rejected, 9.6) | PEP 352 | P1, **partly done in M2** (`BaseException`, `KeyboardInterrupt`, `SystemExit`, `GeneratorExit` rejected with fixes; `IOError`/`EnvironmentError` point to `OSError`; the violation types wait for P3) |
 | 5 | `ExpectationFailed` fields `.expected/.observed/.diff/.result` | Was "carries the full observation" | No | — | P1, M3 (needs item 7 `expect=`; moved from M1) |
 | 6 | Three effect tiers per syscall: observed effects on every result as `r.effects` (tier 1); protected paths in the grant, read-only for `Exec` (tier 2); `Exec` declares tier-3 effects (`network`, `irreversible`, `background`), denied otherwise with `UndeclaredEffect` | Was mandatory `Run.writes` with discard (draft v3, D-1 provisional); replaced after the pilot | No (new API) | D-1; pilot 11.2 | P1 (tiers 1-2, tier-3 vocabulary) / P3 (eBPF enforcement) |
 | 7 | `expect=` optional on every syscall; exit status in it; RPC/MCP `result` and `status` checks; `Tests` row removed | Was part of every action, and for `Exec` only | No | PreAct | P1 |

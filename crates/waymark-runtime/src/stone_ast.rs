@@ -62,6 +62,9 @@ pub struct FunctionDef {
     pub return_type: StoneType,
     pub body: Vec<Stmt>,
     pub stage: Option<Box<StageDecorator>>,
+    /// Set when this function is the constructor of a model-defined error
+    /// class (`class ConfigError(Exception): path: str`); holds the base type.
+    pub error_base: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -269,6 +272,9 @@ pub enum AugOp {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExceptHandler {
+    /// Error types this handler catches, in source order. Never empty: bare
+    /// `except:` is rejected at parse time.
+    pub types: Vec<String>,
     pub name: Option<String>,
     pub body: Vec<Stmt>,
 }
@@ -702,6 +708,7 @@ fn lower_stmt(statement: py::Stmt) -> Result<Stmt, ShellError> {
         py::Stmt::Continue(_) => Ok(Stmt::Continue),
         py::Stmt::For(for_stmt) => lower_for(for_stmt),
         py::Stmt::FunctionDef(function) => lower_function_def(function),
+        py::Stmt::ClassDef(class) => lower_error_class(class),
         py::Stmt::If(if_stmt) => lower_if(if_stmt),
         py::Stmt::Import(import) => Err(unsupported_import_statement(&import.names)),
         py::Stmt::ImportFrom(import) => Err(unsupported_import_from_statement(
@@ -769,6 +776,7 @@ fn lower_function_def(function: py::StmtFunctionDef) -> Result<Stmt, ShellError>
         return_type,
         body: lower_stmt_block(function.body)?,
         stage: stage.map(Box::new),
+        error_base: None,
     }))
 }
 
@@ -904,6 +912,105 @@ pub(crate) fn mutable_default_message(name: &str, literal: &str) -> String {
 /// host when an attempt ends, so cleanup code is only needed for the program's
 /// own state; Joe-E's catch-clean-reraise form covers that.
 pub(crate) const FINALLY_UNSUPPORTED: &str = "`finally` is not part of Stone: the host releases runtime resources (attempts, daemons, open files) when an attempt ends. For your own cleanup, use `except Exception as error:` with the cleanup followed by `raise error`, and repeat the cleanup after the try statement for the success path";
+
+/// Prescriptive rejection of bare `except:`. Stone has no `BaseException`,
+/// so the only difference from `except Exception` would be hiding which
+/// error the handler expects; requiring a type keeps handlers explicit.
+pub(crate) const BARE_EXCEPT_UNSUPPORTED: &str = "bare `except:` is not supported: name the error type. Use `except Exception as error:` to handle any error, or a narrower type such as `except FileNotFoundError as error:` or `except (KeyError, IndexError) as error:`";
+
+const EXCEPT_TYPE_SHAPE_UNSUPPORTED: &str = "an except handler names an error type or a tuple of error types, such as `except ValueError as error:` or `except (KeyError, IndexError) as error:`";
+
+const CLASS_UNSUPPORTED: &str = "classes are limited to error types: `class ConfigError(Exception):` followed by typed fields such as `path: str`. Use a record (dict) for plain data, and def functions for behavior";
+
+/// Lower a model-defined error class to the constructor function that builds
+/// its record. The class has fields only, so the constructor is the whole
+/// class: `ConfigError("bad", path="x")` returns
+/// `{"type": "ConfigError", "message": "bad", "path": "x"}`.
+fn lower_error_class(class: py::StmtClassDef) -> Result<Stmt, ShellError> {
+    let name = class.name.to_string();
+    if !class.decorator_list.is_empty() || class.type_params.is_some() {
+        return Err(unsupported_message("class definition", CLASS_UNSUPPORTED));
+    }
+    let base = match class.arguments.as_deref() {
+        Some(arguments) if arguments.keywords.is_empty() && arguments.args.len() == 1 => {
+            match &arguments.args[0] {
+                py::Expr::Name(base) => base.id.to_string(),
+                _ => return Err(unsupported_message("class definition", CLASS_UNSUPPORTED)),
+            }
+        }
+        _ => return Err(unsupported_message("class definition", CLASS_UNSUPPORTED)),
+    };
+    let mut params = vec![FunctionParam {
+        name: "message".to_string(),
+        ty: StoneType::Str,
+        default: Some(Expr::String(String::new())),
+    }];
+    let mut fields = vec![
+        ("type".to_string(), Expr::String(name.clone())),
+        ("message".to_string(), Expr::Name("message".to_string())),
+    ];
+    for (index, statement) in class.body.into_iter().enumerate() {
+        match statement {
+            py::Stmt::Pass(_) => {}
+            py::Stmt::Expr(expr)
+                if index == 0 && matches!(*expr.value, py::Expr::StringLiteral(_)) => {}
+            py::Stmt::AnnAssign(field) => {
+                let py::Expr::Name(target) = *field.target else {
+                    return Err(unsupported_message(
+                        "class definition",
+                        format!("error class `{name}` fields are simple names: `path: str`"),
+                    ));
+                };
+                let field_name = target.id.to_string();
+                if matches!(field_name.as_str(), "type" | "message") {
+                    return Err(unsupported_message(
+                        "class definition",
+                        format!(
+                            "error class `{name}` cannot redefine the `{field_name}` field; every error already carries `type` and `message`"
+                        ),
+                    ));
+                }
+                let ty = lower_type_annotation(&field.annotation)?;
+                let default = field
+                    .value
+                    .map(|value| lower_function_default(&field_name, *value))
+                    .transpose()?;
+                fields.push((field_name.clone(), Expr::Name(field_name.clone())));
+                params.push(FunctionParam {
+                    name: field_name,
+                    ty,
+                    default,
+                });
+            }
+            py::Stmt::FunctionDef(method) => {
+                return Err(unsupported_message(
+                    "class definition",
+                    format!(
+                        "error class `{name}` cannot define method `{}`: error classes have typed fields only. Pass values as fields (`{name}(\"message\", field=value)`) and use def functions for behavior",
+                        method.name
+                    ),
+                ));
+            }
+            _ => {
+                return Err(unsupported_message(
+                    "class definition",
+                    format!(
+                        "error class `{name}` body may contain only a docstring, `pass`, and typed fields such as `path: str` or `retries: int = 0`"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(Stmt::FunctionDef(FunctionDef {
+        name,
+        is_async: false,
+        params,
+        return_type: StoneType::Record,
+        body: vec![Stmt::Return(Some(Expr::Record(fields)))],
+        stage: None,
+        error_base: Some(base),
+    }))
+}
 
 fn lower_return(return_stmt: py::StmtReturn) -> Result<Stmt, ShellError> {
     Ok(Stmt::Return(
@@ -1073,26 +1180,49 @@ fn lower_try(try_stmt: py::StmtTry) -> Result<Stmt, ShellError> {
     let mut handlers = Vec::with_capacity(try_stmt.handlers.len());
     for handler in try_stmt.handlers {
         let py::ExceptHandler::ExceptHandler(handler) = handler;
-        match handler.type_.as_deref() {
-            None => {}
-            Some(py::Expr::Name(name)) if name.id.as_str() == "Exception" => {}
-            Some(py::Expr::Name(name)) => {
-                let name = name.id.as_str();
+        let types = match handler.type_.as_deref() {
+            None => {
                 return Err(unsupported_message(
                     "try statement",
-                    format!(
-                        "unsupported exception handler `except {name}:`; Stone does not treat a handler name as an error binding; use `except Exception as {name}:` to bind the error or `except:` when no binding is needed",
-                    ),
+                    BARE_EXCEPT_UNSUPPORTED,
                 ));
+            }
+            Some(py::Expr::Name(name)) => {
+                let name = name.id.as_str();
+                if name.starts_with(|c: char| c.is_ascii_lowercase()) {
+                    // Error types are CapWords; a lowercase name is almost
+                    // always an attempt to bind the error (`except error:`).
+                    return Err(unsupported_message(
+                        "try statement",
+                        format!(
+                            "unsupported exception handler `except {name}:`; Stone does not treat a handler name as an error binding; use `except Exception as {name}:` to bind the error, or a specific type such as `except FileNotFoundError as {name}:`",
+                        ),
+                    ));
+                }
+                vec![name.to_string()]
+            }
+            Some(py::Expr::Tuple(tuple)) if !tuple.elts.is_empty() => {
+                let mut types = Vec::with_capacity(tuple.elts.len());
+                for element in &tuple.elts {
+                    let py::Expr::Name(name) = element else {
+                        return Err(unsupported_message(
+                            "try statement",
+                            EXCEPT_TYPE_SHAPE_UNSUPPORTED,
+                        ));
+                    };
+                    types.push(name.id.to_string());
+                }
+                types
             }
             Some(_) => {
                 return Err(unsupported_message(
                     "try statement",
-                    "only bare `except:`, `except Exception:`, and `except Exception as error:` handlers are supported",
+                    EXCEPT_TYPE_SHAPE_UNSUPPORTED,
                 ));
             }
-        }
+        };
         handlers.push(ExceptHandler {
+            types,
             name: handler.name.map(|name| name.to_string()),
             body: lower_stmt_block(handler.body)?,
         });
@@ -2888,7 +3018,8 @@ else:
             "from json import loads",
             "class C:\n    pass",
             "try:\n    x = 1\nfinally:\n    x = 2",
-            "try:\n    x = 1\nexcept ValueError:\n    x = 2",
+            "try:\n    x = 1\nexcept:\n    x = 2",
+            "class Config(object):\n    def load(self):\n        pass",
             "def f(x=[]):\n    return x",
         ] {
             assert_unsupported(source);
@@ -2949,7 +3080,101 @@ else:
         let detail = format!("{error:?}");
         assert!(detail.contains("unsupported exception handler `except error:`"));
         assert!(detail.contains("`except Exception as error:`"));
-        assert!(detail.contains("`except:`"));
+        assert!(!detail.contains("`except:`"), "{detail}");
+    }
+
+    #[test]
+    fn bare_except_is_rejected_with_typed_handler_fix() {
+        let detail = format!(
+            "{:?}",
+            lower_source("try:\n    x = 1\nexcept:\n    x = 2").expect_err("bare except")
+        );
+        assert!(
+            detail.contains("bare `except:` is not supported"),
+            "{detail}"
+        );
+        assert!(detail.contains("`except Exception as error:`"), "{detail}");
+    }
+
+    #[test]
+    fn handlers_carry_types_in_source_order() {
+        let program = lower_source(
+            "try:\n    x = 1\nexcept (KeyError, IndexError) as error:\n    x = 2\nexcept ValueError:\n    x = 3\nexcept Exception as error:\n    x = 4",
+        )
+        .expect("typed handlers");
+        let Stmt::Try { handlers, .. } = &program.statements[0] else {
+            panic!("expected try");
+        };
+        let types = handlers
+            .iter()
+            .map(|handler| handler.types.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            vec![
+                vec!["KeyError".to_string(), "IndexError".to_string()],
+                vec!["ValueError".to_string()],
+                vec!["Exception".to_string()],
+            ]
+        );
+        assert_eq!(handlers[1].name, None);
+    }
+
+    #[test]
+    fn error_class_lowers_to_typed_record_constructor() {
+        let program = lower_source(
+            "class ConfigError(ValueError):\n    \"Bad config.\"\n    path: str\n    retries: int = 0",
+        )
+        .expect("error class");
+        let Stmt::FunctionDef(function) = &program.statements[0] else {
+            panic!("expected constructor");
+        };
+        assert_eq!(function.name, "ConfigError");
+        assert_eq!(function.error_base.as_deref(), Some("ValueError"));
+        let params = function
+            .params
+            .iter()
+            .map(|param| (param.name.as_str(), param.ty, param.default.is_some()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            params,
+            vec![
+                ("message", StoneType::Str, true),
+                ("path", StoneType::Str, false),
+                ("retries", StoneType::Int, true),
+            ]
+        );
+        let [Stmt::Return(Some(Expr::Record(fields)))] = function.body.as_slice() else {
+            panic!("expected record return");
+        };
+        assert_eq!(
+            fields[0],
+            ("type".to_string(), Expr::String("ConfigError".to_string()))
+        );
+    }
+
+    #[test]
+    fn error_class_methods_and_plain_classes_get_prescriptive_errors() {
+        let method = format!(
+            "{:?}",
+            lower_source(
+                "class ConfigError(Exception):\n    def describe(self):\n        return 1"
+            )
+            .expect_err("method")
+        );
+        assert!(
+            method.contains("cannot define method `describe`"),
+            "{method}"
+        );
+        let plain = format!(
+            "{:?}",
+            lower_source("class Point:\n    x: int").expect_err("plain class")
+        );
+        assert!(
+            plain.contains("classes are limited to error types"),
+            "{plain}"
+        );
+        assert!(plain.contains("Use a record"), "{plain}");
     }
 
     #[test]

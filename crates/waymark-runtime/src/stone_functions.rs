@@ -17,7 +17,8 @@ pub(super) enum CallableValue {
     },
     Named {
         function_id: u64,
-        function: FunctionDef,
+        // Boxed so a callable does not inflate every RuntimeValue.
+        function: Box<FunctionDef>,
     },
 }
 
@@ -251,7 +252,7 @@ impl CallableValue {
     pub(super) fn named(function_id: u64, function: FunctionDef) -> Self {
         Self::Named {
             function_id,
-            function,
+            function: Box::new(function),
         }
     }
 

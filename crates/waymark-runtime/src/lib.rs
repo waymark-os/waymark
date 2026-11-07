@@ -31,6 +31,7 @@ mod stone_attempt_scope;
 mod stone_attempt_value;
 mod stone_builtins;
 mod stone_correction;
+mod stone_errors;
 mod stone_eval;
 mod stone_file_ops;
 mod stone_frontend;
@@ -1509,12 +1510,40 @@ emit(preview)"#,
         );
         assert_eq!(
             except_binding["error"]["correction"]["expected"],
-            json!(["except Exception as error:", "except:"])
+            json!(["except Exception as error:"])
         );
         assert_eq!(
             except_binding["error"]["correction"]["execution_state"],
             json!("not_started")
         );
+
+        let bare_except =
+            guest.command_response("try:\n    read_file(\"missing.txt\")\nexcept:\n    x = 1");
+        assert_eq!(bare_except["ok"], json!(false));
+        assert_eq!(
+            bare_except["error"]["correction"]["class"],
+            json!("bare_except")
+        );
+        assert_eq!(
+            bare_except["error"]["correction"]["expected"],
+            json!(["except Exception as error:"])
+        );
+
+        let swallowed = guest
+            .command_response("try:\n    read_file(\"missing.txt\")\nexcept Exception:\n    pass");
+        assert_eq!(swallowed["ok"], json!(false));
+        assert_eq!(
+            swallowed["error"]["correction"]["class"],
+            json!("swallowed_error")
+        );
+        assert_eq!(
+            swallowed["error"]["correction"]["execution_state"],
+            json!("not_started")
+        );
+
+        let narrow_pass =
+            guest.command_response("try:\n    x = {}[\"k\"]\nexcept KeyError:\n    pass\nemit(1)");
+        assert_eq!(narrow_pass["ok"], json!(true));
 
         let mutable_default = guest.command_response("def f(acc=[]):\n    return acc");
         assert_eq!(mutable_default["ok"], json!(false));

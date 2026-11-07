@@ -131,6 +131,13 @@ Implementation notes:
 - Defer `finally` and typed Python exception classes until there is a clear
   need.
 
+Current behavior supersedes the list above: handlers are typed
+(`except FileNotFoundError as e:`, tuples, ordered matching), bare `except:`
+and `pass`-only `Exception`/`ToolError` handlers are rejected before
+execution, and models may define field-only error classes. `finally` remains
+rejected with a cleanup recipe. See
+[Stone Language](STONE_LANGUAGE.md#errors-and-handlers) for the current rules.
+
 Tests:
 
 - missing `read_text` path is caught

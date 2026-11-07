@@ -5,9 +5,12 @@ use std::collections::HashSet;
 use nu_protocol::{shell_error::generic::GenericError, ShellError};
 
 use crate::stone_ast::{
-    AssignTarget, ComprehensionClause, Expr, FormattedStringPart, Program, Stmt,
+    AssignTarget, ComprehensionClause, ExceptHandler, Expr, FormattedStringPart, Program, Stmt,
 };
 use crate::stone_correction::expected_keywords;
+use crate::stone_errors::{
+    builtin_error_type_list, is_builtin_error_type, rejected_error_type_message,
+};
 use crate::stone_eval::stone_builtin_names;
 
 #[derive(Clone)]
@@ -29,6 +32,11 @@ pub(crate) fn validate_program(
         .map(|name| (*name).to_string())
         .collect::<HashSet<_>>();
     callable.extend(["get", "items", "keys", "values", "isinstance"].map(str::to_string));
+    callable.extend(
+        crate::stone_errors::BUILTIN_ERROR_TYPES
+            .iter()
+            .map(|(name, _)| (*name).to_string()),
+    );
     callable.extend(bound_names.iter().cloned());
     let names = AdmissionNames {
         callable,
@@ -77,10 +85,18 @@ fn validate_statements(statements: &[Stmt], names: &AdmissionNames) -> Result<()
             Stmt::Try { body, handlers } => {
                 validate_statements(body, names)?;
                 for handler in handlers {
+                    validate_handler(handler, names)?;
                     validate_statements(&handler.body, names)?;
                 }
             }
             Stmt::FunctionDef(function) => {
+                if let Some(base) = &function.error_base {
+                    validate_error_type_name(
+                        base,
+                        names,
+                        &format!("class {}({base})", function.name),
+                    )?;
+                }
                 if let Some(stage) = &function.stage {
                     validate_expr(&stage.evidence, names)?;
                     if let Some(repair) = &stage.repair {
@@ -106,6 +122,54 @@ fn validate_statements(statements: &[Stmt], names: &AdmissionNames) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Handler rules checked before anything runs: every handler type must exist,
+/// and a handler for `Exception` or `ToolError` may not be only `pass`, since
+/// that discards failed commands, missing files, and failed model calls
+/// without a trace. Narrow handlers such as `except KeyError: pass` stay legal.
+fn validate_handler(handler: &ExceptHandler, names: &AdmissionNames) -> Result<(), ShellError> {
+    let shown = if handler.types.len() == 1 {
+        handler.types[0].clone()
+    } else {
+        format!("({})", handler.types.join(", "))
+    };
+    for handler_type in &handler.types {
+        validate_error_type_name(handler_type, names, &format!("except {shown}"))?;
+    }
+    let broad = handler
+        .types
+        .iter()
+        .find(|handler_type| matches!(handler_type.as_str(), "Exception" | "ToolError"));
+    if let (Some(broad), [Stmt::Pass]) = (broad, handler.body.as_slice()) {
+        let binding = handler.name.as_deref().unwrap_or("error");
+        return Err(admission_error(format!(
+            "`except {shown}: pass` discards every {broad} without a trace, including failed commands, missing files, and failed model calls. Bind the error and use it (`except {shown} as {binding}:` then record {binding}.message, return a fallback, or `raise`), or catch only the error you expect, such as `except FileNotFoundError:`"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_error_type_name(
+    name: &str,
+    names: &AdmissionNames,
+    context: &str,
+) -> Result<(), ShellError> {
+    if is_builtin_error_type(name) {
+        return Ok(());
+    }
+    if let Some(message) = rejected_error_type_message(name) {
+        return Err(admission_error(format!("`{context}`: {message}")));
+    }
+    if names.schema_shadow.contains(name) {
+        // A class defined in this program or the session; the runtime checks
+        // that it really is an error class when it is defined.
+        return Ok(());
+    }
+    Err(admission_error(format!(
+        "`{context}`: unknown error type `{name}`. Builtin error types: {}. Define a new one with `class {name}(Exception):` and optional typed fields",
+        builtin_error_type_list()
+    )))
 }
 
 fn validate_expr(expr: &Expr, names: &AdmissionNames) -> Result<(), ShellError> {
@@ -537,6 +601,54 @@ mod tests {
     use crate::stone_ast::lower_source;
 
     use super::validate_program;
+
+    #[test]
+    fn handler_rules_run_before_evaluation() {
+        let reject = |source: &str, needle: &str| {
+            let program = lower_source(source).expect("lower");
+            let error = validate_program(&program, &[]).expect_err(source);
+            let detail = format!("{error:?}");
+            assert!(detail.contains("stone_admission_error"), "{detail}");
+            assert!(detail.contains(needle), "{source}: {detail}");
+        };
+        reject(
+            "try:\n    x = 1\nexcept Exception:\n    pass",
+            "discards every Exception",
+        );
+        reject(
+            "try:\n    x = 1\nexcept (KeyError, ToolError):\n    pass",
+            "discards every ToolError",
+        );
+        reject(
+            "try:\n    x = 1\nexcept ConfigEror as e:\n    x = 2",
+            "unknown error type `ConfigEror`",
+        );
+        reject(
+            "try:\n    x = 1\nexcept BaseException as e:\n    x = 2",
+            "`BaseException` does not exist",
+        );
+        reject(
+            "try:\n    x = 1\nexcept IOError as e:\n    x = 2",
+            "spelled `OSError`",
+        );
+        reject(
+            "class E(Missing):\n    pass",
+            "unknown error type `Missing`",
+        );
+
+        for source in [
+            "try:\n    x = 1\nexcept KeyError:\n    pass",
+            "try:\n    x = 1\nexcept Exception as error:\n    x = error.message",
+            "class ConfigError(Exception):\n    path: str\ntry:\n    x = 1\nexcept ConfigError as e:\n    x = 2",
+        ] {
+            let program = lower_source(source).expect("lower");
+            validate_program(&program, &[]).expect(source);
+        }
+        // A class defined in an earlier session command is a known type.
+        let program =
+            lower_source("try:\n    x = 1\nexcept ConfigError:\n    x = 2").expect("lower");
+        validate_program(&program, &["ConfigError".to_string()]).expect("session class");
+    }
 
     #[test]
     fn rejects_unknown_calls_and_structured_keywords() {

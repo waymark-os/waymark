@@ -329,29 +329,92 @@ See
 [`typed_evidence_workflow.stone`](../examples/scripts/typed_evidence_workflow.stone)
 canary.
 
+### Errors And Handlers
+
 `try` / `except` catches runtime evaluation errors, not parse or lowering
-errors:
+errors. Every handler names an error type:
 
 ```python
 try:
     text = read_text(path)
-except Exception as e:
+except FileNotFoundError as e:
     text = ""
     emit({"warning": e.message, "code": e.code})
+except (KeyError, IndexError) as e:
+    text = ""
+except Exception as e:
+    raise
 ```
 
-Supported handlers are `except:`, `except Exception:`, and
-`except Exception as name:`. A bound error is a Stone record with stable
+Handlers are tried in source order, and the first handler whose type (or one
+of whose tuple types) matches runs. An error that no handler matches keeps
+propagating. A bound error is a Stone record (data only) with stable `type`,
 `kind`, `code`, and `message` fields. I/O errors also include `path` and
 `operation` when available.
 
-The common generated form `except error:` does not bind `error` in Python or
-Stone. Stone rejects it before execution with a targeted correction offering
-`except Exception as error:` when the handler uses the record, or `except:`
-when it does not. The runtime does not guess between these two intents.
+Builtin error types, with their parents:
 
-Preliminary `raise` support intentionally keeps the same structured failure
-model rather than introducing Python exception classes:
+| Type | Parent | Raised by |
+|---|---|---|
+| `Exception` | none | every catchable error |
+| `ToolError` | `Exception` | failures from outside the program: commands (`must_run`), Gateway and model calls, files |
+| `OSError` | `ToolError` | file and I/O failures |
+| `FileNotFoundError`, `FileExistsError`, `PermissionError`, `IsADirectoryError`, `NotADirectoryError`, `TimeoutError` | `OSError` | the matching I/O failure; `TimeoutError` also for Gateway and model timeouts |
+| `ValueError` | `Exception` | bad values, such as `int("x")` |
+| `TypeError` | `Exception` | wrong operand or argument types, such as `1 + "a"` |
+| `LookupError` | `Exception` | |
+| `KeyError`, `IndexError` | `LookupError` | missing record key, list index out of range |
+| `ArithmeticError` | `Exception` | |
+| `ZeroDivisionError` | `ArithmeticError` | division or modulo by zero |
+| `NameError`, `AttributeError` | `Exception` | unknown name, missing record field |
+| `RuntimeError` | `Exception` | other runtime errors |
+| `NotImplementedError` | `RuntimeError` | |
+| `AssertionError` | `Exception` | |
+
+The tree follows Python except for `ToolError`, which groups every failure
+that comes from outside the program so one handler covers recoverable effect
+failures. Each builtin type is also a constructor that takes one optional
+string message: `raise ValueError("bad row")` and `raise ValueError` both
+work.
+
+Models may define their own error types as field-only classes deriving from an
+error type:
+
+```python
+class ConfigError(ValueError):
+    path: str
+    retries: int = 0
+
+raise ConfigError("missing key", path="/etc/app.toml")
+```
+
+The class body may hold a docstring, `pass`, and typed fields with optional
+immutable defaults. Fields are checked like function parameters. Every error
+already has `type` and `message`, so fields may not redefine them. Methods,
+decorators, and classes that do not derive from an error type are rejected
+with a message naming the fix; use records for plain data. Error classes
+persist in the session like functions.
+
+Rules checked before anything runs:
+
+- Bare `except:` is rejected. Use `except Exception as error:` or a narrower
+  type. `BaseException` does not exist in Stone: budget exhaustion and policy
+  stops end the attempt and are not catchable. `IOError` is spelled `OSError`.
+- A handler for `Exception` or `ToolError` whose body is only `pass` is
+  rejected, because it discards failed commands, missing files, and failed
+  model calls without a trace. Bind the error and use it, or catch the narrow
+  type you expect. `except KeyError: pass` stays legal.
+- A handler naming an unknown type is rejected with the list of builtin types.
+- `except error:` (a lowercase name) does not bind `error` in Python or
+  Stone. Stone rejects it with a correction to `except Exception as error:`.
+
+At run time, a handler that catches a `ToolError` (or a subclass) without
+binding it and without re-raising it is counted. The count and the last such
+error appear under `diagnostics.errors` in the command response, and so in
+`last_result()`.
+
+`raise` also accepts a string or a record, which keep the structured failure
+model:
 
 ```python
 raise "candidate failed"
@@ -362,11 +425,13 @@ raise {
 }
 ```
 
-A string receives declared code `stone_raised`. A record requires `message`
-and may carry `code` and `detail`. Bare `raise` is valid only inside an active
-`except` handler and rethrows its bounded structured error. `raise ... from
-...` and arbitrary exception classes remain unsupported. Prefer `fail(...)`
-when the harness already knows the stable policy/evidence failure code.
+A string receives declared code `stone_raised` and type `Exception`. A record
+requires `message` and may carry `code` and `detail`; a caught record error
+exposes its `detail` field. Bare `raise` is valid only inside an active
+`except` handler and rethrows its bounded structured error; a re-raised typed
+error keeps its type and fields. `raise ... from ...` remains unsupported.
+Prefer `fail(...)` when the harness already knows the stable policy/evidence
+failure code.
 
 ## Core Builtins
 
