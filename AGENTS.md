@@ -66,6 +66,10 @@ reasoning:
 - Stone helpers are discovered from `.stone/helpers` under the command cwd,
   then `~/.stone/helpers`, then `/usr/share/waymark/stone/helpers`; set
   `WAYMARK_STONE_HELPER_DIRS` to override the helper search path.
+- Stone modules (`from lib import name`) are found as `lib.stone` in the
+  command cwd, then `.stone/lib` under it, `~/.stone/lib`, and
+  `/usr/share/waymark/stone/lib`; `WAYMARK_STONE_LIB_DIRS` overrides it. They
+  are linked before the program runs (`stone_modules.rs`).
 - Keep public docs aligned with actual behavior. Do not document aspirational
   features as present.
 - When adding or changing Stone builtins or language features, update `help()`

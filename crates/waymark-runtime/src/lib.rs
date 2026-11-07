@@ -39,6 +39,7 @@ mod stone_frontend;
 mod stone_hash;
 mod stone_helpers;
 mod stone_json_schema;
+mod stone_modules;
 mod stone_raises;
 mod stone_scope;
 mod stone_vm;

@@ -18,6 +18,12 @@
 //!
 //! The results are stored on the AST: `FunctionDef::scope` and the
 //! `captures` of each lambda.
+//!
+//! For a module (`resolve_module`), the same walk also qualifies the
+//! module's top-level names (`helper` becomes `lib.helper`) wherever they are
+//! not shadowed by a local, and rejects top-level code that would run when
+//! the module is imported: modules only define functions, error classes, and
+//! constants.
 
 use std::collections::BTreeSet;
 
@@ -25,8 +31,85 @@ use nu_protocol::{shell_error::generic::GenericError, ShellError};
 
 use crate::stone_ast::{
     AssignTarget, ComprehensionClause, Expr, FormattedStringPart, FunctionDef, FunctionScope,
-    Program, Stmt,
+    ImportKind, Program, Stmt,
 };
+
+/// The walk's context: the enclosing functions (innermost last) and, for a
+/// module, the names to qualify.
+#[derive(Default)]
+struct Ctx {
+    frames: Vec<Enclosing>,
+    /// Comprehension targets in scope, which shadow module names.
+    comprehension: Vec<Names>,
+    module: Option<ModuleNames>,
+}
+
+struct ModuleNames {
+    name: String,
+    names: Names,
+}
+
+impl std::ops::Deref for Ctx {
+    type Target = Vec<Enclosing>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.frames
+    }
+}
+
+impl std::ops::DerefMut for Ctx {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.frames
+    }
+}
+
+impl Ctx {
+    /// Qualify `name` in place if it is a module top-level name not shadowed
+    /// here.
+    fn qualify(&self, name: &mut String) {
+        let Some(module) = &self.module else {
+            return;
+        };
+        if !module.names.contains(name.as_str())
+            || self
+                .frames
+                .iter()
+                .any(|frame| frame.locals.contains(name.as_str()))
+            || self
+                .comprehension
+                .iter()
+                .any(|targets| targets.contains(name.as_str()))
+        {
+            return;
+        }
+        *name = format!("{}.{name}", module.name);
+    }
+
+    /// The module whose top-level code is being walked: that code would run
+    /// at import time.
+    fn import_time_module(&self) -> Option<&str> {
+        match &self.module {
+            Some(module) if self.frames.is_empty() => Some(&module.name),
+            _ => None,
+        }
+    }
+
+    fn reject_import_time_call(&self, callee: &str) -> Result<(), ShellError> {
+        match self.import_time_module() {
+            Some(module) => Err(module_error(format!(
+                "module `{module}` calls `{callee}(...)` at its top level, but importing a module runs no code: a module only defines functions, error classes, and constants. Move the call into a function, or write the value literally"
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+
+fn module_error(message: String) -> ShellError {
+    ShellError::Generic(
+        GenericError::new_internal("unsupported Stone module", message)
+            .with_code("stone_script_unsupported"),
+    )
+}
 
 type Names = BTreeSet<String>;
 
@@ -36,10 +119,80 @@ struct Enclosing {
 }
 
 pub(crate) fn resolve_program(program: &mut Program) -> Result<(), ShellError> {
-    let mut stack = Vec::new();
+    let mut ctx = Ctx::default();
     let mut reads = Names::new();
-    resolve_stmts(&mut program.statements, &mut stack, &mut reads)?;
+    resolve_stmts(&mut program.statements, &mut ctx, &mut reads)?;
     Ok(())
+}
+
+/// Resolve module `name`: qualify its top-level names and check that its top
+/// level only defines things. Returns the names the module reads that are not
+/// its own (builtins and error types, or names it fails to define).
+pub(crate) fn resolve_module(
+    program: &mut Program,
+    name: &str,
+) -> Result<BTreeSet<String>, ShellError> {
+    let mut names = Names::new();
+    for statement in &program.statements {
+        check_module_statement(statement, name)?;
+        match statement {
+            Stmt::Assign { target, .. } => bind_target(target, &mut names),
+            Stmt::FunctionDef(function) if function.error_base.is_none() => {
+                names.insert(function.name.clone());
+            }
+            // Error classes keep their own (global) names.
+            Stmt::Import {
+                names: imported, ..
+            } => names.extend(
+                imported
+                    .iter()
+                    .filter(|import| import.kind != ImportKind::ErrorClass)
+                    .map(|import| import.local.clone()),
+            ),
+            _ => {}
+        }
+    }
+    let mut ctx = Ctx {
+        module: Some(ModuleNames {
+            name: name.to_string(),
+            names,
+        }),
+        ..Ctx::default()
+    };
+    let mut reads = Names::new();
+    resolve_stmts(&mut program.statements, &mut ctx, &mut reads)?;
+    let prefix = format!("{name}.");
+    reads.retain(|read| !read.starts_with(&prefix));
+    Ok(reads)
+}
+
+/// A module's top level may only define functions, error classes, and
+/// constants, import, or hold a docstring.
+fn check_module_statement(statement: &Stmt, module: &str) -> Result<(), ShellError> {
+    let what = match statement {
+        Stmt::Assign {
+            target: AssignTarget::Name(_) | AssignTarget::Tuple(_),
+            ..
+        }
+        | Stmt::Import { .. }
+        | Stmt::Pass
+        | Stmt::Expr(Expr::String(_)) => return Ok(()),
+        Stmt::FunctionDef(function) if function.stage.is_none() => return Ok(()),
+        Stmt::FunctionDef(_) => "a `@stage` function",
+        Stmt::Assign { .. } => "an item assignment",
+        Stmt::AugAssign { .. } => "an augmented assignment",
+        Stmt::For { .. } | Stmt::While { .. } => "a loop",
+        Stmt::If { .. } => "an `if` statement",
+        Stmt::With { .. } => "a `with` statement",
+        Stmt::Try { .. } => "a `try` statement",
+        Stmt::Raise(_) => "a `raise` statement",
+        Stmt::Return(_) | Stmt::Break | Stmt::Continue => "a `return`, `break`, or `continue`",
+        Stmt::Expr(_) => "an expression statement",
+        Stmt::Module(_) => "a linked module",
+    };
+    Err(module_error(format!(
+        "module `{module}` has {what} at its top level, but importing a module runs no code: a module only defines functions (`def`), error classes, and constants (`NAME = value`), and imports other modules. Move this into a function"
+    )))
 }
 
 fn scope_error(message: String) -> ShellError {
@@ -51,10 +204,7 @@ fn scope_error(message: String) -> ShellError {
 
 /// Resolve a function definition found inside `stack` (the enclosing
 /// functions, innermost last). Returns the function's free names.
-fn resolve_function(
-    function: &mut FunctionDef,
-    stack: &mut Vec<Enclosing>,
-) -> Result<Names, ShellError> {
+fn resolve_function(function: &mut FunctionDef, stack: &mut Ctx) -> Result<Names, ShellError> {
     let params = function
         .params
         .iter()
@@ -145,6 +295,10 @@ fn collect_bindings(statements: &[Stmt], bound: &mut Names, augmented: &mut Name
             Stmt::FunctionDef(function) => {
                 bound.insert(function.name.clone());
             }
+            Stmt::Import { names, .. } => {
+                bound.extend(names.iter().map(|import| import.local.clone()));
+            }
+            Stmt::Module(_) => {}
             Stmt::Raise(_)
             | Stmt::Return(_)
             | Stmt::Break
@@ -168,22 +322,31 @@ fn bind_target(target: &AssignTarget, bound: &mut Names) {
 
 fn resolve_stmts(
     statements: &mut [Stmt],
-    stack: &mut Vec<Enclosing>,
+    stack: &mut Ctx,
     reads: &mut Names,
 ) -> Result<(), ShellError> {
     for statement in statements {
         match statement {
             Stmt::Assign { target, value } => {
+                qualify_target(target, stack);
                 read_target(target, stack, reads)?;
                 resolve_expr(value, stack, reads)?;
             }
             Stmt::AugAssign { target, value, .. } => {
+                qualify_target(target, stack);
                 if let AssignTarget::Name(name) = target {
                     reads.insert(name.clone());
                 }
                 read_target(target, stack, reads)?;
                 resolve_expr(value, stack, reads)?;
             }
+            Stmt::Import { names, .. } => {
+                for import in names {
+                    stack.qualify(&mut import.local);
+                }
+            }
+            // A linked module was resolved on its own.
+            Stmt::Module(_) => {}
             Stmt::For { iter, body, .. } => {
                 resolve_expr(iter, stack, reads)?;
                 resolve_stmts(body, stack, reads)?;
@@ -210,6 +373,9 @@ fn resolve_stmts(
                 for handler in handlers {
                     // Handler types are names read in this scope (an error
                     // class may be a local of an enclosing function).
+                    for name in &mut handler.types {
+                        stack.qualify(name);
+                    }
                     reads.extend(handler.types.iter().cloned());
                     resolve_stmts(&mut handler.body, stack, reads)?;
                 }
@@ -240,9 +406,11 @@ fn resolve_stmts(
                         resolve_expr(expr, stack, reads)?;
                     }
                 }
-                if let Some(base) = &function.error_base {
+                if let Some(base) = &mut function.error_base {
+                    stack.qualify(base);
                     reads.insert(base.clone());
                 }
+                stack.qualify(&mut function.name);
                 let free = resolve_function(function, stack)?;
                 reads.extend(free);
             }
@@ -255,9 +423,22 @@ fn resolve_stmts(
     Ok(())
 }
 
+/// Qualify the module names an assignment target binds or indexes into.
+fn qualify_target(target: &mut AssignTarget, stack: &Ctx) {
+    match target {
+        AssignTarget::Name(name) => stack.qualify(name),
+        AssignTarget::Tuple(names) => {
+            for name in names {
+                stack.qualify(name);
+            }
+        }
+        AssignTarget::Subscript { value, .. } => qualify_target(value, stack),
+    }
+}
+
 fn read_target(
     target: &mut AssignTarget,
-    stack: &mut Vec<Enclosing>,
+    stack: &mut Ctx,
     reads: &mut Names,
 ) -> Result<(), ShellError> {
     match target {
@@ -282,7 +463,7 @@ fn read_target_base(target: &AssignTarget, reads: &mut Names) {
 
 fn resolve_exprs<'a>(
     exprs: impl IntoIterator<Item = &'a mut Expr>,
-    stack: &mut Vec<Enclosing>,
+    stack: &mut Ctx,
     reads: &mut Names,
 ) -> Result<(), ShellError> {
     for expr in exprs {
@@ -296,31 +477,37 @@ fn resolve_exprs<'a>(
 fn resolve_comprehension(
     clauses: &mut [ComprehensionClause],
     bodies: &mut [&mut Expr],
-    stack: &mut Vec<Enclosing>,
+    stack: &mut Ctx,
     reads: &mut Names,
 ) -> Result<(), ShellError> {
     let mut inner = Names::new();
     let mut targets = Names::new();
-    for clause in clauses.iter_mut() {
-        resolve_expr(&mut clause.iter, stack, &mut inner)?;
-        targets.extend(clause.targets.iter().cloned());
-        resolve_exprs(clause.filters.iter_mut(), stack, &mut inner)?;
-    }
-    for body in bodies.iter_mut() {
-        resolve_expr(body, stack, &mut inner)?;
-    }
+    stack.comprehension.push(Names::new());
+    let result = (|| -> Result<(), ShellError> {
+        for clause in clauses.iter_mut() {
+            resolve_expr(&mut clause.iter, stack, &mut inner)?;
+            targets.extend(clause.targets.iter().cloned());
+            if let Some(scope) = stack.comprehension.last_mut() {
+                scope.extend(clause.targets.iter().cloned());
+            }
+            resolve_exprs(clause.filters.iter_mut(), stack, &mut inner)?;
+        }
+        for body in bodies.iter_mut() {
+            resolve_expr(body, stack, &mut inner)?;
+        }
+        Ok(())
+    })();
+    stack.comprehension.pop();
+    result?;
     reads.extend(inner.difference(&targets).cloned());
     Ok(())
 }
 
-fn resolve_expr(
-    expr: &mut Expr,
-    stack: &mut Vec<Enclosing>,
-    reads: &mut Names,
-) -> Result<(), ShellError> {
+fn resolve_expr(expr: &mut Expr, stack: &mut Ctx, reads: &mut Names) -> Result<(), ShellError> {
     match expr {
         Expr::None | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::String(_) => Ok(()),
         Expr::Name(name) => {
+            stack.qualify(name);
             reads.insert(name.clone());
             Ok(())
         }
@@ -421,10 +608,11 @@ fn resolve_expr(
         }
         Expr::MethodCall {
             receiver,
+            method,
             positional,
             named,
-            ..
         } => {
+            stack.reject_import_time_call(&format!(".{method}"))?;
             resolve_expr(receiver, stack, reads)?;
             resolve_exprs(positional.iter_mut(), stack, reads)?;
             resolve_exprs(named.iter_mut().map(|(_, value)| value), stack, reads)
@@ -434,6 +622,7 @@ fn resolve_expr(
             positional,
             named,
         } => {
+            stack.reject_import_time_call("a function value")?;
             resolve_expr(callee, stack, reads)?;
             resolve_exprs(positional.iter_mut(), stack, reads)?;
             resolve_exprs(named.iter_mut().map(|(_, value)| value), stack, reads)
@@ -441,6 +630,8 @@ fn resolve_expr(
         Expr::Call(call) => {
             // The callee's name is looked up like any other name, so an inner
             // function can call a helper defined in its enclosing function.
+            stack.reject_import_time_call(&call.name)?;
+            stack.qualify(&mut call.name);
             reads.insert(call.name.clone());
             resolve_exprs(call.positional.iter_mut(), stack, reads)?;
             resolve_exprs(call.named.iter_mut().map(|(_, value)| value), stack, reads)

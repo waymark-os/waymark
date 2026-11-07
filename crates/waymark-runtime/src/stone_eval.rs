@@ -45,7 +45,7 @@ use crate::linux_tools::{
 use crate::stone_agent_control::{AgentControlKind, AgentControlValue};
 use crate::stone_ast::{
     AssignTarget, AugOp, BoolOp, Call, CompareOp, ComprehensionClause, ExceptHandler, Expr,
-    FormattedStringPart, FunctionDef, FunctionScope, Program, StageDecorator, Stmt,
+    FormattedStringPart, FunctionDef, FunctionScope, ImportKind, Program, StageDecorator, Stmt,
     StoneFormatSpec, StoneType,
 };
 use crate::stone_attempt_best::{
@@ -179,6 +179,8 @@ pub struct EvalState {
     context: ContextState,
     stdout: String,
     session_bound_names: Vec<String>,
+    /// Modules linked into this program, for diagnostics.
+    modules: Vec<JsonValue>,
     profiler: EvalProfiler,
     hot_loop_diagnostics: EvalHotLoopDiagnostics,
     hot_loop_enabled: bool,
@@ -938,6 +940,7 @@ fn eval_program_with_source_options(
                 .unwrap_or_default(),
             stdout: String::new(),
             session_bound_names: Vec::new(),
+            modules: Vec::new(),
             profiler: EvalProfiler::default(),
             hot_loop_diagnostics: EvalHotLoopDiagnostics::default(),
             hot_loop_enabled: options.hot_loop_enabled,
@@ -1069,6 +1072,9 @@ fn eval_program_with_source_options(
         if !bound.is_empty() {
             diagnostics["session"] = json!({ "bound": bound });
         }
+    }
+    if !evaluator.state.modules.is_empty() {
+        diagnostics["modules"] = JsonValue::Array(std::mem::take(&mut evaluator.state.modules));
     }
     Ok(EvalProgramOutput {
         pipeline,
@@ -1371,6 +1377,76 @@ impl Evaluator<'_> {
                 Ok(EvalFlow::Output(PipelineData::empty()))
             }
             Stmt::Pass => Ok(EvalFlow::Output(PipelineData::empty())),
+            Stmt::Module(module) => {
+                for statement in &module.body {
+                    self.eval_stmt(statement, PipelineData::empty(), false)?;
+                }
+                // Module values are read-only all the way down, so no
+                // importer can change what another importer sees.
+                for name in &module.constants {
+                    if let Some(value) = self.state.get_local(name) {
+                        self.state.set_local(name.clone(), freeze(value));
+                    }
+                }
+                self.state.modules.push(json!({
+                    "name": module.name,
+                    "path": module.path,
+                    "sha256": module.sha256,
+                }));
+                Ok(EvalFlow::Output(PipelineData::empty()))
+            }
+            Stmt::Import { module, names } => {
+                for import in names {
+                    let qualified = format!("{module}.{}", import.name);
+                    let value = match import.kind {
+                        ImportKind::ErrorClass => continue,
+                        ImportKind::Function => {
+                            let function = self
+                                .state
+                                .functions
+                                .get(&qualified)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    stone_error(
+                                        "import",
+                                        format!("module function `{qualified}` is not defined"),
+                                    )
+                                })?;
+                            // Bound like a top-level `def`, so calls take the
+                            // same fast path as a local function. Like any
+                            // rebinding, it replaces a variable of that name.
+                            if record_session_bindings {
+                                self.state.record_session_binding(&import.local);
+                            }
+                            if let Some(root) = self.state.scopes.first_mut() {
+                                root.locals.remove(&import.local);
+                            }
+                            self.state.functions.insert(import.local.clone(), function);
+                            continue;
+                        }
+                        ImportKind::Value => self.state.get_local(&qualified).ok_or_else(|| {
+                            stone_error(
+                                "import",
+                                format!("module value `{qualified}` is not defined"),
+                            )
+                        })?,
+                        ImportKind::Unresolved => {
+                            return Err(stone_error(
+                                "import",
+                                format!(
+                                    "`from {module} import {}` must be at the top level of a file",
+                                    import.name
+                                ),
+                            ))
+                        }
+                    };
+                    if record_session_bindings {
+                        self.state.record_session_binding(&import.local);
+                    }
+                    self.state.set_local(import.local.clone(), value);
+                }
+                Ok(EvalFlow::Output(PipelineData::empty()))
+            }
             Stmt::FunctionDef(function) => {
                 if let Some(base) = &function.error_base {
                     if is_builtin_error_type(&function.name) {
@@ -18235,6 +18311,80 @@ emit(inc(5))
             json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
             json_value!(105)
         );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn modules_link_with_private_names_and_frozen_values() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("stone-modules")?;
+        fs::create_dir_all(root.join("pkg")).expect("create pkg");
+        let write = |name: &str, source: &str| fs::write(root.join(name), source).expect("write");
+        write(
+            "pkg/limits.stone",
+            "MAX = 3\nclass LimitError(Exception):\n    pass\n",
+        );
+        write(
+            "textutil.stone",
+            "\"\"\"Text helpers.\"\"\"\nfrom pkg.limits import MAX, LimitError\nSEP = \", \"\nDEFAULTS = {\"tags\": [\"a\"]}\ndef _clean(s):\n    return s.strip()\ndef join(items):\n    return SEP.join([_clean(x) for x in items])\ndef capped(items):\n    if len(items) > MAX:\n        raise LimitError(\"too many\")\n    return join(items)\ndef fact(n):\n    return 1 if n <= 1 else n * fact(n - 1)\nHANDLERS = {\"join\": join}\n",
+        );
+        let mut session = StoneSession::default();
+        let mut run = |source: &str| -> Result<serde_json::Value, ShellError> {
+            let output = crate::stone_frontend::eval_stone_source_with_output_and_session(
+                &engine_state,
+                &mut stack,
+                source,
+                PipelineData::empty(),
+                &mut session,
+            )?;
+            json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())
+        };
+
+        // The module's own SEP and _clean are used, not the importer's.
+        let value = run(
+            "from textutil import join, capped, fact, DEFAULTS, HANDLERS, MAX as limit\nfrom pkg.limits import LimitError\nSEP = \"|\"\ndef _clean(s):\n    return \"WRONG\"\nout = {\"join\": join([\" a \", \"b \"]), \"fact\": fact(4), \"handler\": HANDLERS[\"join\"]([\"x\"]), \"limit\": limit}\ntry:\n    capped([\"1\", \"2\", \"3\", \"4\"])\nexcept LimitError as e:\n    out[\"caught\"] = e.message\nemit(out)\n",
+        )?;
+        assert_eq!(
+            value,
+            json_value!({"join": "a, b", "fact": 24, "handler": "x", "limit": 3, "caught": "too many"})
+        );
+        // Imported names stay bound in a warm session.
+        assert_eq!(run("emit(join([\"p\", \"q\"]))\n")?, json_value!("p, q"));
+        // Module values are read-only all the way down.
+        let error = run("DEFAULTS[\"tags\"].append(\"b\")\n").expect_err("frozen");
+        assert!(format!("{error:?}").contains("read-only"), "{error:?}");
+
+        // Problems are reported before anything runs.
+        write("leak.stone", "def show():\n    return out\n");
+        write("calls.stone", "X = len([1])\n");
+        write(
+            "cyc_a.stone",
+            "from cyc_b import g\ndef f():\n    return 1\n",
+        );
+        write(
+            "cyc_b.stone",
+            "from cyc_a import f\ndef g():\n    return 2\n",
+        );
+        for (source, expected) in [
+            ("from leak import show\n", "neither defines nor imports"),
+            ("from calls import X\n", "calls `len(...)` at its top level"),
+            ("from cyc_a import f\n", "cyc_a -> cyc_b -> cyc_a"),
+            ("from textutil import nope\n", "has no `nope`; it defines:"),
+            (
+                "from pkg.limits import LimitError as LE\n",
+                "cannot be renamed on import",
+            ),
+            ("from json import loads\n", "json_loads(text)"),
+            (
+                "def f():\n    from textutil import join\n",
+                "must be at the top level",
+            ),
+        ] {
+            let error = run(source).expect_err(source);
+            let text = format!("{error:?}");
+            assert!(text.contains(expected), "{source}: {text}");
+        }
 
         cleanup_dir(&root);
         Ok(())

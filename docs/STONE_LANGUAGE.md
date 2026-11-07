@@ -396,6 +396,58 @@ emit(rows)  # both rows now have "seen": True
   read-only, all the way down. Changing one is an error; build a modified copy
   with a dict comprehension instead.
 
+### Modules
+
+`from lib import name` imports from the Stone file `lib.stone`. Dotted names
+map to folders: `from pkg.util import clean` reads `pkg/util.stone`.
+
+```python
+# textutil.stone
+SEP = ", "
+
+class ParseError(Exception):
+    line: int
+
+def _clean(s):
+    return s.strip()
+
+def join(items):
+    return SEP.join([_clean(x) for x in items])
+```
+
+```python
+# main.stone
+from textutil import join, SEP as default_sep, ParseError
+emit(join([" a ", "b "]))  # "a, b"
+```
+
+- Modules are found in the command's working directory, then `.stone/lib`
+  under it, then `~/.stone/lib`, then `/usr/share/waymark/stone/lib`.
+  `WAYMARK_STONE_LIB_DIRS` (an OS path list) replaces this search path.
+- Imports are linked before the program runs. A missing module, a name the
+  module does not define, an import cycle, or a module problem is reported
+  before any statement executes. Imports go at the top level of a file.
+- A module's top level only defines things: functions, error classes, and
+  constants (`NAME = value`), plus imports and a docstring. It cannot call
+  functions, loop, or branch at its top level, because importing a module
+  runs no code.
+- A module's functions see only the module's own names, its imports,
+  builtins, and error types. They never see the importing program's
+  variables; using a name the module neither defines nor imports is an error.
+  The importer's names never collide with the module's: a module's private
+  `_clean` and the importer's `_clean` are different functions.
+- Module constants are read-only all the way down. `DEFAULTS["tags"].append(x)`
+  on an imported `DEFAULTS` is an error; copy it first.
+- Imported functions and constants are ordinary names in the importer
+  and can be renamed with `as`. Error classes are global and known by name,
+  so they are imported under their own name, and two modules may not define
+  the same error class.
+- Not supported: `import lib` (write `from lib import name`), relative imports
+  (`from . import x`), and `from lib import *`. Python's standard library is
+  not available; the error names the Stone replacement.
+- Successful results list each linked module's name, path, and SHA-256 under
+  `diagnostics.modules`.
+
 `transition_hooks(pre=..., post=...)` creates a first-class call-local policy
 value. It may be assigned and passed through Stone functions before being used
 as `hooks=` on `model_call`, `model_infer`, `run`, or `must_run`. Literal hook

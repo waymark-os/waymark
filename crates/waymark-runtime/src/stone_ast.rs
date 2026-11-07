@@ -52,6 +52,51 @@ pub enum Stmt {
     Continue,
     Pass,
     Expr(Expr),
+    /// `from lib import name, other as alias`. The link step
+    /// (`stone_modules`) fills in what each name is; running the statement
+    /// binds the local names.
+    Import {
+        module: String,
+        names: Vec<ImportName>,
+    },
+    /// A linked module's top level, placed ahead of the program that imports
+    /// it. Running it defines the module's functions and error classes and
+    /// freezes its constants. It never records session bindings.
+    Module(Box<ModuleInit>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportName {
+    pub name: String,
+    /// The name bound in the importing file (`alias` in `name as alias`).
+    pub local: String,
+    pub kind: ImportKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportKind {
+    /// Not linked yet.
+    Unresolved,
+    /// A module function, bound as a callable value.
+    Function,
+    /// A module constant or a name the module itself imported, bound as the
+    /// module's (frozen) value.
+    Value,
+    /// An error class. Error types are global and known by name, so nothing
+    /// is bound.
+    ErrorClass,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleInit {
+    /// Dotted module name, such as `lib` or `pkg.util`.
+    pub name: String,
+    pub path: String,
+    pub sha256: String,
+    pub body: Vec<Stmt>,
+    /// Qualified names (`lib.LIMIT`) of the module's constants, frozen after
+    /// the body runs.
+    pub constants: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -329,6 +374,16 @@ pub struct ComprehensionClause {
 }
 
 pub fn lower_source(source: &str) -> Result<Program, ShellError> {
+    lower_source_as(source, true)
+}
+
+/// Lower a module's source without resolving scopes. The linker resolves it
+/// (`stone_scope::resolve_module`) once its own imports are known.
+pub(crate) fn lower_module_source(source: &str) -> Result<Program, ShellError> {
+    lower_source_as(source, false)
+}
+
+fn lower_source_as(source: &str, resolve: bool) -> Result<Program, ShellError> {
     let expanded = expand_workflow_block_syntax(source)?;
     let parsed = ruff_python_parser::parse_module(&expanded).map_err(|err| {
         let mut error = GenericError::new_internal("python parse error", err.to_string())
@@ -344,7 +399,7 @@ pub fn lower_source(source: &str) -> Result<Program, ShellError> {
         ShellError::Generic(error)
     })?;
 
-    lower_module(parsed.into_syntax())
+    lower_module(parsed.into_syntax(), resolve)
 }
 
 fn expand_workflow_block_syntax(source: &str) -> Result<Cow<'_, str>, ShellError> {
@@ -720,14 +775,16 @@ fn workflow_syntax_error(message: impl Into<String>) -> ShellError {
     )
 }
 
-fn lower_module(module: py::ModModule) -> Result<Program, ShellError> {
+fn lower_module(module: py::ModModule, resolve: bool) -> Result<Program, ShellError> {
     let mut statements = Vec::with_capacity(module.body.len());
     for statement in module.body {
         statements.push(lower_stmt(statement)?);
     }
 
     let mut program = Program { statements };
-    crate::stone_scope::resolve_program(&mut program)?;
+    if resolve {
+        crate::stone_scope::resolve_program(&mut program)?;
+    }
     Ok(program)
 }
 
@@ -742,10 +799,7 @@ fn lower_stmt(statement: py::Stmt) -> Result<Stmt, ShellError> {
         py::Stmt::ClassDef(class) => lower_error_class(class),
         py::Stmt::If(if_stmt) => lower_if(if_stmt),
         py::Stmt::Import(import) => Err(unsupported_import_statement(&import.names)),
-        py::Stmt::ImportFrom(import) => Err(unsupported_import_from_statement(
-            import.module.as_ref().map(|module| module.to_string()),
-            &import.names,
-        )),
+        py::Stmt::ImportFrom(import) => lower_import_from(import),
         py::Stmt::Pass(_) => Ok(Stmt::Pass),
         py::Stmt::Raise(raise_stmt) => lower_raise(raise_stmt),
         py::Stmt::Return(return_stmt) => lower_return(return_stmt),
@@ -1994,28 +2048,65 @@ fn unsupported_error(kind: &str, value: &impl std::fmt::Debug) -> ShellError {
     unsupported_message(kind, format!("unsupported {kind}: {value:?}"))
 }
 
+fn lower_import_from(import: py::StmtImportFrom) -> Result<Stmt, ShellError> {
+    let names = import
+        .names
+        .iter()
+        .map(|alias| alias.name.to_string())
+        .collect::<Vec<_>>();
+    let Some(module) = import.module.as_ref().map(|module| module.to_string()) else {
+        return Err(unsupported_message(
+            "import",
+            format!(
+                "relative imports are not supported: from . import {}. Name the module from the search path instead, e.g. `from lib import {}`",
+                names.join(", "),
+                names.join(", ")
+            ),
+        ));
+    };
+    if import.level > 0 {
+        return Err(unsupported_message(
+            "import",
+            format!(
+                "relative imports are not supported: from {}{module} import {}. Name the module from the search path instead: `from {module} import {}`",
+                ".".repeat(import.level as usize),
+                names.join(", "),
+                names.join(", ")
+            ),
+        ));
+    }
+    if names.iter().any(|name| name == "*") {
+        return Err(unsupported_message(
+            "import",
+            format!(
+                "`from {module} import *` is not supported: name what you use, e.g. `from {module} import name, other`"
+            ),
+        ));
+    }
+    Ok(Stmt::Import {
+        module,
+        names: import
+            .names
+            .iter()
+            .map(|alias| ImportName {
+                name: alias.name.to_string(),
+                local: alias
+                    .asname
+                    .as_ref()
+                    .map(|name| name.to_string())
+                    .unwrap_or_else(|| alias.name.to_string()),
+                kind: ImportKind::Unresolved,
+            })
+            .collect(),
+    })
+}
+
 fn unsupported_import_statement(aliases: &[py::Alias]) -> ShellError {
     let modules = aliases
         .iter()
         .map(|alias| alias.name.to_string())
         .collect::<Vec<_>>();
     unsupported_import_modules("import", &modules)
-}
-
-fn unsupported_import_from_statement(module: Option<String>, aliases: &[py::Alias]) -> ShellError {
-    let module = module.unwrap_or_else(|| "<relative>".to_owned());
-    let names = aliases
-        .iter()
-        .map(|alias| alias.name.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    unsupported_message(
-        "import",
-        format!(
-            "Python import is not supported: from {module} import {names}. {}",
-            import_suggestions_for_module(&module)
-        ),
-    )
 }
 
 fn unsupported_import_modules(kind: &str, modules: &[String]) -> ShellError {
@@ -2029,13 +2120,16 @@ fn unsupported_import_modules(kind: &str, modules: &[String]) -> ShellError {
         .map(|module| import_suggestions_for_module(module))
         .collect::<Vec<_>>()
         .join(" ");
+    let first = modules.first().map(String::as_str).unwrap_or("lib");
     unsupported_message(
         "import",
-        format!("Python {kind} is not supported: {modules_text}. {suggestions}"),
+        format!(
+            "Python {kind} is not supported: {modules_text}. Stone modules are imported by name: `from {first} import name`. {suggestions}"
+        ),
     )
 }
 
-fn import_suggestions_for_module(module: &str) -> &'static str {
+pub(crate) fn import_suggestions_for_module(module: &str) -> &'static str {
     match module.split('.').next().unwrap_or(module) {
         "os" => {
             "Stone replacements for os: use ls(path) or find(path, \"*\") for directory listings; use string concatenation for simple path joins; use pwd()/cd(path) for cwd."
@@ -3080,7 +3174,8 @@ else:
     fn rejects_unsupported_python_statements() {
         for source in [
             "import os",
-            "from json import loads",
+            "from . import util",
+            "from json import *",
             "class C:\n    pass",
             "try:\n    x = 1\nfinally:\n    x = 2",
             "try:\n    x = 1\nexcept:\n    x = 2",
@@ -3279,12 +3374,16 @@ else:
         assert!(os_debug.contains("ls(path)"));
         assert!(os_debug.contains("find(path"));
 
-        let json_error =
-            lower_source("from json import loads").expect_err("from json import loads");
-        let json_debug = format!("{json_error:?}");
-        assert!(json_debug.contains("from json import loads"));
-        assert!(json_debug.contains("json_loads(text)"));
-        assert!(json_debug.contains("read_json(path)"));
+        // `from json import loads` parses as a Stone module import; the link
+        // step reports the missing module with the same suggestions
+        // (`stone_eval` tests cover it).
+        assert!(matches!(
+            lower_source("from json import loads")
+                .expect("parses")
+                .statements
+                .as_slice(),
+            [Stmt::Import { module, .. }] if module == "json"
+        ));
 
         let hashlib_error = lower_source("import hashlib").expect_err("import hashlib");
         let hashlib_debug = format!("{hashlib_error:?}");

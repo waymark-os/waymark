@@ -96,11 +96,12 @@ contract; it is not an authoritative task verifier.
 
 ## Current Packaging
 
-Stone does not yet have a module import mechanism. Consequently V14 is a
-checked-in source bundle containing the library functions and a small default
-adapter invocation. The complete source is included in the admitted program
-digest. This keeps policy visible while leaving module loading as a separate
-language-design decision.
+V14 is a checked-in source bundle containing the library functions and a small
+default adapter invocation. The complete source is included in the admitted
+program digest. Stone now has modules (`from lib import name`, see
+`docs/STONE_LANGUAGE.md`), and each linked module's path and SHA-256 are
+reported under `diagnostics.modules`; moving the library into a module has not
+been done yet.
 
 The default dispatcher supports `read`, exact-replacement `edit`, `write`, short synchronous
 `run_linux`, runtime-owned `run_complete`, the four manual owned-task lifecycle

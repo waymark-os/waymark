@@ -282,7 +282,9 @@ impl Analyzer<'_> {
             | Stmt::Return(None)
             | Stmt::Break
             | Stmt::Continue
-            | Stmt::Pass => Some(BTreeSet::new()),
+            | Stmt::Pass
+            | Stmt::Import { .. }
+            | Stmt::Module(_) => Some(BTreeSet::new()),
         }
     }
 

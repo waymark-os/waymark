@@ -131,6 +131,21 @@ For large values, bind the value and emit compact summaries such as
 previews large emitted values unless `allow_large_output` is set. One-shot CLI
 invocations still start fresh.
 
+## Modules
+
+`from lib import name, other as alias` loads `lib.stone` (and `pkg.util` loads
+`pkg/util.stone`) from these directories, in order:
+
+- the current Stone cwd
+- `<current Stone cwd>/.stone/lib`
+- `~/.stone/lib`
+- `/usr/share/waymark/stone/lib`
+
+Set `WAYMARK_STONE_LIB_DIRS` to an OS path list to replace that search path.
+Imports are linked before the program runs, and a module's top level only
+defines functions, error classes, and constants. See
+[docs/STONE_LANGUAGE.md](./docs/STONE_LANGUAGE.md#modules).
+
 ## Helpers
 
 Stone helpers are dynamic extension scripts. The shell loads helper registrations

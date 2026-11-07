@@ -134,6 +134,8 @@ fn validate_statements(statements: &[Stmt], names: &AdmissionNames) -> Result<()
             Stmt::Raise(Some(value)) | Stmt::Return(Some(value)) | Stmt::Expr(value) => {
                 validate_expr(value, names)?;
             }
+            Stmt::Import { .. } => {}
+            Stmt::Module(module) => validate_statements(&module.body, names)?,
             Stmt::Raise(None) | Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Pass => {}
         }
     }
@@ -467,6 +469,12 @@ fn collect_statement_bindings(statements: &[Stmt], names: &mut HashSet<String>) 
             Stmt::Raise(Some(value)) | Stmt::Return(Some(value)) | Stmt::Expr(value) => {
                 collect_expr_bindings(value, names);
             }
+            Stmt::Import {
+                names: imported, ..
+            } => {
+                names.extend(imported.iter().map(|import| import.local.clone()));
+            }
+            Stmt::Module(module) => collect_statement_bindings(&module.body, names),
             Stmt::Raise(None) | Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Pass => {}
         }
     }

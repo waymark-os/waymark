@@ -1300,6 +1300,37 @@ Known gaps:
 - Item assignment into a call's result (`f()[0] = x`) is rejected at parse
   time.
 
+After M4's module step (L9 and R5), `from lib import name` works
+(`stone_modules.rs`). Joe-E §4.2.2 requires all static state to be
+transitively immutable, so that no code can corrupt state other code relies
+on without holding a reference to it; Stone applies the same rule to module
+constants at run time with the `frozen` flag. As implemented:
+
+- Imports are linked before the program runs, like admission: a missing
+  module, an unknown name, an import cycle, or a module problem is reported
+  with no statement run. Imports must be at the top level of a file.
+- Search path: the command cwd, `.stone/lib` under it, `~/.stone/lib`,
+  `/usr/share/waymark/stone/lib`; `WAYMARK_STONE_LIB_DIRS` replaces it. This
+  mirrors helpers. R7a (no loading from directories inside the agent's write
+  grant) applies here too once the controlled profile exists.
+- A module's top level may only define functions, error classes, and
+  constants, import, and hold a docstring. No calls run at import, so a module
+  holds no authority of its own. Its functions run with the caller's
+  authority, as every function does until the controlled profile (L7).
+- A module's top-level names are qualified at link time (`helper` becomes
+  `lib.helper`, which no program can spell), and its functions are rewritten
+  to use those names. Calls into and within a module are ordinary function
+  calls, so there is no per-call module lookup. A free name in a module that
+  is not its own, an import, a builtin, or an error type is a link error;
+  otherwise it would read the importer's globals, which is dynamic scope again.
+- Error classes keep their names (error types are global and matched by
+  name), cannot be renamed on import, and may be defined by only one module.
+- Modules are re-linked per command; there is no cache yet. Each linked
+  module's name, path, and SHA-256 are reported under `diagnostics.modules`.
+- Not supported: `import lib`, relative imports, `import *`, and `@stage`
+  functions in modules. L10 (`from typing import ...` as no-ops) is not done:
+  those imports fail as a missing module, with the replacement hint.
+
 ### 9.6 M0: Executable Probes And Source Reading (2026-11-07)
 
 `host/check_stone_semantics_compat.py` turns the 9.5 scan into measurements
@@ -1761,7 +1792,7 @@ in the last column and for the compatibility measurement.
 | 8 | Budget checked at model and tool calls; exhaustion ends the attempt with a host-built `Unfinished`; `model.reserve` removed | Was a Trio-style `with budget(...)` scope with `grace=` (dropped by D-3) | No (new API) | — | P1 |
 | 9 | `finally` stays absent; error becomes prescriptive | Was unaddressed | Message only | Joe-E §4.3 | P1, **done in M1** (message plus `finally` repair envelope) |
 | 10 | Mutable default argument error becomes prescriptive | Was unaddressed | Message only | — | P1, **done in M1** (message plus `mutable_default` repair envelope) |
-| 11 | L9 module values deep-frozen at import | New | No (no modules yet) | Joe-E §4.2 | P1 |
+| 11 | L9 module values deep-frozen at import | New | No (no modules yet) | Joe-E §4.2 | P1, **done in M4** (module constants frozen after the module's top level runs; imported values share the frozen object) |
 | 12 | Ablation harness `host/bench/eval_stone_outcome_prediction_ablation.py`, two arms (tiers, tiers plus `expect`), dry-run only | Was four write-declaration arms | No | PreAct; Lee 2026 | P1, **done in M1** (dry-run passes; not run) |
 | 13 | `Verified` as a sealed box with value, verifier id, claim, nonce; verifier in its own read-only attempt; no `critic=` | Was an opaque tag minted with an optional critic | No (new type) | Morris 1973 §6-7 | P2 |
 | 14 | Boundary walk component with five call sites | New | No | Taly et al. 2011 §II.B, §V | P2 |

@@ -1881,13 +1881,14 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "File handles support read(), readlines()/splitlines(), write(text), and close().",
             "Lists support append(value), extend(values), count(value), mutating sort(key=..., reverse=...), and set-style add(value) for unique append; xs += ys extends xs in place.",
             "Use emit(value) when you want structured data returned to the caller.",
+            "Modules: from lib import name, other as alias loads lib.stone (pkg/util.stone for pkg.util) from the cwd, then .stone/lib, ~/.stone/lib, /usr/share/waymark/stone/lib (WAYMARK_STONE_LIB_DIRS overrides). Imports go at the top of a file and are checked before anything runs. A module only defines functions, error classes, and constants; its constants are read-only, and its functions see only its own names, its imports, and builtins.",
         ],
     },
     StoneHelpTopic {
         name: "unsupported",
         summary: "Common Python habits that fail in Stone, with replacements.",
         bullets: &[
-            "No imports/modules/os/pathlib/glob/json; use find/read_json/json_loads/json_dumps.",
+            "No Python standard library: import os/pathlib/glob/json fail; use find/read_json/json_loads/json_dumps. Stone modules use from lib import name (see help(\"syntax\")); import lib, relative imports, and import * are not supported.",
             "Lambda is expression-only; use explicit loops when callback logic needs statements or mutation.",
             "No general classes or general Python decorators; the only classes are field-only error types (class ConfigError(Exception): path: str), and the only decorator is Stone's @stage(...). Use records for plain data.",
             "No global or nonlocal: a function reads module variables and a closure reads its enclosing function's variables, but neither rebinds them. Keep shared state in a list or dict (count = [0], then count[0] += 1) or return the new value. A local assigned anywhere in a function hides the module variable for the whole function.",
