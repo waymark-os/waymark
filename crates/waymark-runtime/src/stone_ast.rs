@@ -249,6 +249,12 @@ pub enum Expr {
         named: Vec<(String, Expr)>,
     },
     Call(Call),
+    /// Calling the value of an expression: `make(2)(3)`, `handlers[0](x)`.
+    CallValue {
+        callee: Box<Expr>,
+        positional: Vec<Expr>,
+        named: Vec<(String, Expr)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1951,6 +1957,28 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
             Ok(Expr::MethodCall {
                 receiver: Box::new(lower_expr(*attribute.value)?),
                 method,
+                positional,
+                named,
+            })
+        }
+        callee @ (py::Expr::Call(_) | py::Expr::Subscript(_) | py::Expr::Lambda(_)) => {
+            let named = call
+                .arguments
+                .keywords
+                .into_vec()
+                .into_iter()
+                .map(|keyword| {
+                    let Some(name) = keyword.arg else {
+                        return Err(unsupported_message(
+                            "call",
+                            "keyword spread is not supported yet",
+                        ));
+                    };
+                    Ok((name.to_string(), lower_expr(keyword.value)?))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Expr::CallValue {
+                callee: Box::new(lower_expr(callee)?),
                 positional,
                 named,
             })

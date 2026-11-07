@@ -359,6 +359,43 @@ emit(counter())  # 2
   `len(items)` is an error that names the hidden builtin and suggests
   renaming the variable.
 
+### Lists And Dicts
+
+Lists and dicts are shared objects, as in Python. Assigning one to another
+name, passing it to a function, or storing it inside another list or dict
+does not copy it, so a change made through one name is visible through every
+other name for the same object.
+
+```python
+def tag(row):
+    row["seen"] = True
+
+rows = [{"n": 2}, {"n": 1}]
+for row in sorted(rows, key=lambda r: r["n"]):
+    tag(row)
+emit(rows)  # both rows now have "seen": True
+```
+
+- `xs += ys` extends `xs` in place, including `d["xs"] += ys`.
+- `list(xs)`, `xs[:]`, and comprehensions make a new outer list; the elements
+  are still shared. `{k: v for k, v in d.items()}` copies a dict the same way.
+- `a is b` is true only when both names refer to the same list or dict;
+  `a == b` compares contents.
+- `x or y` and `x and y` return one of the operands itself, not a copy.
+- `for`, `enumerate`, `sorted`, `filter`, `where`, `first`, `last`,
+  slicing, and a dict's `.get`, `.values`, and `.items` hand out the same
+  elements, and a list method such as `.append` changes the list it is
+  called on even when that list came from a call: `groups()[0].append(x)`.
+  Other builtins, such as `unique`, `map`, and the JSON helpers, return
+  copies.
+- Lists and dicts can hold functions and lambdas. Any expression that gives a
+  function can be called: `handlers["save"](path)`, `fs[0](x)`,
+  `make_adder(2)(3)`. Calling a value that is not a function is an error that
+  names the value's type.
+- Errors the host reports (`ExpectationFailed`, `UndeclaredEffect`) are
+  read-only, all the way down. Changing one is an error; build a modified copy
+  with a dict comprehension instead.
+
 `transition_hooks(pre=..., post=...)` creates a first-class call-local policy
 value. It may be assigned and passed through Stone functions before being used
 as `hooks=` on `model_call`, `model_infer`, `run`, or `must_run`. Literal hook
@@ -432,7 +469,8 @@ work.
 `ExpectationFailed` and `UndeclaredEffect` are host-only. A program can catch
 them, test them with `isinstance`, and re-raise one it caught (`raise` or
 `raise error`, unchanged), but it cannot construct, raise, or subclass them,
-and a modified copy cannot be raised. `isinstance(x, ExpectationFailed)` is
+and a modified copy cannot be raised. A caught host-only error is read-only:
+`error["observed"] = ...` is an error. `isinstance(x, ExpectationFailed)` is
 true only for an error the host raised, never for a dict that merely has
 `type="ExpectationFailed"`. A parent deciding what to do after a failure can
 therefore trust that the failure came from a checked call.

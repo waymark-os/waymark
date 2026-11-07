@@ -266,7 +266,7 @@ impl Evaluator<'_> {
     ) {
         if let Some(value) = last_value {
             if let Some(target) = targets.first() {
-                self.state.set_local(target.clone(), value);
+                self.state.set_local_in_place(target.clone(), value);
             }
         }
         self.state.hot_loop_diagnostics.loop_vm_executed();
@@ -277,7 +277,7 @@ impl Evaluator<'_> {
         local: &str,
         values: &[RuntimeValue],
     ) -> Result<GenericVmLoopResult, ShellError> {
-        let Some(local_value) = self.state.get_local(local) else {
+        let Some(local_value) = self.state.get_local_plain(local) else {
             self.state
                 .hot_loop_diagnostics
                 .lowering_miss("unsupported_expr");
@@ -289,7 +289,8 @@ impl Evaluator<'_> {
         else {
             return Ok(GenericVmLoopResult::Unsupported);
         };
-        self.state.set_local(local.to_owned(), result.value);
+        self.state
+            .set_local_in_place(local.to_owned(), result.value);
         Ok(GenericVmLoopResult::Executed {
             last_value: result.last_value,
         })
@@ -301,7 +302,7 @@ impl Evaluator<'_> {
         lines: &TextLines,
         parse: GenericParseNumber,
     ) -> Result<GenericVmLoopResult, ShellError> {
-        let Some(local_value) = self.state.get_local(local) else {
+        let Some(local_value) = self.state.get_local_plain(local) else {
             self.state
                 .hot_loop_diagnostics
                 .lowering_miss("unsupported_expr");
@@ -314,7 +315,8 @@ impl Evaluator<'_> {
         else {
             return Ok(GenericVmLoopResult::Unsupported);
         };
-        self.state.set_local(local.to_owned(), result.value);
+        self.state
+            .set_local_in_place(local.to_owned(), result.value);
         Ok(GenericVmLoopResult::Executed {
             last_value: result.last_value,
         })
@@ -405,7 +407,7 @@ impl Evaluator<'_> {
     ) -> Result<GenericVmLoopResult, ShellError> {
         let current = self
             .state
-            .get_local(list)
+            .get_local_plain(list)
             .ok_or_else(|| stone_error("hot loop", format!("unknown name `{list}`")))?;
         let Some(result) =
             execute_generic_vm_list_append_loop(current, values, unique, values_equal, |reason| {
@@ -414,7 +416,7 @@ impl Evaluator<'_> {
         else {
             return Ok(GenericVmLoopResult::Unsupported);
         };
-        self.state.set_local(
+        self.state.set_local_in_place(
             list.to_owned(),
             RuntimeValue::Nu(Value::list(result.items, Span::unknown())),
         );
@@ -433,7 +435,7 @@ impl Evaluator<'_> {
         for local in &function.locals {
             let value = self
                 .state
-                .get_local(local)
+                .get_local_plain(local)
                 .and_then(|value| value.into_nu_value("hot loop").ok())
                 .and_then(|value| match value {
                     Value::Int { val, .. } => Some(val),
@@ -451,7 +453,7 @@ impl Evaluator<'_> {
 
         for (name, value) in function.locals.iter().zip(result.locals.into_iter()) {
             if let Some(value) = value {
-                self.state.set_local(
+                self.state.set_local_in_place(
                     name.clone(),
                     RuntimeValue::Nu(Value::int(value, Span::unknown())),
                 );

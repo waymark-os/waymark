@@ -1395,8 +1395,21 @@ pub(crate) fn sort_key_kind(value: &Value) -> Result<SortKeyKind, ShellError> {
 pub(crate) fn sort_builtin_values(
     values: Vec<Value>,
     reverse: bool,
-    mut key_for_value: impl FnMut(&Value) -> Result<Value, ShellError>,
+    key_for_value: impl FnMut(&Value) -> Result<Value, ShellError>,
 ) -> Result<Value, ShellError> {
+    Ok(Value::list(
+        sort_keyed(values, reverse, key_for_value)?,
+        Span::unknown(),
+    ))
+}
+
+/// Stable sort of any items by a computed key, with Stone's key rules (all
+/// keys of compatible types).
+pub(crate) fn sort_keyed<T>(
+    values: Vec<T>,
+    reverse: bool,
+    mut key_for_value: impl FnMut(&T) -> Result<Value, ShellError>,
+) -> Result<Vec<T>, ShellError> {
     let mut keyed = Vec::with_capacity(values.len());
     let mut key_kind = None;
     for value in values {
@@ -1423,10 +1436,7 @@ pub(crate) fn sort_builtin_values(
             ordering
         }
     });
-    Ok(Value::list(
-        keyed.into_iter().map(|(_, value)| value).collect(),
-        Span::unknown(),
-    ))
+    Ok(keyed.into_iter().map(|(_, value)| value).collect())
 }
 
 pub(crate) fn starts_with_builtin(text: &Value, prefix: &Value) -> Result<Value, ShellError> {

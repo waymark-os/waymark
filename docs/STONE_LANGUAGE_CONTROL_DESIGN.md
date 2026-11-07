@@ -1259,6 +1259,47 @@ As implemented (`stone_scope.rs`, `Scope` in `stone_eval.rs`):
 - Debug-build recursion depth at a 2 MB stack and the time of a
   50,000-call loop are unchanged from M3.
 
+After M4's shared-container step (L2 and R9), every probe matches: L1 8/8,
+L2 5/5, both "outside the plan" probes (a call's result can be called, and
+lists can hold functions), and L18 4/4. The corpus diff against the M3 build
+shows 1 of 224 units changed, the `help(help)` overview, on purpose.
+
+As implemented (`stone_containers.rs`):
+
+- `RuntimeValue` gains `List` and `Dict`: `Rc` objects whose items are a
+  64-byte slot (a plain Nu `Value`, a nested shared list or dict, or a boxed
+  runtime value such as a callable). Each object carries an unused
+  information-flow label slot and a `frozen` flag.
+- Binding a plain list or dict to a variable makes it shared. Nested plain
+  containers become shared lazily, when first read out. Builtins that take
+  Nu values get a deep copy at the call; cycles give an error at depth 512.
+- `for`, `enumerate`, `sorted`, `filter`, `where`, `first`, `last`, slicing,
+  and dict `.get`/`.values`/`.items` hand out the same elements. `is`
+  compares identity. `xs += ys` extends in place for any target.
+- Any expression that gives a function can be called (`Expr::CallValue`), and
+  list methods work on any expression that gives a list.
+- Caught host-only errors are frozen, so a forged copy must be built
+  explicitly and still cannot be raised as a host error. Frozen is the hook
+  for read-only module values (L9).
+- `Scope` keeps captured cells in a small vector, and functions are held by
+  `Rc`, so a call no longer deep-copies its function body.
+
+Release-build timings against the M3 build (best of five): user-function
+calls 1.07s to 0.96s; a bare loop 0.44s to 0.46s; builtin calls 0.40s to
+0.42s; a loop inside a function 0.76s both; a container-heavy script 1.07s to
+1.14s, with peak memory 171 MB to 204 MB.
+
+Known gaps:
+
+- Builtins outside the list above (`unique`, `map`, the JSON helpers) return
+  copies, not the same elements.
+- Reference cycles are not collected; they are freed when the run ends.
+- When the loop engine (`stone_vm`) writes a container back to a variable,
+  nested shared objects inside it become plain copies.
+- A dict `.get(key, default)` returns a copy of the default.
+- Item assignment into a call's result (`f()[0] = x`) is rejected at parse
+  time.
+
 ### 9.6 M0: Executable Probes And Source Reading (2026-11-07)
 
 `host/check_stone_semantics_compat.py` turns the 9.5 scan into measurements

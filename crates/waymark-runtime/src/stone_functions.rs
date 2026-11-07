@@ -27,8 +27,8 @@ pub(super) enum CallableValue {
     },
     Named {
         function_id: u64,
-        // Boxed so a callable does not inflate every RuntimeValue.
-        function: Box<FunctionDef>,
+        // Shared, so passing a function around does not copy its body.
+        function: Rc<FunctionDef>,
         /// Cells for the enclosing-function variables the body reads; empty
         /// for module-level functions.
         captures: Vec<(String, Cell)>,
@@ -262,18 +262,18 @@ impl CallableValue {
         }
     }
 
-    pub(super) fn named(function_id: u64, function: FunctionDef) -> Self {
+    pub(super) fn named(function_id: u64, function: Rc<FunctionDef>) -> Self {
         Self::closure(function_id, function, Vec::new())
     }
 
     pub(super) fn closure(
         function_id: u64,
-        function: FunctionDef,
+        function: Rc<FunctionDef>,
         captures: Vec<(String, Cell)>,
     ) -> Self {
         Self::Named {
             function_id,
-            function: Box::new(function),
+            function,
             captures,
         }
     }
@@ -319,7 +319,7 @@ impl CallableValue {
 #[derive(Default)]
 pub(crate) struct StoneSession {
     pub(super) locals: HashMap<String, RuntimeValue>,
-    pub(super) functions: HashMap<String, FunctionDef>,
+    pub(super) functions: HashMap<String, Rc<FunctionDef>>,
     pub(super) context: ContextState,
     pub(super) next_transition_id: u64,
     /// Host-only errors (such as `ExpectationFailed`) this session has caught.
@@ -357,7 +357,7 @@ impl StoneSession {
             .collect();
     }
 
-    pub(super) fn update_functions(&mut self, functions: &HashMap<String, FunctionDef>) {
+    pub(super) fn update_functions(&mut self, functions: &HashMap<String, Rc<FunctionDef>>) {
         self.functions = functions.clone();
     }
 

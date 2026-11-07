@@ -61,6 +61,7 @@ pub(super) fn generic_vm_record_field_value(
         RuntimeValue::Nu(Value::Record { val, .. }) => {
             Ok(val.get(field).cloned().map(RuntimeValue::Nu))
         }
+        RuntimeValue::Dict(dict) => Ok(dict.get(field)),
         RuntimeValue::JsonObjectView(view) => json_object_view_get(view, field),
         _ => Ok(None),
     }

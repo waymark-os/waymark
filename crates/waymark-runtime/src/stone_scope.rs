@@ -64,7 +64,8 @@ fn resolve_function(
     let mut augmented = Names::new();
     collect_bindings(&function.body, &mut bound, &mut augmented);
 
-    for name in augmented.difference(&bound) {
+    // Report the first name that `+=` rebinds without the function binding it.
+    if let Some(name) = augmented.difference(&bound).next() {
         let enclosing = stack.iter().rev().find(|scope| scope.locals.contains(name));
         let message = match enclosing {
             Some(scope) => format!(
@@ -425,6 +426,15 @@ fn resolve_expr(
             ..
         } => {
             resolve_expr(receiver, stack, reads)?;
+            resolve_exprs(positional.iter_mut(), stack, reads)?;
+            resolve_exprs(named.iter_mut().map(|(_, value)| value), stack, reads)
+        }
+        Expr::CallValue {
+            callee,
+            positional,
+            named,
+        } => {
+            resolve_expr(callee, stack, reads)?;
             resolve_exprs(positional.iter_mut(), stack, reads)?;
             resolve_exprs(named.iter_mut().map(|(_, value)| value), stack, reads)
         }

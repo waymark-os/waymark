@@ -2,6 +2,7 @@
 
 use nu_protocol::{ShellError, Span, Value};
 
+use super::stone_containers::{containers_are_persistable, materialize_owned, DictRef, ListRef};
 use super::stone_error;
 use super::stone_functions::{
     CallableValue, TransitionHooksValue, WorkflowEvidenceSourceValue, WorkflowStageValue,
@@ -22,6 +23,10 @@ use crate::stone_attempt_value::{
 #[derive(Clone)]
 pub(super) enum RuntimeValue {
     Nu(Value),
+    /// A shared list (Python reference semantics; see stone_containers).
+    List(ListRef),
+    /// A shared dict.
+    Dict(DictRef),
     File(FileHandle),
     TextLines(TextLines),
     JsonlRows(JsonlRows),
@@ -46,6 +51,8 @@ pub(super) enum RuntimeValue {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RuntimeValueTag {
     Nu,
+    List,
+    Dict,
     File,
     TextLines,
     JsonlRows,
@@ -91,6 +98,8 @@ impl RuntimeValueTag {
             RuntimeValueTag::AttemptAcceptance => 18,
             RuntimeValueTag::AttemptBest => 19,
             RuntimeValueTag::AttemptFailure => 20,
+            RuntimeValueTag::List => 21,
+            RuntimeValueTag::Dict => 22,
         }
     }
 }
@@ -111,6 +120,7 @@ impl RuntimeValue {
     pub(super) fn is_session_persistable(&self) -> bool {
         match self {
             RuntimeValue::Nu(_) => true,
+            RuntimeValue::List(_) | RuntimeValue::Dict(_) => containers_are_persistable(self),
             RuntimeValue::TextLines(_) => true,
             RuntimeValue::JsonlRows(_) => true,
             RuntimeValue::JsonObjectView(_) => true,
@@ -137,6 +147,8 @@ impl RuntimeValue {
     pub(super) fn type_tag(&self) -> RuntimeValueTag {
         match self {
             RuntimeValue::Nu(_) => RuntimeValueTag::Nu,
+            RuntimeValue::List(_) => RuntimeValueTag::List,
+            RuntimeValue::Dict(_) => RuntimeValueTag::Dict,
             RuntimeValue::File(_) => RuntimeValueTag::File,
             RuntimeValue::TextLines(_) => RuntimeValueTag::TextLines,
             RuntimeValue::JsonlRows(_) => RuntimeValueTag::JsonlRows,
@@ -162,6 +174,9 @@ impl RuntimeValue {
     pub(super) fn into_nu_value(self, context: &str) -> Result<Value, ShellError> {
         match self {
             RuntimeValue::Nu(value) => Ok(value),
+            value @ (RuntimeValue::List(_) | RuntimeValue::Dict(_)) => {
+                materialize_owned(value, context)
+            }
             RuntimeValue::File(_) => Err(stone_error(
                 context,
                 "file objects are task-owned runtime values and cannot cross this boundary",

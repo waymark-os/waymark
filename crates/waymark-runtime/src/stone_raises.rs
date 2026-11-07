@@ -14,6 +14,8 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use std::rc::Rc;
+
 use crate::stone_ast::{ComprehensionClause, Expr, FormattedStringPart, FunctionDef, Stmt};
 use crate::stone_errors::{
     builtin_call_raises, error_type_matches, is_builtin_error_type, is_tool_error_type,
@@ -74,7 +76,7 @@ const MAX_CALL_DEPTH: usize = 8;
 type Raises = Option<BTreeSet<String>>;
 
 struct Analyzer<'a> {
-    functions: &'a HashMap<String, FunctionDef>,
+    functions: &'a HashMap<String, Rc<FunctionDef>>,
     visiting: HashSet<String>,
 }
 
@@ -83,7 +85,7 @@ struct Analyzer<'a> {
 /// functions and error classes visible to the program.
 pub(crate) fn unreachable_handler_warnings(
     statements: &[Stmt],
-    functions: &HashMap<String, FunctionDef>,
+    functions: &HashMap<String, Rc<FunctionDef>>,
 ) -> Vec<String> {
     let mut all_functions = functions.clone();
     collect_functions(statements, &mut all_functions);
@@ -98,11 +100,11 @@ pub(crate) fn unreachable_handler_warnings(
     warnings
 }
 
-fn collect_functions(statements: &[Stmt], functions: &mut HashMap<String, FunctionDef>) {
+fn collect_functions(statements: &[Stmt], functions: &mut HashMap<String, Rc<FunctionDef>>) {
     for statement in statements {
         match statement {
             Stmt::FunctionDef(function) => {
-                functions.insert(function.name.clone(), function.clone());
+                functions.insert(function.name.clone(), Rc::new(function.clone()));
                 collect_functions(&function.body, functions);
             }
             Stmt::For { body, .. } | Stmt::While { body, .. } | Stmt::With { body, .. } => {
@@ -372,6 +374,8 @@ impl Analyzer<'_> {
             // A lambda's body may run wherever the lambda is passed.
             Expr::Lambda { body, .. } => self.expr(body),
             Expr::Await(_) => None,
+            // The callee is not known statically: it may raise anything.
+            Expr::CallValue { .. } => None,
             Expr::MethodCall {
                 receiver,
                 method,

@@ -443,7 +443,7 @@ impl Evaluator<'_> {
                     default,
                 } => {
                     let value = json_object_view_get_string_default(row, key, default)?;
-                    self.state.set_local(
+                    self.state.set_local_in_place(
                         target.clone(),
                         RuntimeValue::Nu(Value::string(value, Span::unknown())),
                     );
@@ -454,7 +454,7 @@ impl Evaluator<'_> {
                     default,
                 } => {
                     let value = json_object_view_get_f64_default(row, key, *default)?;
-                    self.state.set_local(
+                    self.state.set_local_in_place(
                         target.clone(),
                         RuntimeValue::Nu(Value::float(value, Span::unknown())),
                     );
@@ -465,20 +465,20 @@ impl Evaluator<'_> {
                     default,
                 } => {
                     let value = json_object_view_get_i64_default(row, key, *default)?;
-                    self.state.set_local(
+                    self.state.set_local_in_place(
                         target.clone(),
                         RuntimeValue::Nu(Value::int(value, Span::unknown())),
                     );
                 }
                 HotLoopOp::JsonGetArrayDefault { target, key } => {
                     let value = json_object_view_get_array_default(row, key)?;
-                    self.state.set_local(target.clone(), value);
+                    self.state.set_local_in_place(target.clone(), value);
                 }
                 HotLoopOp::JsonGetValue { target, key } => {
                     let value = json_object_view_get(row, key)?.ok_or_else(|| {
                         stone_error("hot loop", format!("record has no key `{key}`"))
                     })?;
-                    self.state.set_local(target.clone(), value);
+                    self.state.set_local_in_place(target.clone(), value);
                 }
             }
         }
@@ -567,7 +567,7 @@ impl Evaluator<'_> {
             };
             if let Some(target) = targets.first() {
                 self.state
-                    .set_local(target.clone(), RuntimeValue::JsonObjectView(row.clone()));
+                    .set_local_in_place(target.clone(), RuntimeValue::JsonObjectView(row.clone()));
             }
             let snapshot = self.materialize_hot_jsonl_vm_snapshot_row_locals(
                 vm_function,
@@ -687,7 +687,7 @@ impl Evaluator<'_> {
             };
             if let Some(target) = targets.first() {
                 self.state
-                    .set_local(target.clone(), RuntimeValue::JsonObjectView(row.clone()));
+                    .set_local_in_place(target.clone(), RuntimeValue::JsonObjectView(row.clone()));
             }
             let snapshot = self.materialize_hot_jsonl_vm_snapshot_row_locals(
                 vm_function,
@@ -789,7 +789,7 @@ impl Evaluator<'_> {
             };
             if let Some(target) = targets.first() {
                 self.state
-                    .set_local(target.clone(), RuntimeValue::JsonObjectView(row.clone()));
+                    .set_local_in_place(target.clone(), RuntimeValue::JsonObjectView(row.clone()));
             }
             let row = HotJsonlRowSlice {
                 bytes: &row.bytes[row.range.clone()],
@@ -805,7 +805,7 @@ impl Evaluator<'_> {
             } else {
                 hot_jsonl_row_get_string_required(&row, &body_plan.user_key)?
             };
-            self.state.set_local(
+            self.state.set_local_in_place(
                 body_plan.user_name.clone(),
                 RuntimeValue::Nu(Value::string(user.into_owned(), Span::unknown())),
             );
@@ -822,7 +822,7 @@ impl Evaluator<'_> {
         self.state
             .hot_loop_diagnostics
             .fused_kernel_executed(LoopIrFusedKernel::JsonlAggregation);
-        self.state.set_local(
+        self.state.set_local_in_place(
             nested.map_name.clone(),
             RuntimeValue::Nu(Value::record(
                 nested_totals_record_from_native_maps(
@@ -835,7 +835,7 @@ impl Evaluator<'_> {
                 Span::unknown(),
             )),
         );
-        self.state.set_local(
+        self.state.set_local_in_place(
             body_plan.tag_counts_map.clone(),
             RuntimeValue::Nu(Value::record(
                 i64_record_from_native_map(&accumulators.tags, &accumulators.tag_counts),
@@ -937,7 +937,7 @@ impl Evaluator<'_> {
             .fused_kernel_executed(LoopIrFusedKernel::JsonlAggregation);
         if let Some(line) = last_line {
             if let Some(target) = targets.first() {
-                self.state.set_local(
+                self.state.set_local_in_place(
                     target.clone(),
                     RuntimeValue::Nu(Value::string(line, Span::unknown())),
                 );
@@ -1029,12 +1029,12 @@ impl Evaluator<'_> {
             .fused_kernel_executed(LoopIrFusedKernel::JsonlAggregation);
         if let Some(line) = last_line {
             if let Some(target) = targets.first() {
-                self.state.set_local(
+                self.state.set_local_in_place(
                     target.clone(),
                     RuntimeValue::Nu(Value::string(line.clone(), Span::unknown())),
                 );
             }
-            self.state.set_local(
+            self.state.set_local_in_place(
                 line_target.clone(),
                 RuntimeValue::Nu(Value::string(line, Span::unknown())),
             );
@@ -1218,7 +1218,7 @@ impl Evaluator<'_> {
 
     fn apply_stone_materialized_snapshot(&mut self, snapshot: StoneMaterializedSnapshot) {
         for (name, value) in snapshot.locals {
-            self.state.set_local(name, value);
+            self.state.set_local_in_place(name, value);
         }
     }
 
@@ -1939,9 +1939,12 @@ impl Evaluator<'_> {
         &self,
         nested: &HotJsonlNestedUserTotals,
     ) -> Result<(Vec<String>, HashMap<String, f64>, HashMap<String, i64>), ShellError> {
-        let value = self.state.get_local(&nested.map_name).ok_or_else(|| {
-            stone_error("hot loop", format!("unknown name `{}`", nested.map_name))
-        })?;
+        let value = self
+            .state
+            .get_local_plain(&nested.map_name)
+            .ok_or_else(|| {
+                stone_error("hot loop", format!("unknown name `{}`", nested.map_name))
+            })?;
         let RuntimeValue::Nu(Value::Record { val, .. }) = value else {
             return Err(stone_error(
                 "hot loop",
@@ -1992,7 +1995,7 @@ impl Evaluator<'_> {
     fn load_f64_record_map(&self, name: &str) -> Result<HashMap<String, f64>, ShellError> {
         let value = self
             .state
-            .get_local(name)
+            .get_local_plain(name)
             .ok_or_else(|| stone_error("hot loop", format!("unknown name `{name}`")))?;
         let RuntimeValue::Nu(Value::Record { val, .. }) = value else {
             return Err(stone_error("hot loop", format!("{name} is not a record")));
@@ -2010,7 +2013,7 @@ impl Evaluator<'_> {
     ) -> Result<HashMap<String, i64>, ShellError> {
         let value = self
             .state
-            .get_local(name)
+            .get_local_plain(name)
             .ok_or_else(|| stone_error("hot loop", format!("unknown name `{name}`")))?;
         let RuntimeValue::Nu(Value::Record { val, .. }) = value else {
             return Err(stone_error("hot loop", format!("{name} is not a record")));
@@ -2023,7 +2026,7 @@ impl Evaluator<'_> {
     }
 
     pub(super) fn store_i64_record_map(&mut self, name: &str, map: &HashMap<String, i64>) {
-        self.state.set_local(
+        self.state.set_local_in_place(
             name.to_owned(),
             RuntimeValue::Nu(Value::record(
                 i64_record_from_native_map(&[], map),
@@ -2035,7 +2038,7 @@ impl Evaluator<'_> {
     fn load_string_list(&self, name: &str) -> Result<Vec<String>, ShellError> {
         let value = self
             .state
-            .get_local(name)
+            .get_local_plain(name)
             .ok_or_else(|| stone_error("hot loop", format!("unknown name `{name}`")))?;
         let RuntimeValue::Nu(Value::List { vals, .. }) = value else {
             return Err(stone_error("hot loop", format!("{name} is not a list")));

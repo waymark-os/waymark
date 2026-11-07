@@ -324,6 +324,17 @@ fn validate_expr(expr: &Expr, names: &AdmissionNames) -> Result<(), ShellError> 
                 validate_expr(value, names)?;
             }
         }
+        Expr::CallValue {
+            callee,
+            positional,
+            named,
+        } => {
+            validate_expr(callee, names)?;
+            validate_exprs(positional, names)?;
+            for (_, value) in named {
+                validate_expr(value, names)?;
+            }
+        }
         Expr::Call(call) => {
             if !names.callable.contains(&call.name) {
                 return Err(admission_error(format!(
@@ -583,6 +594,19 @@ fn collect_expr_bindings(expr: &Expr, names: &mut HashSet<String>) {
             ..
         } => {
             collect_expr_bindings(receiver, names);
+            for value in positional {
+                collect_expr_bindings(value, names);
+            }
+            for (_, value) in named {
+                collect_expr_bindings(value, names);
+            }
+        }
+        Expr::CallValue {
+            callee,
+            positional,
+            named,
+        } => {
+            collect_expr_bindings(callee, names);
             for value in positional {
                 collect_expr_bindings(value, names);
             }

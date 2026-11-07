@@ -14,6 +14,7 @@ waymark-global-audit = { path = "../waymark-global-audit" }
 asset-image = { path = "../asset-image" }
 waymark-gateway-client = { path = "../../../waymark-gateway/crates/waymark-gateway-client" }
 waymark-runtime-support = { path = "../waymark-runtime-support" }
+indexmap = "2.14"
 libc = "0.2.186"
 md5 = { version = "0.10", package = "md-5" }
 memchr = "2.8.0"

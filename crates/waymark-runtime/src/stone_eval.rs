@@ -60,14 +60,14 @@ use crate::stone_builtins::{
     add_values, bitwise_int_values, compare_values, div_values, enumerate_builtin,
     find_method_builtin, first_builtin, float_builtin, floor_div_values, format_builtin,
     index_method_builtin, int_builtin, join_builtin, last_builtin, len_builtin, list_builtin,
-    map_builtin_value, min_max_builtin, mod_values, mul_values, neg_value, normalize_index,
-    parse_float_builtin, parse_int_builtin, python_str, range_builtin, record_method_builtin,
-    repr_builtin, round_builtin, set_builtin, shift_value, slice_builtin, sort_builtin_values,
-    sort_key_for_value, split_builtin, starts_with_builtin, str_builtin, string_method_builtin,
-    sub_values, subscript_builtin, sum_builtin, unique_builtin, value_identity_key, value_to_bool,
-    value_to_display_string, value_to_f64, value_to_i64, value_to_limit, value_to_operator_i64,
-    value_to_path_string, value_to_string, value_to_u64, value_truthy, value_type_name,
-    where_builtin, where_compare_builtin, zfill_text,
+    map_builtin_value, min_max_builtin, mod_values, mul_values, neg_value, parse_float_builtin,
+    parse_int_builtin, python_str, range_builtin, record_method_builtin, repr_builtin,
+    round_builtin, set_builtin, shift_value, slice_builtin, sort_builtin_values,
+    sort_key_for_value, sort_keyed, split_builtin, starts_with_builtin, str_builtin,
+    string_method_builtin, sub_values, sum_builtin, unique_builtin, value_identity_key,
+    value_to_bool, value_to_display_string, value_to_f64, value_to_i64, value_to_limit,
+    value_to_operator_i64, value_to_path_string, value_to_string, value_to_u64, value_truthy,
+    value_type_name, where_builtin, where_compare_builtin, zfill_text,
 };
 use crate::stone_correction;
 use crate::stone_errors::{
@@ -99,6 +99,8 @@ use crate::stone_vm::{
 };
 use crate::StoneGuest;
 
+#[path = "stone_containers.rs"]
+mod stone_containers;
 #[path = "stone_context.rs"]
 mod stone_context;
 #[path = "stone_expect.rs"]
@@ -117,6 +119,10 @@ mod stone_vm_interp;
 mod stone_vm_jsonl_runtime;
 #[path = "stone_vm/runtime.rs"]
 mod stone_vm_runtime;
+use stone_containers::{
+    assign_item, child_for_mutation, dict_from_entries, ensure_mutable, freeze, is_frozen,
+    is_plain_container, list_from_values, materialize, share, unshare, ListRef,
+};
 use stone_context::ContextState;
 pub(crate) use stone_functions::StoneSession;
 use stone_functions::{
@@ -146,7 +152,7 @@ const MAX_SEMANTIC_FRONTIER_DIAGNOSTICS: usize = 256;
 #[derive(Default)]
 pub struct EvalState {
     scopes: Vec<Scope>,
-    functions: HashMap<String, FunctionDef>,
+    functions: HashMap<String, Rc<FunctionDef>>,
     next_file_id: u64,
     next_callable_id: u64,
     next_transition_id: u64,
@@ -386,7 +392,7 @@ struct Scope {
     files: HashMap<u64, RuntimeFile>,
     /// Locals shared with closures. A name lives in `locals` or `cells`,
     /// never both. Only frame scopes (and the root) hold cells.
-    cells: HashMap<String, Cell>,
+    cells: CellMap,
     /// True for the scope a function or lambda call pushes. Name lookup
     /// stops at the nearest frame and then falls back to the root scope
     /// (module globals): Stone scoping is lexical, not dynamic.
@@ -397,35 +403,44 @@ struct Scope {
     declared: Option<Arc<FunctionScope>>,
 }
 
+/// The cells of one frame. Closures capture a handful of names, so a small
+/// vector beats a hash map here, and an empty one costs nothing to create.
+#[derive(Default)]
+struct CellMap(Vec<(String, Cell)>);
+
+impl CellMap {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn get(&self, name: &str) -> Option<&Cell> {
+        self.0
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, cell)| cell)
+    }
+
+    fn contains_key(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    fn insert(&mut self, name: String, cell: Cell) {
+        match self.0.iter_mut().find(|(key, _)| *key == name) {
+            Some((_, existing)) => *existing = cell,
+            None => self.0.push((name, cell)),
+        }
+    }
+
+    fn remove(&mut self, name: &str) {
+        self.0.retain(|(key, _)| key != name);
+    }
+}
+
 /// A mutable borrow of a variable, whether it is a plain slot or a cell
 /// shared with closures.
 enum LocalMut<'a, T = RuntimeValue> {
     Slot(&'a mut T),
     Cell(std::cell::RefMut<'a, T>),
-}
-
-impl<'a, T> LocalMut<'a, T> {
-    /// Narrow the borrow to a part of the value, such as `xs[0]` of `xs`.
-    fn try_map<U>(
-        self,
-        f: impl FnOnce(&mut T) -> Result<&mut U, ShellError>,
-    ) -> Result<LocalMut<'a, U>, ShellError> {
-        match self {
-            Self::Slot(value) => f(value).map(LocalMut::Slot),
-            Self::Cell(value) => {
-                let mut error = None;
-                std::cell::RefMut::filter_map(value, |value| match f(value) {
-                    Ok(part) => Some(part),
-                    Err(err) => {
-                        error = Some(err);
-                        None
-                    }
-                })
-                .map(LocalMut::Cell)
-                .map_err(|_| error.unwrap_or_else(|| stone_error("variable", "borrow failed")))
-            }
-        }
-    }
 }
 
 impl<T> std::ops::Deref for LocalMut<'_, T> {
@@ -493,8 +508,10 @@ impl EvalState {
             if let Some(value) = scope.locals.get(name) {
                 return Some(value.clone());
             }
-            if let Some(cell) = scope.cells.get(name) {
-                return cell.borrow().clone();
+            if !scope.cells.is_empty() {
+                if let Some(cell) = scope.cells.get(name) {
+                    return cell.borrow().clone();
+                }
             }
             if scope.frame || index == 0 {
                 if index == 0 {
@@ -510,6 +527,7 @@ impl EvalState {
                 let root = &self.scopes[0];
                 return match root.locals.get(name) {
                     Some(value) => Some(value.clone()),
+                    None if root.cells.is_empty() => None,
                     None => root.cells.get(name).and_then(|cell| cell.borrow().clone()),
                 };
             }
@@ -546,15 +564,53 @@ impl EvalState {
     }
 
     fn set_local(&mut self, name: String, value: RuntimeValue) {
+        // A list or dict bound to a name becomes a shared object, so later
+        // reads of the name alias it (Python reference semantics).
+        let value = if is_plain_container(&value) {
+            share(value)
+        } else {
+            value
+        };
         if self.scopes.is_empty() {
             self.scopes.push(Scope::default());
         }
         let frame = self.frame_index();
-        if let Some(cell) = self.scopes[frame].cells.get(&name) {
-            *cell.borrow_mut() = Some(value);
-            return;
+        if !self.scopes[frame].cells.is_empty() {
+            if let Some(cell) = self.scopes[frame].cells.get(&name) {
+                *cell.borrow_mut() = Some(value);
+                return;
+            }
         }
         self.root_scope_mut().locals.insert(name, value);
+    }
+
+    /// A variable's value with shared containers copied to plain values, for
+    /// the loop engine, which works on plain values.
+    fn get_local_plain(&self, name: &str) -> Option<RuntimeValue> {
+        let value = self.get_local(name)?;
+        // A frozen container stays shared: the loop engine does not handle
+        // it, so the loop runs on the general path, which reports the error.
+        if matches!(value, RuntimeValue::List(_) | RuntimeValue::Dict(_)) && !is_frozen(&value) {
+            if let Ok(plain) = materialize(&value, "hot loop") {
+                return Some(RuntimeValue::Nu(plain));
+            }
+        }
+        Some(value)
+    }
+
+    /// Store a loop-engine result. When the variable holds a shared list or
+    /// dict and the result is the new contents of that container (the loop
+    /// mutated it), update the shared object so every alias sees the change.
+    fn set_local_in_place(&mut self, name: String, value: RuntimeValue) {
+        match (self.get_local(&name), value) {
+            (Some(RuntimeValue::Dict(dict)), RuntimeValue::Nu(Value::Record { val, .. })) => {
+                dict.replace_plain(val.into_owned());
+            }
+            (Some(RuntimeValue::List(list)), RuntimeValue::Nu(Value::List { vals, .. })) => {
+                list.replace_plain(vals);
+            }
+            (_, value) => self.set_local(name, value),
+        }
     }
 
     /// Share the named variables of the running call with a closure being
@@ -604,10 +660,7 @@ impl EvalState {
             self.scopes.push(Scope::default());
         }
         self.scopes.push(Scope {
-            cells: captures
-                .iter()
-                .map(|(name, cell)| (name.clone(), cell.clone()))
-                .collect(),
+            cells: CellMap(captures.to_vec()),
             frame: true,
             declared,
             ..Scope::default()
@@ -689,7 +742,10 @@ impl EvalState {
             if Some(name.as_str()) == exclude {
                 continue;
             }
-            if matches!(value, RuntimeValue::Nu(_)) {
+            if matches!(
+                value,
+                RuntimeValue::Nu(_) | RuntimeValue::List(_) | RuntimeValue::Dict(_)
+            ) {
                 parent.locals.insert(name, value);
             }
         }
@@ -1212,9 +1268,10 @@ impl Evaluator<'_> {
                 .as_ref()
                 .map(|decorator| self.eval_stage_declaration(&module_function, decorator))
                 .transpose()?;
-            self.state
-                .functions
-                .insert(module_function.name.clone(), module_function.clone());
+            self.state.functions.insert(
+                module_function.name.clone(),
+                Rc::new(module_function.clone()),
+            );
             if let Some(stage) = stage {
                 self.state.set_local(
                     module_function.name.clone(),
@@ -1297,6 +1354,15 @@ impl Evaluator<'_> {
             }
             Stmt::AugAssign { target, op, value } => {
                 let left = self.eval_assign_target_value(target)?;
+                if let (AugOp::Add, RuntimeValue::List(list)) = (op, &left) {
+                    // `xs += ys` extends the list in place, as in Python, so
+                    // every alias of `xs` (or of `d["xs"]`) sees the new items.
+                    ensure_mutable(&left, "augmented assignment")?;
+                    let items = self.eval_iterable_expr(value)?;
+                    list.extend(items);
+                    return Ok(EvalFlow::Output(PipelineData::empty()));
+                }
+                let left = left.into_nu_value("augmented assignment")?;
                 let right = self
                     .eval_expr_value(value, input)?
                     .into_nu_value("augmented assignment")?;
@@ -1345,7 +1411,7 @@ impl Evaluator<'_> {
                     let captures = self.state.capture_cells(&function.scope.captures);
                     let callable = CallableValue::closure(
                         self.state.next_callable_id(),
-                        function.clone(),
+                        Rc::new(function.clone()),
                         captures,
                     );
                     self.state
@@ -1354,7 +1420,7 @@ impl Evaluator<'_> {
                 }
                 self.state
                     .functions
-                    .insert(function.name.clone(), function.clone());
+                    .insert(function.name.clone(), Rc::new(function.clone()));
                 if let Some(stage) = stage {
                     self.state
                         .set_local(function.name.clone(), RuntimeValue::WorkflowStage(stage));
@@ -1377,10 +1443,8 @@ impl Evaluator<'_> {
             Stmt::While { condition, body } => {
                 let mut output = PipelineData::empty();
                 for _ in 0..1_000_000 {
-                    let condition = self
-                        .eval_expr_value(condition, PipelineData::empty())?
-                        .into_nu_value("while")?;
-                    if !value_truthy(&condition) {
+                    let condition = self.eval_expr_value(condition, PipelineData::empty())?;
+                    if !runtime_truthy(&condition, "while")? {
                         return Ok(EvalFlow::Output(output));
                     }
                     match self.eval_block(body, PipelineData::empty(), false)? {
@@ -1405,10 +1469,8 @@ impl Evaluator<'_> {
                 {
                     return Ok(EvalFlow::Output(PipelineData::empty()));
                 }
-                let condition = self
-                    .eval_expr_value(condition, input)?
-                    .into_nu_value("if")?;
-                let branch = if value_truthy(&condition) {
+                let condition = self.eval_expr_value(condition, input)?;
+                let branch = if runtime_truthy(&condition, "if")? {
                     then_branch
                 } else {
                     else_branch
@@ -1706,13 +1768,14 @@ impl Evaluator<'_> {
             .state
             .get_local_mut(map_name)
             .ok_or_else(|| stone_error("membership", format!("unknown name `{map_name}`")))?;
-        let RuntimeValue::Nu(Value::Record { val, .. }) = &mut *map else {
-            return Err(stone_error(
+        match &mut *map {
+            RuntimeValue::Dict(dict) => Ok(dict.contains_key(key)),
+            RuntimeValue::Nu(Value::Record { val, .. }) => Ok(val.get(key).is_some()),
+            _ => Err(stone_error(
                 "membership",
                 format!("{map_name} is not a record"),
-            ));
-        };
-        Ok(val.get(key).is_some())
+            )),
+        }
     }
 
     fn apply_fused_map_update(
@@ -1726,6 +1789,27 @@ impl Evaluator<'_> {
             .state
             .get_local_mut(map_name)
             .ok_or_else(|| stone_error("assignment", format!("unknown name `{map_name}`")))?;
+        if let RuntimeValue::Dict(dict) = &*map {
+            if is_frozen(&RuntimeValue::Dict(dict.clone())) {
+                return Err(stone_error(
+                    "assignment",
+                    format!("{map_name} is read-only; change a copy instead"),
+                ));
+            }
+            if exists {
+                let current = dict.get(key).ok_or_else(|| {
+                    stone_error("assignment", format!("record has no key `{key}`"))
+                })?;
+                let current = materialize(&current, "assignment")?;
+                dict.insert(
+                    key.to_owned(),
+                    RuntimeValue::Nu(add_values(&current, &addend)?),
+                );
+            } else {
+                dict.insert(key.to_owned(), RuntimeValue::Nu(addend));
+            }
+            return Ok(());
+        }
         let RuntimeValue::Nu(Value::Record { val, .. }) = &mut *map else {
             return Err(stone_error(
                 "assignment",
@@ -1749,10 +1833,16 @@ impl Evaluator<'_> {
             .state
             .get_local_mut(list_name)
             .ok_or_else(|| stone_error("append", format!("unknown name `{list_name}`")))?;
-        let RuntimeValue::Nu(Value::List { vals, .. }) = &mut *list else {
-            return Err(stone_error("append", format!("{list_name} is not a list")));
-        };
-        vals.push(key);
+        match &mut *list {
+            target @ RuntimeValue::List(_) if !is_frozen(target) => {
+                let RuntimeValue::List(target) = target else {
+                    unreachable!("matched above");
+                };
+                target.push(RuntimeValue::Nu(key))
+            }
+            RuntimeValue::Nu(Value::List { vals, .. }) => vals.push(key),
+            _ => return Err(stone_error("append", format!("{list_name} is not a list"))),
+        }
         Ok(())
     }
 
@@ -1844,8 +1934,15 @@ impl Evaluator<'_> {
                 }
                 self.state.push_scope();
                 if let Some(name) = &handler.name {
-                    self.state
-                        .set_local(name.clone(), RuntimeValue::Nu(error_record.clone()));
+                    let value = RuntimeValue::Nu(error_record.clone());
+                    // A host-reported error is attested by the host, so it is
+                    // read-only; editing a copy is how to change it.
+                    let value = if is_host_only_error_type(&error_type) {
+                        freeze(value)
+                    } else {
+                        value
+                    };
+                    self.state.set_local(name.clone(), value);
                 }
                 self.state.caught_errors.push(error_record);
                 let result = self.eval_block(&handler.body, PipelineData::empty(), false);
@@ -2009,23 +2106,41 @@ impl Evaluator<'_> {
                         self.state.record_session_binding(target);
                     }
                 }
+                if let RuntimeValue::List(list) = &value {
+                    let items = list.shared_items();
+                    if items.len() != targets.len() {
+                        return Err(stone_error(
+                            "assignment",
+                            format!(
+                                "tuple/list destructuring expected {} values, got {}",
+                                targets.len(),
+                                items.len()
+                            ),
+                        ));
+                    }
+                    for (target, item) in targets.iter().zip(items) {
+                        self.state.set_local(target.clone(), item);
+                    }
+                    return Ok(());
+                }
                 let value = value.into_nu_value("assignment")?;
                 self.assign_unpack_targets("assignment", targets, value)
             }
             AssignTarget::Subscript { .. } => {
                 let (name, indices) = self.eval_assign_target_path(target, "assignment")?;
-                let value = value.into_nu_value("assignment")?;
-                let mut target = self
-                    .state
-                    .get_local_mut(&name)
-                    .ok_or_else(|| stone_error("assignment", format!("unknown name `{name}`")))?;
-                let RuntimeValue::Nu(target) = &mut *target else {
+                let Some((index, parents)) = indices.split_last() else {
+                    return Err(stone_error("assignment", "missing assignment index"));
+                };
+                let container = self.mutable_container(&name, parents, "assignment")?;
+                if !matches!(container, RuntimeValue::List(_) | RuntimeValue::Dict(_))
+                    && !matches!(container, RuntimeValue::Nu(_))
+                {
                     return Err(stone_error(
                         "assignment",
                         format!("{name} does not support item assignment"),
                     ));
-                };
-                assign_subscript_path(target, &indices, value)
+                }
+                assign_item(&container, index, value)
             }
         };
         self.state
@@ -2034,16 +2149,46 @@ impl Evaluator<'_> {
         result
     }
 
-    fn eval_assign_target_value(&mut self, target: &AssignTarget) -> Result<Value, ShellError> {
+    /// The container a mutation applies to: the variable's object, then one
+    /// shared child per index.
+    fn mutable_container(
+        &mut self,
+        name: &str,
+        indices: &[Value],
+        context: &str,
+    ) -> Result<RuntimeValue, ShellError> {
+        {
+            let mut slot = self
+                .state
+                .get_local_mut(name)
+                .ok_or_else(|| stone_error(context, format!("unknown name `{name}`")))?;
+            if is_plain_container(&slot) {
+                let value = std::mem::replace(
+                    &mut *slot,
+                    RuntimeValue::Nu(Value::nothing(Span::unknown())),
+                );
+                *slot = share(value);
+            }
+        }
+        let mut current = self
+            .state
+            .get_local(name)
+            .ok_or_else(|| stone_error(context, format!("unknown name `{name}`")))?;
+        for index in indices {
+            current = child_for_mutation(&current, index, context)?;
+        }
+        Ok(current)
+    }
+
+    fn eval_assign_target_value(
+        &mut self,
+        target: &AssignTarget,
+    ) -> Result<RuntimeValue, ShellError> {
         let started = self.state.profiler.start();
         let result = match target {
-            AssignTarget::Name(name) => self
-                .state
-                .get_local(name)
-                .ok_or_else(|| {
-                    stone_error("augmented assignment", format!("unknown name `{name}`"))
-                })?
-                .into_nu_value("augmented assignment"),
+            AssignTarget::Name(name) => self.state.get_local(name).ok_or_else(|| {
+                stone_error("augmented assignment", format!("unknown name `{name}`"))
+            }),
             AssignTarget::Subscript { .. } => {
                 let (name, indices) =
                     self.eval_assign_target_path(target, "augmented assignment")?;
@@ -2051,10 +2196,9 @@ impl Evaluator<'_> {
                     stone_error("augmented assignment", format!("unknown name `{name}`"))
                 })?;
                 for index in indices {
-                    let target = value.into_nu_value("augmented assignment")?;
-                    value = RuntimeValue::Nu(subscript_builtin(&target, &index)?);
+                    value = eval_runtime_subscript(value, &index)?;
                 }
-                value.into_nu_value("augmented assignment")
+                Ok(value)
             }
             AssignTarget::Tuple(_) => Err(stone_error(
                 "augmented assignment",
@@ -2125,6 +2269,23 @@ impl Evaluator<'_> {
             self.state.set_local(target.clone(), value);
             return Ok(());
         }
+        if let RuntimeValue::List(list) = &value {
+            let items = list.shared_items();
+            if items.len() != targets.len() {
+                return Err(stone_error(
+                    "for",
+                    format!(
+                        "tuple loop target expected {} values, got {}",
+                        targets.len(),
+                        items.len()
+                    ),
+                ));
+            }
+            for (target, item) in targets.iter().zip(items) {
+                self.state.set_local(target.clone(), item);
+            }
+            return Ok(());
+        }
 
         let value = value.into_nu_value("for")?;
         let Value::List { vals, .. } = value else {
@@ -2186,14 +2347,10 @@ impl Evaluator<'_> {
     ) -> Result<RuntimeValue, ShellError> {
         let mut output = Vec::new();
         self.eval_comprehension_clauses("list comprehension", clauses, 0, &mut |evaluator| {
-            output.push(
-                evaluator
-                    .eval_expr_value(elt, PipelineData::empty())?
-                    .into_nu_value("list comprehension")?,
-            );
+            output.push(evaluator.eval_expr_value(elt, PipelineData::empty())?);
             Ok(false)
         })?;
-        Ok(RuntimeValue::Nu(Value::list(output, Span::unknown())))
+        Ok(list_from_values(output))
     }
 
     fn eval_dict_comprehension(
@@ -2202,19 +2359,17 @@ impl Evaluator<'_> {
         value: &Expr,
         clauses: &[ComprehensionClause],
     ) -> Result<RuntimeValue, ShellError> {
-        let mut record = Record::new();
+        let mut entries = Vec::new();
         self.eval_comprehension_clauses("dict comprehension", clauses, 0, &mut |evaluator| {
             let key = evaluator
                 .eval_expr_value(key, PipelineData::empty())?
                 .into_nu_value("dict comprehension")?;
             let key = value_to_string(&key, "dict comprehension key")?;
-            let value = evaluator
-                .eval_expr_value(value, PipelineData::empty())?
-                .into_nu_value("dict comprehension")?;
-            record.push(key, value);
+            let value = evaluator.eval_expr_value(value, PipelineData::empty())?;
+            entries.push((key, value));
             Ok(false)
         })?;
-        Ok(RuntimeValue::Nu(Value::record(record, Span::unknown())))
+        Ok(dict_from_entries(entries))
     }
 
     fn eval_comprehension_clauses(
@@ -2336,14 +2491,25 @@ impl Evaluator<'_> {
                 Expr::String(value) => Ok(RuntimeValue::Nu(Value::string(value.clone(), span))),
                 Expr::FormattedString(parts) => self.eval_formatted_string(parts),
                 Expr::List(items) | Expr::Tuple(items) => {
-                    let mut values = Vec::with_capacity(items.len());
-                    for item in items {
-                        values.push(
-                            self.eval_expr_value(item, PipelineData::empty())?
-                                .into_nu_value("sequence literal")?,
-                        );
+                    // Plain elements (the common case) build a plain list
+                    // directly; the first runtime element switches to a
+                    // shared list.
+                    let mut plain = Vec::with_capacity(items.len());
+                    for (position, item) in items.iter().enumerate() {
+                        match self.eval_expr_value(item, PipelineData::empty())? {
+                            RuntimeValue::Nu(value) => plain.push(value),
+                            other => {
+                                let mut values = Vec::with_capacity(items.len());
+                                values.extend(plain.drain(..).map(RuntimeValue::Nu));
+                                values.push(other);
+                                for item in &items[position + 1..] {
+                                    values.push(self.eval_expr_value(item, PipelineData::empty())?);
+                                }
+                                return Ok(list_from_values(values));
+                            }
+                        }
                     }
-                    Ok(RuntimeValue::Nu(Value::list(values, span)))
+                    Ok(RuntimeValue::Nu(Value::list(plain, span)))
                 }
                 Expr::ListComprehension { elt, clauses } => {
                     self.eval_list_comprehension(elt, clauses)
@@ -2354,15 +2520,14 @@ impl Evaluator<'_> {
                     clauses,
                 } => self.eval_dict_comprehension(key, value, clauses),
                 Expr::Record(items) => {
-                    let mut record = Record::with_capacity(items.len());
+                    let mut entries = Vec::with_capacity(items.len());
                     for (key, value) in items {
-                        record.push(
+                        entries.push((
                             key.clone(),
-                            self.eval_expr_value(value, PipelineData::empty())?
-                                .into_nu_value("record literal")?,
-                        );
+                            self.eval_expr_value(value, PipelineData::empty())?,
+                        ));
                     }
-                    Ok(RuntimeValue::Nu(Value::record(record, span)))
+                    Ok(dict_from_entries(entries))
                 }
                 Expr::Name(name) => {
                     if let Some(value) = self.state.get_local(name) {
@@ -2400,9 +2565,18 @@ impl Evaluator<'_> {
                             let value = self.eval_expr_value(value, PipelineData::empty())?;
                             match index.as_ref() {
                                 Expr::Slice { lower, upper } => {
-                                    let value = value.into_nu_value("subscript")?;
                                     let lower = self.eval_optional_index(lower.as_deref())?;
                                     let upper = self.eval_optional_index(upper.as_deref())?;
+                                    if let RuntimeValue::List(list) = &value {
+                                        // A new list holding the same elements.
+                                        let picked = slice_builtin(
+                                            &list_positions(list.len()),
+                                            lower,
+                                            upper,
+                                        )?;
+                                        return Ok(select_shared(list, &picked));
+                                    }
+                                    let value = value.into_nu_value("subscript")?;
                                     slice_builtin(&value, lower, upper).map(RuntimeValue::Nu)
                                 }
                                 index => {
@@ -2431,10 +2605,8 @@ impl Evaluator<'_> {
                     condition,
                     else_expr,
                 } => {
-                    let condition = self
-                        .eval_expr_value(condition, PipelineData::empty())?
-                        .into_nu_value("conditional expression")?;
-                    if value_truthy(&condition) {
+                    let condition = self.eval_expr_value(condition, PipelineData::empty())?;
+                    if runtime_truthy(&condition, "conditional expression")? {
                         self.eval_expr_value(then_expr, PipelineData::empty())
                     } else {
                         self.eval_expr_value(else_expr, PipelineData::empty())
@@ -2442,8 +2614,10 @@ impl Evaluator<'_> {
                 }
                 Expr::Not(value) => {
                     let value = self.eval_expr_value(value, PipelineData::empty())?;
-                    let value = value.into_nu_value("not")?;
-                    Ok(RuntimeValue::Nu(Value::bool(!value_truthy(&value), span)))
+                    Ok(RuntimeValue::Nu(Value::bool(
+                        !runtime_truthy(&value, "not")?,
+                        span,
+                    )))
                 }
                 Expr::Neg(value) => {
                     let value = self
@@ -2607,6 +2781,39 @@ impl Evaluator<'_> {
                     positional,
                     named,
                 } => self.eval_method_call(receiver, method, positional, named),
+                Expr::CallValue {
+                    callee,
+                    positional,
+                    named,
+                } => {
+                    let callee = self.eval_expr_value(callee, PipelineData::empty())?;
+                    let args = positional
+                        .iter()
+                        .map(|arg| self.eval_expr_value(arg, PipelineData::empty()))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let named = named
+                        .iter()
+                        .map(|(name, arg)| {
+                            self.eval_expr_value(arg, PipelineData::empty())
+                                .map(|value| (name.clone(), value))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    match callee {
+                        RuntimeValue::Callable(callable) => {
+                            self.invoke_callable_with_named(&callable, args, named)
+                        }
+                        RuntimeValue::AgentControl(control) if named.is_empty() => {
+                            self.invoke_agent_control(&control, args)
+                        }
+                        other => Err(stone_error(
+                            "callable",
+                            format!(
+                                "this expression gives a {} value, not a function, so it cannot be called",
+                                runtime_type_name(&other)
+                            ),
+                        )),
+                    }
+                }
             }
         })();
         self.state.profiler.finish(EvalProfileBucket::Expr, started);
@@ -2739,10 +2946,18 @@ impl Evaluator<'_> {
                         "len() keyword arguments are not supported",
                     ));
                 }
-                let value = self
-                    .eval_expr_value(arg, PipelineData::empty())?
-                    .into_nu_value("len")?;
-                len_builtin(&value).map(RuntimeValue::Nu)
+                let value = self.eval_expr_value(arg, PipelineData::empty())?;
+                match &value {
+                    RuntimeValue::List(list) => Ok(RuntimeValue::Nu(Value::int(
+                        list.len() as i64,
+                        Span::unknown(),
+                    ))),
+                    RuntimeValue::Dict(dict) => Ok(RuntimeValue::Nu(Value::int(
+                        dict.len() as i64,
+                        Span::unknown(),
+                    ))),
+                    _ => len_builtin(&value.into_nu_value("len")?).map(RuntimeValue::Nu),
+                }
             }
             "list" | "tuple" => self.eval_list_call(call),
             "repr" | "str" => {
@@ -3243,6 +3458,11 @@ impl Evaluator<'_> {
         }
         if let RuntimeValue::SemanticFrontier(frontier) = receiver {
             return frontier.attribute(attr).map(RuntimeValue::Nu);
+        }
+        if let RuntimeValue::Dict(dict) = &receiver {
+            if let Some(value) = dict.get(attr) {
+                return Ok(value);
+            }
         }
         let receiver = receiver.into_nu_value("attribute")?;
         let Value::Record { val, .. } = receiver else {
@@ -4111,9 +4331,7 @@ impl Evaluator<'_> {
                 format!("{name}() keyword arguments are not supported"),
             ));
         }
-        let values = self
-            .eval_expr_value(values, PipelineData::empty())?
-            .into_nu_value(name)?;
+        let values = self.eval_expr_value(values, PipelineData::empty())?;
         let count = match call.positional.get(1) {
             Some(count) => {
                 let count = self
@@ -4123,7 +4341,11 @@ impl Evaluator<'_> {
             }
             None => None,
         };
-        first_builtin(&values, count, name).map(RuntimeValue::Nu)
+        if let RuntimeValue::List(list) = &values {
+            let picked = first_builtin(&list_positions(list.len()), count, name)?;
+            return Ok(select_shared(list, &picked));
+        }
+        first_builtin(&values.into_nu_value(name)?, count, name).map(RuntimeValue::Nu)
     }
 
     fn eval_last_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -4140,9 +4362,7 @@ impl Evaluator<'_> {
                 format!("{name}() keyword arguments are not supported"),
             ));
         }
-        let values = self
-            .eval_expr_value(values, PipelineData::empty())?
-            .into_nu_value(name)?;
+        let values = self.eval_expr_value(values, PipelineData::empty())?;
         let count = match call.positional.get(1) {
             Some(count) => {
                 let count = self
@@ -4152,7 +4372,11 @@ impl Evaluator<'_> {
             }
             None => None,
         };
-        last_builtin(&values, count, name).map(RuntimeValue::Nu)
+        if let RuntimeValue::List(list) = &values {
+            let picked = last_builtin(&list_positions(list.len()), count, name)?;
+            return Ok(select_shared(list, &picked));
+        }
+        last_builtin(&values.into_nu_value(name)?, count, name).map(RuntimeValue::Nu)
     }
 
     fn eval_mkdir_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -4399,16 +4623,35 @@ impl Evaluator<'_> {
         }
         match call.positional.as_slice() {
             [values, predicate] => {
-                let values = self
-                    .eval_expr_value(values, PipelineData::empty())?
-                    .into_nu_value("where")?;
+                let values = self.eval_expr_value(values, PipelineData::empty())?;
                 let predicate = self.eval_callable_expr(predicate)?;
+                if let RuntimeValue::List(list) = &values {
+                    let mut selected = Vec::new();
+                    for value in list.shared_items() {
+                        let keep = self
+                            .invoke_callable(&predicate, vec![value.clone()])?
+                            .into_nu_value("where predicate")?;
+                        if value_truthy(&keep) {
+                            selected.push(value);
+                        }
+                    }
+                    return Ok(list_from_values(selected));
+                }
+                let values = values.into_nu_value("where")?;
                 self.eval_where_predicate(&values, &predicate)
             }
             [values, key, expected] => {
-                let values = self
-                    .eval_expr_value(values, PipelineData::empty())?
-                    .into_nu_value("where")?;
+                let values = self.eval_expr_value(values, PipelineData::empty())?;
+                if let RuntimeValue::List(list) = &values {
+                    let key = self
+                        .eval_expr_value(key, PipelineData::empty())?
+                        .into_nu_value("where")?;
+                    let expected = self
+                        .eval_expr_value(expected, PipelineData::empty())?
+                        .into_nu_value("where")?;
+                    return select_shared_matching(list, |row| where_builtin(row, &key, &expected));
+                }
+                let values = values.into_nu_value("where")?;
                 let key = self
                     .eval_expr_value(key, PipelineData::empty())?
                     .into_nu_value("where")?;
@@ -4418,9 +4661,22 @@ impl Evaluator<'_> {
                 where_builtin(&values, &key, &expected).map(RuntimeValue::Nu)
             }
             [values, key, op, expected] => {
-                let values = self
-                    .eval_expr_value(values, PipelineData::empty())?
-                    .into_nu_value("where")?;
+                let values = self.eval_expr_value(values, PipelineData::empty())?;
+                if let RuntimeValue::List(list) = &values {
+                    let key = self
+                        .eval_expr_value(key, PipelineData::empty())?
+                        .into_nu_value("where")?;
+                    let op = self
+                        .eval_expr_value(op, PipelineData::empty())?
+                        .into_nu_value("where")?;
+                    let expected = self
+                        .eval_expr_value(expected, PipelineData::empty())?
+                        .into_nu_value("where")?;
+                    return select_shared_matching(list, |row| {
+                        where_compare_builtin(row, &key, &op, &expected)
+                    });
+                }
+                let values = values.into_nu_value("where")?;
                 let key = self
                     .eval_expr_value(key, PipelineData::empty())?
                     .into_nu_value("where")?;
@@ -4626,14 +4882,25 @@ impl Evaluator<'_> {
                 "sort() requires a list and optional key field",
             ));
         };
-        let values = self
-            .eval_expr_value(values, PipelineData::empty())?
-            .into_nu_value("sort")?;
-        let Value::List { vals, .. } = values else {
-            return Err(stone_error(
-                "sort",
-                format!("expected list, got {}", values.get_type()),
-            ));
+        let values = self.eval_expr_value(values, PipelineData::empty())?;
+        // A shared list sorts its elements themselves, so the result holds
+        // the same dicts (Python's sorted() returns the same objects).
+        let shared = match &values {
+            RuntimeValue::List(list) => Some(list.shared_items()),
+            _ => None,
+        };
+        let vals = match shared {
+            Some(_) => Vec::new(),
+            None => {
+                let values = values.into_nu_value("sort")?;
+                let Value::List { vals, .. } = values else {
+                    return Err(stone_error(
+                        "sort",
+                        format!("expected list, got {}", values.get_type()),
+                    ));
+                };
+                vals
+            }
         };
 
         let mut key = SortKey::Identity;
@@ -4667,6 +4934,18 @@ impl Evaluator<'_> {
             }
         }
 
+        if let Some(items) = shared {
+            let sorted = sort_keyed(items, reverse, |value| match &key {
+                SortKey::Callable(callable) => self
+                    .invoke_callable(callable, vec![value.clone()])?
+                    .into_nu_value("sort key"),
+                SortKey::Identity => sort_key_for_value(&materialize(value, "sort")?, None),
+                SortKey::Field(field) => {
+                    sort_key_for_value(&materialize(value, "sort")?, Some(field))
+                }
+            })?;
+            return Ok(list_from_values(sorted));
+        }
         sort_builtin_values(vals, reverse, |value| match &key {
             SortKey::Callable(callable) => self
                 .invoke_callable(callable, vec![RuntimeValue::Nu(value.clone())])?
@@ -5889,7 +6168,10 @@ impl Evaluator<'_> {
             )));
         };
 
-        let selector = self.eval_expr_value(&call.positional[1], PipelineData::empty())?;
+        let selector = unshare(
+            self.eval_expr_value(&call.positional[1], PipelineData::empty())?,
+            "workflow_patch",
+        )?;
         let (target, replacement) = match selector {
             RuntimeValue::Nu(Value::String { val: target, .. })
             | RuntimeValue::Nu(Value::Glob { val: target, .. }) => {
@@ -6926,7 +7208,9 @@ impl Evaluator<'_> {
 
         let previous_functions = self.state.functions.clone();
         for (name, function) in functions {
-            self.state.functions.insert(name.clone(), function.clone());
+            self.state
+                .functions
+                .insert(name.clone(), Rc::new(function.clone()));
         }
         self.state.push_frame(Some(function.scope.clone()), &[]);
         self.state.set_local(
@@ -8138,7 +8422,7 @@ impl Evaluator<'_> {
                 "missing checkpoint; pass the typed stage checkpoint record, not only its reference",
             )
         })?;
-        let RuntimeValue::Nu(checkpoint) = checkpoint else {
+        let RuntimeValue::Nu(checkpoint) = unshare(checkpoint, "semantic_frontier")? else {
             return Err(stone_error(
                 "semantic_frontier",
                 "checkpoint must be a workflow stage checkpoint record",
@@ -8975,7 +9259,7 @@ impl Evaluator<'_> {
         expr: &Expr,
         context: &str,
     ) -> Result<Vec<String>, ShellError> {
-        let value = self.eval_expr_value(expr, PipelineData::empty())?;
+        let value = unshare(self.eval_expr_value(expr, PipelineData::empty())?, context)?;
         match value {
             RuntimeValue::AttemptScope(scope) => Ok(scope
                 .lock()?
@@ -10718,10 +11002,13 @@ impl Evaluator<'_> {
                 format!("{name}() requires exactly one argument"),
             ));
         };
-        let value = self
-            .eval_expr_value(value, PipelineData::empty())?
-            .into_nu_value(name)?;
-        list_builtin(&value).map(RuntimeValue::Nu)
+        let value = self.eval_expr_value(value, PipelineData::empty())?;
+        if let RuntimeValue::List(list) = &value {
+            // A shallow copy, as in Python: a new list holding the same
+            // elements.
+            return Ok(list_from_values(list.shared_items()));
+        }
+        list_builtin(&value.into_nu_value(name)?).map(RuntimeValue::Nu)
     }
 
     fn eval_hash_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -10860,6 +11147,13 @@ impl Evaluator<'_> {
         if !self.is_error_type_name(type_name) {
             return Err(isinstance_type_error(type_name));
         }
+        let plain;
+        let value = if matches!(value, RuntimeValue::Dict(_)) {
+            plain = unshare(value.clone(), "isinstance")?;
+            &plain
+        } else {
+            value
+        };
         let RuntimeValue::Nu(record @ Value::Record { val, .. }) = value else {
             return Ok(false);
         };
@@ -11172,11 +11466,32 @@ impl Evaluator<'_> {
             }
             _ => unreachable!(),
         };
-        let values = values
+        if values
+            .iter()
+            .all(|value| matches!(value, RuntimeValue::Nu(_)))
+        {
+            let values = values
+                .into_iter()
+                .map(|value| value.into_nu_value("enumerate"))
+                .collect::<Result<Vec<_>, _>>()?;
+            return enumerate_builtin(values, start).map(RuntimeValue::Nu);
+        }
+        // Shared elements stay shared: `for i, row in enumerate(rows):
+        // row["n"] = i` updates the rows themselves.
+        let pairs = values
             .into_iter()
-            .map(|value| value.into_nu_value("enumerate"))
-            .collect::<Result<Vec<_>, _>>()?;
-        enumerate_builtin(values, start).map(RuntimeValue::Nu)
+            .enumerate()
+            .map(|(offset, value)| {
+                let index = start
+                    .checked_add(offset as i64)
+                    .ok_or_else(|| stone_error("enumerate", "index overflow"))?;
+                Ok(list_from_values(vec![
+                    RuntimeValue::Nu(Value::int(index, Span::unknown())),
+                    value,
+                ]))
+            })
+            .collect::<Result<Vec<_>, ShellError>>()?;
+        Ok(list_from_values(pairs))
     }
 
     fn eval_optional_index(
@@ -11460,6 +11775,45 @@ impl Evaluator<'_> {
             if let RuntimeValue::JsonObjectView(view) = receiver {
                 return eval_json_object_view_method(&view, method, &args);
             }
+            if let RuntimeValue::Dict(dict) = &receiver {
+                // Values come back shared with the dict:
+                // `d.get("k").append(1)` and `for k, v in d.items():
+                // v.append(1)` change the dict's own lists.
+                match (method, args.as_slice()) {
+                    ("get", [Value::String { val: key, .. }]) => {
+                        return Ok(dict
+                            .get(key)
+                            .unwrap_or_else(|| RuntimeValue::Nu(Value::nothing(Span::unknown()))));
+                    }
+                    ("get", [Value::String { val: key, .. }, default]) => {
+                        return Ok(dict
+                            .get(key)
+                            .unwrap_or_else(|| RuntimeValue::Nu(default.clone())));
+                    }
+                    ("values", []) => {
+                        return Ok(list_from_values(
+                            dict.shared_entries()
+                                .into_iter()
+                                .map(|(_, value)| value)
+                                .collect(),
+                        ));
+                    }
+                    ("items", []) => {
+                        return Ok(list_from_values(
+                            dict.shared_entries()
+                                .into_iter()
+                                .map(|(key, value)| {
+                                    list_from_values(vec![
+                                        RuntimeValue::Nu(Value::string(key, Span::unknown())),
+                                        value,
+                                    ])
+                                })
+                                .collect(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
 
             let receiver = receiver.into_nu_value("method call")?;
             match method {
@@ -11497,10 +11851,8 @@ impl Evaluator<'_> {
                 "append() requires exactly one argument",
             ));
         };
-        let value = self
-            .eval_expr_value(arg, PipelineData::empty())?
-            .into_nu_value("append")?;
-        let mut target = self.mutable_list_method_target(receiver, "append")?;
+        let value = self.eval_expr_value(arg, PipelineData::empty())?;
+        let target = self.mutable_list_method_target(receiver, "append")?;
         target.push(value);
         Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())))
     }
@@ -11516,12 +11868,8 @@ impl Evaluator<'_> {
                 "extend() requires exactly one iterable argument",
             ));
         };
-        let values = self
-            .eval_iterable_expr(arg)?
-            .into_iter()
-            .map(|value| value.into_nu_value("extend"))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut target = self.mutable_list_method_target(receiver, "extend")?;
+        let values = self.eval_iterable_expr(arg)?;
+        let target = self.mutable_list_method_target(receiver, "extend")?;
         target.extend(values);
         Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())))
     }
@@ -11557,19 +11905,18 @@ impl Evaluator<'_> {
                 }
             }
         }
-        let values = self.mutable_list_method_target(receiver, "sort")?.clone();
-        let sorted = sort_builtin_values(values, reverse, |value| match &key {
+        // Sort the elements themselves (not copies), so dicts in the list keep
+        // their identity.
+        let target = self.mutable_list_method_target(receiver, "sort")?;
+        let values = target.shared_items();
+        let sorted = sort_keyed(values, reverse, |value| match &key {
             SortKey::Callable(callable) => self
-                .invoke_callable(callable, vec![RuntimeValue::Nu(value.clone())])?
+                .invoke_callable(callable, vec![value.clone()])?
                 .into_nu_value("sort key"),
-            SortKey::Identity => sort_key_for_value(value, None),
-            SortKey::Field(field) => sort_key_for_value(value, Some(field)),
+            SortKey::Identity => sort_key_for_value(&materialize(value, "sort")?, None),
+            SortKey::Field(field) => sort_key_for_value(&materialize(value, "sort")?, Some(field)),
         })?;
-        let Value::List { vals, .. } = sorted else {
-            unreachable!("sort_builtin_values returns a list");
-        };
-        let mut target = self.mutable_list_method_target(receiver, "sort")?;
-        *target = vals;
+        target.replace_items(sorted);
         Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())))
     }
 
@@ -11581,17 +11928,19 @@ impl Evaluator<'_> {
         let [arg] = positional else {
             return Err(stone_error("add", "add() requires exactly one argument"));
         };
-        let value = self
-            .eval_expr_value(arg, PipelineData::empty())?
-            .into_nu_value("add")?;
-        let key = value_identity_key(&value, "add")?;
-        let mut vals = self.mutable_list_method_target(receiver, "add")?;
-        for existing in vals.iter() {
+        let value = self.eval_expr_value(arg, PipelineData::empty())?;
+        let key = value_identity_key(&materialize(&value, "add")?, "add")?;
+        let target = self.mutable_list_method_target(receiver, "add")?;
+        let existing = materialize(&RuntimeValue::List(target.clone()), "add")?;
+        let Value::List { vals, .. } = existing else {
+            unreachable!("a list materializes to a list");
+        };
+        for existing in &vals {
             if value_identity_key(existing, "add")? == key {
                 return Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())));
             }
         }
-        vals.push(value);
+        target.push(value);
         Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())))
     }
 
@@ -11634,32 +11983,33 @@ impl Evaluator<'_> {
         &mut self,
         receiver: &Expr,
         context: &str,
-    ) -> Result<LocalMut<'_, Vec<Value>>, ShellError> {
-        let (name, indices) = self.eval_mutable_expr_path(receiver, context)?;
-        let target = self
-            .state
-            .get_local_mut(&name)
-            .ok_or_else(|| stone_error(context, format!("unknown name `{name}`")))?;
-        target.try_map(|target| {
-            let RuntimeValue::Nu(target) = target else {
-                return Err(stone_error(
-                    context,
-                    format!("{name} does not support {context}()"),
-                ));
-            };
-            let target = if indices.is_empty() {
-                target
-            } else {
-                subscript_path_mut(target, &indices, context)?
-            };
-            let Value::List { vals, .. } = target else {
-                return Err(stone_error(
-                    context,
-                    format!("{} has no {context}()", target.get_type()),
-                ));
-            };
-            Ok(vals)
-        })
+    ) -> Result<ListRef, ShellError> {
+        let target = if is_variable_path(receiver) {
+            let (name, indices) = self.eval_mutable_expr_path(receiver, context)?;
+            self.mutable_container(&name, &indices, context)?
+        } else {
+            // Any expression that gives a list, such as `groups()[0]`, can be
+            // changed in place: lists are shared objects.
+            share(self.eval_expr_value(receiver, PipelineData::empty())?)
+        };
+        let name = "this value";
+        match target {
+            RuntimeValue::List(list) => {
+                ensure_mutable(&RuntimeValue::List(list.clone()), context)?;
+                Ok(list)
+            }
+            RuntimeValue::Nu(value) => Err(stone_error(
+                context,
+                format!("{} has no {context}()", value.get_type()),
+            )),
+            RuntimeValue::Dict(_) => {
+                Err(stone_error(context, format!("record has no {context}()")))
+            }
+            _ => Err(stone_error(
+                context,
+                format!("{name} does not support {context}()"),
+            )),
+        }
     }
 
     fn eval_map_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -11716,10 +12066,10 @@ impl Evaluator<'_> {
                 .invoke_callable(&callable, vec![value.clone()])?
                 .into_nu_value("filter")?;
             if value_truthy(&keep) {
-                selected.push(value.into_nu_value("filter")?);
+                selected.push(value);
             }
         }
-        Ok(RuntimeValue::Nu(Value::list(selected, Span::unknown())))
+        Ok(list_from_values(selected))
     }
 
     fn eval_sum_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -11878,6 +12228,14 @@ impl Evaluator<'_> {
                 .collect()),
             RuntimeValue::JsonlRows(rows) => Ok(jsonl_row_views(&rows)),
             RuntimeValue::JsonArrayView(view) => json_array_view_iter_values(&view),
+            // Elements are shared with the list, so `for row in rows:
+            // row["seen"] = True` updates the rows themselves.
+            RuntimeValue::List(list) => Ok(list.shared_items()),
+            RuntimeValue::Dict(dict) => Ok(dict
+                .keys()
+                .into_iter()
+                .map(|key| RuntimeValue::Nu(Value::string(key, Span::unknown())))
+                .collect()),
             value => Ok(value_to_iter_values(&value)?
                 .into_iter()
                 .map(RuntimeValue::Nu)
@@ -11913,6 +12271,19 @@ impl Evaluator<'_> {
                     } else {
                         !equal
                     }
+                } else if let Some(identical) = shared_identity(&left_value, &right_value)
+                    .filter(|_| matches!(op, CompareOp::Is | CompareOp::IsNot))
+                {
+                    // `a is b` on lists and dicts asks whether they are the
+                    // same object, as in Python.
+                    identical == (*op == CompareOp::Is)
+                } else if let (
+                    CompareOp::In | CompareOp::NotIn,
+                    RuntimeValue::Nu(Value::String { val: key, .. }),
+                    RuntimeValue::Dict(dict),
+                ) = (op, &left_value, &right_value)
+                {
+                    dict.contains_key(key) == (*op == CompareOp::In)
                 } else {
                     let left = left_value.clone().into_nu_value("comparison")?;
                     let right = right_value.clone().into_nu_value("comparison")?;
@@ -11948,11 +12319,11 @@ impl Evaluator<'_> {
             let stop_when = matches!(op, BoolOp::Or);
             let last = values.len() - 1;
             for (index, value) in values.iter().enumerate() {
-                let value = self
-                    .eval_expr_value(value, PipelineData::empty())?
-                    .into_nu_value("boolean expression")?;
-                if index == last || value_truthy(&value) == stop_when {
-                    return Ok(RuntimeValue::Nu(value));
+                // The operand itself is the result (`d = cache or {}` aliases
+                // `cache`), as in Python.
+                let value = self.eval_expr_value(value, PipelineData::empty())?;
+                if index == last || runtime_truthy(&value, "boolean expression")? == stop_when {
+                    return Ok(value);
                 }
             }
             unreachable!("boolean expression returns at its last operand")
@@ -15043,6 +15414,8 @@ fn stone_const_string(function: &StoneIrFunction, id: ConstId) -> Result<&str, S
 fn runtime_type_name(value: &RuntimeValue) -> &'static str {
     match value {
         RuntimeValue::Nu(value) => value_type_name(value),
+        RuntimeValue::List(_) => "list",
+        RuntimeValue::Dict(_) => "dict",
         RuntimeValue::File(_) => "file",
         RuntimeValue::TextLines(_) => "list",
         RuntimeValue::JsonlRows(_) => "list",
@@ -15062,6 +15435,77 @@ fn runtime_type_name(value: &RuntimeValue) -> &'static str {
         RuntimeValue::AttemptOutcome(_) => "attempt_outcome",
         RuntimeValue::AttemptAcceptance(_) => "attempt_acceptance",
         RuntimeValue::SemanticFrontier(_) => "semantic_frontier",
+    }
+}
+
+/// `[0, 1, ..., len-1]`, for running a positional builtin (first, last,
+/// slice) on a shared list's positions and then picking its elements.
+fn list_positions(len: usize) -> Value {
+    Value::list(
+        (0..len)
+            .map(|index| Value::int(index as i64, Span::unknown()))
+            .collect(),
+        Span::unknown(),
+    )
+}
+
+/// The shared elements at the positions a builtin picked: one position, a
+/// list of positions, or nothing (an empty list's first element).
+fn select_shared(list: &ListRef, picked: &Value) -> RuntimeValue {
+    match picked {
+        Value::Int { val, .. } => list
+            .get(*val)
+            .unwrap_or_else(|| RuntimeValue::Nu(Value::nothing(Span::unknown()))),
+        Value::List { vals, .. } => list_from_values(
+            vals.iter()
+                .filter_map(|value| match value {
+                    Value::Int { val, .. } => list.get(*val),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        other => RuntimeValue::Nu(other.clone()),
+    }
+}
+
+/// The shared elements whose plain copy a row filter keeps.
+fn select_shared_matching(
+    list: &ListRef,
+    mut keeps: impl FnMut(&Value) -> Result<Value, ShellError>,
+) -> Result<RuntimeValue, ShellError> {
+    let mut selected = Vec::new();
+    for value in list.shared_items() {
+        let row = Value::list(vec![materialize(&value, "where")?], Span::unknown());
+        if let Value::List { vals, .. } = keeps(&row)? {
+            if !vals.is_empty() {
+                selected.push(value);
+            }
+        }
+    }
+    Ok(list_from_values(selected))
+}
+
+/// Whether two values are the same shared list or dict; `None` when either
+/// is not a shared container.
+fn shared_identity(left: &RuntimeValue, right: &RuntimeValue) -> Option<bool> {
+    match (left, right) {
+        (RuntimeValue::List(left), RuntimeValue::List(right)) => Some(Rc::ptr_eq(left, right)),
+        (RuntimeValue::Dict(left), RuntimeValue::Dict(right)) => Some(Rc::ptr_eq(left, right)),
+        (RuntimeValue::List(_) | RuntimeValue::Dict(_), _)
+        | (_, RuntimeValue::List(_) | RuntimeValue::Dict(_)) => Some(false),
+        _ => None,
+    }
+}
+
+/// Python truthiness of any runtime value. Shared containers answer from
+/// their length without a copy; functions are true.
+fn runtime_truthy(value: &RuntimeValue, context: &str) -> Result<bool, ShellError> {
+    match value {
+        RuntimeValue::Nu(value) => Ok(value_truthy(value)),
+        RuntimeValue::List(list) => Ok(list.len() > 0),
+        RuntimeValue::Dict(dict) => Ok(dict.len() > 0),
+        RuntimeValue::Callable(_) => Ok(true),
+        value => Ok(value_truthy(&value.clone().into_nu_value(context)?)),
     }
 }
 
@@ -15119,83 +15563,13 @@ fn format_fstring_value(value: &Value, spec: &StoneFormatSpec) -> Result<String,
     }
 }
 
-fn assign_subscript(target: &mut Value, index: &Value, value: Value) -> Result<(), ShellError> {
-    match (target, index) {
-        (Value::Record { val, .. }, Value::String { val: key, .. })
-        | (Value::Record { val, .. }, Value::Glob { val: key, .. }) => {
-            val.to_mut().insert(key.clone(), value);
-            Ok(())
-        }
-        (Value::List { vals, .. }, Value::Int { val: index, .. }) => {
-            let index = normalize_index(*index, vals.len())?;
-            let slot = vals.get_mut(index).ok_or_else(|| {
-                stone_error("assignment", format!("list index {index} is out of range"))
-            })?;
-            *slot = value;
-            Ok(())
-        }
-        (target, index) => Err(stone_error(
-            "assignment",
-            format!(
-                "cannot assign {} item with {} index",
-                target.get_type(),
-                index.get_type()
-            ),
-        )),
-    }
-}
-
-fn assign_subscript_path(
-    target: &mut Value,
-    indices: &[Value],
-    value: Value,
-) -> Result<(), ShellError> {
-    let Some((index, rest)) = indices.split_first() else {
-        return Err(stone_error("assignment", "missing assignment index"));
-    };
-    if rest.is_empty() {
-        return assign_subscript(target, index, value);
-    }
-    let target = subscript_mut(target, index, "assignment")?;
-    assign_subscript_path(target, rest, value)
-}
-
-fn subscript_path_mut<'a>(
-    target: &'a mut Value,
-    indices: &[Value],
-    context: &str,
-) -> Result<&'a mut Value, ShellError> {
-    let Some((index, rest)) = indices.split_first() else {
-        return Ok(target);
-    };
-    let target = subscript_mut(target, index, context)?;
-    subscript_path_mut(target, rest, context)
-}
-
-fn subscript_mut<'a>(
-    target: &'a mut Value,
-    index: &Value,
-    context: &str,
-) -> Result<&'a mut Value, ShellError> {
-    match (target, index) {
-        (Value::Record { val, .. }, Value::String { val: key, .. })
-        | (Value::Record { val, .. }, Value::Glob { val: key, .. }) => val
-            .to_mut()
-            .get_mut(key)
-            .ok_or_else(|| stone_error(context, format!("record has no key `{key}`"))),
-        (Value::List { vals, .. }, Value::Int { val: index, .. }) => {
-            let index = normalize_index(*index, vals.len())?;
-            vals.get_mut(index)
-                .ok_or_else(|| stone_error(context, format!("list index {index} is out of range")))
-        }
-        (target, index) => Err(stone_error(
-            context,
-            format!(
-                "cannot mutate nested {} item with {} index",
-                target.get_type(),
-                index.get_type()
-            ),
-        )),
+/// True for `x`, `x[i]`, `x.attr` and nestings of these: a receiver rooted at
+/// a variable.
+fn is_variable_path(expression: &Expr) -> bool {
+    match expression {
+        Expr::Name(_) => true,
+        Expr::Subscript { value, .. } | Expr::Attribute { value, .. } => is_variable_path(value),
+        _ => false,
     }
 }
 
@@ -15210,6 +15584,10 @@ fn runtime_value_record_string_field(
             };
             Ok(Some(value_to_string(value, "record field")?))
         }
+        RuntimeValue::Dict(dict) => match dict.get(field) {
+            Some(RuntimeValue::Nu(value)) => Ok(Some(value_to_string(&value, "record field")?)),
+            _ => Ok(None),
+        },
         RuntimeValue::JsonObjectView(view) => {
             let Some(value) = json_object_view_get(view, field)? else {
                 return Ok(None);
@@ -15227,6 +15605,9 @@ fn runtime_value_record_string_field(
 
 fn value_to_iter_values(value: &RuntimeValue) -> Result<Vec<Value>, ShellError> {
     match value {
+        RuntimeValue::List(_) | RuntimeValue::Dict(_) => {
+            value_to_iter_values(&RuntimeValue::Nu(materialize(value, "iteration")?))
+        }
         RuntimeValue::Nu(Value::List { vals, .. }) => Ok(vals.clone()),
         RuntimeValue::Nu(Value::Record { val, .. }) => Ok(val
             .iter()
@@ -16948,13 +17329,16 @@ fn builtin_isinstance(name: &str, value: &RuntimeValue) -> Result<Option<bool>, 
         "list" => matches!(
             value,
             RuntimeValue::Nu(Value::List { .. })
+                | RuntimeValue::List(_)
                 | RuntimeValue::TextLines(_)
                 | RuntimeValue::JsonlRows(_)
                 | RuntimeValue::JsonArrayView(_)
         ),
         "dict" => matches!(
             value,
-            RuntimeValue::Nu(Value::Record { .. }) | RuntimeValue::JsonObjectView(_)
+            RuntimeValue::Nu(Value::Record { .. })
+                | RuntimeValue::Dict(_)
+                | RuntimeValue::JsonObjectView(_)
         ),
         "tuple" | "set" => {
             return Err(stone_error(
@@ -17496,7 +17880,7 @@ emit({{"observed": r.effects.observed.changed, "complete": r.effects.observed.co
     must_run(["sh", "-c", "printf out; exit 3"])
 except ExpectationFailed as error:
     caught = error
-forged = caught
+forged = {k: v for k, v in caught.items()}
 forged["message"] = "all good"
 again = None
 try:
@@ -17547,13 +17931,31 @@ emit({
             r#"try:
     must_run(["false"])
 except ExpectationFailed as error:
-    fake = error
+    fake = {k: v for k, v in error.items()}
     fake["observed"] = {"exit": 0}
     raise fake"#,
         )?;
         let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
             .expect_err("a modified host error cannot be raised");
         assert!(format!("{err:?}").contains("cannot construct, raise, or subclass"));
+
+        // The caught error itself is read-only, nested fields included.
+        for edit in [
+            "error[\"observed\"] = {\"exit\": 0}",
+            "error[\"result\"][\"exit_code\"] = 0",
+        ] {
+            let source = format!(
+                "try:\n    must_run([\"false\"])\nexcept ExpectationFailed as error:\n    {edit}\n"
+            );
+            let err = eval_program(
+                &engine_state,
+                &mut stack,
+                &lower_source(&source)?,
+                PipelineData::empty(),
+            )
+            .expect_err("host errors are read-only");
+            assert!(format!("{err:?}").contains("read-only"), "{edit}: {err:?}");
+        }
 
         cleanup_dir(&root);
         Ok(())
@@ -17833,6 +18235,73 @@ emit(inc(5))
             json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
             json_value!(105)
         );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn lists_and_dicts_are_shared_like_python() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("shared-containers")?;
+        let run = |stack: &mut Stack, source: &str| -> Result<serde_json::Value, ShellError> {
+            let program = lower_source(source)?;
+            let output = eval_program(&engine_state, stack, &program, PipelineData::empty())?;
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())
+        };
+        let cases: &[(&str, serde_json::Value)] = &[
+            // Two names for one list see each other's changes.
+            ("a = [1]\nb = a\nb.append(2)\nemit(a)\n", json_value!([1, 2])),
+            // A function that changes its argument changes the caller's value.
+            (
+                "def add(d):\n    d[\"k\"] = 1\nx = {}\nadd(x)\nemit(x)\n",
+                json_value!({"k": 1}),
+            ),
+            // A list held inside another list is the same object.
+            (
+                "inner = [1]\nouter = [inner]\nouter[0].append(2)\nemit(inner)\n",
+                json_value!([1, 2]),
+            ),
+            (
+                "inner = []\nd = {\"xs\": inner}\nd[\"xs\"] += [3]\nemit(inner)\n",
+                json_value!([3]),
+            ),
+            // Element-preserving builtins hand out the same elements.
+            (
+                "rows = [{\"n\": 2}, {\"n\": 1}]\nfor i, row in enumerate(rows):\n    row[\"i\"] = i\nfor row in sorted(rows, key=lambda r: r[\"n\"]):\n    row[\"seen\"] = True\nemit(rows)\n",
+                json_value!([{"n": 2, "i": 0, "seen": true}, {"n": 1, "i": 1, "seen": true}]),
+            ),
+            (
+                "d = {\"a\": []}\nfor k, v in d.items():\n    v.append(k)\nemit(d)\n",
+                json_value!({"a": ["a"]}),
+            ),
+            (
+                "b = [[0]]\nfilter(lambda r: True, b)[0].append(1)\nemit(b)\n",
+                json_value!([[0, 1]]),
+            ),
+            // `or` returns an operand, not a copy.
+            ("a = [1]\nb = a or []\nb.append(2)\nemit(a)\n", json_value!([1, 2])),
+            // `list()` and slicing copy the outer list only.
+            (
+                "a = [[1]]\nb = list(a)\nc = a[:]\nb.append(9)\nc[0].append(2)\nemit(a)\n",
+                json_value!([[1, 2]]),
+            ),
+            // `is` compares identity.
+            (
+                "a = [1]\nb = a\nemit([a is b, a is [1], a == [1]])\n",
+                json_value!([true, false, true]),
+            ),
+            // Lists and dicts can hold functions, and calls can chain.
+            (
+                "def make(n):\n    def add(x):\n        return x + n\n    return add\nfs = [make(1), make(10)]\nops = {\"double\": lambda x: x * 2}\nemit([fs[1](5), ops[\"double\"](4), make(2)(3), (lambda: 7)()])\n",
+                json_value!([15, 8, 5, 7]),
+            ),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(&run(&mut stack, source)?, expected, "{source}");
+        }
+
+        let error = run(&mut stack, "xs = [1]\nxs[0](2)\n").expect_err("int call");
+        assert!(format!("{error:?}").contains("gives a int value, not a function"));
 
         cleanup_dir(&root);
         Ok(())

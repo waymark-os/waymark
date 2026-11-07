@@ -127,6 +127,33 @@ pub(super) fn eval_runtime_subscript(
     match value {
         RuntimeValue::JsonObjectView(view) => json_object_view_subscript(&view, index),
         RuntimeValue::JsonArrayView(view) => json_array_view_subscript(&view, index),
+        // Shared containers return the element itself, so `y = x["k"]`
+        // aliases a nested list or dict. A miss or an unusual index type
+        // takes the plain path below for the usual error.
+        RuntimeValue::List(list) if matches!(index, Value::Int { .. }) => {
+            let Value::Int { val, .. } = index else {
+                unreachable!("guarded by matches!");
+            };
+            match list.get(*val) {
+                Some(value) => Ok(value),
+                None => {
+                    subscript_builtin(&RuntimeValue::List(list).into_nu_value("subscript")?, index)
+                        .map(RuntimeValue::Nu)
+                }
+            }
+        }
+        RuntimeValue::Dict(dict) if matches!(index, Value::String { .. }) => {
+            let Value::String { val, .. } = index else {
+                unreachable!("guarded by matches!");
+            };
+            match dict.get(val) {
+                Some(value) => Ok(value),
+                None => {
+                    subscript_builtin(&RuntimeValue::Dict(dict).into_nu_value("subscript")?, index)
+                        .map(RuntimeValue::Nu)
+                }
+            }
+        }
         other => {
             let value = other.into_nu_value("subscript")?;
             subscript_builtin(&value, index).map(RuntimeValue::Nu)
