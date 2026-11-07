@@ -57,10 +57,10 @@ use crate::stone_builtins::{
     find_method_builtin, first_builtin, float_builtin, floor_div_values, format_builtin,
     index_method_builtin, int_builtin, join_builtin, last_builtin, len_builtin, list_builtin,
     map_builtin_value, min_max_builtin, mod_values, mul_values, neg_value, normalize_index,
-    parse_float_builtin, parse_int_builtin, range_builtin, record_method_builtin, round_builtin,
-    set_builtin, shift_value, slice_builtin, sort_builtin_values, sort_key_for_value,
-    split_builtin, starts_with_builtin, str_builtin, string_method_builtin, sub_values,
-    subscript_builtin, sum_builtin, unique_builtin, value_identity_key, value_to_bool,
+    parse_float_builtin, parse_int_builtin, python_str, range_builtin, record_method_builtin,
+    repr_builtin, round_builtin, set_builtin, shift_value, slice_builtin, sort_builtin_values,
+    sort_key_for_value, split_builtin, starts_with_builtin, str_builtin, string_method_builtin,
+    sub_values, subscript_builtin, sum_builtin, unique_builtin, value_identity_key, value_to_bool,
     value_to_display_string, value_to_f64, value_to_i64, value_to_limit, value_to_operator_i64,
     value_to_path_string, value_to_string, value_to_u64, value_truthy, value_type_name,
     where_builtin, where_compare_builtin, zfill_text,
@@ -2002,7 +2002,7 @@ impl Evaluator<'_> {
                     let value = self
                         .eval_expr_value(expr, PipelineData::empty())?
                         .into_nu_value("f-string")?;
-                    output.push_str(&value_to_display_string(&value)?);
+                    output.push_str(&python_str(&value)?);
                 }
                 FormattedStringPart::Formatted { expr, spec } => {
                     let value = self
@@ -2462,7 +2462,11 @@ impl Evaluator<'_> {
                 let value = self
                     .eval_expr_value(arg, PipelineData::empty())?
                     .into_nu_value(name)?;
-                str_builtin(&value).map(RuntimeValue::Nu)
+                if name == "repr" {
+                    repr_builtin(&value).map(RuntimeValue::Nu)
+                } else {
+                    str_builtin(&value).map(RuntimeValue::Nu)
+                }
             }
             "md5" | "sha1" | "sha256" => self.eval_hash_call(call),
             "type" => self.eval_type_call(call),
@@ -4387,12 +4391,15 @@ impl Evaluator<'_> {
             .eval_expr_value(value, PipelineData::empty())?
             .into_nu_value("round")?;
         let digits = match call.positional.as_slice() {
-            [_] => 0,
+            [_] => None,
             [_, digits] => {
                 let digits = self
                     .eval_expr_value(digits, PipelineData::empty())?
                     .into_nu_value("round")?;
-                value_to_i64(&digits, "round")?
+                match digits {
+                    Value::Nothing { .. } => None,
+                    digits => Some(value_to_i64(&digits, "round")?),
+                }
             }
             _ => unreachable!(),
         };
@@ -11407,30 +11414,20 @@ impl Evaluator<'_> {
                 ));
             }
 
-            match op {
-                BoolOp::And => {
-                    for value in values {
-                        let value = self
-                            .eval_expr_value(value, PipelineData::empty())?
-                            .into_nu_value("boolean expression")?;
-                        if !value_truthy(&value) {
-                            return Ok(RuntimeValue::Nu(Value::bool(false, Span::unknown())));
-                        }
-                    }
-                    Ok(RuntimeValue::Nu(Value::bool(true, Span::unknown())))
-                }
-                BoolOp::Or => {
-                    for value in values {
-                        let value = self
-                            .eval_expr_value(value, PipelineData::empty())?
-                            .into_nu_value("boolean expression")?;
-                        if value_truthy(&value) {
-                            return Ok(RuntimeValue::Nu(Value::bool(true, Span::unknown())));
-                        }
-                    }
-                    Ok(RuntimeValue::Nu(Value::bool(false, Span::unknown())))
+            // Python semantics: `and` yields the first falsy operand (or the
+            // last one), `or` the first truthy operand (or the last one).
+            // Conditions only test truthiness, so they are unaffected.
+            let stop_when = matches!(op, BoolOp::Or);
+            let last = values.len() - 1;
+            for (index, value) in values.iter().enumerate() {
+                let value = self
+                    .eval_expr_value(value, PipelineData::empty())?
+                    .into_nu_value("boolean expression")?;
+                if index == last || value_truthy(&value) == stop_when {
+                    return Ok(RuntimeValue::Nu(value));
                 }
             }
+            unreachable!("boolean expression returns at its last operand")
         })();
         self.state
             .profiler
@@ -21636,7 +21633,7 @@ emit({
                 "format": "port:8080 {ok} 3.00",
                 "format_index": "2/x/2.0",
                 "max": 7,
-                "repr": "[\"ok\",2]",
+                "repr": "['ok', 2]",
             })
         );
 
@@ -22665,10 +22662,11 @@ emit({
             ("string_not_in", json_value!(true)),
             ("is_none", json_value!(true)),
             ("is_not_none", json_value!(true)),
-            ("and_true", json_value!(true)),
-            ("and_zero_false", json_value!(false)),
+            // `and`/`or` yield an operand, as in Python.
+            ("and_true", json_value!("x")),
+            ("and_zero_false", json_value!(0)),
             ("and_false_short", json_value!(false)),
-            ("or_true", json_value!(true)),
+            ("or_true", json_value!("fallback")),
             ("or_short", json_value!(true)),
             ("not_false", json_value!(true)),
             ("not_zero", json_value!(true)),

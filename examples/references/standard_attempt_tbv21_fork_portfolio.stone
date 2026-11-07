@@ -205,7 +205,7 @@ def portfolio_parent(input):
         "requirement",
         {
             "task_id": get(session.task, "id", ""),
-            "objective": get(session.task, "objective", str(session.task)),
+            "objective": get(session.task, "objective", session.task if type(session.task) == "str" else json_dumps(session.task)),
         },
         status="pending",
         evidence=["public:task_spec"],

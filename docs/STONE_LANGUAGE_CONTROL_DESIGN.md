@@ -971,8 +971,8 @@ keeping reference semantics.
 |---|---|---|---|---|
 | L1 | Lexical scoping; closures read captured variables but do not rebind them (D-3) | Adopt | Dynamic scope lets a callee use its caller's capabilities, and lets helpers read agent locals (9.3). It is also a silent Python divergence. | Enables register allocation (perf D1) |
 | L2 | List/dict semantics | **Python reference semantics**, with copies at pass-style boundaries (R10) | Copy semantics silently break `def add(items, x): items.append(x)` and `for row in rows: row["k"] = v` | Shared mutable objects, like Lua tables; copying only at boundaries |
-| L3 | `or`/`and` return operands | Adopt Python semantics | `name = x or "default"` currently yields `True` | None |
-| L4 | `str(None)`, `str(True)`, `str(1.0)`, `round()` | Python behavior | Silent divergences today | None |
+| L3 | `or`/`and` return operands | Adopt Python semantics; **done in M2** | `name = x or "default"` yielded `True` before M2 | None |
+| L4 | `str(None)`, `str(True)`, `str(1.0)`, `round()` | Python behavior; **done in M2** (`round(x)` returns an int, half to even) | Silent divergences before M2 | None |
 | L5 | Records: field-only `class X(Record)`, `Literal`, `A \| B` unions, `T \| None`, defaults, real `list[T]` element types | Adopt | Needed for `output=`, typed state, and contracts | Fixed shapes give slot offsets for the VM |
 | L6 | Typed exceptions: builtin error types plus model-defined field-only error classes (D-3); `except Name as e`; three tiers (5.5) | Adopt | Recovery contracts | None |
 | L6a | Bare `except:` is a parse error; `pass`-only handlers for `Exception`/`ToolError` are admission errors; swallow counter | Adopt (R13-R15) | Makes the remaining exception failure mode visible | Counter is on the handler path only |
@@ -1209,6 +1209,10 @@ program logic.
 
 Unmeasured: whether target models read JSON better than Python repr in
 observations. That is a cheap authorship-eval A/B if it matters.
+
+After M2, the probes read: L3 6/6, L4 11/11, D-2 4/4 (the `print` probe now
+expects JSON, per D-2), L6a 3/3, item 4 1/1. The corpus diff shows no
+behavior change outside `help()` text.
 
 ### 9.6 M0: Executable Probes And Source Reading (2026-11-07)
 
@@ -1685,7 +1689,7 @@ in the last column and for the compatibility measurement.
 | 22 | `PolicyViolation`/`ContractViolation` fatal, no agent code afterward | Was "outside `Exception`, catchable explicitly" | No (no violations exist yet) | Joe-E §4.3 | P3 |
 | 23 | 0-CFA admission check for delegated bodies | New | No | Taly et al. §V | **Dropped by D-3** |
 | 24 | H-4 test dropped; capabilities allowed in containers | Removed | No | — | — |
-| 25 | L4 extended to `str()` of dicts and records (D-2); 11 call sites switched to `json_dumps` | D-2 decided | **Yes**: `str(dict)` is JSON today | — | P1 |
+| 25 | L4 extended to `str()` of dicts and records (D-2); 11 call sites switched to `json_dumps` | D-2 decided | **Yes**: `str(dict)` was JSON | — | P1, **done in M2** (`str`/`repr`/f-strings/`format()` follow Python; `print` of containers stays JSON; 14 sites in the controllers and canaries switched to `json_dumps` or a `standard_text` helper) |
 | 26 | Write-prediction pilot harness (11.2) | New | No | — | P1 (done) |
 | 27 | Syscall effect manifest: Gateway-owned effect signatures for host tools, RPC, and MCP tools, seeded from MCP annotations (R25b, R25c) | New | No | MCP spec, tool annotations | P2 (manifest) / P3 (enforcement) |
 

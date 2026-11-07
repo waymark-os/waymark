@@ -106,7 +106,21 @@ code crosses the Python/JSON boundary.
 
 Truthiness follows Python's common data model: `False`, `None`, numeric zero,
 empty strings, empty lists, and empty records are falsey; non-empty values and
-non-zero numbers are truthy. Boolean operators short-circuit and return booleans.
+non-zero numbers are truthy. Boolean operators short-circuit and, as in
+Python, yield an operand: `a or b` is `a` when `a` is truthy and `b`
+otherwise, and `a and b` is `a` when `a` is falsey and `b` otherwise. So
+`name = given or "default"` works. Conditions only test truthiness.
+
+Text built from values follows Python inside programs: `str()`, `repr()`,
+f-string fields, and `format()` placeholders give `"None"`, `"True"`,
+`"1.0"`, `"[1, 'x']"`, and `"{'a': None}"`. Text the model reads stays JSON:
+`emit`, returned values, observations, error envelopes, and `print()` of a list
+or record (`print([1, "x"])` writes `[1,"x"]`). `print()` of a scalar follows
+Python (`print(None)` writes `None`). Use `json_dumps(value)` when a program
+builds text that must be JSON, such as a model prompt that embeds a record.
+`round(x)` returns an int and rounds halfway cases to even (`round(2.5)` is
+2); `round(x, n)` returns a float and rounds the stored binary value
+(`round(2.675, 2)` is 2.67), as in Python.
 
 Numeric operators support integers and floats:
 
@@ -491,9 +505,9 @@ failure code.
   uniqueness.
 - `set()` and `set(iterable)`: materialize a deterministic unique list. The
   `.add(value)` method appends only values not already present.
-- `str(value)` and `repr(value)`: convert a typed value to display text.
-  `repr()` is a Python-compatibility alias; use `json_dumps(value)` when valid
-  JSON text is required.
+- `str(value)` and `repr(value)`: Python's text forms (`str(None)` is
+  `"None"`, `repr("x")` is `"'x'"`, `str({"a": 1})` is `"{'a': 1}"`); use
+  `json_dumps(value)` when valid JSON text is required.
 - `json_dumps(value, indent=None, separators=None)`: serialize typed Stone
   values as JSON text. The common Python-shaped calls `indent=2` and
   `separators=(",", ":")` are supported.

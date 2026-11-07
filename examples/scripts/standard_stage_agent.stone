@@ -897,7 +897,7 @@ def stage_agent_dispatch(action):
             "ok": False,
             "kind": "tool_error",
             "tool": tool,
-            "message": slice(str(error), 0, 2048),
+            "message": slice(json_dumps(error), 0, 2048),
         }
 
 
@@ -936,7 +936,7 @@ def agent_loop(step):
         )
     except Exception as error:
         action = {"tool": "model_infer", "input": {}}
-        error_text = str(error)
+        error_text = json_dumps(error)
         outcome = {
             "ok": False,
             "kind": "model_schema_error",

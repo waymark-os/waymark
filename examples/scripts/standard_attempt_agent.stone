@@ -804,7 +804,7 @@ def standard_terminate_and_reap(run_id, options):
         try:
             cleanup = run_terminate(run_id)
         except Exception as error:
-            last_error = str(error)
+            last_error = json_dumps(error)
             cleanup = {"still_running": True}
         termination_attempts += 1
         if get(cleanup, "still_running", False):
@@ -814,7 +814,7 @@ def standard_terminate_and_reap(run_id, options):
                     timeout_ms=options.run_cleanup_wait_ms,
                 )
             except Exception as error:
-                last_error = str(error)
+                last_error = json_dumps(error)
                 cleanup = {"still_running": True}
             waits += 1
     still_running = get(cleanup, "still_running", False)
@@ -1029,7 +1029,7 @@ def standard_shell_dispatch(action, options):
         outcome["cleanup"] = cleanup
         return outcome
     fail(
-        "schema-admitted unsupported tool: " + str(tool),
+        "schema-admitted unsupported tool: " + standard_text(tool),
         code="agent_dispatch_invariant",
     )
 
@@ -1064,10 +1064,17 @@ def standard_action_summary(action):
     return {"tool": tool, "path": get(args, "path", None)}
 
 
+def standard_text(value):
+    # Text the model reads: strings as-is, everything else as JSON.
+    if type(value) == "str":
+        return value
+    return json_dumps(value)
+
+
 def standard_text_signature(value):
     if value is None:
         return None
-    text = str(value)
+    text = standard_text(value)
     return {"characters": len(text), "sha256": sha256(text)}
 
 
@@ -1271,7 +1278,7 @@ def standard_reap_active_runs(state, options):
 def standard_bounded_evidence_text(value, max_characters):
     if value is None:
         return ""
-    text = str(value)
+    text = standard_text(value)
     if len(text) <= max_characters:
         return text
     marker = "\n...<bounded-middle-omitted>...\n"
@@ -1310,10 +1317,10 @@ def standard_outcome_evidence(action, outcome, state, options):
             result[field] = value
     for field in ["content", "stdout", "stderr", "message"]:
         value = get(outcome, field, None)
-        if value is not None and len(str(value)) > 0:
-            result[field + "_characters"] = len(str(value))
+        if value is not None and len(standard_text(value)) > 0:
+            result[field + "_characters"] = len(standard_text(value))
             result[field + "_truncated"] = (
-                len(str(value)) > options.max_evidence_characters
+                len(standard_text(value)) > options.max_evidence_characters
             )
             result[field] = standard_bounded_evidence_text(
                 value,
@@ -1341,11 +1348,11 @@ def standard_record_evidence(action, outcome, state, options):
 
 
 def standard_task_requirement(session, options):
-    objective = get(session.task, "objective", str(session.task))
+    objective = get(session.task, "objective", standard_text(session.task))
     return {
         "task_id": get(session.task, "id", ""),
         "objective": slice(
-            str(objective),
+            standard_text(objective),
             0,
             options.max_requirement_characters,
         ),
@@ -1526,10 +1533,10 @@ def standard_model_outcome(outcome, options):
             result[field] = value
     for field in ["content", "stdout", "stderr", "message"]:
         value = get(outcome, field, None)
-        if value is not None and len(str(value)) > 0:
-            result[field + "_characters"] = len(str(value))
+        if value is not None and len(standard_text(value)) > 0:
+            result[field + "_characters"] = len(standard_text(value))
             result[field + "_truncated"] = (
-                len(str(value))
+                len(standard_text(value))
                 > options.max_observation_field_characters
             )
             if result[field + "_truncated"]:
@@ -2087,7 +2094,7 @@ def standard_agent_control(
                 outcome = {
                     "ok": False,
                     "kind": "tool_error",
-                    "message": str(error),
+                    "message": json_dumps(error),
                 }
         outcome["time_budget"] = standard_current_time_budget()
         if not get(outcome, "ok", False):

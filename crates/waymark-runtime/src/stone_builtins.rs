@@ -458,7 +458,8 @@ pub(crate) fn map_builtin_value(func_name: &str, value: &Value) -> Result<Value,
         "json_dumps" => serde_json::to_string(&nu_to_json_value(value))
             .map(|text| Value::string(text, Span::unknown()))
             .map_err(|err| stone_error("map", err.to_string())),
-        "repr" | "str" => str_builtin(value),
+        "str" => str_builtin(value),
+        "repr" => repr_builtin(value),
         other => Err(stone_error(
             "map",
             format!("map() does not support `{other}` yet"),
@@ -466,8 +467,160 @@ pub(crate) fn map_builtin_value(func_name: &str, value: &Value) -> Result<Value,
     }
 }
 
+/// Python `str()`: strings are unchanged; everything else is its repr.
 pub(crate) fn str_builtin(value: &Value) -> Result<Value, ShellError> {
-    value_to_display_string(value).map(|text| Value::string(text, Span::unknown()))
+    python_str(value).map(|text| Value::string(text, Span::unknown()))
+}
+
+/// Python `repr()`.
+pub(crate) fn repr_builtin(value: &Value) -> Result<Value, ShellError> {
+    python_repr(value).map(|text| Value::string(text, Span::unknown()))
+}
+
+/// Text that a program builds from a value, following Python: `str()`,
+/// f-string fields, and `format()` placeholders. Model-facing output
+/// (`emit`, results, `print` of a container) stays JSON; see D-2 in
+/// `docs/STONE_LANGUAGE_CONTROL_DESIGN.md`.
+pub(crate) fn python_str(value: &Value) -> Result<String, ShellError> {
+    match value {
+        Value::String { val, .. } | Value::Glob { val, .. } => Ok(val.clone()),
+        other => python_repr(other),
+    }
+}
+
+pub(crate) fn python_repr(value: &Value) -> Result<String, ShellError> {
+    let mut out = String::new();
+    write_python_repr(value, &mut out)?;
+    Ok(out)
+}
+
+fn write_python_repr(value: &Value, out: &mut String) -> Result<(), ShellError> {
+    match value {
+        Value::Nothing { .. } => out.push_str("None"),
+        Value::Bool { val, .. } => out.push_str(if *val { "True" } else { "False" }),
+        Value::Int { val, .. } => out.push_str(&val.to_string()),
+        Value::Float { val, .. } => out.push_str(&python_float_repr(*val)),
+        Value::String { val, .. } | Value::Glob { val, .. } => {
+            write_python_string_repr(val, out);
+        }
+        Value::List { vals, .. } => {
+            out.push('[');
+            for (index, item) in vals.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                write_python_repr(item, out)?;
+            }
+            out.push(']');
+        }
+        Value::Record { val, .. } => {
+            out.push('{');
+            for (index, (key, item)) in val.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                write_python_string_repr(key, out);
+                out.push_str(": ");
+                write_python_repr(item, out)?;
+            }
+            out.push('}');
+        }
+        other => out.push_str(
+            &serde_json::to_string(&nu_to_json_value(other))
+                .map_err(|err| stone_error("str", err.to_string()))?,
+        ),
+    }
+    Ok(())
+}
+
+/// Python's quoting: single quotes unless the text contains a single quote
+/// and no double quote.
+fn write_python_string_repr(text: &str, out: &mut String) {
+    let quote = if text.contains('\'') && !text.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    out.push(quote);
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch == quote => {
+                out.push('\\');
+                out.push(ch);
+            }
+            ch if ch.is_control() => {
+                let code = ch as u32;
+                if code <= 0xff {
+                    out.push_str(&format!("\\x{code:02x}"));
+                } else if code <= 0xffff {
+                    out.push_str(&format!("\\u{code:04x}"));
+                } else {
+                    out.push_str(&format!("\\U{code:08x}"));
+                }
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push(quote);
+}
+
+/// Python's float repr: the shortest round-trip digits, fixed notation when
+/// the decimal exponent is in [-4, 16), otherwise `1e+16` style.
+pub(crate) fn python_float_repr(value: f64) -> String {
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "inf" } else { "-inf" }.to_string();
+    }
+    if value == 0.0 {
+        return if value.is_sign_negative() {
+            "-0.0"
+        } else {
+            "0.0"
+        }
+        .to_string();
+    }
+    // Rust's `{:e}` is the shortest round-trip form, like Python's repr.
+    let scientific = format!("{value:e}");
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("float exponent formatting always has an exponent");
+    let exponent: i32 = exponent.parse().expect("float exponent is an integer");
+    let negative = mantissa.starts_with('-');
+    let digits = mantissa
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>();
+    let body = if (-4..16).contains(&exponent) {
+        if exponent >= 0 {
+            let integer_len = exponent as usize + 1;
+            if digits.len() <= integer_len {
+                format!("{digits}{}.0", "0".repeat(integer_len - digits.len()))
+            } else {
+                format!("{}.{}", &digits[..integer_len], &digits[integer_len..])
+            }
+        } else {
+            format!("0.{}{digits}", "0".repeat((-exponent - 1) as usize))
+        }
+    } else {
+        let mantissa = if digits.len() == 1 {
+            digits.clone()
+        } else {
+            format!("{}.{}", &digits[..1], &digits[1..])
+        };
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exponent.abs())
+    };
+    if negative {
+        format!("-{body}")
+    } else {
+        body
+    }
 }
 
 pub(crate) fn sum_builtin(values: Vec<Value>) -> Result<Value, ShellError> {
@@ -720,13 +873,16 @@ pub(crate) fn value_to_path_string(value: &Value, context: &str) -> Result<Strin
     }
 }
 
+/// Text for `print`: scalars follow Python (`None`, `True`, `1.0`), and
+/// containers stay compact JSON because the model reads printed output.
 pub(crate) fn value_to_display_string(value: &Value) -> Result<String, ShellError> {
     match value {
-        Value::Nothing { .. } => Ok(String::new()),
-        Value::Bool { val, .. } => Ok(val.to_string()),
-        Value::Int { val, .. } => Ok(val.to_string()),
-        Value::Float { val, .. } => Ok(val.to_string()),
-        Value::String { val, .. } | Value::Glob { val, .. } => Ok(val.clone()),
+        Value::Nothing { .. }
+        | Value::Bool { .. }
+        | Value::Int { .. }
+        | Value::Float { .. }
+        | Value::String { .. }
+        | Value::Glob { .. } => python_str(value),
         other => serde_json::to_string(&nu_to_json_value(other))
             .map_err(|err| stone_error("str", err.to_string())),
     }
@@ -986,19 +1142,50 @@ pub(crate) fn parse_int_builtin(value: &Value, default: Value) -> Result<Value, 
     }
 }
 
-pub(crate) fn round_builtin(value: &Value, digits: i64) -> Result<Value, ShellError> {
-    let value = value_to_f64(value, "round")?;
+/// Python `round()`. Without digits it returns an int, rounding halfway
+/// cases to even. With digits it rounds the exact binary value, so
+/// `round(2.675, 2)` is 2.67 as in Python (2.675 is stored just below).
+pub(crate) fn round_builtin(value: &Value, digits: Option<i64>) -> Result<Value, ShellError> {
+    let Some(digits) = digits else {
+        if let Value::Int { val, .. } = value {
+            return Ok(Value::int(*val, Span::unknown()));
+        }
+        let value = value_to_f64(value, "round")?;
+        if !value.is_finite() {
+            return Err(stone_error(
+                "round",
+                format!("cannot round {} to an integer", python_float_repr(value)),
+            ));
+        }
+        let rounded = value.round_ties_even();
+        if rounded < i64::MIN as f64 || rounded >= i64::MAX as f64 {
+            return Err(stone_error(
+                "round",
+                "round() result does not fit in an int",
+            ));
+        }
+        return Ok(Value::int(rounded as i64, Span::unknown()));
+    };
     if !(0..=9).contains(&digits) {
         return Err(stone_error(
             "round",
             "round() digits must be between 0 and 9",
         ));
     }
-    let factor = 10_f64.powi(digits as i32);
-    Ok(Value::float(
-        (value * factor).round() / factor,
-        Span::unknown(),
-    ))
+    if let Value::Int { val, .. } = value {
+        return Ok(Value::int(*val, Span::unknown()));
+    }
+    let value = value_to_f64(value, "round")?;
+    if !value.is_finite() {
+        return Ok(Value::float(value, Span::unknown()));
+    }
+    // Rust's fixed-precision formatting rounds the exact binary value
+    // half-to-even, which is what Python's round() does.
+    let text = format!("{value:.prec$}", prec = digits as usize);
+    let rounded = text
+        .parse::<f64>()
+        .map_err(|err| stone_error("round", err.to_string()))?;
+    Ok(Value::float(rounded, Span::unknown()))
 }
 
 pub(crate) fn slice_builtin(
@@ -1654,7 +1841,7 @@ fn split_format_index_and_spec(spec: &str) -> Result<(Option<usize>, &str), Shel
 
 fn format_value(value: &Value, spec: &str) -> Result<String, ShellError> {
     if spec.is_empty() {
-        return value_to_display_string(value);
+        return python_str(value);
     }
     if let Some(precision) = parse_fixed_decimal_format_spec(spec) {
         let value = value_to_f64(value, "format")?;
@@ -1718,4 +1905,79 @@ fn stone_error(kind: &str, message: impl Into<String>) -> ShellError {
         GenericError::new_internal(format!("Stone {kind} error"), message.into())
             .with_code("stone_script_error"),
     )
+}
+
+#[cfg(test)]
+mod python_text_tests {
+    use super::*;
+    use nu_protocol::Record;
+
+    fn text(value: Value) -> String {
+        python_str(&value).expect("str")
+    }
+
+    #[test]
+    fn str_and_repr_follow_python() {
+        let span = Span::unknown();
+        assert_eq!(text(Value::nothing(span)), "None");
+        assert_eq!(text(Value::bool(true, span)), "True");
+        assert_eq!(text(Value::string("it's", span)), "it's");
+        assert_eq!(
+            python_repr(&Value::string("it's", span)).expect("repr"),
+            "\"it's\""
+        );
+        assert_eq!(
+            python_repr(&Value::string("a\n'b'\\", span)).expect("repr"),
+            "\"a\\n'b'\\\\\""
+        );
+        let mut record = Record::new();
+        record.push("a", Value::nothing(span));
+        record.push(
+            "b",
+            Value::list(vec![Value::int(1, span), Value::float(2.5, span)], span),
+        );
+        assert_eq!(
+            text(Value::record(record, span)),
+            "{'a': None, 'b': [1, 2.5]}"
+        );
+        assert_eq!(text(Value::list(Vec::new(), span)), "[]");
+    }
+
+    #[test]
+    fn float_repr_matches_python() {
+        for (value, expected) in [
+            (1.0, "1.0"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (1e16, "1e+16"),
+            (1e15, "1000000000000000.0"),
+            (1e-5, "1e-05"),
+            (0.0001, "0.0001"),
+            (-2.5, "-2.5"),
+            (123456789.0, "123456789.0"),
+            (1.5e300, "1.5e+300"),
+            (-0.0, "-0.0"),
+            (f64::INFINITY, "inf"),
+            (f64::NAN, "nan"),
+        ] {
+            assert_eq!(python_float_repr(value), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn round_follows_python() {
+        let span = Span::unknown();
+        let round = |value: f64, digits: Option<i64>| {
+            round_builtin(&Value::float(value, span), digits).expect("round")
+        };
+        assert_eq!(round(2.5, None), Value::int(2, span));
+        assert_eq!(round(3.5, None), Value::int(4, span));
+        assert_eq!(round(-0.5, None), Value::int(0, span));
+        assert_eq!(round(2.675, Some(2)), Value::float(2.67, span));
+        assert_eq!(round(0.125, Some(2)), Value::float(0.12, span));
+        assert_eq!(
+            round_builtin(&Value::int(7, span), Some(2)).expect("int"),
+            Value::int(7, span)
+        );
+        assert!(round_builtin(&Value::float(f64::NAN, span), None).is_err());
+    }
 }

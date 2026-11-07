@@ -29,7 +29,7 @@ def react_agent():
             decoded = json_loads(response.content)
         except Exception as error:
             fail(
-                "model did not return valid JSON: " + str(error),
+                "model did not return valid JSON: " + json_dumps(error),
                 code="invalid_model_response",
             )
         actions = decoded.actions

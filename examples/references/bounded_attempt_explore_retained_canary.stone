@@ -183,7 +183,7 @@ def main(input):
     try:
         attempt_branch(frontier)
     except Exception as error:
-        release_error = str(error)
+        release_error = json_dumps(error)
     if "released" not in release_error:
         fail(
             "released retained frontier remained branchable",

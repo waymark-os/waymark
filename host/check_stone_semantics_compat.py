@@ -51,6 +51,9 @@ class Probe:
     # "python": the target is CPython's behavior.
     # "error": the target is a rejected program (parse, admission, or runtime error).
     # "python-if-d2": CPython's behavior if D-2 extends L4 to containers.
+    #   D-2 is decided (str()/repr() follow Python), so these are "python" now.
+    # "stdout:<text>": an exact expected stdout, for deliberate deviations
+    #   (D-2 keeps print() of containers as JSON because the model reads it).
     target: str = "python"
     note: str = ""
 
@@ -205,12 +208,12 @@ else:
       note="round-half-even: 0+2+2"),
     p("l4_round_int", "L4", 'print(str(round(2.4)) + "|")\n'),
     p("l4_str_compare", "L4", 'print("yes" if str(True) == "True" else "no")\n'),
-    # D-2: str() of containers (open decision).
-    p("d2_str_list", "D-2", "print(str([1.0, None, True]))\n", target="python-if-d2"),
-    p("d2_str_dict", "D-2", 'print(str({"a": None}))\n', target="python-if-d2"),
-    p("d2_str_nested_str", "D-2", 'print(str(["x"]))\n', target="python-if-d2"),
-    p("d2_print_list", "D-2", 'print([1, "x"])\n', target="python-if-d2",
-      note="D-2 proposal keeps print() of containers as JSON"),
+    # D-2: str() of containers (decided: Python inside programs, JSON for print).
+    p("d2_str_list", "D-2", "print(str([1.0, None, True]))\n", target="python"),
+    p("d2_str_dict", "D-2", 'print(str({"a": None}))\n', target="python"),
+    p("d2_str_nested_str", "D-2", 'print(str(["x"]))\n', target="python"),
+    p("d2_print_list", "D-2", 'print([1, "x"])\n', target='stdout:[1,"x"]\n',
+      note="D-2 keeps print() of containers as JSON"),
     # L6a and item 4: exception handlers.
     p("l6a_bare_except", "L6a", """
 try:
@@ -283,6 +286,9 @@ def run_python(source: str, cwd: Path) -> dict[str, Any]:
 def judge(probe: Probe, stone: dict[str, Any], python: dict[str, Any]) -> str:
     if probe.target == "error":
         return "match" if not stone["ok"] else "diverges"
+    if probe.target.startswith("stdout:"):
+        expected = probe.target[len("stdout:"):]
+        return "match" if stone["ok"] and stone["stdout"] == expected else "diverges"
     same = stone["ok"] == python["ok"] and stone["stdout"] == python["stdout"]
     if probe.target == "python-if-d2":
         return "match" if same else "diverges (D-2)"
@@ -304,7 +310,12 @@ def cmd_probes(args: argparse.Namespace) -> int:
         for probe in PROBES:
             stone = run_stone(args.waymark_bin, probe.source, cwd)
             python = run_python(probe.source, cwd)
-            target = "error" if probe.target == "error" else show(python)
+            if probe.target == "error":
+                target = "error"
+            elif probe.target.startswith("stdout:"):
+                target = probe.target[len("stdout:"):].rstrip("\n") + " (deliberate)"
+            else:
+                target = show(python)
             rows.append({
                 "id": probe.id, "change": probe.change, "verdict": judge(probe, stone, python),
                 "stone": show(stone), "target": target, "note": probe.note,
