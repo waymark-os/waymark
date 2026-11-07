@@ -16,6 +16,13 @@ primary sources (Section 12.1).
 
 ## 1. Goal
 
+**Core principle: make computers easy for LLMs to use.** Syntax sugar,
+formal contracts, the strongly typed runtime, and performance all serve this
+goal. Where a Python convention helps LLMs, Stone keeps it. Where it hurts,
+Stone deviates. Each decision below is judged by that test, and contested
+cases are settled by measuring models (authorship evals, pilots), not by
+fidelity to Python.
+
 Stone is the language Waymark agent loops are written in. Earlier work made
 Stone easy for LLMs to write without retraining and gave it a strongly typed
 runtime. This design makes Stone good at agent control:
@@ -57,7 +64,13 @@ The language must also stay easy to optimize (see
 - No retraining or fine-tuning: few-shot prompting plus a checker in the loop.
 - Contracts use syntax these models already write reliably: annotations and
   pydantic/FastAPI-shaped declarations.
-- Deviations from Python are absent or loud, never quietly different.
+- Python is a means, not a goal (see the core principle above). Keep Python
+  where it helps LLMs, and deviate where it hurts. Every deviation is loud:
+  - Stone may reject a Python construct, such as bare `except:`,
+    `pass`-only handlers, or calling a call's result, with an error that
+    names the fix.
+  - A program Stone accepts never quietly behaves differently from what a
+    model trained on Python would expect.
 - Errors contain the fix.
 
 ### Settled Decisions (2026-11-06)
@@ -1108,6 +1121,99 @@ program logic.
 
 Unmeasured: whether target models read JSON better than Python repr in
 observations. That is a cheap authorship-eval A/B if it matters.
+
+### 9.6 M0: Executable Probes And Source Reading (2026-11-07)
+
+`host/check_stone_semantics_compat.py` turns the 9.5 scan into measurements
+that run on the binary.
+
+- **`probes`** runs 44 small programs in `waymark eval` and in CPython. The
+  target is CPython for L1-L4, and an explicit rejection for L6a, item 4,
+  and the L18 shadowing error. A change is done when all of its probes
+  match.
+- **`snapshot` and `diff`** record and compare the results of the
+  executable corpus: 52 example and reference scripts and 159 help
+  examples, run in a scratch copy. The baseline is 211 units (169 ok, 42
+  deterministic errors), with 0 unstable across two runs. After each change,
+  `diff` lists exactly which units changed.
+
+Corpus coverage is partial:
+
+- 21 scripts need a live Gateway.
+- About 13 are library fragments that cannot run alone.
+- The standard controller and the libraries are covered only by the static
+  scan (9.5) and the 475 runtime unit tests.
+
+Probe results today (matching target / total):
+
+| Change | Match | What diverges |
+|---|---|---|
+| L1 | 3/8 | **Stone scopes dynamically.** A function reads its caller's locals (`g` sees `f`'s `y`). A returned inner function does not capture its environment: it fails with "unknown name", or picks up a later global of the same name (`add(3)` gives 103, not 5). Plain globals and in-function rebinding already match. |
+| L2 | 1/5 | Lists and dicts are copied on assignment and on argument passing. Explicit copies already match. |
+| L3 | 1/6 | `or`/`and` return booleans. Test contexts already match. |
+| L4 | 2/11 | `str(None)` is `""`, `str(True)` is `"true"`, `str(1.0)` is `"1"`, `print(None)` prints nothing, `round` rounds half up on the decimal text (2.675 becomes 2.68; 0.5+1.5+2.5 rounds to 6, not 4). Float repr already matches. |
+| D-2 | 0/4 | Containers render as compact JSON (`[1.0,null,true]`). |
+| L6a | 1/3 | Bare `except:` and `pass`-only handlers are accepted. |
+| Item 4 | 1/1 | `except BaseException:` is **already rejected** ("unsupported exception handler"). |
+| L18 | 3/4 | `len = 5; len([1])` still calls the builtin. `def len` and local shadowing already behave like Python. |
+
+Two limits found that are outside the plan:
+
+- **A call's result cannot be called** (`make(2)(3)`: "unsupported call
+  target").
+- **Callables cannot be stored in lists or dicts** ("task-owned runtime
+  value cannot cross this boundary", `stone_runtime_value.rs:184`).
+  Containers are Nu `Value`s, and runtime values (callables, files,
+  attempts) cannot live inside them.
+
+This data-model split is also the root of L2's copy semantics. It
+constrains R9 (capabilities in containers) and R8 and R10 (pass-style
+boundaries), so L2 and R9 are one piece of M4 work, not two.
+
+**Source reading for items 1, 2, and 18.**
+
+- **Item 1 (bare `except:`).** Three sources bear on it:
+  - Joe-E §4.3 rejects any `catch` whose *type* is `Throwable` or `Error`,
+    so no code runs after an error. The rule is on the caught type, not on
+    syntax.
+  - PEP 352 discourages bare `except:` and `except BaseException:` for the
+    same reason: terminating exceptions must propagate.
+  - PEP 760 (2024) proposed making bare `except:` a SyntaxError and was
+    withdrawn. The PEP gives no reason; Python has a large installed base
+    and Stone does not. Its one rejected counter-example, a catch-all that
+    aborts a transaction and re-raises, is the host's job in Stone (R19).
+    Its suggested rewrite (`except BaseException:`) is banned here, so the
+    fix Stone suggests stays `except Exception as e:`.
+  
+  Consequence: items 1 and 4 are one rule, about which exception types a
+  handler may catch, and the tooling fix (9.5) ships with it.
+- **Item 2 (`pass`-only handlers).** The cited empirical papers support it
+  only weakly.
+  - Ren et al. 2023 (ASE, Java, ChatGPT) found that missing handling is the
+    dominant failure (81 of 92 tasks), with wrong exception types in 4 and
+    try-catch abuse in 5.
+  - Seeker (arXiv 2410.06949, Java) reports detection and type-precision
+    problems.
+  - Neither measures handlers that swallow an error with `pass`.
+  
+  They support raising by default (5.8) more than banning `pass`. Item 2
+  stays, but its justification is visibility (5.5), and H-11 must measure
+  its cost.
+- **Item 18 (frozen builtins).** Taly et al. §II.B (SESlight) makes builtin
+  objects transitively immutable and the builtin properties of the global
+  object immutable. Top-level rebinding of a builtin fails; function-local
+  shadowing is allowed.
+  - Applied to Stone sessions, that would reject the corpus's 19 top-level
+    bindings of builtin names (`state`, `first`, `stage`, `items`) and 6
+    top-level `def artifact`.
+  - The current plan (Python shadowing, plus an error when a shadowing
+    non-callable is called) rejects none of them.
+  - Confinement does not need the stricter rule once helpers run in their
+    own evaluator (item 17): a session's rebinding then only affects that
+    session's own code.
+  
+  Recommendation: keep the current plan.
+- **Item 25 (`str()`).** It cites no sources. It waits on D-2.
 
 ## 10. Performance Requirements On The Design
 
