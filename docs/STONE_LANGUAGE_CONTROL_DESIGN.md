@@ -1,10 +1,11 @@
 # Stone As An Agent Control Language (Draft)
 
-Status: draft v3 (2026-11-06). Decisions S1-S3 are settled. Draft v3 adds the
-decisions from the literature review (Section 3). Each one is marked **from
-review** or **deviates from review because ...**. One review decision
-conflicted with S2; it is resolved provisionally by D-1 (Section 3.1),
-pending LLM trials. Nothing is
+Status: draft v3.1 (2026-11-07). Decisions S1-S3 are settled. Draft v3 adds
+the decisions from the literature review (Section 3). Each one is marked
+**from review** or **deviates from review because ...**. One review decision
+(mandatory declared writes) conflicted with S2. D-1 (Section 3.1) resolves it
+after an LLM pilot (11.2): effects fall into three tiers, and models declare
+only irreversible effects. Nothing is
 implemented. Items marked **H-n** are hypotheses to test, **L-n** are language
 decisions (Section 7), and **R-n** are review decisions (Section 3).
 
@@ -25,10 +26,18 @@ runtime. This design makes Stone good at agent control:
 - **Lifecycle**: which resources must be released before a scope ends.
 - **Recovery**: which failures a loop may handle, and which it must not
   swallow.
-- **Expectations and side effects** (per tool call): what each invocation may
-  change, and optionally what it is expected to achieve. The runtime confines
-  the call to its declared writes and reports whether the observed result met
-  the expectation.
+- **Syscall contracts** (per tool call). The Gateway is the kernel, and
+  every call that crosses it is a syscall: `Exec`, host tools, RPCs, and MCP
+  tool calls. Each syscall has the following, all checked at runtime:
+  - an effect signature;
+  - a precondition (`requires`: the grant covers it);
+  - a postcondition (`ensures`: the observed effects fit the signature, and
+    any optional expectation holds).
+  
+  Recoverable effects are reported, not declared. Models declare only what
+  cannot be undone (5.8). MCP is a good interface but has no formal
+  contracts. Adding those contracts is what lets language-based agent
+  control (Section 2) govern tool calls.
 
 Each contract is part of a function's signature or a value's type, written in
 Python-shaped syntax. Admission checks it before running where it can, and the
@@ -64,8 +73,8 @@ The language must also stay easy to optimize (see
   allowed and reported. Effects that cannot be reversed (network, external
   services, anything outside the overlay) stay off. They are prohibited unless
   the host grants a capability for them and the call declares them.
-  **For model-issued commands in the controlled profile, D-1 provisionally
-  replaces the first half of S2 with enforcement, pending LLM trials.**
+  **D-1 (3.1) extends S2 into three effect tiers and applies them to every
+  syscall, not only file operations.**
 - **S3. Priority: task completion first, then drift, then security.** The
   roadmap (Section 13) orders features by that priority. Security properties
   are designed in from the start so later phases do not change the language,
@@ -153,64 +162,100 @@ The review's two cross-cutting conclusions, both adopted **from review**:
 | R22 | A `Verified` value is accepted only by the parent of the attempt that minted it (nonce check). | From review (RQ5) | 5.2 |
 | R23 | A 0-CFA reachability check at admission catches bad returns and spawn arguments before any budget is spent. The runtime check stays the guarantee. | From review (RQ1, RQ5), **scoped because** L12 requires per-command admission to stay a linear pass. It runs on delegated bodies and library loops, not on every one-line command, and ships in P3. | 7 (L12) |
 | R24 | One reachability-walk component, used at child start, return, and host callbacks. | From review. Two more call sites are mine: `raise` (R2) and session injection or restore (R6). | 5.1 |
-| R25 | Declared writes are mandatory and enforced at the capability layer. | From review (RQ6, the brief's Q6 directive). Adopted provisionally by D-1; the enforcement mechanism (per-call overlay layer) is ours, since the review does not cover the OS layer. | 5.8 |
-| R26 | Outcome prediction (`expect=`) is optional, typed, and host-diffed. The diff is reported only on a mismatch, and mismatches are kept in history. | From review (RQ6) | 5.8 |
-| R26a | Expected exit status belongs to the optional prediction, not the mandatory declaration. | **Deviates from review** (which lists exit status with the mandatory declaration) **because** exit status is an outcome prediction, and keeping it out of the mandatory part keeps ablation arms 2 and 3 distinct. | 5.8 |
-| R27 | Set up, but do not run, the three-arm ablation. | From review (RQ6). GPT-6 Luna added as an optional third model if we have access. | 11.1 |
-| R27a | Add a fourth arm: declared writes, reported but not enforced. Measure write-prediction accuracy in every arm that declares. | **Deviates from review** (three arms) **because** predicting side effects may be hard. Without this arm, a drop in arm 2 could come from bad predictions or from enforcement, and we could not tell which. | 11.1 |
+| R25 | ~~Declared writes are mandatory and enforced at the capability layer.~~ Replaced by R25a-R25c. | **Deviates from review** (RQ6, the brief's Q6 directive) **because** the pilot (11.2) found that per-path write declarations caught no drift. Every rollback was a toolchain by-product or a legitimate edit, and the capable models over-declared (`/app`), which defeats enforcement. Each declaration is also an escalation with a cost (D-1). | 5.8 |
+| R25a | Effects fall into three tiers. (1) Recoverable effects are not declared; they are observed and reported on every result. (2) Critical recoverable paths are protected by the grant and enforced by the Gateway. (3) Irreversible effects are denied unless granted and declared. | Mine (D-1), decided with you after the pilot. Keeps the review's point that declarations are policy, applied only where a declaration buys safety. | 3.1, 5.8 |
+| R25b | Every Gateway call (`Exec`, host tool, RPC, MCP tool) is a syscall with a Gateway-owned effect signature, `requires`, and `ensures`. For a typed syscall, the call itself is the declaration. A model declares effects only for opaque syscalls (`Exec`), and only in tier 3. | Mine. Generalizes RQ6's per-call contracts from shell commands to all RPC. | 5.8 |
+| R25c | MCP tool annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) may seed a tool's effect signature but never decide it. | Mine. The MCP spec itself calls these untrusted hints unless the server is trusted. | 5.8 |
+| R26 | Outcome prediction (`expect=`) is optional, typed, and host-diffed, on any syscall. The diff is reported only on a mismatch, and mismatches are kept in history. | From review (RQ6), extended to every syscall (R25b) | 5.8 |
+| R26a | Expected exit status belongs to the optional prediction, not to any declaration. | **Deviates from review** (which lists exit status with the mandatory declaration) **because** exit status is an outcome prediction. | 5.8 |
+| R27 | Set up, but do not run, the ablation. Reduced to two arms: tiers only, and tiers plus `expect`. | **Deviates from review** (three arms) **because** D-1 removed declared writes. The write arms ran as the pilot instead (11.2). | 11.1 |
+| R27a | ~~Add a fourth arm: writes reported but not enforced.~~ Done as the pilot's report arm (11.2). | **Deviates from review** (three arms); the pilot has run it. | 11.2 |
 
 ### 3.1 Decisions
 
-**D-1. Undeclared reversible writes: refuse (R25) or allow and report (S2)?**
-**Decided provisionally (2026-11-06): start with mandatory, enforced
-declarations, and let LLM trials decide what stays.** Predicting side effects
-may be hard for the target models, so this is a starting point, not a
-settled rule. The review does not cover the OS layer. The enforcement
-mechanism below is ours.
+**D-1. Which effects must a model declare?**
+**Decided (2026-11-07), after the pilot (11.2): three tiers. A model declares
+only irreversible effects of opaque syscalls.**
 
-S2 says undeclared file writes on the overlay are allowed and reported. R25
-says declared writes are mandatory and undeclared writes are refused. These
-conflict for model-issued commands.
+Draft v3 started from R25: declared writes are mandatory, and undeclared
+writes are refused. That conflicted with S2, under which undeclared file
+writes on the overlay are allowed and reported. The pilot ran four models
+(Haiku 5.5, GPT-6 Luna, Gemini 3.8 Flash, Qwen3.8-27B), and per-path
+declarations bought almost nothing:
 
-The starting design:
+- Every rollback was a toolchain by-product (`__pycache__`, `.o`) or an edit
+  the model meant to make. None was drift.
+- The capable models declared `/app` or `/work` before running tests or
+  builds. A declaration that broad turns enforcement into a rubber stamp.
+- The cost was low (no measurable drop in task success), but it was not
+  zero: an extra field per action, rollbacks, and repair turns.
 
-- **Controlled profile, model-issued `Exec` and host-tool calls: enforce
-  (R25).** Each call runs in its own overlay layer. If it wrote anything
-  outside its declared set, the whole layer is discarded (all or nothing, so
-  no half-applied build is left behind), and the call raises
-  `UndeclaredEffect`. The error names each undeclared path and the fix ("add
-  `.pytest_cache` to `writes`, or run with `--no-cacheprovider`"). Where the
-  Gateway can mount everything except the declared paths read-only, the write
-  is prevented outright instead of discarded.
-- **Default profile (today's scripts): S2 unchanged.** Undeclared reversible
-  writes are kept and reported.
-- **Irreversible effects: unchanged.** They are prohibited unless granted and
-  declared. Reversibility (S2) is what makes enforcement cheap: discarding a
-  layer is the refusal.
-- **Revisit by measurement.** The trials (11.1) separate two questions: can
-  the models predict writes (arm 2r, report-only), and does enforcement cost
-  task success (arm 2 versus 2r and arm 1)? If enforcement lowers task
-  success, S3 says fall back to S2 behavior.
+Like a mobile permission prompt or an OS context switch, every declaration
+is an escalation with a cost. The design therefore keeps declarations to a
+minimum. A model declares an effect only if the Gateway cannot infer it from
+the syscall's signature **and** cannot undo it.
 
-The completion risk is incidental writes (`__pycache__`, `.pytest_cache`,
-build outputs, tool caches under `$HOME`) that the model did not predict.
-Declarations can name directories (`src / "build"`), and the error is
-prescriptive. Whether that brings the cost down to about one repair per new
-command family is unmeasured (H-9, H-12).
+| Tier | Effects | Who decides | Enforcement | On violation |
+|---|---|---|---|---|
+| 1. Recoverable | File changes inside the attempt's transaction; reads; processes that end with the call | Nobody declares | Transaction (overlay, copy, or worktree). The observed diff is reported on every result. Rollback to a checkpoint is a Gateway operation the harness can request. | None; observed and reported |
+| 2. Critical, recoverable | Writes to protected paths: `tests/`, `.git`, CI config, credentials, verifier inputs | The grant (harness or host), never the model | The Gateway mounts the paths read-only for `Exec`; capability methods fail containment | `Exec` sees `EROFS`, and the result names the protected path; a capability method raises `PolicyViolation` (5.5) |
+| 3. Irreversible | Network egress, push, publish, send, deploy, external API writes, processes that outlive the call, signals to processes outside the transaction | Typed syscalls: the effect signature, so the call is the declaration. `Exec`: the model declares (`network=[...]`, `irreversible=[...]`). | Denied unless the grant allows it and the call declares it. Approval handler (L13) where the host requires one. | Blocked before it happens; `UndeclaredEffect` (`ToolError`) names the attempt and the fix |
 
-If the trials show prediction is hard, the fallbacks, in order of how much
-they keep:
+Notes:
 
-1. Coarser declarations: directory-level `writes` only, or a per-command
-   write profile the runtime learns from earlier observed runs of the same
-   command family and offers to the model as a default.
-2. Enforce only where the declaration matters for drift (for example, writes
-   into read-only-intended paths such as `tests/`), and report elsewhere.
-3. S2 as the default: report only.
+- **Tier 2 is where drift protection lives.** "Do not edit tests" is a
+  property of the task, so the harness states it once, in the grant. It
+  should not depend on a model scoping each call correctly.
+- **Tier 3 is not Linux-specific.** It applies to every syscall. For typed
+  RPC and MCP calls, the Gateway checks the call against the tool's effect
+  signature (R25b). Only `Exec` is opaque, and only there does the model
+  name the effects. On Linux, the Gateway can enforce `Exec` declarations
+  per call with eBPF (cgroup `connect`/`sendmsg` hooks, BPF LSM). Other
+  substrates use a network namespace with a Gateway proxy, or deny by
+  default.
+- **Default profile (today's scripts): S2 unchanged.** Tier 1 is S2. Tiers 2
+  and 3 need a grant, so they apply in the controlled profile.
+- **Deferred.** How predictable effects are for models was discussed but not
+  settled. The pilot is weak evidence: the tasks were short, and recall was
+  89-100%. Under D-1, the question matters only for tier-3 declarations on
+  `Exec`.
 
-Note what discarding does and does not do. The command still saw its own
-writes while it ran, so a refusal by discard is equivalent to prevention only
-in its effect on the workspace afterward.
+**What the Gateway provides today** (read-only review of
+`../waymark-gateway` at `60e9d6f`, 2026-11-06):
+
+- Isolation is one overlay (or full-copy, or git-worktree) transaction per
+  **attempt**, not per command. Every `run(...)` is a `docker exec` into one
+  long-lived container per transaction.
+- A per-operation private overlay is designed in the Gateway docs but not
+  built.
+- A file diff exists, but it is cumulative for the transaction (base versus
+  merged tree, full-tree hash). Stone receives only its text form
+  (`env_diff`).
+- Checkpoints are full copies, about 300 ms per 50 MB of workspace.
+- There is no per-command read-only mounting (no Landlock, seccomp, or bwrap)
+  and no network control.
+- Writes outside the workspace mount (`$HOME` caches, `/tmp`) are not
+  observed.
+- Background jobs from earlier commands write into the same tree, which
+  breaks attributing writes to one command.
+
+Gateway work for D-1, ranked by effort (Gateway changes live outside this
+repository):
+
+1. Pass the structured diff to Stone, and diff before and after each
+   command. This is the tier-1 report. Small.
+2. Checkpoint and restore of changed paths, so the harness can request a
+   rollback. Small to medium; the copy machinery exists.
+3. Tier 2: read-only bind mounts for the grant's protected paths inside the
+   transaction's container. Small to medium.
+4. Tier 3 for `Exec`: network off by default, with per-call egress
+   allowances enforced by eBPF on Linux. Medium.
+5. Effect signatures for host tools, RPC, and MCP tools in a Gateway-owned
+   manifest (R25b, R25c). Medium.
+6. A policy for processes that outlive the call (tier 3). Medium.
+
+A per-command overlay is no longer needed. Tier 1 does not discard per call.
+The pilot (11.2) emulated items 1 and 2 at harness level with bubblewrap.
 
 ## 4. The Problem In The Current Stone Loop
 
@@ -265,14 +310,14 @@ def solve(task: str, src: Dir[Read, Write], tests: Dir[Read],
 - `Exec` is the residual hole: Stone cannot see what argv touches. Every
   `Exec` must be bound by the Gateway or OS sandbox to the directory
   capabilities in the same grant (`shell.within(...)` maps to a sandbox mount).
-  Mandatory declared writes (5.8) narrow this further, to what one command
-  says it will touch.
+  Tier-2 protected paths and tier-3 egress rules (D-1, 5.8) are enforced by
+  the Gateway on each `Exec`, whatever argv does.
 
 The leak channels the review lists, and where each is closed:
 
 | Channel | Rule | Today |
 |---|---|---|
-| Capability inside an exception | R2: walk at `raise` | Exceptions bind JSON strings; no handles can leak yet |
+| Capability inside an exception | R2: walk at `raise` | Caught exceptions are plain dicts; no handles can leak yet |
 | Frame or traceback objects | R3 | None are exposed |
 | Mutable builtins | R4: frozen table | `def read_text(...)` shadows the builtin and persists in the session (9.4) |
 | Mutable module state | R5 | No modules yet |
@@ -420,7 +465,8 @@ There are three tiers.
 Rules:
 
 - Errors are typed: `except ToolError as e:` with fields (`e.kind`,
-  `e.detail`). Today `except Exception as e` binds a JSON string.
+  `e.detail`). Today `except Exception as e` binds a plain dict
+  (`{"code", "kind", "message", ...}`), and `str(e)` renders it as JSON.
 - Exceptions carry data only (R2). `raise ToolError(detail=src)` where `src`
   is a capability is an error at the raise site that says to return the handle
   instead.
@@ -489,64 +535,94 @@ arguments are copied, so I expect models to handle it. The child's results
 come back through its return value, which crosses the same boundary. Whether
 this surprises target models is untested (added to H-7).
 
-### 5.8 Declared Writes And Optional Outcome Prediction
+### 5.8 Syscall Contracts: Effect Tiers And Optional Expectations
 
-Capabilities bound what a function *may* do over its whole run. A single tool
-call usually means to do much less. RQ6 splits per-call contracts into two
-parts with different status:
+MCP gives tools a good interface: a name, a typed input schema, and a
+result. It has no formal contract. Nothing binding says what a call may
+change, whether the change can be undone, what must hold before the call, or
+what the caller can rely on afterward. Its tool annotations are explicitly
+untrusted hints. Language-based agent control (Section 2) needs those
+contracts in order to reason about tool calls at all. This section adds them
+uniformly to every call that crosses the Gateway.
 
-| Part | Status | Why |
+The Gateway is the kernel. Every call that crosses it is a syscall:
+
+- `Exec`;
+- host tools;
+- RPCs;
+- MCP tool calls;
+- model calls, which are metered by budget scopes (5.3).
+
+Capabilities bound what a function *may* do over its whole run. A syscall
+contract states what one call does. It has three parts, all checked at
+runtime and none proved. There is no `requires`/`ensures` logic and nothing
+to prove; the contract is types, capabilities, and runtime checks.
+
+| Part | Holder | Checked |
 |---|---|---|
-| Declared effects (`effects=`, the action's `writes`) | Mandatory, enforced at the capability layer (R25; provisional, D-1) | A policy, not a prediction. The review expects small models to produce it reliably as structured output; whether they can predict a command's writes is H-12. |
-| Outcome prediction (`expect=`) | Optional per harness, typed, host-diffed (R26) | Positive evidence at GPT-3.5/4 scale (PreAct), but per-step prediction costs tokens and can hurt smaller models |
+| Effect signature: which effects the syscall can have, by tier (D-1) | The Gateway, in a manifest it owns (R25b). MCP annotations may seed it but never decide it (R25c). | Statically at admission for literal calls, and before dispatch |
+| `requires`: the capability is held, the arguments are within the grant, and any tier-3 effect is granted and declared | Grant plus signature; `Exec` adds the model's tier-3 declaration | Before dispatch; failure means nothing runs |
+| `ensures`: the observed effects fit the signature and declaration, plus the optional expectation (`expect=`) | Signature, declaration, and caller | After the call; tier 1 is reported, a tier-3 attempt was blocked, and `expect` raises `ExpectationFailed` |
 
 ```python
-r = shell.run(
-    ["pytest", "tests/test_parser.py", "-x", "-q"],
-    cwd=src,
-    effects=Effects(writes=[src / ".pytest_cache"]),            # mandatory
-    expect=Expect(exit=0, stdout_contains="passed"),           # optional
-)
+r = shell.run(["pytest", "tests/test_parser.py", "-x", "-q"], cwd=src,
+              expect=Expect(exit=0, stdout_contains="passed"))  # optional
+r.effects.observed            # tier 1: what the command changed, always reported
+
+r = shell.run(["pip", "download", "requests"], cwd=src,
+              effects=Effects(network=["pypi.org", "files.pythonhosted.org"]))  # tier 3, Exec only
+
+gh.create_pull_request(repo, title=t, body=b)   # typed syscall: the signature says
+                                                 # "irreversible: publish"; the grant must allow it
 ```
 
-These are runtime-checked observations, not proof obligations. There is no
-`requires`/`ensures` logic and nothing to prove. That keeps the settled rule
-that contracts are types, capabilities, and runtime checks.
+#### Minimize what models declare
+
+The model declares an effect only when both are true:
+
+1. The Gateway cannot infer the effect from the syscall's signature. In
+   practice that means only `Exec`, whose effects depend on argv.
+2. The effect cannot be undone (tier 3).
+
+Everything else is inferred, granted, or observed. A capability method whose
+effect is evident (`src.file(p).replace(...)` writes `p`) needs no
+declaration. A typed RPC or MCP tool carries its effects in its signature.
+Recoverable file changes from `Exec` are reported after the fact.
 
 #### Two authors, one vocabulary
 
-- **Harness code** writes `effects=` and `expect=` as record literals.
-  Literal declarations are validated at admission: fields exist, and paths
-  are capability expressions within the function's grant.
-- **The model** writes them as data inside its action, through `output=`
-  structured output. `writes` is a required field with no default, so a model
-  cannot omit it; an empty list declares no writes. The vocabulary is a
-  closed, JSON-Schema-expressible record set, emitted with structured or
-  constrained decoding.
+- **Harness code** writes grants (including tier-2 protected paths),
+  `effects=`, and `expect=` as record literals. Literals are validated at
+  admission: fields exist, and paths and hosts are within the function's
+  grant.
+- **The model** writes tier-3 `effects` and an optional `expect` as data
+  inside its action, through `output=` structured output. Both fields are
+  optional and default to "none". The vocabulary is a closed,
+  JSON-Schema-expressible record set, emitted with structured or constrained
+  decoding.
 
 #### Effect vocabulary (closed)
 
+Declared, tier 3 only:
+
 | Field | Meaning | When omitted |
 |---|---|---|
-| `reads` | Dirs or files the call may read | The capability's read grant |
-| `writes` | Dirs or files the call may create or modify | Empty. Writes outside the set: see D-1 |
-| `deletes` | Paths the call may remove | Empty, same enforcement as `writes` |
-| `network` | `False`, or a list of hosts | `False` (irreversible) |
+| `network` | `False`, or a list of hosts the call may reach | `False` |
+| `irreversible` | Named effect kinds outside any transaction (`push`, `publish`, `send`, `deploy`, `external_write`) | Empty; allowed only with a host-granted capability **and** a declaration |
 | `background` | May leave a process running after return | `False` |
-| `irreversible` | Effects outside any transaction (send, push, deploy, external API write) | `False`; allowed only with a host-granted capability **and** a declaration |
+
+Observed, tier 1, reported on every result as `r.effects`: `writes`,
+`deletes`, and processes started. These are never declared.
+
+Tier 2 lives in the grant (`Dir(..., protect=["tests", ".git"])` or a
+read-only sub-capability), not in the call.
 
 Each effect has a reversibility class: read-only, reversible (workspace
-changes on the overlay that an attempt can roll back), or irreversible. This
-extends the classes in `STONE_AGENT_PROGRAMMING_DESIGN.md` (`workspace.read`,
-`workspace.write` transactional, `model.call` irreversible budget effect). The
-host reports which class each substrate provides. Local mode without an
-overlay has no cheap rollback, so enforcement there needs prevention
-(read-only mounts) or is unavailable; see Section 12.
-
-For capability methods whose effects are evident from the method
-(`src.file(p).replace(...)` writes `p`), the runtime knows the effect set, and
-declaring it is unnecessary. Declarations matter for `Exec` and host-defined
-tools, whose effects Stone cannot see.
+changes in the transaction), or irreversible. This extends the classes in
+`STONE_AGENT_PROGRAMMING_DESIGN.md` (`workspace.read`, `workspace.write`
+transactional, `model.call` irreversible budget effect). The host reports
+which class each substrate provides. Local mode without an overlay has no
+rollback, so tier 1 there is report-only (Section 12).
 
 #### Outcome vocabulary (closed, plus one escape; optional)
 
@@ -555,29 +631,31 @@ tools, whose effects Stone cannot see.
 | Process | `exit` (int or list), `stdout_contains`, `stdout_matches` (regex), `stderr_empty`, `stdout_json` (record type), `max_seconds` |
 | File | `exists`, `contains`, `unchanged` |
 | Edit | `occurrences` (default exactly 1) |
+| RPC / MCP tool | `result` (record type the result must validate against), `status` (success or a named error), `max_seconds` |
 | Custom | `check=fn`: a Stone function that admission proves pure (no capability parameters or captures) |
 
 Draft v2's `Tests: passes=[...]` row is removed. Test results that count
 toward success go through a `Verifier` (5.2), not a per-call expectation.
 
-Expected exit status is part of this optional record, not the mandatory
-declaration (R26a).
+Expected exit status is part of this optional record, not of any
+declaration (R26a). `expect=` is accepted on every syscall (R26).
 
 #### Safeguards
 
-| When | What the runtime does |
+| When | What the runtime and Gateway do |
 |---|---|
-| Admission | Literal `effects` must be within the function's capabilities; otherwise `PolicyViolation` before anything runs |
-| Before the call | Model-supplied `effects` must be within the capability grant; otherwise `PolicyViolation`. Declared `irreversible` effects need a host-granted capability and go through the approval handler (L13). |
-| During the call | The call runs in its own overlay layer, bounded by the capability grant. Irreversible effects are prevented: network off unless declared and granted, no writes outside the overlay. Where the Gateway supports it, paths outside the declared write set are mounted read-only. Timeout comes from `max_seconds`. |
-| After the call | The observed file diff and surviving processes are compared with the declaration. Under D-1's recommendation, an undeclared write discards the whole layer and raises `UndeclaredEffect`. If `expect=` was given, the checks run on the observation. |
-| Retry | Only effects declared idempotent may be retried automatically |
+| Admission | A literal call is checked against the syscall's effect signature and the function's grant. Literal `effects` must be within the grant. Otherwise `PolicyViolation` before anything runs. |
+| Before dispatch (`requires`) | A model-supplied tier-3 declaration must be within the grant; otherwise `PolicyViolation`. A typed syscall whose signature has a tier-3 effect needs a granting capability. Irreversible effects go through the approval handler (L13). |
+| During the call | Tier 1: the call runs inside the attempt's transaction. Tier 2: protected paths are read-only. Tier 3: everything not declared and granted is denied (`Exec` network off; eBPF per call on Linux). Timeout comes from `max_seconds`. |
+| After the call (`ensures`) | The observed diff and surviving processes are attached as `r.effects`. A blocked tier-3 attempt raises `UndeclaredEffect`. If `expect=` was given, the checks run on the observation. |
+| Retry | Only syscalls whose signature says idempotent may be retried automatically |
 
 Failure tiers:
 
 - **Outside the capability grant** (authority): `PolicyViolation`, fatal
   (5.5).
-- **Outside the call's own declaration**: `UndeclaredEffect`, a `ToolError`.
+- **Tier-3 effect not declared**: `UndeclaredEffect`, a `ToolError`. The
+  effect was blocked, so nothing irreversible happened.
 - **Prediction not met**: `ExpectationFailed`, a `ToolError`. It carries
   `.expected`, `.observed`, `.diff`, and `.result` (R12), so a handler never
   needs to re-run the tool to get the output. Re-running would double the
@@ -590,8 +668,10 @@ remaining failure (over-broad handlers) visible.
 
 #### Feedback shape
 
-The model-facing rendering states the fix-relevant facts first. When there is
-no mismatch, nothing extra is added to the context (R26).
+The model-facing rendering states the fix-relevant facts first. The tier-1
+effect report is one compact line, with directories collapsed. The pilot's
+report arm showed this on every result without a measurable cost to task
+success. A met expectation adds nothing to the context (R26).
 
 ```text
 run pytest tests/test_parser.py -x -q: expectation NOT met
@@ -600,14 +680,19 @@ run pytest tests/test_parser.py -x -q: expectation NOT met
 ```
 
 ```text
-run make: UndeclaredEffect, changes discarded
-  declared writes: [src/build]
-  undeclared: src/.deps/parser.d, src/config.h
-  fix: add the paths (or src/.deps) to writes, or point the build at src/build
+run make: ok (exit 0)
+  changed: src/build/ (14 files), src/.deps/ (6 files), src/config.h
+```
+
+```text
+run pip install requests: UndeclaredEffect, blocked
+  attempted: connect pypi.org:443
+  declared network: none; grant allows: pypi.org, files.pythonhosted.org
+  fix: add effects network=["pypi.org", "files.pythonhosted.org"], or use the vendored wheel in deps/
 ```
 
 The structured form (`r.checks[i].expected/actual/met`,
-`r.effects.declared/observed/undeclared/discarded`) is what the harness reads.
+`r.effects.observed`, `r.effects.blocked`) is what the harness reads.
 The runtime also counts mismatches per action signature, which gives
 `log.stuck(...)` a real signal instead of string comparison. Mismatches are
 kept in history; matched predictions are not (R26, following PreAct's finding
@@ -635,8 +720,9 @@ class Edit(Record):
 class Run(Record):
     kind: Literal["run"]
     argv: list[str]
-    writes: list[str]                 # mandatory: paths under src it may modify ([] = none)
     expect: Expect | None = None      # optional outcome prediction
+    # No effect fields: file changes are reported (tier 1), tests/ is protected
+    # by the grant (tier 2), and this grant allows no network (tier 3).
 
 class Finish(Record):
     kind: Literal["finish"]
@@ -669,12 +755,7 @@ def solve(task: str, repo: Dir[Read], src: Dir[Read, Write], shell: Exec,
                         action.old, action.new, expect=Expect(occurrences=1))
                     changed.append(action.path)
                 elif isinstance(action, Run):
-                    obs = shell.run(
-                        action.argv,
-                        cwd=src,
-                        effects=Effects(writes=[src / p for p in action.writes]),
-                        expect=action.expect,
-                    )
+                    obs = shell.run(action.argv, cwd=src, expect=action.expect)
                 else:
                     outcome = check.verify(
                         Report(summary=action.summary, files_changed=changed))
@@ -695,15 +776,20 @@ A model action (structured output, validated against `Run`):
 
 ```json
 {"kind": "run", "argv": ["pytest", "tests/test_parser.py", "-x", "-q"],
- "writes": [".pytest_cache"],
  "expect": {"exit": 0, "stdout_contains": "passed"}}
 ```
 
-If the command fails, the next observation says which predicted check failed.
-If it writes outside `.pytest_cache`, its changes are discarded and the
-observation names the undeclared paths (D-1). If an action names a path
-outside `src`, it is rejected before running. If it tries to reach the
-network, the sandbox blocks it.
+What happens next:
+
+- If the command fails, the next observation says which predicted check
+  failed.
+- Every observation lists what the command changed (tier 1).
+- `shell` is bound to `src` with `tests/` protected, so if the command
+  writes there, the write fails and the observation names the protected
+  path (tier 2).
+- If an action names a path outside `src`, it is rejected before running.
+- If the command tries to reach the network, the Gateway blocks it and
+  raises `UndeclaredEffect` (tier 3).
 
 What the runtime guarantees here, where today's controller needs convention:
 
@@ -715,7 +801,7 @@ What the runtime guarantees here, where today's controller needs convention:
 | Room to finish | `grace` holds calls back from the loop's budget scope |
 | Budget accounting | Metered; `BudgetExhausted` cannot be caught inside the scope |
 | Malformed actions | `output=Action`, repair charged to the budget |
-| Commands touch only what they claim | Mandatory `writes`; undeclared changes discarded |
+| Commands cannot touch tests or the network | Tier 2 protected paths and tier 3 egress denial, enforced by the Gateway on every `Exec`; tier 1 changes reported on every result |
 | The loop notices a failed step | Optional `expect`: `ExpectationFailed` with expected, observed, and diff |
 | Errors are not swallowed | Bare `except:` rejected; `pass` handlers rejected; swallow count in the trace |
 | Stuck detection | Repeated mismatch per action signature, counted by the runtime |
@@ -797,11 +883,11 @@ keeping reference semantics.
 | L11 | `match` statement | Defer | `isinstance` chains suffice | — |
 | L12 | Static checking at admission | Linear pass per command: ambient authority, unknown record fields, unknown capability methods, visibly wrong return types, bare `except`, `pass` handlers. 0-CFA reachability (R23) only for delegated bodies and library loops, in P3. | Agents run many small commands | Per-command cost stays linear |
 | L13 | Effects as internal handlers (record, replay, mock, approval); hooks become one handler kind | Adopt, no user syntax | Replay and durable loops without new constructs | Effect calls are already off the hot path |
-| L14 | Per-call `effects=` (mandatory for `Exec`/host tools) and `expect=` (optional) | Adopt (R25, R26; D-1 pending) | Safeguards each tool call and gives checked feedback | Checks run on effect calls only; per-call overlay layer cost is unknown (Section 12) |
+| L14 | Syscall contracts: Gateway-owned effect signatures for every syscall; models declare only tier-3 effects of `Exec` (`effects=`); `expect=` optional on any syscall | Adopt (R25a-R25c, R26; D-1) | Safeguards each syscall and gives checked feedback with the fewest declarations | Checks run on syscalls only; tier-1 diff cost per command is one diff (Section 12) |
 | L15 | `ExpectationFailed` and `UndeclaredEffect` are `ToolError` subclasses carrying the full result | Adopt (R12) | Loud by default, recoverable, one handler in loops | None |
 | L16 | Custom `check=fn` must be pure | Adopt | Expectation checks cannot have effects | Pure functions are VM-compilable |
 | L17 | `with budget(...) as b:` with Trio scope semantics; `model.limit` for children; no `reserve` | Adopt (R17, R17a) | Budget exhaustion cannot be swallowed inside, and is handled at one place | Metering is on effect calls only |
-| L18 | Builtin table frozen; local shadowing follows Python | Adopt (R4, R4a) | Confinement without rejecting common code | Builtins resolve at compile time unless lexically shadowed (with L1) |
+| L18 | Builtin table frozen; one Python namespace for callables and variables; local shadowing follows Python; calling a non-callable that shadows a builtin is a prescriptive error | Adopt (R4, R4a; namespace finding in 9.5) | Confinement without rejecting common code; the shadowing error keeps unification loud | Builtins resolve at compile time unless lexically shadowed (with L1) |
 
 Compatibility: L1-L4, L6a, and L18 change existing behavior. Measure their
 impact on examples, help examples, task specs, and the conformance corpus
@@ -946,12 +1032,82 @@ Checked against `crates/waymark-runtime/src` at `c68abb2`.
   (`stone_ast.rs`, "mutable default parameter values are not supported").
 - `def read_text(p)` shadows the builtin, and the definition persists in the
   session.
-- Exceptions bound by `except Exception as e` are JSON strings, so R2 holds
+- Exceptions bound by `except Exception as e` are plain dicts (data), so R2 holds
   trivially today. Typed exceptions (L6) must keep it.
 - No frame or traceback objects are exposed (R3 holds).
 - Attempts are started by id (`attempt_start(attempt=...)`), not as
   function-plus-arguments. `scope.start(f, ...)` and `delegate` are new
   surface, so R8 and R10 change no existing semantics.
+- Callables and variables live in **separate namespaces** today:
+  `round = 2; round(2.4)` returns `2.0`. Python has one namespace.
+
+### 9.5 Compatibility Scan (L1-L4, L6a, L18)
+
+The scan covered 482 parsed units: 65 `.stone` files (about 10.1k lines,
+including the standard controller), 227 `help()` examples, 4 task-spec
+sources, 58 doc blocks, and 128 Stone strings embedded in `host/bench` and
+`host/mcp`. It used static analysis with scope resolution and a call graph,
+after checking today's behavior on the binary. Scripts and results are in the
+session scratchpad (`compat/`).
+
+| Change | Sites that change behavior | Notes |
+|---|---|---|
+| L1 lexical scoping | 0 in executed code (424 functions) | No function reads a caller's local; no closure depends on late binding. State carried between session commands is not visible to a static scan. |
+| L2 reference semantics | 0-2 | All 20 call sites that pass a mutated parameter use `state = f(state, ...)`. About 10 alias-then-mutate lines, for example `final = action.input` in the standard controller; harmless today because that path returns. Host-returned values must be fresh objects under L2. |
+| L3 operand `or`/`and` | 0 | No `x or default` idiom anywhere; all value-position BoolOps have bool operands |
+| L4 scalar `str()`/`round()` | 2 | Two `round(x, 2)` calls that can differ on half-way cases (`round(2.675, 2)` is 2.68 today, 2.67 in Python) |
+| L4 `str()` of records | 11 | See decision D-2 |
+| L6a bare `except`, `pass` handlers | 0 of 15 handlers | But the tooling suggests bare `except:` (below) |
+| L18 builtin shadowing | 0 calls today, 71 latent bindings | See namespace unification below |
+
+Findings that change the plan:
+
+- **The correction engine recommends bare `except:`.**
+  `stone_correction.rs:195-197, 918` suggests it as a repair. So do
+  `stone_ast.rs:1069,1076`, `lib.rs:1512`, `commands.rs:1805`, and
+  `docs/STONE_LANGUAGE.md:343-350`, with a test at `stone_eval.rs:20919`.
+  L6a must change all of these in the same change. The replacement
+  suggestion is `except Exception as e:`.
+- **Namespace unification is the largest silent risk.** Under Python's single
+  namespace, a variable named like a builtin hides the builtin. The corpus
+  binds builtin names 71 times (`state`, `round`, `head`, `tail`, `first`,
+  `items`, `stage`). No scope that binds one also calls that builtin, so the
+  risk is latent in files. It is real in sessions: the MCP tool examples
+  (`host/mcp/stone_mcp_server.py:283,338,386`) bind `state`, `first`, and
+  `run` at top level. Those persist, so a later `run([...])` or `state()` in
+  the same session would break. To stay "absent or loud": calling a
+  non-callable value whose name shadows a builtin is an error that names the
+  binding site and suggests renaming it. The MCP examples are renamed in the
+  same change.
+- **`str()` is internally inconsistent today.** `str(1.0)` is `"1"`, but
+  `str([1.0])` contains `1.0` and renders `None` as `null`. `format()` and
+  `print` share the scalar rules.
+
+**D-2. Does L4 cover `str()` of dicts and records? Open.** Containers render
+as JSON today by design: structured text was judged better for LLMs than plain
+strings. Today's scalars follow neither convention: `str(None)` is `""` and
+`str(True)` is `"true"`.
+
+The proposal separates two uses:
+
+- **What the model reads**: `emit`, returned values, observations, error
+  envelopes, and `print` of a container. These stay JSON. This is where the
+  structured-I/O argument applies, and no program logic depends on the
+  rendering.
+- **What `str()`/`repr()` return inside a program**: these follow Python
+  (`"None"`, `"True"`, `"{'a': None}"`). Their results feed comparisons,
+  concatenation, and parsing in model-written code, where a silent divergence
+  causes bugs (`if str(flag) == "True":`).
+
+The 11 controller sites that build model-facing text with `str(error)` switch
+to `json_dumps(error)`, so the model still reads JSON there.
+
+The alternative is JSON as `str()`'s convention for containers, with scalars
+made consistent (`null`, `true`). It is coherent, but a quiet divergence in
+program logic.
+
+Unmeasured: whether target models read JSON better than Python repr in
+observations. That is a cheap authorship-eval A/B if it matters.
 
 ## 10. Performance Requirements On The Design
 
@@ -986,13 +1142,13 @@ Checked against `crates/waymark-runtime/src` at `c68abb2`.
 | H-5 | `/` beats `//` and `.sub()` for narrowing on the target models | Authorship eval (`host/bench/` harness) |
 | H-6 | Accepting `BaseModel` as an alias raises the first-pass rate without importing other pydantic habits | Authorship eval |
 | H-7 | Target models write level-A bodies under capability signatures with about 1 repair or fewer, including budget scopes and copy-at-boundary | Authorship eval on 6-10 realistic tasks |
-| H-8 | Optional outcome prediction, host-diffed, reduces derailing beyond declared writes alone | Ablation arm 3 versus arm 2 (11.1) |
-| H-9 | Enforced declared writes do not lower task success, or lower it less than they reduce derailing | Ablation arm 2 versus arms 2r and 1 (11.1); decides D-1 by measurement |
-| H-12 | Target models can predict a command's writes well enough to declare them: high recall against observed writes, with misses concentrated in a few incidental paths that one repair fixes | Arm 2r: per-call precision and recall of declared versus observed writes, by command family |
-| H-10 | Target models produce well-formed `writes`/`expect` with near-zero errors when they are structured-output fields | Measured within the ablation |
+| H-8 | Optional outcome prediction, host-diffed, reduces derailing beyond the effect tiers alone | Ablation arm B versus arm A (11.1) |
+| H-9 | Tier-2 protection and tier-3 denial do not lower task success, and tier 2 measurably cuts test tampering | Ablation: attempted writes to protected paths and blocked egress per task, against V14 tampering rates |
+| H-12 | Deferred. Whether models can predict a command's effects. The pilot (11.2) is weak evidence (recall 89-100% on short tasks). Under D-1 this matters only for tier-3 `Exec` declarations. | Revisit if tier-3 `UndeclaredEffect` rates are high |
+| H-10 | Target models produce well-formed `expect` and tier-3 `effects` with near-zero errors as structured-output fields, provided the field sits flat in the schema | Measured within the ablation; the pilot (11.2) found nesting mattered for Qwen |
 | H-11 | Rejecting `pass` handlers and bare `except` costs about one repair and does not push models toward worse patterns (for example `except Exception as e: e`) | Authorship eval; inspect handler bodies after repair |
 
-### 11.1 The Declared-Effects Ablation (Set Up, Not Run)
+### 11.1 The Outcome-Prediction Ablation (Set Up, Not Run)
 
 From review (RQ6). The setup is a prototype deliverable; running it waits for
 your go-ahead and model access.
@@ -1001,42 +1157,176 @@ your go-ahead and model access.
   an optional third if we have access.
 - **Tasks**: the existing standard-agent task suites behind
   `host/bench/eval_standard_agent_*.py`, so results compare with V14.
-- **Arms**, one controller with four action schemas and runtime flags:
-  1. No declarations: `Run` has no `writes` and no `expect`; S2 allow-and-report.
-  2r. Declared writes, report only: `writes` required; undeclared writes kept
-     and reported (R27a, not from review).
-  2. Declared writes, enforced: `writes` required; undeclared writes discarded
-     with `UndeclaredEffect` (D-1).
-  3. Declared writes plus outcome prediction: arm 2, plus `expect` required
-     in the schema, mismatches reported and kept in history.
+- **Arms**, one controller with two action schemas. Both run with D-1's
+  tiers: tier-1 reports, protected `tests/`, and no network.
+  - A. Tiers only: `Run` has no `expect`.
+  - B. Tiers plus outcome prediction: `expect` is required in the schema;
+    mismatches are reported and kept in history.
+  
+  The review's write-declaration arms were run as the pilot (11.2) and are
+  not repeated (R27).
 - **Metrics**: task success; tokens per task; loop repetition (same action
-  signature after a failure); repairs per action (H-10); undeclared-write
-  refusals; false "done" claims rejected by the verifier.
-- **Write-prediction accuracy** (H-12), in arms 2r, 2, and 3: per call,
-  precision and recall of declared versus observed writes (observed before
-  any discard), grouped by command family, plus the most common missed
-  paths. Arm 1 also records observed writes, as the baseline for what
-  commands actually touch.
+  signature after a failure); repairs per action (H-10); attempted writes to
+  protected paths and blocked egress (H-9); false "done" claims rejected by
+  the verifier.
 - **Off-canonical-call rate**: the review's metric, from Toolathlon, needs a
   canonical tool path per task. Our suites do not have one. I propose
   steps-to-recovery after the first failed call as a proxy. This is a
   substitution, not the review's metric.
-- **Prediction from the review**: arm 2 wins on cost-adjusted success, arm 3
-  on raw success for 27B+ models.
-- **Script**: `host/bench/eval_stone_declared_effects_ablation.py`, following
+- **Prediction from the review** (restated for the two arms): B wins on raw
+  success for 27B+ models; A wins on cost-adjusted success for smaller ones.
+- **Script**: `host/bench/eval_stone_outcome_prediction_ablation.py`, following
   the existing `eval_*` pattern, with a `--dry-run` that validates arms and
   schemas without model calls.
+
+### 11.2 Write-Prediction Pilot
+
+`host/bench/pilot_declared_writes.py` runs arms 1, 2r, and 2 at harness
+level, before any language change. It reuses the `run_stone_tbench4.py`
+ReAct loop (JSON actions: `stone_eval`, `escape_linux`, `stone_help`,
+`finish`).
+
+- **Isolation.** Each action runs in bubblewrap. The root is read-only; only
+  `/app`, `/work`, `/tmp`, and a sandbox `$HOME` are writable. The network is
+  off and the environment is cleared. Every write therefore lands where the
+  harness can see it.
+- **Observed writes.** A snapshot diff before and after each action, with
+  file hashes.
+- **Enforcement (arm 2).** Restores a copy of the writable directories taken
+  before the action, and returns `UndeclaredEffect` with the undeclared paths
+  and a fix.
+- **Tasks.** 12 Terminal-Bench data tasks the existing harness can verify
+  locally, plus 2 synthetic coding tasks with incidental writes: a Python fix
+  run under `unittest` (`__pycache__`) and a C build with `make` (`.o`
+  files).
+- **Models.** Local Qwen3.8-27B (Q4_K_XL; the brief named Qwen3.6-27B, but
+  this is what the local server runs), Claude Haiku 5.5, and optionally
+  GPT-6 Luna and Gemini 3.8 Flash.
+- **Metrics.** Per (model, arm): tasks resolved; the fraction of writing
+  actions fully declared; path recall; misses by class (pycache, build
+  artifact, `$HOME` cache, `/tmp`, task path); overly broad declarations
+  (`/app`, `/work`); rollbacks; format errors; tokens.
+
+Limits: outcome prediction is not in the pilot, and the prompt
+re-sends a long Stone guide every turn, so token counts are high in absolute
+terms.
+
+**Pilot v1 (2026-11-06, one repeat, 14 tasks): format confound.** v1 placed
+`writes` beside the nested `input` object.
+
+- **Haiku 5.5 was unaffected.**
+  - It resolved 13, 13, and 14 of 14 tasks in arms 1, 2r, and 2.
+  - It fully declared every writing action (path recall 100%), including
+    `__pycache__` and `/tmp` scratch files.
+  - Enforcement never rolled back an action.
+  - It made three overly broad declarations (`/app`, `/app/src`) before
+    running tests or `make`.
+- **Qwen3.8-27B dropped from 11 resolved tasks to 8 in both declaring arms.**
+  The cause was mostly format, not prediction:
+  - It produced 34 and 53 JSON parse errors (mostly an extra closing brace),
+    against none without `writes`.
+  - In 30 actions it put `writes` inside `input`, which v1 counted as
+    missing.
+  - Its actual write prediction was 87% path recall. Every miss was
+    `__pycache__`, and it never declared broadly.
+
+Lessons:
+
+- For the smaller model, *where* the field sits in the schema matters as
+  much as whether the model can predict its contents (H-10). This supports a
+  flat record field plus constrained decoding over free-form JSON.
+- Broad declarations defeat per-call enforcement. Drift-critical rules such
+  as "never write `tests/`" belong in the capability grant, not the
+  declaration.
+
+v2 moves `writes` into `input`, accepts the first complete JSON object
+(counting such "lenient parses"), and runs three repeats.
+
+**Pilot v2 (2026-11-06, three repeats, 14 tasks, 42 episodes per arm).**
+
+| Model | Resolved: none / report / enforce | Path recall | Missed writes | Broad declarations | Rollbacks | Parse errors |
+|---|---|---|---|---|---|---|
+| Haiku 5.5 | 39 / 40 / 41 | 99.1% | 1 `main.o` per arm | 6 / 8 | 1 | 2 / 1 / 3 |
+| Qwen3.8-27B (T=0.7) | 35 / 34 / 36 | 89% | 14 `__pycache__` per arm; 2 task paths (enforce) | 0 | 8 | 1 / 0 / 1 |
+| GPT-6 Luna | 41 / 42 / 42 | 97.5% / 100% | 3 `__pycache__` (report) | 4 / 5 | 0 | 4 / 1 / 0 |
+| Gemini 3.8 Flash (partial: run stopped at 106 of 126) | 29/42 / 25/36 / 18/28 | about 95% | 3 `__pycache__`, 2 task paths | 4 / 8 | 3 | 59 / 49 / 31 |
+
+GPT-6 Luna and Gemini were added on 2026-11-07.
+
+- **GPT-6 Luna** behaves like Haiku but stronger. It over-declares `/app`
+  on the Python-fix task. One enforce episode was cut short by a host DNS
+  failure after the correct output was already written, so it still counts
+  as resolved.
+- **Gemini 3.8 Flash** solves about two thirds of tasks in every arm, about
+  65–70%. Its per-task results match across arms. Its many JSON parse errors
+  appear in the no-declaration arm too, so they come from its general output
+  format, not from `writes`. Its declarations show both failure directions:
+  broad declarations and a few missed paths.
+
+- **Mandatory declarations cost neither model task success.** The arms are
+  within one task of each other, which is within per-task repeat variance.
+  Almost every Haiku failure is `count-call-stack`, which no arm solves
+  reliably. One Haiku report episode was lost to a harness bug: a
+  whitespace-only reply was echoed into the history and rejected by the API.
+  The bug is now fixed.
+- **With the format confound removed, Qwen recovers fully.** Its v1 drop of
+  3 tasks was the schema, not the prediction.
+- **Enforcement rollbacks were cheap.** Qwen's 8 rollbacks were all fixed by
+  the next action:
+  - 6 were `__pycache__`;
+  - 1 was a source file it edited without declaring it;
+  - 1 was a `count.c` it created.
+  
+  Its mean turns per episode (6.6 enforce against 7.1 none) did not rise.
+  Haiku's one rollback (`make` writing `main.o`) was also fixed on the next
+  action.
+- **The two models fail in opposite directions.**
+  - Haiku *over-declares*: it lists `/app` or `/work` before running tests
+    or a build. Enforcement then cannot catch drift inside those
+    directories.
+  - Qwen *under-declares toolchain side effects*: it never predicts
+    `__pycache__`. Excluding that class, its recall is about 99%.
+
+Lessons (provisional; the tasks are small and easy, and three repeats give
+no statistical power):
+
+- Across all four models, mandatory, enforced write declarations did not
+  measurably hurt completion, provided the field sits flat in the schema.
+  Gemini's run is partial.
+- They also bought almost nothing. Every rollback was a toolchain by-product
+  or an intended edit; none was drift.
+- Capable models over-declared, which defeats per-call enforcement.
+  Drift-critical rules such as "never write `tests/`" belong in the grant.
+- Incidental toolchain writes (`__pycache__`, object files) should never be
+  a prediction burden.
+
+**Outcome:** D-1 was decided as three tiers (3.1). Write declarations were
+dropped, and models declare only tier-3 effects of `Exec`.
+
+Not yet tested:
+
+- outcome prediction (11.1);
+- longer-horizon tasks where drift actually happens;
+- tier-2 and tier-3 enforcement on the Gateway;
+- the Gateway's real checkpoint cost (about 300 ms per 50 MB) in place of the
+  harness's copy-restore.
 
 ## 12. Uncertainties
 
 - No experiment has been run for any proposal here.
-- The Gateway repo (`../waymark-gateway`) was not reviewed. How `Exec.within`,
-  `Dir` grants, `Verifier` attempts on read-only snapshots, and per-call
-  overlay layers map onto the Gateway is unresolved. D-1's mechanism depends
-  on the per-call layer being cheap.
-- Local mode without an overlay cannot discard a call's writes cheaply.
-  Enforcement there needs read-only mounts or is limited to capability
-  methods.
+- The Gateway was reviewed only for D-1 (3.1): protected-path mounts,
+  network control, eBPF egress enforcement, and a syscall effect manifest
+  do not exist yet. How `Exec.within`, `Dir`
+  grants, and `Verifier` attempts on read-only snapshots map onto it is still
+  unresolved.
+- Local mode without an overlay has no rollback, so tier 1 there is
+  report-only. Tiers 2 and 3 need prevention (read-only mounts, network
+  denial), or are limited to capability methods.
+- Effect predictability for models (H-12) is deferred. It affects only
+  tier-3 `Exec` declarations.
+- Effect signatures for third-party MCP tools come from a manifest we
+  maintain. A wrong signature (an irreversible tool marked recoverable) is
+  a hole the runtime cannot detect.
 - `Verified` is only as strong as its verifier. The claim field makes weak
   verifiers visible; it does not make them strong.
 - The utility cost of capability confinement is unmeasured. Elba reports
@@ -1104,7 +1394,10 @@ evals updated.
 - L6 typed exceptions with the three tiers; L6a (bare `except`, `pass`
   handlers, swallow counter); L6b prescriptive `finally` error.
 - `ExpectationFailed` with full result (R12); optional `expect=` (R26).
-- Mandatory declared writes for `Exec` (R25), behind D-1.
+- Tier-1 effect reports on every `Exec` result; tier-2 protected paths in
+  grants (D-1, R25a).
+- Tier-3 `effects=` vocabulary for `Exec`, with the network off unless
+  declared (already S2).
 - L17 budget scopes and `model.limit`.
 - L9 modules with frozen module values.
 - Ablation harness set up (R27).
@@ -1134,14 +1427,15 @@ Exit: measured drop in false "done" claims, test tampering, and stuck loops
 - Session vat with ceiling (R6); helpers not loaded from agent-writable
   directories (R7a).
 - Irreversible effects only through host-granted capabilities, with approval
-  handlers (L13).
+  handlers (L13). Syscall effect manifest for host tools, RPC, and MCP
+  (R25b, R25c); per-call eBPF egress enforcement for `Exec` on Linux.
 - `model.delegate` with explicit grants (level B); 0-CFA admission check for
   delegated bodies (R23).
 - Information-flow control (taint and declassify) reconsidered, with
   measurements.
 
 Exit: adversarial delegation and injection tests, plus Gateway mapping for
-`Exec.within`, grants, and per-call layers.
+`Exec.within`, grants, protected paths, and egress control.
 
 ## 14. What Changes In The Prototype
 
@@ -1151,32 +1445,37 @@ in the last column and for the compatibility measurement.
 
 | # | Item | Change from draft v2 | Existing | Read before implementing | Phase |
 |---|---|---|---|---|---|
-| 1 | Bare `except:` is a parse error | New | **Yes**: accepted today | Joe-E §4.3; PEP 352; Ren et al. 2023 | P1 |
+| 1 | Bare `except:` is a parse error; the correction engine, AST hints, CLI help, and `STONE_LANGUAGE.md` stop suggesting it (9.5) | New | **Yes**: accepted and recommended today | Joe-E §4.3; PEP 352; Ren et al. 2023 | P1 |
 | 2 | `pass`-only handler for `Exception`/`ToolError` is an admission error | New | **Yes**: legal today | Ren et al. 2023; Seeker 2024 | P1 |
 | 3 | Swallowed-`ToolError` counter in trace and `last_result()` | New | Additive field | — | P1 |
 | 4 | `except BaseException`, `except PolicyViolation`, `except BudgetExhausted` rejected | New | No (names do not exist) | Trio cancellation docs | P1 |
 | 5 | `ExpectationFailed` fields `.expected/.observed/.diff/.result` | Was "carries the full observation" | No | — | P1 |
-| 6 | `Run.writes` mandatory; undeclared writes discard the call's layer and raise `UndeclaredEffect`; a report-only flag for arm 2r | Was allow-and-report (S2) | No (new API) | D-1 (provisional); PreAct; Near-Miss | P1 |
-| 7 | `expect=` optional; exit status moved into it; `Tests` row removed | Was part of every action | No | PreAct | P1 |
+| 6 | Three effect tiers per syscall: observed effects on every result as `r.effects` (tier 1); protected paths in the grant, read-only for `Exec` (tier 2); `Exec` declares tier-3 effects (`network`, `irreversible`, `background`), denied otherwise with `UndeclaredEffect` | Was mandatory `Run.writes` with discard (draft v3, D-1 provisional); replaced after the pilot | No (new API) | D-1; pilot 11.2 | P1 (tiers 1-2, tier-3 vocabulary) / P3 (eBPF enforcement) |
+| 7 | `expect=` optional on every syscall; exit status in it; RPC/MCP `result` and `status` checks; `Tests` row removed | Was part of every action, and for `Exec` only | No | PreAct | P1 |
 | 8 | `with budget(...) as b:` with Trio semantics; `grace=`; `model.reserve` removed | Was `limit` + `reserve`, exhaustion propagating | No (new API) | Trio "Cancellation semantics"; bpo-32528 thread | P1 |
 | 9 | `finally` stays absent; error becomes prescriptive | Was unaddressed | Message only | Joe-E §4.3 | P1 |
 | 10 | Mutable default argument error becomes prescriptive | Was unaddressed | Message only | — | P1 |
 | 11 | L9 module values deep-frozen at import | New | No (no modules yet) | Joe-E §4.2 | P1 |
-| 12 | Ablation harness `host/bench/eval_stone_declared_effects_ablation.py`, four arms, write-prediction accuracy, dry-run only | New | No | PreAct; Lee 2026 | P1 |
+| 12 | Ablation harness `host/bench/eval_stone_outcome_prediction_ablation.py`, two arms (tiers, tiers plus `expect`), dry-run only | Was four write-declaration arms | No | PreAct; Lee 2026 | P1 |
 | 13 | `Verified` as a sealed box with value, verifier id, claim, nonce; verifier in its own read-only attempt; no `critic=` | Was an opaque tag minted with an optional critic | No (new type) | Morris 1973 §6-7 | P2 |
 | 14 | Boundary walk component with five call sites | New | No | Taly et al. 2011 §II.B, §V | P2 |
 | 15 | Pass-style `scope.start(f, **args)`: copy data, share handles, closure rule | Was "capability arguments", no copy rule | No (attempts start by id today) | Agoric "Far, Remotable, and Marshaling" | P2 |
 | 16 | Daemon obligation registry and unforgeable handles; host stops daemons on attempt exit | New | **Yes**: `stop_daemon(pid)` behavior in controlled profile | Weimer & Necula §5-7 | P2 |
 | 17 | Helpers in an isolated evaluator state | New | **Yes**: helpers share scope and function table today | `docs/STONE_HELPERS.md`; Taly et al. §VI.A | P2 |
-| 18 | Builtin table frozen; helper and agent function tables separate; local shadowing allowed | New | **Yes**: agent `def` of a builtin name persists in the session | Taly et al. §II.B | P2 |
-| 19 | Exceptions carry data only (walk at `raise`) | New, with L6 | No (exceptions are strings today) | Joe-E §4.3, Fig. 6 | P2 |
+| 18 | Builtin table frozen; helper and agent function tables separate; one Python namespace with local shadowing; calling a non-callable that shadows a builtin is a prescriptive error; rename MCP examples (9.5) | New | **Yes**: separate callable namespace today; agent `def` of a builtin name persists in the session | Taly et al. §II.B | P1 (namespace, with L1) / P2 (freeze, helper tables) |
+| 19 | Exceptions carry data only (walk at `raise`) | New, with L6 | No (exceptions are plain dicts today) | Joe-E §4.3, Fig. 6 | P2 |
 | 20 | Session ceiling; capabilities persisted as host-table references; checks at injection, restore, child start | Was "capabilities not session-persistable" | **Yes**: `StoneSession` persistence | Miller 2006 (vats); Agoric docs | P3 |
 | 21 | Helper directories inside the agent's write grant skipped in controlled profile | New | **Yes**: documented search path (controlled profile only) | `docs/STONE_HELPERS.md` | P3 |
 | 22 | `PolicyViolation`/`ContractViolation` fatal, no agent code afterward | Was "outside `Exception`, catchable explicitly" | No (no violations exist yet) | Joe-E §4.3 | P3 |
 | 23 | 0-CFA admission check for delegated bodies | New | No | Taly et al. §V | P3 |
 | 24 | H-4 test dropped; capabilities allowed in containers | Removed | No | — | — |
+| 25 | L4 extended to `str()` of dicts and records (D-2); 11 call sites switched to `json_dumps` | New | **Yes**: `str(dict)` is JSON today | — | P1 |
+| 26 | Write-prediction pilot harness (11.2) | New | No | — | P1 (done) |
+| 27 | Syscall effect manifest: Gateway-owned effect signatures for host tools, RPC, and MCP tools, seeded from MCP annotations (R25b, R25c) | New | No | MCP spec, tool annotations | P2 (manifest) / P3 (enforcement) |
 
-Items 1, 2, 16, 17, 18, 20, and 21 change existing behavior. For each, the
+Items 1, 2, 16, 17, 18, 20, 21, and 25 change existing behavior. The
+compatibility scan (9.5) found almost no executed code that depends on
+L1-L4 or L6a; the cost is concentrated in items 1, 18, and 25. For each, the
 plan is: read the cited sections, measure the impact on examples, help
 examples, task specs, and the conformance corpus, then ask before changing the
 interpreter.
