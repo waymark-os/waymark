@@ -140,13 +140,15 @@ pub(crate) fn resolve_module(
             Stmt::FunctionDef(function) if function.error_base.is_none() => {
                 names.insert(function.name.clone());
             }
-            // Error classes keep their own (global) names.
+            // Error classes and records keep their own (global) names.
             Stmt::Import {
                 names: imported, ..
             } => names.extend(
                 imported
                     .iter()
-                    .filter(|import| import.kind != ImportKind::ErrorClass)
+                    .filter(|import| {
+                        !matches!(import.kind, ImportKind::ErrorClass | ImportKind::Record)
+                    })
                     .map(|import| import.local.clone()),
             ),
             _ => {}
@@ -175,6 +177,7 @@ fn check_module_statement(statement: &Stmt, module: &str) -> Result<(), ShellErr
             ..
         }
         | Stmt::Import { .. }
+        | Stmt::RecordDef(_)
         | Stmt::Pass
         | Stmt::Expr(Expr::String(_)) => return Ok(()),
         Stmt::FunctionDef(function) if function.stage.is_none() => return Ok(()),
@@ -191,7 +194,7 @@ fn check_module_statement(statement: &Stmt, module: &str) -> Result<(), ShellErr
         Stmt::Module(_) => "a linked module",
     };
     Err(module_error(format!(
-        "module `{module}` has {what} at its top level, but importing a module runs no code: a module only defines functions (`def`), error classes, and constants (`NAME = value`), and imports other modules. Move this into a function"
+        "module `{module}` has {what} at its top level, but importing a module runs no code: a module only defines functions (`def`), records, error classes, and constants (`NAME = value`), and imports other modules. Move this into a function"
     )))
 }
 
@@ -298,7 +301,8 @@ fn collect_bindings(statements: &[Stmt], bound: &mut Names, augmented: &mut Name
             Stmt::Import { names, .. } => {
                 bound.extend(names.iter().map(|import| import.local.clone()));
             }
-            Stmt::Module(_) => {}
+            // Record names are global, like error types.
+            Stmt::Module(_) | Stmt::RecordDef(_) => {}
             Stmt::Raise(_)
             | Stmt::Return(_)
             | Stmt::Break
@@ -315,8 +319,8 @@ fn bind_target(target: &AssignTarget, bound: &mut Names) {
             bound.insert(name.clone());
         }
         AssignTarget::Tuple(names) => bound.extend(names.iter().cloned()),
-        // `x[k] = v` reads x; it does not bind it.
-        AssignTarget::Subscript { .. } => {}
+        // `x[k] = v` and `x.f = v` read x; they do not bind it.
+        AssignTarget::Subscript { .. } | AssignTarget::Attribute { .. } => {}
     }
 }
 
@@ -345,8 +349,9 @@ fn resolve_stmts(
                     stack.qualify(&mut import.local);
                 }
             }
-            // A linked module was resolved on its own.
-            Stmt::Module(_) => {}
+            // A linked module was resolved on its own. A record's field
+            // types and literal defaults name no variables.
+            Stmt::Module(_) | Stmt::RecordDef(_) => {}
             Stmt::For { iter, body, .. } => {
                 resolve_expr(iter, stack, reads)?;
                 resolve_stmts(body, stack, reads)?;
@@ -432,7 +437,9 @@ fn qualify_target(target: &mut AssignTarget, stack: &Ctx) {
                 stack.qualify(name);
             }
         }
-        AssignTarget::Subscript { value, .. } => qualify_target(value, stack),
+        AssignTarget::Subscript { value, .. } | AssignTarget::Attribute { value, .. } => {
+            qualify_target(value, stack)
+        }
     }
 }
 
@@ -448,6 +455,10 @@ fn read_target(
             read_target(value, stack, reads)?;
             resolve_expr(index, stack, reads)
         }
+        AssignTarget::Attribute { value, .. } => {
+            read_target_base(value, reads);
+            read_target(value, stack, reads)
+        }
     }
 }
 
@@ -457,7 +468,9 @@ fn read_target_base(target: &AssignTarget, reads: &mut Names) {
             reads.insert(name.clone());
         }
         AssignTarget::Tuple(_) => {}
-        AssignTarget::Subscript { value, .. } => read_target_base(value, reads),
+        AssignTarget::Subscript { value, .. } | AssignTarget::Attribute { value, .. } => {
+            read_target_base(value, reads)
+        }
     }
 }
 

@@ -621,6 +621,55 @@ number of times. All attempts are charged to `model`. This replaces
 hand-written schema dicts (35+ lines in `typed_react_agent.stone`, about 250
 lines of schema in the standard controller).
 
+As implemented in M5 step 1 (L5, L10, and this section; `stone_records.rs`,
+`stone_model.rs`; user docs in `STONE_LANGUAGE.md`, "Records"):
+
+- A record is a new value kind: fixed slots in field order behind a shared
+  reference, so `b = a` aliases like a dict (L2) and field access is an
+  index, not a hash lookup. Measured in release builds, a field
+  read-modify-write loop runs about 30% faster than the same loop on a dict,
+  and building a record costs the same as building a dict. Other benchmarks
+  did not move.
+- Record and alias names are global, like error classes: one type table per
+  session, records exported by name from modules, never renamed, and never
+  defined by two modules. A bare record name is a value (a type), so
+  `Read | Edit` builds a union at run time and a top-level
+  `Action = Read | Edit` registers an alias.
+- Annotations reuse the existing parameter checks when they can express the
+  type. Only records, `Literal`, and unions that contain them take the new
+  path, so `list[str]` keeps its old (shallow) check and plain functions pay
+  nothing new. Field types resolve on first use, which allows forward and
+  self references (`list["Tree"]`). An unknown type is reported when the
+  function is first called, not at definition.
+- Stone code is checked, never converted: a dict passed where a record is
+  declared is a `TypeError` that names the constructor to use. Model output
+  is converted: JSON objects become records, a union of records is chosen by
+  a `Literal` discriminator field or else by the first member that matches,
+  and every problem is collected with its path (up to 20) for the repair turn.
+- `model.ask` builds the schema from the type (`$defs` for nested records,
+  docstrings as `description`, `additionalProperties: false`), sends it in a
+  system message with portable JSON-object mode, and repairs up to `retries`
+  times (default 2, at most 4). Constrained decoding is not used yet: like
+  `model_infer`, it uses only the portable JSON-object mode, because
+  schema-constrained modes are provider-specific. Every
+  attempt is an ordinary model transition, so traces and hooks see each one;
+  charging attempts to a budget comes with L17. When retries run out the
+  host raises `ModelOutputError` (a host-only `ToolError`).
+- `model` is a value bound at the top of every program and not saved in the
+  session. Module functions cannot read it as a free name, so a library must
+  take `model: Model` as a parameter; this is where budgets (`model.limit`)
+  will attach.
+- L10: `from typing import Any, Dict, List, Literal, Optional, Union`,
+  `from pydantic import BaseModel`, `from dataclasses import dataclass`, and
+  `from __future__ import annotations` are no-ops. Any other name from those
+  modules is an error listing the accepted names. `class X(BaseModel):` and
+  `@dataclass class X:` define records.
+- Known limits: lists and dicts inside a record are not re-checked when
+  changed in place (pydantic behaves the same); builtins and `print` see a
+  plain dict, so `len(record)` is the field count; two modules may define
+  aliases with the same name and the later one wins; error messages inside
+  module functions show qualified names (`shapes.describe()`).
+
 ### 5.7 Delegation And The Pass-Style Boundary
 
 - **Run a written function in isolation:** `scope.start(f, **args)` starts a
@@ -1328,8 +1377,8 @@ constants at run time with the `frozen` flag. As implemented:
 - Modules are re-linked per command; there is no cache yet. Each linked
   module's name, path, and SHA-256 are reported under `diagnostics.modules`.
 - Not supported: `import lib`, relative imports, `import *`, and `@stage`
-  functions in modules. L10 (`from typing import ...` as no-ops) is not done:
-  those imports fail as a missing module, with the replacement hint.
+  functions in modules. L10 (`from typing import ...` as no-ops) was added in
+  M5 step 1 (Section 5.6).
 
 ### 9.6 M0: Executable Probes And Source Reading (2026-11-07)
 
@@ -1727,7 +1776,8 @@ evals updated.
 ### P1. Task Completion
 
 - L1-L4 semantics fixes.
-- L5 records and `model.ask(..., output=T)`.
+- L5 records and `model.ask(..., output=T)`. **Done in M5 step 1** (5.6),
+  with L10.
 - L6 typed exceptions with the three tiers; L6a (bare `except`, `pass`
   handlers, swallow counter); L6b prescriptive `finally` error.
 - `ExpectationFailed` with full result (R12); optional `expect=` (R26).

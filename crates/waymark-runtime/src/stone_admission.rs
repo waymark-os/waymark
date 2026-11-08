@@ -135,9 +135,26 @@ fn validate_statements(statements: &[Stmt], names: &AdmissionNames) -> Result<()
                 validate_expr(value, names)?;
             }
             Stmt::Import { .. } => {}
+            Stmt::RecordDef(record) => validate_record_name(&record.name)?,
             Stmt::Module(module) => validate_statements(&module.body, names)?,
             Stmt::Raise(None) | Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Pass => {}
         }
+    }
+    Ok(())
+}
+
+/// A record cannot take the name of a builtin or an error type: the name
+/// would mean two things.
+fn validate_record_name(name: &str) -> Result<(), ShellError> {
+    if is_builtin_error_type(name) || rejected_error_type_message(name).is_some() {
+        return Err(admission_error(format!(
+            "`class {name}(Record)`: `{name}` is an error type name; choose another record name"
+        )));
+    }
+    if stone_builtin_names().contains(&name) || name == "model" {
+        return Err(admission_error(format!(
+            "`class {name}(Record)`: `{name}` is a builtin name; choose another record name"
+        )));
     }
     Ok(())
 }
@@ -475,6 +492,9 @@ fn collect_statement_bindings(statements: &[Stmt], names: &mut HashSet<String>) 
                 names.extend(imported.iter().map(|import| import.local.clone()));
             }
             Stmt::Module(module) => collect_statement_bindings(&module.body, names),
+            Stmt::RecordDef(record) => {
+                names.insert(record.name.clone());
+            }
             Stmt::Raise(None) | Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Pass => {}
         }
     }
@@ -492,6 +512,7 @@ fn collect_assign_target(target: &AssignTarget, names: &mut HashSet<String>) {
             collect_assign_target(value, names);
             collect_expr_bindings(index, names);
         }
+        AssignTarget::Attribute { value, .. } => collect_assign_target(value, names),
     }
 }
 

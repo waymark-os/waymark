@@ -95,7 +95,8 @@ struct Linker {
     exports: HashMap<String, HashMap<String, ImportKind>>,
     /// Modules being linked, outermost first, to report import cycles.
     loading: Vec<String>,
-    /// Error class name -> the module that defines it.
+    /// Error class and record name -> the module that defines it. These
+    /// names are global.
     error_classes: HashMap<String, String>,
     /// Linked modules in dependency order.
     linked: Vec<Stmt>,
@@ -132,11 +133,18 @@ impl Linker {
                         ),
                     ));
                 };
-                if *kind == ImportKind::ErrorClass && import.local != import.name {
+                if matches!(kind, ImportKind::ErrorClass | ImportKind::Record)
+                    && import.local != import.name
+                {
+                    let what = if *kind == ImportKind::Record {
+                        "record"
+                    } else {
+                        "error class"
+                    };
                     return Err(module_error(
                         "unsupported Stone import",
                         format!(
-                            "error class `{}` cannot be renamed on import (`as {}`): error types are known by their own name. Write `from {module} import {}`",
+                            "{what} `{}` cannot be renamed on import (`as {}`): records and error types are known by their own name. Write `from {module} import {}`",
                             import.name, import.local, import.name
                         ),
                     ));
@@ -228,6 +236,21 @@ impl Linker {
                     }
                     exports.insert(function.name.clone(), ImportKind::ErrorClass);
                 }
+                Stmt::RecordDef(record) => {
+                    if let Some(other) = self
+                        .error_classes
+                        .insert(record.name.clone(), module.to_string())
+                    {
+                        return Err(module_error(
+                            "duplicate Stone record",
+                            format!(
+                                "`{}` is defined by both module `{other}` and module `{module}`; record and error type names are global, so rename one",
+                                record.name
+                            ),
+                        ));
+                    }
+                    exports.insert(record.name.clone(), ImportKind::Record);
+                }
                 Stmt::FunctionDef(function) => {
                     if let Some(name) = function.name.strip_prefix(&prefix) {
                         exports.insert(name.to_string(), ImportKind::Function);
@@ -237,7 +260,9 @@ impl Linker {
                     let names = match target {
                         AssignTarget::Name(name) => vec![name.clone()],
                         AssignTarget::Tuple(names) => names.clone(),
-                        AssignTarget::Subscript { .. } => Vec::new(),
+                        AssignTarget::Subscript { .. } | AssignTarget::Attribute { .. } => {
+                            Vec::new()
+                        }
                     };
                     for name in names {
                         if let Some(short) = name.strip_prefix(&prefix) {
@@ -248,8 +273,8 @@ impl Linker {
                 }
                 Stmt::Import { names, .. } => {
                     for import in names {
-                        if import.kind == ImportKind::ErrorClass {
-                            exports.insert(import.local.clone(), ImportKind::ErrorClass);
+                        if matches!(import.kind, ImportKind::ErrorClass | ImportKind::Record) {
+                            exports.insert(import.local.clone(), import.kind);
                         } else if let Some(short) = import.local.strip_prefix(&prefix) {
                             // Re-exported under the module's qualified name.
                             exports.insert(short.to_string(), import.kind);
@@ -286,10 +311,15 @@ impl Linker {
                 Stmt::FunctionDef(function) if function.error_base.is_some() => {
                     error_classes.insert(function.name.as_str());
                 }
+                Stmt::RecordDef(record) => {
+                    error_classes.insert(record.name.as_str());
+                }
                 Stmt::Import { names, .. } => error_classes.extend(
                     names
                         .iter()
-                        .filter(|import| import.kind == ImportKind::ErrorClass)
+                        .filter(|import| {
+                            matches!(import.kind, ImportKind::ErrorClass | ImportKind::Record)
+                        })
                         .map(|import| import.local.as_str()),
                 ),
                 _ => {}

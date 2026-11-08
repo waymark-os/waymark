@@ -26,6 +26,7 @@ pub(crate) const BUILTIN_ERROR_TYPES: &[(&str, Option<&str>)] = &[
     ("TimeoutError", Some("OSError")),
     ("ExpectationFailed", Some("ToolError")),
     ("UndeclaredEffect", Some("ToolError")),
+    ("ModelOutputError", Some("ToolError")),
     ("ValueError", Some("Exception")),
     ("TypeError", Some("Exception")),
     ("LookupError", Some("Exception")),
@@ -74,7 +75,8 @@ pub(crate) const REJECTED_ERROR_TYPES: &[(&str, &str)] = &[
 /// raise, or subclass them. A parent deciding what to do after a child's
 /// failure can therefore trust that an `ExpectationFailed` really came from a
 /// checked call and not from the child's own code.
-pub(crate) const HOST_ONLY_ERROR_TYPES: &[&str] = &["ExpectationFailed", "UndeclaredEffect"];
+pub(crate) const HOST_ONLY_ERROR_TYPES: &[&str] =
+    &["ExpectationFailed", "UndeclaredEffect", "ModelOutputError"];
 
 pub(crate) fn is_host_only_error_type(name: &str) -> bool {
     HOST_ONLY_ERROR_TYPES.contains(&name)
@@ -83,6 +85,7 @@ pub(crate) fn is_host_only_error_type(name: &str) -> bool {
 pub(crate) fn host_only_error_message(name: &str) -> String {
     let made_by = match name {
         "ExpectationFailed" => "a call whose `expect=` check failed (or must_run/edit)",
+        "ModelOutputError" => "model.ask() when the model's answers never matched `output=`",
         _ => "the host when a call attempts an effect it did not declare",
     };
     format!(
@@ -421,6 +424,7 @@ pub(crate) fn classify_error(kind: &str, code: &str, message: &str) -> &'static 
             | "len"
             | "augmented assignment"
             | "function call"
+            | "record"
     ) || message.starts_with("cannot ")
         || message.contains(" expects ")
         || message.contains(" requires ")

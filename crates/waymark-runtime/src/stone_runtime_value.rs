@@ -2,7 +2,9 @@
 
 use nu_protocol::{ShellError, Span, Value};
 
-use super::stone_containers::{containers_are_persistable, materialize_owned, DictRef, ListRef};
+use super::stone_containers::{
+    containers_are_persistable, materialize, materialize_owned, DictRef, ListRef, RecordRef,
+};
 use super::stone_error;
 use super::stone_functions::{
     CallableValue, TransitionHooksValue, WorkflowEvidenceSourceValue, WorkflowStageValue,
@@ -12,6 +14,8 @@ use super::stone_json_view::{
     materialize_json_array_view, materialize_json_object_view, materialize_json_scalar_view,
     materialize_jsonl_rows, JsonArrayView, JsonObjectView, JsonScalarView, JsonlRows,
 };
+use super::stone_model::ModelValue;
+use super::stone_records::TypeSpec;
 use crate::stone_agent_control::AgentControlValue;
 use crate::stone_attempt_best::AttemptBestValue;
 use crate::stone_attempt_scope::AttemptScopeValue;
@@ -27,6 +31,13 @@ pub(super) enum RuntimeValue {
     List(ListRef),
     /// A shared dict.
     Dict(DictRef),
+    /// A record (`class Plan(Record):`), shared like a dict.
+    Record(RecordRef),
+    /// A type used as a value: a record class, or a union such as
+    /// `Read | Edit`, for `output=`, `isinstance`, and aliases.
+    Type(std::rc::Rc<TypeSpec>),
+    /// The Gateway model (`model.ask(...)`).
+    Model(ModelValue),
     File(FileHandle),
     TextLines(TextLines),
     JsonlRows(JsonlRows),
@@ -53,6 +64,9 @@ pub(super) enum RuntimeValueTag {
     Nu,
     List,
     Dict,
+    Record,
+    Type,
+    Model,
     File,
     TextLines,
     JsonlRows,
@@ -100,6 +114,9 @@ impl RuntimeValueTag {
             RuntimeValueTag::AttemptFailure => 20,
             RuntimeValueTag::List => 21,
             RuntimeValueTag::Dict => 22,
+            RuntimeValueTag::Record => 23,
+            RuntimeValueTag::Type => 24,
+            RuntimeValueTag::Model => 25,
         }
     }
 }
@@ -120,7 +137,11 @@ impl RuntimeValue {
     pub(super) fn is_session_persistable(&self) -> bool {
         match self {
             RuntimeValue::Nu(_) => true,
-            RuntimeValue::List(_) | RuntimeValue::Dict(_) => containers_are_persistable(self),
+            RuntimeValue::List(_) | RuntimeValue::Dict(_) | RuntimeValue::Record(_) => {
+                containers_are_persistable(self)
+            }
+            RuntimeValue::Type(_) => true,
+            RuntimeValue::Model(_) => false,
             RuntimeValue::TextLines(_) => true,
             RuntimeValue::JsonlRows(_) => true,
             RuntimeValue::JsonObjectView(_) => true,
@@ -149,6 +170,9 @@ impl RuntimeValue {
             RuntimeValue::Nu(_) => RuntimeValueTag::Nu,
             RuntimeValue::List(_) => RuntimeValueTag::List,
             RuntimeValue::Dict(_) => RuntimeValueTag::Dict,
+            RuntimeValue::Record(_) => RuntimeValueTag::Record,
+            RuntimeValue::Type(_) => RuntimeValueTag::Type,
+            RuntimeValue::Model(_) => RuntimeValueTag::Model,
             RuntimeValue::File(_) => RuntimeValueTag::File,
             RuntimeValue::TextLines(_) => RuntimeValueTag::TextLines,
             RuntimeValue::JsonlRows(_) => RuntimeValueTag::JsonlRows,
@@ -177,6 +201,15 @@ impl RuntimeValue {
             value @ (RuntimeValue::List(_) | RuntimeValue::Dict(_)) => {
                 materialize_owned(value, context)
             }
+            // A record crosses as a plain dict of its fields (JSON output,
+            // builtins), as pydantic's model_dump() gives.
+            value @ RuntimeValue::Record(_) => materialize(&value, context),
+            // A type crosses as its name, as an error type does.
+            RuntimeValue::Type(spec) => Ok(Value::string(spec.display(), Span::unknown())),
+            RuntimeValue::Model(_) => Err(stone_error(
+                context,
+                "the model is a runtime capability and cannot cross this boundary; pass `model` to functions as a parameter",
+            )),
             RuntimeValue::File(_) => Err(stone_error(
                 context,
                 "file objects are task-owned runtime values and cannot cross this boundary",

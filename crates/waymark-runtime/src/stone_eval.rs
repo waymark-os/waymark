@@ -45,8 +45,8 @@ use crate::linux_tools::{
 use crate::stone_agent_control::{AgentControlKind, AgentControlValue};
 use crate::stone_ast::{
     AssignTarget, AugOp, BoolOp, Call, CompareOp, ComprehensionClause, ExceptHandler, Expr,
-    FormattedStringPart, FunctionDef, FunctionScope, ImportKind, Program, StageDecorator, Stmt,
-    StoneFormatSpec, StoneType,
+    FormattedStringPart, FunctionDef, FunctionScope, ImportKind, LiteralValue, Program, RecordDef,
+    StageDecorator, Stmt, StoneFormatSpec, StoneType, TypeExpr,
 };
 use crate::stone_attempt_best::{
     AttemptBestCandidate, AttemptBestObjective, AttemptBestPlan, AttemptBestValue,
@@ -98,6 +98,8 @@ use crate::stone_vm::{
     StoneLoopIrOptimizationResult,
 };
 use crate::StoneGuest;
+use stone_model::ModelValue;
+use stone_records::{RecordType, TypeSpec, TypeTable};
 
 #[path = "stone_containers.rs"]
 mod stone_containers;
@@ -109,6 +111,10 @@ mod stone_expect;
 mod stone_functions;
 #[path = "stone_json_view.rs"]
 mod stone_json_view;
+#[path = "stone_model.rs"]
+mod stone_model;
+#[path = "stone_records.rs"]
+mod stone_records;
 #[path = "stone_runtime_value.rs"]
 mod stone_runtime_value;
 #[path = "stone_state.rs"]
@@ -181,6 +187,10 @@ pub struct EvalState {
     session_bound_names: Vec<String>,
     /// Modules linked into this program, for diagnostics.
     modules: Vec<JsonValue>,
+    /// Record types and type aliases (design L5).
+    types: TypeTable,
+    #[cfg(test)]
+    test_model: Option<Rc<std::cell::RefCell<stone_model::TestModel>>>,
     profiler: EvalProfiler,
     hot_loop_diagnostics: EvalHotLoopDiagnostics,
     hot_loop_enabled: bool,
@@ -887,11 +897,16 @@ fn eval_program_with_source_options(
             .unwrap_or_else(|_| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         stone_helper_registry(&cwd)
     };
-    let root_scope = options
+    let mut root_scope = options
         .session
         .as_ref()
         .map(|session| session.root_scope())
         .unwrap_or_default();
+    // The Gateway model is a value, so functions can take it as a parameter.
+    root_scope
+        .locals
+        .entry("model".to_string())
+        .or_insert(RuntimeValue::Model(ModelValue));
     let mut evaluator = Evaluator {
         engine_state,
         stack,
@@ -941,6 +956,16 @@ fn eval_program_with_source_options(
             stdout: String::new(),
             session_bound_names: Vec::new(),
             modules: Vec::new(),
+            types: options
+                .session
+                .as_ref()
+                .map(|session| session.types.clone())
+                .unwrap_or_default(),
+            #[cfg(test)]
+            test_model: options
+                .session
+                .as_ref()
+                .and_then(|session| session.test_model.clone()),
             profiler: EvalProfiler::default(),
             hot_loop_diagnostics: EvalHotLoopDiagnostics::default(),
             hot_loop_enabled: options.hot_loop_enabled,
@@ -977,6 +1002,7 @@ fn eval_program_with_source_options(
             session.update_from_root_scope(root_scope);
         }
         session.update_functions(&evaluator.state.functions);
+        session.types = evaluator.state.types.clone();
         session.update_context(&evaluator.state.context);
         session.update_transition_id(evaluator.state.next_transition_id);
         session.update_host_errors(&evaluator.state.host_errors);
@@ -1354,7 +1380,13 @@ impl Evaluator<'_> {
         let started = self.state.profiler.start();
         let result = match statement {
             Stmt::Assign { target, value } => {
-                let value = self.eval_expr_value(value, input)?;
+                let value = match self.static_type_value(value) {
+                    Some(spec) => RuntimeValue::Type(Rc::new(spec?)),
+                    None => self.eval_expr_value(value, input)?,
+                };
+                if let (AssignTarget::Name(name), RuntimeValue::Type(spec)) = (target, &value) {
+                    self.define_type_alias(name, spec)?;
+                }
                 self.assign_value(target, value, record_session_bindings)?;
                 Ok(EvalFlow::Output(PipelineData::empty()))
             }
@@ -1399,7 +1431,7 @@ impl Evaluator<'_> {
                 for import in names {
                     let qualified = format!("{module}.{}", import.name);
                     let value = match import.kind {
-                        ImportKind::ErrorClass => continue,
+                        ImportKind::ErrorClass | ImportKind::Record => continue,
                         ImportKind::Function => {
                             let function = self
                                 .state
@@ -1447,8 +1479,21 @@ impl Evaluator<'_> {
                 }
                 Ok(EvalFlow::Output(PipelineData::empty()))
             }
+            Stmt::RecordDef(record) => {
+                self.define_record(record)?;
+                Ok(EvalFlow::Output(PipelineData::empty()))
+            }
             Stmt::FunctionDef(function) => {
                 if let Some(base) = &function.error_base {
+                    if self.state.types.record(base).is_some() {
+                        return Err(stone_error(
+                            "class",
+                            format!(
+                                "`{}` derives from the record `{base}`, but records do not inherit; repeat the fields in `class {}(Record):`",
+                                function.name, function.name
+                            ),
+                        ));
+                    }
                     if is_builtin_error_type(&function.name) {
                         return Err(stone_error(
                             "class",
@@ -2070,6 +2115,236 @@ impl Evaluator<'_> {
         is_builtin_error_type(name) || self.error_class_base(name).is_some()
     }
 
+    /// `class Plan(Record):` defines (or, re-run, redefines) a record type.
+    fn define_record(&mut self, record: &RecordDef) -> Result<(), ShellError> {
+        let name = &record.name;
+        if self.is_error_type_name(name) {
+            return Err(stone_error(
+                "class",
+                format!("`{name}` is already an error type; choose another record name"),
+            ));
+        }
+        if self.state.functions.contains_key(name) {
+            return Err(stone_error(
+                "class",
+                format!("`{name}` is already a function; choose another record name"),
+            ));
+        }
+        let ty = Rc::new(RecordType::new(
+            name.clone(),
+            record.doc.clone(),
+            record.fields.clone(),
+        ));
+        self.state.types.define(name.clone(), TypeSpec::Record(ty));
+        Ok(())
+    }
+
+    /// A type assigned at the top level of a file (`Action = Read | Edit`)
+    /// is also a name annotations can use. In a module the name is
+    /// qualified (`lib.Action`); annotations use the short name.
+    fn define_type_alias(&mut self, name: &str, spec: &Rc<TypeSpec>) -> Result<(), ShellError> {
+        if self.state.frame_index() > 0 {
+            return Ok(());
+        }
+        let short = name.rsplit('.').next().unwrap_or(name);
+        if let Some(TypeSpec::Record(record)) = self.state.types.get(short) {
+            if record.name == short {
+                return if matches!(&**spec, TypeSpec::Record(same) if Rc::ptr_eq(same, record)) {
+                    Ok(())
+                } else {
+                    Err(stone_error(
+                        "assignment",
+                        format!("`{short}` is a record type; choose another name for this type"),
+                    ))
+                };
+            }
+        }
+        self.state.types.define(short.to_string(), (**spec).clone());
+        Ok(())
+    }
+
+    /// `A | B`, `Optional[A]`, `Literal[...]`, or `list[A]` written as an
+    /// expression, when every name in it is a type. `None` when the
+    /// expression is not of that shape (`a | b` on integers evaluates as
+    /// usual).
+    fn static_type_value(&self, expr: &Expr) -> Option<Result<TypeSpec, ShellError>> {
+        if !matches!(expr, Expr::BitOr { .. } | Expr::Subscript { .. }) {
+            return None;
+        }
+        let ty = self.expr_type_expr(expr)?;
+        Some(
+            self.state
+                .types
+                .resolve(&ty)
+                .map_err(|message| stone_error("type", message)),
+        )
+    }
+
+    fn expr_type_expr(&self, expr: &Expr) -> Option<TypeExpr> {
+        match expr {
+            Expr::None => Some(TypeExpr::None),
+            Expr::Name(name) => {
+                let builtin = match name.as_str() {
+                    "str" => Some(TypeExpr::Str),
+                    "int" => Some(TypeExpr::Int),
+                    "float" => Some(TypeExpr::Float),
+                    "bool" => Some(TypeExpr::Bool),
+                    "Any" => Some(TypeExpr::Any),
+                    "list" | "List" => Some(TypeExpr::List(Box::new(TypeExpr::Any))),
+                    "dict" | "Dict" => Some(TypeExpr::Dict(Box::new(TypeExpr::Any))),
+                    "Model" => Some(TypeExpr::Model),
+                    _ => None,
+                };
+                if self.state.get_local(name).is_some() {
+                    return None;
+                }
+                builtin.or_else(|| {
+                    self.state
+                        .types
+                        .get(name)
+                        .map(|_| TypeExpr::Named(name.clone()))
+                })
+            }
+            Expr::BitOr { left, right } => Some(crate::stone_ast::type_union(vec![
+                self.expr_type_expr(left)?,
+                self.expr_type_expr(right)?,
+            ])),
+            Expr::Subscript { value, index } => {
+                let Expr::Name(base) = value.as_ref() else {
+                    return None;
+                };
+                if !matches!(
+                    base.as_str(),
+                    "list" | "List" | "dict" | "Dict" | "Optional" | "Union" | "Literal"
+                ) || self.state.get_local(base).is_some()
+                {
+                    return None;
+                }
+                let args = match index.as_ref() {
+                    Expr::Tuple(items) => items.iter().collect::<Vec<_>>(),
+                    other => vec![other],
+                };
+                match (base.as_str(), args.as_slice()) {
+                    ("list" | "List", [element]) => {
+                        Some(TypeExpr::List(Box::new(self.expr_type_expr(element)?)))
+                    }
+                    ("dict" | "Dict", [key, value]) => {
+                        (self.expr_type_expr(key)? == TypeExpr::Str).then_some(())?;
+                        Some(TypeExpr::Dict(Box::new(self.expr_type_expr(value)?)))
+                    }
+                    ("Optional", [inner]) => Some(crate::stone_ast::type_union(vec![
+                        self.expr_type_expr(inner)?,
+                        TypeExpr::None,
+                    ])),
+                    ("Union", members) => Some(crate::stone_ast::type_union(
+                        members
+                            .iter()
+                            .map(|member| self.expr_type_expr(member))
+                            .collect::<Option<Vec<_>>>()?,
+                    )),
+                    ("Literal", values) => {
+                        let mut literals = Vec::new();
+                        let mut has_none = false;
+                        for value in values {
+                            match value {
+                                Expr::String(text) => {
+                                    literals.push(LiteralValue::Str(text.clone()))
+                                }
+                                Expr::Bool(flag) => literals.push(LiteralValue::Bool(*flag)),
+                                Expr::Int(text) => {
+                                    literals.push(LiteralValue::Int(text.parse().ok()?))
+                                }
+                                Expr::Neg(inner) => match inner.as_ref() {
+                                    Expr::Int(text) => {
+                                        literals.push(LiteralValue::Int(-text.parse::<i64>().ok()?))
+                                    }
+                                    _ => return None,
+                                },
+                                Expr::None => has_none = true,
+                                _ => return None,
+                            }
+                        }
+                        let mut members = Vec::new();
+                        if !literals.is_empty() {
+                            members.push(TypeExpr::Literal(literals));
+                        }
+                        if has_none {
+                            members.push(TypeExpr::None);
+                        }
+                        (!members.is_empty()).then(|| crate::stone_ast::type_union(members))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// A type given as an argument (`output=Plan`, `isinstance(x, Read | Edit)`):
+    /// written in place, or a variable that holds a type.
+    fn eval_type_argument(&mut self, expr: &Expr, context: &str) -> Result<TypeSpec, ShellError> {
+        if let Some(ty) = self.expr_type_expr(expr) {
+            return self
+                .state
+                .types
+                .resolve(&ty)
+                .map_err(|message| stone_error("type", message));
+        }
+        match self.eval_expr_value(expr, PipelineData::empty())? {
+            RuntimeValue::Type(spec) => Ok((*spec).clone()),
+            other => Err(stone_error(
+                "type",
+                format!(
+                    "{context} takes a type such as `Plan`, `list[str]`, or `Read | Edit`, got {}",
+                    stone_records::runtime_kind(&other)
+                ),
+            )),
+        }
+    }
+
+    /// Check a value against a parameter or return annotation that
+    /// `StoneType` cannot express.
+    fn check_annotation(
+        &self,
+        value: &RuntimeValue,
+        ty: &TypeExpr,
+        context: &str,
+    ) -> Result<(), ShellError> {
+        let spec = self
+            .state
+            .types
+            .resolve(ty)
+            .map_err(|message| stone_error("type check", format!("{context}: {message}")))?;
+        stone_records::check(value, &spec, &self.state.types).map_err(|issue| {
+            let detail = if issue.path.is_empty() {
+                format!("{context} {}", issue.message)
+            } else {
+                format!("{context}: {}", issue.describe("value"))
+            };
+            stone_error("type check", detail)
+        })
+    }
+
+    fn eval_record_constructor(
+        &mut self,
+        record: &Rc<RecordType>,
+        positional: &[Expr],
+        named: &[(String, Expr)],
+    ) -> Result<RuntimeValue, ShellError> {
+        let args = positional
+            .iter()
+            .map(|arg| self.eval_expr_value(arg, PipelineData::empty()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let named = named
+            .iter()
+            .map(|(name, arg)| {
+                self.eval_expr_value(arg, PipelineData::empty())
+                    .map(|value| (name.clone(), value))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        stone_records::construct(record, args, named, &self.state.types)
+    }
+
     fn eval_builtin_error_constructor(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let name = call.name.as_str();
         if is_host_only_error_type(name) {
@@ -2218,6 +2493,11 @@ impl Evaluator<'_> {
                 }
                 assign_item(&container, index, value)
             }
+            AssignTarget::Attribute { value: base, attr } => {
+                let (name, indices) = self.eval_assign_target_path(base, "assignment")?;
+                let container = self.mutable_container(&name, &indices, "assignment")?;
+                stone_records::assign_field(&container, attr, value, &self.state.types)
+            }
         };
         self.state
             .profiler
@@ -2272,9 +2552,19 @@ impl Evaluator<'_> {
                     stone_error("augmented assignment", format!("unknown name `{name}`"))
                 })?;
                 for index in indices {
-                    value = eval_runtime_subscript(value, &index)?;
+                    value = path_step(value, &index)?;
                 }
                 Ok(value)
+            }
+            AssignTarget::Attribute { value: base, attr } => {
+                let (name, indices) = self.eval_assign_target_path(base, "augmented assignment")?;
+                let mut value = self.state.get_local(&name).ok_or_else(|| {
+                    stone_error("augmented assignment", format!("unknown name `{name}`"))
+                })?;
+                for index in indices {
+                    value = path_step(value, &index)?;
+                }
+                self.attribute_of(value, attr)
             }
             AssignTarget::Tuple(_) => Err(stone_error(
                 "augmented assignment",
@@ -2304,6 +2594,11 @@ impl Evaluator<'_> {
                     .eval_expr_value(index, PipelineData::empty())?
                     .into_nu_value(context)?;
                 indices.push(index);
+                Ok((name, indices))
+            }
+            AssignTarget::Attribute { value, attr } => {
+                let (name, mut indices) = self.eval_assign_target_path(value, context)?;
+                indices.push(Value::string(attr.clone(), Span::unknown()));
                 Ok((name, indices))
             }
         }
@@ -2507,10 +2802,11 @@ impl Evaluator<'_> {
             match part {
                 FormattedStringPart::Literal(text) => output.push_str(text),
                 FormattedStringPart::Expr(expr) => {
-                    let value = self
-                        .eval_expr_value(expr, PipelineData::empty())?
-                        .into_nu_value("f-string")?;
-                    output.push_str(&python_str(&value)?);
+                    let value = self.eval_expr_value(expr, PipelineData::empty())?;
+                    match value {
+                        RuntimeValue::Nu(value) => output.push_str(&python_str(&value)?),
+                        other => output.push_str(&stone_records::python_str(&other)?),
+                    }
                 }
                 FormattedStringPart::Formatted { expr, spec } => {
                     let value = self
@@ -2533,6 +2829,7 @@ impl Evaluator<'_> {
                 if is_builtin_call(call)
                     || is_builtin_error_type(&call.name)
                     || self.state.functions.contains_key(&call.name)
+                    || self.state.types.record(&call.name).is_some()
                     || self.state.get_local(&call.name).is_some() =>
             {
                 Ok(self
@@ -2618,6 +2915,9 @@ impl Evaluator<'_> {
                             self.state.next_callable_id(),
                             function,
                         )))
+                    } else if let Some(spec) = self.state.types.get(name) {
+                        // A record class or type alias used as a value.
+                        Ok(RuntimeValue::Type(Rc::new(spec.clone())))
                     } else if name == "true" {
                         // Agent-authored records frequently cross the
                         // Python/JSON boundary. Accept JSON scalar spellings
@@ -2659,6 +2959,9 @@ impl Evaluator<'_> {
                                     let index = self
                                         .eval_expr_value(index, PipelineData::empty())?
                                         .into_nu_value("subscript")?;
+                                    if let RuntimeValue::Record(record) = &value {
+                                        return Err(record_subscript_error(record, &index));
+                                    }
                                     eval_runtime_subscript(value, &index)
                                 }
                             }
@@ -2774,12 +3077,14 @@ impl Evaluator<'_> {
                         .map(RuntimeValue::Nu)
                 }
                 Expr::BitOr { left, right } => {
-                    let left = self
-                        .eval_expr_value(left, PipelineData::empty())?
-                        .into_nu_value("bitwise or")?;
-                    let right = self
-                        .eval_expr_value(right, PipelineData::empty())?
-                        .into_nu_value("bitwise or")?;
+                    let left = self.eval_expr_value(left, PipelineData::empty())?;
+                    let right = self.eval_expr_value(right, PipelineData::empty())?;
+                    // `Read | Edit` on types (held in variables) is a union.
+                    if let Some(union) = type_union_value(&left, &right) {
+                        return Ok(union);
+                    }
+                    let left = left.into_nu_value("bitwise or")?;
+                    let right = right.into_nu_value("bitwise or")?;
                     bitwise_int_values(&left, &right, "bitwise or", |left, right| left | right)
                         .map(RuntimeValue::Nu)
                 }
@@ -2841,6 +3146,9 @@ impl Evaluator<'_> {
                     Some(RuntimeValue::WorkflowStage(_)) | None => {
                         if self.state.functions.contains_key(&call.name) {
                             self.eval_user_function_call(call)
+                        } else if let Some(record) = self.state.types.record(&call.name).cloned()
+                        {
+                            self.eval_record_constructor(&record, &call.positional, &call.named)
                         } else if is_builtin_error_type(&call.name) {
                             self.eval_builtin_error_constructor(call)
                         } else if is_builtin_call(call) {
@@ -2849,6 +3157,19 @@ impl Evaluator<'_> {
                             Err(unknown_stone_call_error(&call.name))
                         }
                     }
+                    Some(RuntimeValue::Type(spec)) => match &*spec {
+                        TypeSpec::Record(record) => {
+                            self.eval_record_constructor(record, &call.positional, &call.named)
+                        }
+                        other => Err(stone_error(
+                            "callable",
+                            format!(
+                                "`{}` is the type `{}`, which cannot be called; only a record type builds values",
+                                call.name,
+                                other.display()
+                            ),
+                        )),
+                    },
                     Some(value) => Err(self.not_callable_error(&call.name, &value)),
                 },
                 Expr::MethodCall {
@@ -2881,6 +3202,18 @@ impl Evaluator<'_> {
                         RuntimeValue::AgentControl(control) if named.is_empty() => {
                             self.invoke_agent_control(&control, args)
                         }
+                        RuntimeValue::Type(spec) => match &*spec {
+                            TypeSpec::Record(record) => {
+                                stone_records::construct(record, args, named, &self.state.types)
+                            }
+                            other => Err(stone_error(
+                                "callable",
+                                format!(
+                                    "the type `{}` cannot be called; only a record type builds values",
+                                    other.display()
+                                ),
+                            )),
+                        },
                         other => Err(stone_error(
                             "callable",
                             format!(
@@ -3050,9 +3383,17 @@ impl Evaluator<'_> {
                         format!("{name}() keyword arguments are not supported"),
                     ));
                 }
-                let value = self
-                    .eval_expr_value(arg, PipelineData::empty())?
-                    .into_nu_value(name)?;
+                let value = self.eval_expr_value(arg, PipelineData::empty())?;
+                if !matches!(value, RuntimeValue::Nu(_)) {
+                    // Records inside are written as Python writes them.
+                    let text = if name == "repr" {
+                        stone_records::python_repr(&value)?
+                    } else {
+                        stone_records::python_str(&value)?
+                    };
+                    return Ok(RuntimeValue::Nu(Value::string(text, Span::unknown())));
+                }
+                let value = value.into_nu_value(name)?;
                 if name == "repr" {
                     repr_builtin(&value).map(RuntimeValue::Nu)
                 } else {
@@ -3367,6 +3708,13 @@ impl Evaluator<'_> {
                 )?,
             };
             ensure_runtime_type(&value, param.ty, &format!("argument `{}`", param.name))?;
+            if let Some(check) = &param.check {
+                self.check_annotation(
+                    &value,
+                    check,
+                    &format!("{}() argument `{}`", function.name, param.name),
+                )?;
+            }
             bindings.push((param.name.clone(), value));
         }
 
@@ -3396,6 +3744,9 @@ impl Evaluator<'_> {
             function.return_type,
             &format!("{}() return value", function.name),
         )?;
+        if let Some(check) = &function.return_check {
+            self.check_annotation(&value, check, &format!("{}() return value", function.name))?;
+        }
         Ok(value)
     }
 
@@ -3475,6 +3826,43 @@ impl Evaluator<'_> {
         attr: &str,
     ) -> Result<RuntimeValue, ShellError> {
         let receiver = self.eval_expr_value(value, PipelineData::empty())?;
+        self.attribute_of(receiver, attr)
+    }
+
+    fn attribute_of(
+        &mut self,
+        receiver: RuntimeValue,
+        attr: &str,
+    ) -> Result<RuntimeValue, ShellError> {
+        match &receiver {
+            RuntimeValue::Record(record) => {
+                return match record.ty.field_index(attr) {
+                    Some(index) => Ok(record.get(index)),
+                    None => Err(stone_error("attribute", record.ty.no_field_message(attr))),
+                };
+            }
+            RuntimeValue::Type(spec) => {
+                return Err(stone_error(
+                    "attribute",
+                    format!(
+                        "the type `{}` has no attribute `{attr}`; read fields from a record value, such as `{}(...).{attr}`",
+                        spec.display(),
+                        spec.display()
+                    ),
+                ));
+            }
+            RuntimeValue::Model(_) => {
+                return Err(stone_error(
+                    "attribute",
+                    if attr == "ask" {
+                        "call the method: `model.ask(prompt, output=Type)`".to_string()
+                    } else {
+                        format!("the model has no attribute `{attr}`; use `model.ask(prompt, output=Type)`")
+                    },
+                ));
+            }
+            _ => {}
+        }
         if let RuntimeValue::JsonObjectView(view) = receiver {
             let Some(value) = json_object_view_get(&view, attr)? else {
                 return Err(stone_error(
@@ -7568,6 +7956,169 @@ impl Evaluator<'_> {
         unreachable!("bounded inference loop always returns")
     }
 
+    /// `model.ask(prompt, output=T, system=..., retries=..., hooks=...)`.
+    /// Without `output=` the answer is the reply text.
+    fn eval_model_ask(
+        &mut self,
+        _model: ModelValue,
+        positional: &[Expr],
+        named: &[(String, Expr)],
+    ) -> Result<RuntimeValue, ShellError> {
+        if self.state.active_transition_hook {
+            return Err(transition_hook_error(
+                "model.ask",
+                "model.ask() cannot be called from a transition hook",
+            ));
+        }
+        let mut output = None;
+        let mut rest = Vec::with_capacity(named.len());
+        for (name, expr) in named {
+            if name == "output" {
+                if output.is_some() {
+                    return Err(model_ask_input_error("output= may be given only once"));
+                }
+                output = Some(self.eval_type_argument(expr, "model.ask() output=")?);
+            } else {
+                rest.push((name.clone(), expr.clone()));
+            }
+        }
+        let call = Call {
+            name: "model.ask".to_string(),
+            positional: positional.to_vec(),
+            named: rest,
+        };
+        let (positional, named, hooks) = self.eval_call_values_with_transition_hooks(&call)?;
+        let [prompt] = positional.as_slice() else {
+            return Err(model_ask_input_error(
+                "model.ask() takes one prompt: a string, or a list of {\"role\": ..., \"content\": ...} messages",
+            ));
+        };
+        let messages = match prompt {
+            Value::String { val, .. } => {
+                let mut message = nu_protocol::Record::new();
+                message.push("role", Value::string("user", Span::unknown()));
+                message.push("content", Value::string(val.clone(), Span::unknown()));
+                Value::list(
+                    vec![Value::record(message, Span::unknown())],
+                    Span::unknown(),
+                )
+            }
+            Value::List { .. } => prompt.clone(),
+            other => {
+                return Err(model_ask_input_error(format!(
+                    "model.ask() prompt must be a string or a list of messages, got {}",
+                    value_type_name(other)
+                )))
+            }
+        };
+        let mut retries = stone_model::DEFAULT_RETRIES;
+        let mut system = None;
+        let mut options = Vec::new();
+        for (name, value) in named {
+            match name.as_str() {
+                "retries" => {
+                    retries = match value {
+                        Value::Int { val, .. } if (0..=stone_model::MAX_RETRIES).contains(&val) => val,
+                        other => {
+                            return Err(model_ask_input_error(format!(
+                                "model.ask() retries must be an integer from 0 to {}, got {}",
+                                stone_model::MAX_RETRIES,
+                                nu_to_json_value(&other)
+                            )))
+                        }
+                    }
+                }
+                "system" => {
+                    system = Some(value_to_string(&value, "model.ask system").map_err(|error| {
+                        model_ask_input_error(error.to_string())
+                    })?)
+                }
+                "response_format" | "schema" => {
+                    return Err(model_ask_input_error(format!(
+                        "model.ask() takes the answer's type as output=, such as `output=Plan`; remove `{name}=`"
+                    )))
+                }
+                _ => options.push((name, value)),
+            }
+        }
+        let mut request = model_request_from_values(&messages, options, "model.ask", false)?;
+        let message_values = request
+            .get_mut("messages")
+            .and_then(JsonValue::as_array_mut)
+            .expect("model request builder always supplies messages");
+        if let Some(system) = system {
+            message_values.insert(0, json!({"role": "system", "content": system}));
+        }
+        let Some(ty) = output else {
+            let response = self.execute_model_request(request, &hooks)?;
+            return model_response_content(&response)
+                .map(|content| RuntimeValue::Nu(Value::string(content, Span::unknown())));
+        };
+
+        let schema = stone_records::output_schema(&ty, &self.state.types)?;
+        let instruction = stone_model::output_instruction(&schema.schema, schema.wrapped);
+        if instruction.len() > stone_model::MAX_SCHEMA_BYTES {
+            return Err(model_ask_input_error(format!(
+                "the JSON Schema for `{}` is larger than {} bytes; split the answer into smaller records",
+                ty.display(),
+                stone_model::MAX_SCHEMA_BYTES
+            )));
+        }
+        let insertion = message_values
+            .iter()
+            .take_while(|message| message.get("role").and_then(JsonValue::as_str) == Some("system"))
+            .count();
+        message_values.insert(insertion, json!({"role": "system", "content": instruction}));
+        request.insert(
+            "response_format".to_string(),
+            json!({"type": "json_object"}),
+        );
+
+        let mut issues = Vec::new();
+        let mut content = String::new();
+        for attempt in 0..=retries {
+            let response = self.execute_model_request(request.clone(), &hooks)?;
+            content = model_response_content(&response)?;
+            issues = match stone_model::parse_answer(&content) {
+                Err(message) => vec![stone_model::parse_issue(message)],
+                Ok(answer) => {
+                    let target = if schema.wrapped {
+                        match answer {
+                            JsonValue::Object(mut object) if object.contains_key("value") => {
+                                object.remove("value").expect("checked")
+                            }
+                            _ => JsonValue::Null,
+                        }
+                    } else {
+                        answer
+                    };
+                    match stone_records::convert_json(&target, &ty, &self.state.types) {
+                        Ok(value) => return Ok(value),
+                        Err(found) => found.iter().map(|issue| issue.to_json()).collect(),
+                    }
+                }
+            };
+            if attempt == retries {
+                break;
+            }
+            let messages = request
+                .get_mut("messages")
+                .and_then(JsonValue::as_array_mut)
+                .expect("model request builder always supplies messages");
+            messages.push(json!({
+                "role": "assistant",
+                "content": bounded_text(&content, stone_model::MAX_REPAIR_CONTENT_CHARS),
+            }));
+            messages.push(json!({"role": "user", "content": stone_model::repair_message(&issues)}));
+        }
+        Err(host_error(model_output_error(
+            &ty,
+            retries + 1,
+            &issues,
+            &content,
+        )))
+    }
+
     fn execute_model_request(
         &mut self,
         mut request: serde_json::Map<String, JsonValue>,
@@ -7615,12 +8166,20 @@ impl Evaluator<'_> {
         }
 
         let effective_input = json_to_nu_value(JsonValue::Object(request.clone()), Span::unknown());
+        #[cfg(test)]
+        let result = match &self.state.test_model {
+            Some(test_model) => Ok(test_model
+                .borrow_mut()
+                .reply(&JsonValue::Object(request.clone()))),
+            None => gateway_runtime::model_call_value(&JsonValue::Object(request), Span::unknown()),
+        };
+        #[cfg(not(test))]
         let result =
-            gateway_runtime::model_call_value(&JsonValue::Object(request), Span::unknown())
-                .and_then(|mut response| {
-                    attach_transition_id(&mut response, &transition_id, "model_call")?;
-                    Ok(response)
-                });
+            gateway_runtime::model_call_value(&JsonValue::Object(request), Span::unknown());
+        let result = result.and_then(|mut response| {
+            attach_transition_id(&mut response, &transition_id, "model_call")?;
+            Ok(response)
+        });
         self.state.record_transition_event(json!({
             "id": transition_id,
             "kind": "model_call",
@@ -11195,10 +11754,21 @@ impl Evaluator<'_> {
                 }
             }
         }
-        match self
-            .eval_expr_value(spec, PipelineData::empty())?
-            .into_nu_value("isinstance")?
-        {
+        // A record type, an alias, or a union written in place.
+        let spec_value = match self.expr_type_expr(spec) {
+            Some(ty) => RuntimeValue::Type(Rc::new(
+                self.state
+                    .types
+                    .resolve(&ty)
+                    .map_err(|message| stone_error("isinstance", message))?,
+            )),
+            None => self.eval_expr_value(spec, PipelineData::empty())?,
+        };
+        if let RuntimeValue::Type(ty) = &spec_value {
+            return stone_records::isinstance(value, ty)
+                .map_err(|message| stone_error("isinstance", message));
+        }
+        match spec_value.into_nu_value("isinstance")? {
             Value::String { val, .. } => self.isinstance_error_type(value, &val),
             Value::List { vals, .. } => {
                 for item in vals {
@@ -11258,10 +11828,11 @@ impl Evaluator<'_> {
             ));
         }
         let value = self.eval_expr_value(arg, PipelineData::empty())?;
-        Ok(RuntimeValue::Nu(Value::string(
-            runtime_type_name(&value),
-            Span::unknown(),
-        )))
+        let name = match &value {
+            RuntimeValue::Record(record) => record.ty.name.clone(),
+            other => runtime_type_name(other).to_string(),
+        };
+        Ok(RuntimeValue::Nu(Value::string(name, Span::unknown())))
     }
 
     fn eval_min_max_call(
@@ -11792,6 +12363,21 @@ impl Evaluator<'_> {
                 )),
                 _ => None,
             };
+            if method == "ask" {
+                let model = match self.eval_expr_value(receiver, PipelineData::empty())? {
+                    RuntimeValue::Model(model) => model,
+                    other => {
+                        return Err(stone_error(
+                            "method call",
+                            format!(
+                                "unsupported method `ask` on {}; `ask` is the model's method: `model.ask(prompt, output=Type)`",
+                                stone_records::runtime_kind(&other)
+                            ),
+                        ))
+                    }
+                };
+                return self.eval_model_ask(model, positional, named);
+            }
             if let Some((name, positional, named)) = resource_call {
                 let call = Call {
                     name: name.to_string(),
@@ -12360,6 +12946,8 @@ impl Evaluator<'_> {
                 ) = (op, &left_value, &right_value)
                 {
                     dict.contains_key(key) == (*op == CompareOp::In)
+                } else if let Some(result) = record_comparison(*op, &left_value, &right_value)? {
+                    result
                 } else {
                     let left = left_value.clone().into_nu_value("comparison")?;
                     let right = right_value.clone().into_nu_value("comparison")?;
@@ -15492,6 +16080,9 @@ fn runtime_type_name(value: &RuntimeValue) -> &'static str {
         RuntimeValue::Nu(value) => value_type_name(value),
         RuntimeValue::List(_) => "list",
         RuntimeValue::Dict(_) => "dict",
+        RuntimeValue::Record(_) => "record",
+        RuntimeValue::Type(_) => "type",
+        RuntimeValue::Model(_) => "Model",
         RuntimeValue::File(_) => "file",
         RuntimeValue::TextLines(_) => "list",
         RuntimeValue::JsonlRows(_) => "list",
@@ -15563,12 +16154,63 @@ fn select_shared_matching(
 
 /// Whether two values are the same shared list or dict; `None` when either
 /// is not a shared container.
+/// `==` on values that may be records: records are equal when they have the
+/// same type and equal fields; a record never equals a dict.
+fn runtime_values_equal(left: &RuntimeValue, right: &RuntimeValue) -> Result<bool, ShellError> {
+    match (left, right) {
+        (RuntimeValue::Record(left), RuntimeValue::Record(right)) => {
+            stone_records::records_equal(left, right, &mut runtime_values_equal)
+        }
+        (RuntimeValue::Record(_), _) | (_, RuntimeValue::Record(_)) => Ok(false),
+        _ => Ok(crate::stone_builtins::values_equal(
+            &materialize(left, "comparison")?,
+            &materialize(right, "comparison")?,
+        )),
+    }
+}
+
+/// Comparisons with a record on either side, or `None` for other values.
+fn record_comparison(
+    op: CompareOp,
+    left: &RuntimeValue,
+    right: &RuntimeValue,
+) -> Result<Option<bool>, ShellError> {
+    let left_record = matches!(left, RuntimeValue::Record(_));
+    let right_record = matches!(right, RuntimeValue::Record(_));
+    if !left_record && !right_record {
+        return Ok(None);
+    }
+    Ok(Some(match op {
+        CompareOp::Eq => runtime_values_equal(left, right)?,
+        CompareOp::NotEq => !runtime_values_equal(left, right)?,
+        CompareOp::Is | CompareOp::IsNot => {
+            unreachable!("identity is answered before record comparison")
+        }
+        CompareOp::In | CompareOp::NotIn if right_record => {
+            return Err(stone_error(
+                "membership",
+                "a record is not a container; read its fields as attributes, such as `value.field`",
+            ));
+        }
+        CompareOp::In | CompareOp::NotIn => return Ok(None),
+        CompareOp::Lt | CompareOp::LtE | CompareOp::Gt | CompareOp::GtE => {
+            return Err(stone_error(
+                "comparison",
+                "records cannot be ordered with <, <=, >, or >=; compare a field instead",
+            ));
+        }
+    }))
+}
+
 fn shared_identity(left: &RuntimeValue, right: &RuntimeValue) -> Option<bool> {
     match (left, right) {
         (RuntimeValue::List(left), RuntimeValue::List(right)) => Some(Rc::ptr_eq(left, right)),
         (RuntimeValue::Dict(left), RuntimeValue::Dict(right)) => Some(Rc::ptr_eq(left, right)),
-        (RuntimeValue::List(_) | RuntimeValue::Dict(_), _)
-        | (_, RuntimeValue::List(_) | RuntimeValue::Dict(_)) => Some(false),
+        (RuntimeValue::Record(left), RuntimeValue::Record(right)) => Some(Rc::ptr_eq(left, right)),
+        (RuntimeValue::List(_) | RuntimeValue::Dict(_) | RuntimeValue::Record(_), _)
+        | (_, RuntimeValue::List(_) | RuntimeValue::Dict(_) | RuntimeValue::Record(_)) => {
+            Some(false)
+        }
         _ => None,
     }
 }
@@ -15580,7 +16222,11 @@ fn runtime_truthy(value: &RuntimeValue, context: &str) -> Result<bool, ShellErro
         RuntimeValue::Nu(value) => Ok(value_truthy(value)),
         RuntimeValue::List(list) => Ok(list.len() > 0),
         RuntimeValue::Dict(dict) => Ok(dict.len() > 0),
-        RuntimeValue::Callable(_) => Ok(true),
+        // Records, types, and the model are objects: always true, as in Python.
+        RuntimeValue::Callable(_)
+        | RuntimeValue::Record(_)
+        | RuntimeValue::Type(_)
+        | RuntimeValue::Model(_) => Ok(true),
         value => Ok(value_truthy(&value.clone().into_nu_value(context)?)),
     }
 }
@@ -15641,6 +16287,54 @@ fn format_fstring_value(value: &Value, spec: &StoneFormatSpec) -> Result<String,
 
 /// True for `x`, `x[i]`, `x.attr` and nestings of these: a receiver rooted at
 /// a variable.
+fn record_subscript_error(record: &stone_containers::RecordRef, index: &Value) -> ShellError {
+    let field = match index {
+        Value::String { val, .. } => val.clone(),
+        _ => record
+            .ty
+            .fields
+            .first()
+            .map(|f| f.name.clone())
+            .unwrap_or_else(|| "field".to_string()),
+    };
+    stone_error(
+        "subscript",
+        format!(
+            "cannot subscript a {name} record; read fields as attributes: `value.{field}` (fields: {})",
+            record.ty.field_names(),
+            name = record.ty.name
+        ),
+    )
+}
+
+/// `A | B` where both sides are types (or one is `None`).
+fn type_union_value(left: &RuntimeValue, right: &RuntimeValue) -> Option<RuntimeValue> {
+    let as_type = |value: &RuntimeValue| match value {
+        RuntimeValue::Type(spec) => Some((**spec).clone()),
+        RuntimeValue::Nu(Value::Nothing { .. }) => Some(TypeSpec::None),
+        _ => None,
+    };
+    if !matches!(left, RuntimeValue::Type(_)) && !matches!(right, RuntimeValue::Type(_)) {
+        return None;
+    }
+    Some(RuntimeValue::Type(Rc::new(TypeSpec::union(
+        as_type(left)?,
+        as_type(right)?,
+    ))))
+}
+
+/// One step along an assignment path: a record field (an attribute in the
+/// source) or an item.
+fn path_step(value: RuntimeValue, index: &Value) -> Result<RuntimeValue, ShellError> {
+    if let (RuntimeValue::Record(record), Value::String { val, .. }) = (&value, index) {
+        return match record.ty.field_index(val) {
+            Some(position) => Ok(record.get(position)),
+            None => Err(stone_error("attribute", record.ty.no_field_message(val))),
+        };
+    }
+    eval_runtime_subscript(value, index)
+}
+
 fn is_variable_path(expression: &Expr) -> bool {
     match expression {
         Expr::Name(_) => true,
@@ -15774,6 +16468,19 @@ fn value_to_iter_values(value: &RuntimeValue) -> Result<Vec<Value>, ShellError> 
             "iteration",
             "cannot iterate a semantic frontier; pass it to attempt_branch(frontier=...)",
         )),
+        RuntimeValue::Record(record) => Err(stone_error(
+            "iteration",
+            format!(
+                "cannot iterate a {} record; read its fields by name ({})",
+                record.ty.name,
+                record.ty.field_names()
+            ),
+        )),
+        RuntimeValue::Type(spec) => Err(stone_error(
+            "iteration",
+            format!("cannot iterate the type `{}`", spec.display()),
+        )),
+        RuntimeValue::Model(_) => Err(stone_error("iteration", "cannot iterate the model")),
     }
 }
 
@@ -16385,6 +17092,43 @@ fn model_response_content(response: &Value) -> Result<String, ShellError> {
     })?;
     value_to_string(content, "model_infer response content")
         .map_err(|error| model_infer_validation_error(error.to_string()))
+}
+
+fn model_ask_input_error(message: impl Into<String>) -> ShellError {
+    stone_error("model.ask", message)
+}
+
+/// The `ModelOutputError` a program can catch when the model's answers never
+/// matched the requested type.
+fn model_output_error(ty: &TypeSpec, attempts: i64, issues: &[JsonValue], answer: &str) -> Value {
+    let first = issues
+        .first()
+        .map(|issue| {
+            format!(
+                "{}: {}",
+                issue.get("path").and_then(JsonValue::as_str).unwrap_or("$"),
+                issue
+                    .get("message")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("")
+            )
+        })
+        .unwrap_or_default();
+    json_to_nu_value(
+        json!({
+            "type": "ModelOutputError",
+            "message": format!(
+                "the model's answer did not match `{}` after {attempts} attempt(s); first problem: {first}",
+                ty.display()
+            ),
+            "call": "model.ask",
+            "expected": ty.display(),
+            "issues": issues,
+            "attempts": attempts,
+            "answer": bounded_text(answer, 2_048),
+        }),
+        Span::unknown(),
+    )
 }
 
 fn model_infer_repair_message(repair_prompt: &str, attempt: i64, issues: &[JsonValue]) -> String {
@@ -18386,6 +19130,305 @@ emit(inc(5))
             assert!(text.contains(expected), "{source}: {text}");
         }
 
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn records_are_typed_shared_and_checked() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("stone-records")?;
+        let write = |name: &str, source: &str| fs::write(root.join(name), source).expect("write");
+        write(
+            "shapes.stone",
+            "from typing import Literal\nclass Read(Record):\n    kind: Literal[\"read\"] = \"read\"\n    path: str\nclass Edit(Record):\n    kind: Literal[\"edit\"] = \"edit\"\n    path: str\n    new: str\nAction = Read | Edit\ndef describe(action: Action) -> str:\n    return action.kind + \":\" + action.path\n",
+        );
+        let mut session = StoneSession::default();
+        let mut run = |source: &str| -> Result<serde_json::Value, ShellError> {
+            let output = crate::stone_frontend::eval_stone_source_with_output_and_session(
+                &engine_state,
+                &mut stack,
+                source,
+                PipelineData::empty(),
+                &mut session,
+            )?;
+            json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())
+        };
+
+        let value = run(concat!(
+            "from typing import Optional\n",
+            "class Step(Record):\n    \"\"\"One step.\"\"\"\n    title: str\n    done: bool = False\n",
+            "class Plan(Record):\n    steps: list[Step]\n    risky: bool\n    note: Optional[str] = None\n    tags: list[str] = []\n    score: float = 0\n",
+            "p = Plan(steps=[Step(\"read\")], risky=False)\n",
+            "q = Plan([], True)\n",
+            "alias = p\n",
+            "alias.steps.append(Step(title=\"edit\", done=True))\n",
+            "p.tags.append(\"x\")\n",
+            "p.note = \"careful\"\n",
+            "p.score += 1.5\n",
+            "def titles(plan: Plan) -> list:\n    return [s.title for s in plan.steps]\n",
+            "emit({\"titles\": titles(p), \"note\": alias.note, \"q_tags\": q.tags, \"score\": p.score,\n",
+            "      \"type\": type(p), \"is_plan\": isinstance(p, Plan), \"is_step\": isinstance(p, Step),\n",
+            "      \"eq\": p == Plan(steps=p.steps, risky=False, note=\"careful\", tags=[\"x\"], score=1.5),\n",
+            "      \"eq_dict\": p == {\"steps\": [], \"risky\": False}, \"same\": alias is p,\n",
+            "      \"plain\": q})\n",
+        ))?;
+        assert_eq!(
+            value,
+            json_value!({
+                "titles": ["read", "edit"], "note": "careful", "q_tags": [], "score": 1.5,
+                "type": "Plan", "is_plan": true, "is_step": false, "eq": true,
+                "eq_dict": false, "same": true,
+                "plain": {"steps": [], "risky": true, "note": null, "tags": [], "score": 0}
+            })
+        );
+        // Record types stay defined in a warm session.
+        assert_eq!(run("emit(Step(\"later\").done)\n")?, json_value!(false));
+
+        // Records from a module; aliases from a module work in annotations.
+        let value = run(concat!(
+            "from shapes import Read, Edit, Action, describe\n",
+            "def first(actions: list[Action]) -> Action | None:\n    return actions[0] if actions else None\n",
+            "a = Edit(path=\"x.py\", new=\"y\")\n",
+            "emit([describe(a), isinstance(a, Action), isinstance(Read(path=\"r\"), Edit), first([]), describe(first([a]))])\n",
+        ))?;
+        assert_eq!(
+            value,
+            json_value!(["edit:x.py", true, false, null, "edit:x.py"])
+        );
+
+        // A self-referencing record.
+        assert_eq!(
+            run("class Tree(Record):\n    name: str\n    children: list[\"Tree\"] = []\nt = Tree(\"root\", [Tree(\"leaf\")])\nemit(t.children[0].name)\n")?,
+            json_value!("leaf")
+        );
+        // typing, pydantic, and dataclass spellings are accepted.
+        assert_eq!(
+            run("from typing import List, Dict, Union, Any\nfrom pydantic import BaseModel\nfrom dataclasses import dataclass\nclass A(BaseModel):\n    xs: List[int]\n    m: Dict[str, Any] = {}\n@dataclass\nclass B:\n    v: Union[int, str]\nemit([A(xs=[1]).xs, B(\"s\").v])\n")?,
+            json_value!([[1], "s"])
+        );
+        // A type error is a catchable TypeError.
+        assert_eq!(
+            run("try:\n    Step(title=3)\nexcept TypeError as e:\n    emit(e.type)\n")?,
+            json_value!("TypeError")
+        );
+
+        for (source, expected) in [
+            (
+                "Plan(steps=[Step(\"a\"), 3], risky=True)\n",
+                "Plan() field steps[1]: expected Step, got int",
+            ),
+            ("Plan(steps=[])\n", "missing required field(s): risky"),
+            (
+                "Plan(steps=[], risky=True, junk=1)\n",
+                "unexpected field `junk`; its fields are: steps, risky, note, tags, score",
+            ),
+            (
+                "p.risky = \"yes\"\n",
+                "cannot set Plan.risky: expected bool, got str",
+            ),
+            ("p.bogus = 1\n", "record `Plan` has no field `bogus`"),
+            ("p[\"steps\"]\n", "read fields as attributes: `value.steps`"),
+            ("for x in p:\n    pass\n", "cannot iterate a Plan record"),
+            (
+                "titles({\"steps\": []})\n",
+                "expected Plan, got dict; build the record with `Plan(field=value, ...)`",
+            ),
+            (
+                "Edit(path=\"a\", new=\"b\", kind=\"read\")\n",
+                "Edit() field kind: expected Literal[",
+            ),
+            (
+                "describe(3)\n",
+                "describe() argument `action` expected Read | Edit, got 3",
+            ),
+            (
+                "class Bad(Record):\n    def go(self):\n        pass\n",
+                "cannot define method `go`",
+            ),
+            ("class Bad(Record):\n    x = 1\n", "field `x` needs a type"),
+            (
+                "class Bad(Record):\n    x: list = [y]\n",
+                "default must be a literal",
+            ),
+            ("class len(Record):\n    x: int\n", "is a builtin name"),
+            (
+                "class Bad(Record):\n    x: tuple[int, int]\n",
+                "use `list[T]`",
+            ),
+            (
+                "from typing import Protocol\n",
+                "From `typing`, Stone accepts",
+            ),
+            (
+                "from shapes import Read as R\n",
+                "cannot be renamed on import",
+            ),
+            (
+                "def f(x: Missing):\n    return x\nf(1)\n",
+                "unknown type `Missing`",
+            ),
+            ("p < p\n", "records cannot be ordered"),
+            ("d = {}\nd.x = 1\n", "use item assignment"),
+        ] {
+            let error = run(source).expect_err(source);
+            let text = format!("{error:?}");
+            assert!(text.contains(expected), "{source}: {text}");
+        }
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn model_ask_returns_checked_values_and_repairs_wrong_answers() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("stone-model-ask")?;
+        let test_model = std::rc::Rc::new(std::cell::RefCell::new(
+            super::stone_model::TestModel::default(),
+        ));
+        let mut session = StoneSession {
+            test_model: Some(test_model.clone()),
+            ..StoneSession::default()
+        };
+        let mut run = |source: &str,
+                       replies: &[&str]|
+         -> (
+            Result<serde_json::Value, ShellError>,
+            Vec<serde_json::Value>,
+        ) {
+            {
+                let mut model = test_model.borrow_mut();
+                model.replies = replies.iter().map(|reply| reply.to_string()).collect();
+                model.requests.clear();
+            }
+            let result = crate::stone_frontend::eval_stone_source_with_output_and_session(
+                &engine_state,
+                &mut stack,
+                source,
+                PipelineData::empty(),
+                &mut session,
+            )
+            .and_then(|output| {
+                json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())
+            });
+            let requests = std::mem::take(&mut test_model.borrow_mut().requests);
+            (result, requests)
+        };
+        let header = "from typing import Literal\nclass Step(Record):\n    title: str\nclass Plan(Record):\n    \"\"\"A work plan.\"\"\"\n    steps: list[Step]\n    risky: bool = False\nclass Read(Record):\n    kind: Literal[\"read\"]\n    path: str\nclass Edit(Record):\n    kind: Literal[\"edit\"]\n    path: str\n    new: str\nAction = Read | Edit\n";
+        run(header, &[]).0?;
+
+        // A good first answer becomes a record; the schema is in a system message.
+        let (value, requests) = run(
+            "plan = model.ask(\"plan it\", output=Plan, system=\"Be brief.\")\nemit([type(plan), plan.steps[0].title, plan.risky])\n",
+            &[r#"{"steps": [{"title": "read"}]}"#],
+        );
+        assert_eq!(value?, json_value!(["Plan", "read", false]));
+        assert_eq!(requests.len(), 1);
+        let messages = requests[0]["messages"].as_array().expect("messages");
+        assert_eq!(
+            messages[0],
+            json_value!({"role": "system", "content": "Be brief."})
+        );
+        let instruction = messages[1]["content"].as_str().expect("instruction");
+        let schema: serde_json::Value =
+            serde_json::from_str(instruction.split("JSON Schema: ").nth(1).expect("schema"))
+                .expect("schema json");
+        assert_eq!(schema["title"], json_value!("Plan"));
+        assert_eq!(schema["description"], json_value!("A work plan."));
+        assert_eq!(schema["required"], json_value!(["steps"]));
+        assert_eq!(
+            schema["properties"]["risky"],
+            json_value!({"type": "boolean", "default": false})
+        );
+        assert_eq!(
+            schema["properties"]["steps"]["items"],
+            json_value!({"$ref": "#/$defs/Step"})
+        );
+        assert_eq!(schema["$defs"]["Step"]["required"], json_value!(["title"]));
+        assert_eq!(
+            messages[2],
+            json_value!({"role": "user", "content": "plan it"})
+        );
+        assert_eq!(
+            requests[0]["response_format"],
+            json_value!({"type": "json_object"})
+        );
+
+        // A wrong answer is sent back with its problems, then repaired.
+        let (value, requests) = run(
+            "plan = model.ask(\"plan it\", output=Plan)\nemit(plan.steps[0].title)\n",
+            &[
+                r#"{"steps": [{"title": 3}], "extra": 1}"#,
+                "```json\n{\"steps\": [{\"title\": \"ok\"}]}\n```",
+            ],
+        );
+        assert_eq!(value?, json_value!("ok"));
+        assert_eq!(requests.len(), 2);
+        let repair = requests[1]["messages"]
+            .as_array()
+            .expect("messages")
+            .last()
+            .expect("repair")["content"]
+            .as_str()
+            .expect("text")
+            .to_string();
+        assert!(
+            repair.contains("- $.steps[0].title: expected string, got 3"),
+            "{repair}"
+        );
+        assert!(repair.contains("unexpected field `extra`"), "{repair}");
+
+        // A union is decided by its Literal field; other types are wrapped.
+        let (value, _) = run(
+            "a = model.ask(\"next\", output=Action)\nxs = model.ask(\"list\", output=list[str])\nyes = model.ask(\"ok?\", output=Literal[\"yes\", \"no\"])\nemit([isinstance(a, Edit), a.new, xs, yes])\n",
+            &[
+                r#"{"kind": "edit", "path": "a.py", "new": "x"}"#,
+                r#"{"value": ["a", "b"]}"#,
+                r#"{"value": "no"}"#,
+            ],
+        );
+        assert_eq!(value?, json_value!([true, "x", ["a", "b"], "no"]));
+
+        // An answer that never matches raises ModelOutputError.
+        let (value, requests) = run(
+            "try:\n    model.ask(\"next\", output=Action, retries=1)\nexcept ModelOutputError as e:\n    emit([e.attempts, e.expected, e.issues[0][\"path\"], isinstance(e, ToolError)])\n",
+            &[r#"{"kind": "edit", "path": "a.py"}"#, "not json"],
+        );
+        assert_eq!(value?, json_value!([2, "Read | Edit", "$", true]));
+        assert_eq!(requests.len(), 2);
+
+        // Without output= the answer is the text.
+        let (value, _) = run("emit(model.ask(\"hi\"))\n", &["hello"]);
+        assert_eq!(value?, json_value!("hello"));
+
+        // The model is a value that functions take as a parameter.
+        let (value, _) = run(
+            "def make_plan(task: str, m: Model) -> Plan:\n    return m.ask(task, output=Plan)\nemit(make_plan(\"t\", model).steps)\n",
+            &[r#"{"steps": []}"#],
+        );
+        assert_eq!(value?, json_value!([]));
+
+        for (source, expected) in [
+            (
+                "model.ask(\"x\", output=3)\n",
+                "takes a type such as `Plan`",
+            ),
+            (
+                "model.ask(\"x\", output=Plan, schema={})\n",
+                "remove `schema=`",
+            ),
+            (
+                "model.ask(\"x\", output=Plan, retries=9)\n",
+                "retries must be an integer from 0 to 4",
+            ),
+            (
+                "raise ModelOutputError(\"fake\")\n",
+                "is raised only by model.ask()",
+            ),
+            ("model.answer\n", "the model has no attribute `answer`"),
+        ] {
+            let (result, _) = run(source, &[]);
+            let text = format!("{:?}", result.expect_err(source));
+            assert!(text.contains(expected), "{source}: {text}");
+        }
         cleanup_dir(&root);
         Ok(())
     }

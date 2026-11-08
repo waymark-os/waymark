@@ -317,6 +317,82 @@ emit(inference.value.ready)"#,
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "model.ask",
+        signature: r#"model.ask(prompt: str | list[record], output: type = None, system: str = "", retries: int = 2, model_class: str = "agent", model: str = "", temperature: float? = None, max_output_tokens: int = 0, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> output type, or str without output="#,
+        use_when: "Gateway mode only. Ask the model for an answer of a declared type: a record class, a union of records, list[T], Literal[...], or any other annotation type. The JSON Schema comes from the type, and the answer comes back as a checked value, so no schema dict or JSON probing is needed.",
+        examples: &[
+            r#"class Plan(Record):
+    steps: list[str]
+    risky: bool = False
+plan = model.ask("Plan how to fix the failing test.", output=Plan)
+emit(plan.steps)"#,
+            r#"class Read(Record):
+    kind: Literal["read"]
+    path: str
+class Finish(Record):
+    kind: Literal["finish"]
+    summary: str
+action = model.ask(history, output=Read | Finish, system="Choose the next action.")
+if isinstance(action, Finish):
+    emit(action.summary)"#,
+            r#"try:
+    answer = model.ask("Is the build green?", output=Literal["yes", "no"], retries=1)
+except ModelOutputError as error:
+    answer = "unknown"
+    emit(error.issues)"#,
+        ],
+        avoid: &[
+            "Do not write a JSON Schema by hand or pass response_format; output= derives both from the type.",
+            "A wrong answer is sent back to the model with each problem's path (such as $.steps[1]), up to retries times (default 2, at most 4); every attempt is a separate traced model call. If no answer matches, ModelOutputError (a ToolError) carries expected, issues, attempts, and the last answer.",
+            "A union of records is decided by a Literal field such as kind: Literal[\"read\"]; give every record in a union one.",
+            "Types that are not records are wrapped for the model as {\"value\": ...}; the result is the inner value.",
+            "Without output= the result is the reply text. Use model_call for the full response record.",
+            "`model` is a value: pass it to functions as a parameter (def solve(task: str, model: Model)); module functions cannot read the program's `model`.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "Record",
+        signature: r#"class Name(Record): field: type, field: type = literal_default"#,
+        use_when: "Define a typed record: fixed fields, each checked when the record is built and when a field is assigned. Use records for structured state, function contracts, and model answers (model.ask(..., output=Name)).",
+        examples: &[
+            r#"class Step(Record):
+    """One step of a plan."""
+    title: str
+    done: bool = False
+class Plan(Record):
+    steps: list[Step]
+    note: str | None = None
+plan = Plan(steps=[Step("read"), Step(title="edit")])
+plan.steps[1].done = True
+plan.note = "careful"
+emit([plan.steps[1].done, isinstance(plan, Plan), str(plan.steps[0])])"#,
+            r#"from typing import Literal
+class Read(Record):
+    kind: Literal["read"] = "read"
+    path: str
+class Edit(Record):
+    kind: Literal["edit"] = "edit"
+    path: str
+    new: str
+Action = Read | Edit
+def target(action: Action) -> str:
+    return action.path
+emit([target(Read(path="a.py")), isinstance(Edit(path="b", new="c"), Action)])"#,
+        ],
+        avoid: &[
+            "Field types: str, int, float, bool, None, Any, list[T], dict[str, T], Literal[...], Optional[T], A | B, Model, and other records (a quoted name such as list[\"Tree\"] refers ahead or to the record itself). A top-level alias such as Action = Read | Edit can be used in annotations.",
+            "Build with keywords or positionally in field order. A missing field, an unknown field, or a value of the wrong type is a TypeError naming the field and path; a dict is not converted into a record.",
+            "Read and assign fields as attributes (plan.note), not plan[\"note\"]; records cannot be iterated. A record is shared like a dict: b = a refers to the same record.",
+            "Defaults are literals (0, \"\", None, [], {}) and are fresh for each record, so a default list is never shared.",
+            "No methods, inheritance, or class keywords: write def functions that take the record. class X(BaseModel): and @dataclass class X: are accepted as records; from typing/pydantic/dataclasses imports of those names are accepted and change nothing.",
+            "Lists and dicts inside a record are checked when assigned, not when later changed in place (as in pydantic).",
+            "Records compare equal with the same type and equal fields. str(record) is Python's form, Plan(steps=[], note=None); print, emit, and builtins see a plain dict of the fields.",
+            "Record names are global, like error types: a module's records keep their names on import and cannot be renamed with as.",
+        ],
+        aliases: &["BaseModel", "dataclass"],
+    },
+    StoneHelpEntry {
         name: "context_write",
         signature: r#"context_write(key: str, kind: str, content: Any, status: str = "active", evidence: list = []) -> record"#,
         use_when: "Experimental Stone context surface. Add or revise stable task state under one key for later reads and bounded prompt projection.",
@@ -1881,7 +1957,8 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "File handles support read(), readlines()/splitlines(), write(text), and close().",
             "Lists support append(value), extend(values), count(value), mutating sort(key=..., reverse=...), and set-style add(value) for unique append; xs += ys extends xs in place.",
             "Use emit(value) when you want structured data returned to the caller.",
-            "Modules: from lib import name, other as alias loads lib.stone (pkg/util.stone for pkg.util) from the cwd, then .stone/lib, ~/.stone/lib, /usr/share/waymark/stone/lib (WAYMARK_STONE_LIB_DIRS overrides). Imports go at the top of a file and are checked before anything runs. A module only defines functions, error classes, and constants; its constants are read-only, and its functions see only its own names, its imports, and builtins.",
+            "Records: class Plan(Record): with typed fields such as steps: list[str] or risky: bool = False defines a checked, shared record; build it with Plan(steps=[...]) and use plan.steps. Annotations also take records, Literal[...], unions such as Read | Edit or str | None, and top-level aliases (Action = Read | Edit). See help(\"Record\") and help(\"model.ask\").",
+            "Modules: from lib import name, other as alias loads lib.stone (pkg/util.stone for pkg.util) from the cwd, then .stone/lib, ~/.stone/lib, /usr/share/waymark/stone/lib (WAYMARK_STONE_LIB_DIRS overrides). Imports go at the top of a file and are checked before anything runs. A module only defines functions, records, error classes, and constants; its constants are read-only, and its functions see only its own names, its imports, and builtins.",
         ],
     },
     StoneHelpTopic {
@@ -1890,7 +1967,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
         bullets: &[
             "No Python standard library: import os/pathlib/glob/json fail; use find/read_json/json_loads/json_dumps. Stone modules use from lib import name (see help(\"syntax\")); import lib, relative imports, and import * are not supported.",
             "Lambda is expression-only; use explicit loops when callback logic needs statements or mutation.",
-            "No general classes or general Python decorators; the only classes are field-only error types (class ConfigError(Exception): path: str), and the only decorator is Stone's @stage(...). Use records for plain data.",
+            "No general classes or general Python decorators: a class is a field-only record (class Plan(Record): steps: list[str]; @dataclass and BaseModel spellings are accepted) or a field-only error type (class ConfigError(Exception): path: str). No methods or inheritance; write def functions that take the record. The only function decorator is Stone's @stage(...). from typing import Literal, Optional, Union, Any, List, Dict is accepted and changes nothing.",
             "No global or nonlocal: a function reads module variables and a closure reads its enclosing function's variables, but neither rebinds them. Keep shared state in a list or dict (count = [0], then count[0] += 1) or return the new value. A local assigned anywhere in a function hides the module variable for the whole function.",
             "Variables, functions, and builtins share one namespace: after len = 5, len(items) is an error. Rename the variable.",
             "No mutable default args: write def f(items=None) and `if items is None: items = []` in the body. No *args, **kwargs, or keyword calls to user functions.",
@@ -1908,7 +1985,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "Every handler names a type: except FileNotFoundError as error:, except (KeyError, IndexError) as error:, except Exception as error:. Handlers are tried in order; an unmatched error keeps propagating.",
             "A caught error is a record with type, kind, code, and message (plus path/operation for I/O errors and your own fields for model-defined errors).",
             "Exception > ToolError > OSError > FileNotFoundError, FileExistsError, PermissionError, IsADirectoryError, NotADirectoryError, TimeoutError. ToolError covers failures from outside the program: commands (must_run), Gateway and model calls, and files.",
-            "ToolError > ExpectationFailed (an expect= check, must_run, or edit did not match; fields expected, observed, diff, result) and UndeclaredEffect (a call tried an effect it did not declare). Only the host raises these: programs can catch, test, and re-raise them unchanged, but not construct, raise, or subclass them.",
+            "ToolError > ExpectationFailed (an expect= check, must_run, or edit did not match; fields expected, observed, diff, result), UndeclaredEffect (a call tried an effect it did not declare), and ModelOutputError (model.ask answers never matched output=; fields expected, issues, attempts, answer). Only the host raises these: programs can catch, test, and re-raise them unchanged, but not construct, raise, or subclass them.",
             "Error types are values: retry_on = [TimeoutError, ExpectationFailed] then isinstance(error, retry_on); error.type == \"FileNotFoundError\" for an exact match. A caught error's type field is the type's name.",
             "Each tool's help lists what it raises. run() does not raise for a failed or missing command (it returns ok=False), so except FileNotFoundError around run() does not catch a missing command. A handler that nothing in its try block can raise is reported in diagnostics.warnings.",
             "Exception > ValueError, TypeError, NameError, AttributeError, AssertionError; LookupError > KeyError, IndexError; ArithmeticError > ZeroDivisionError; RuntimeError > NotImplementedError.",

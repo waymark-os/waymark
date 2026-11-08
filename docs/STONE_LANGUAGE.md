@@ -396,6 +396,73 @@ emit(rows)  # both rows now have "seen": True
   read-only, all the way down. Changing one is an error; build a modified copy
   with a dict comprehension instead.
 
+### Records
+
+A record is a value with fixed, typed fields. Records are how a program
+states the shape of its data: a function's parameters, the state a loop
+carries, and what the model must answer (`model.ask(..., output=Plan)`).
+
+```python
+from typing import Literal, Optional
+
+class Step(Record):
+    """One step of a plan."""
+    title: str
+    done: bool = False
+
+class Plan(Record):
+    steps: list[Step]
+    risky: bool = False
+    note: Optional[str] = None
+
+plan = Plan(steps=[Step("read the failing test"), Step(title="fix it")])
+plan.steps[0].done = True
+emit(str(plan.steps[0]))  # Step(title='read the failing test', done=True)
+```
+
+- `class Name(Record):` defines a record. The Python spellings
+  `class Name(BaseModel):` and `@dataclass class Name:` define the same thing.
+  `from typing import Any, Dict, List, Literal, Optional, Union`,
+  `from pydantic import BaseModel`, `from dataclasses import dataclass`, and
+  `from __future__ import annotations` are accepted and do nothing; any other
+  name from those modules is an error that lists the accepted ones.
+- The class body holds a docstring and typed fields with optional defaults.
+  A default is a literal (`0`, `""`, `None`, `[]`, `{}`, ...) and is created
+  fresh for each record, so a default list is never shared. Methods,
+  inheritance, and class keywords are rejected; write functions that take the
+  record.
+- Field types: `str`, `int`, `float`, `bool`, `None`, `Any`, `list[T]`,
+  `dict[str, T]`, `Literal["a", "b"]`, `Optional[T]`, unions (`A | B`,
+  `Union[A, B]`), `Model`, and other records. A quoted name such as
+  `list["Tree"]` refers to a record defined later, or to the record itself.
+  The same types work in function annotations (`def run(p: Plan) -> Step:`)
+  and are checked when the function is called and returns.
+- A top-level `Action = Read | Edit` names a type. It can be used in
+  annotations, in `isinstance(x, Action)`, and as `output=`.
+- Build a record with keywords, or positionally in field order. A missing
+  field, an unknown field, a repeated field, or a value of the wrong type is
+  a `TypeError` that names the field and its path, such as
+  ``Plan() field steps[0]: expected Step, got dict; build the record with `Step(field=value, ...)` ``.
+  Nothing is converted: a dict is never turned
+  into a record, though an `int` is accepted where a `float` is declared.
+- Fields are read and assigned as attributes. Assignment is checked:
+  `plan.risky = "no"` is `cannot set Plan.risky: expected bool, got str`.
+  `plan["note"]` is an error that names the attribute to use, and a record
+  cannot be iterated.
+- A record is shared like a list or dict: `same = plan` refers to the same
+  record, and a change through either name is seen by both.
+- Lists and dicts held by a record are checked when assigned, not when later
+  changed in place: `plan.steps.append(3)` is not caught, as in pydantic.
+- `==` is true for two records of the same type with equal fields; a record
+  never equals a dict. `type(plan)` is `"Plan"`. A record is always true.
+- `str()`, `repr()`, and f-strings give Python's dataclass form,
+  `Plan(steps=[...], risky=False, note=None)`. `print`, `emit`, JSON, and
+  builtins such as `len` see a plain dict of the fields.
+- Record names are global, like error classes. A module may define records;
+  they are imported under their own name, cannot be renamed with `as`, and
+  two modules may not define the same record. Record classes persist in the
+  session like functions.
+
 ### Modules
 
 `from lib import name` imports from the Stone file `lib.stone`. Dotted names
@@ -427,8 +494,8 @@ emit(join([" a ", "b "]))  # "a, b"
 - Imports are linked before the program runs. A missing module, a name the
   module does not define, an import cycle, or a module problem is reported
   before any statement executes. Imports go at the top level of a file.
-- A module's top level only defines things: functions, error classes, and
-  constants (`NAME = value`), plus imports and a docstring. It cannot call
+- A module's top level only defines things: functions, records, error
+  classes, and constants (`NAME = value`), plus imports and a docstring. It cannot call
   functions, loop, or branch at its top level, because importing a module
   runs no code.
 - A module's functions see only the module's own names, its imports,
@@ -439,9 +506,11 @@ emit(join([" a ", "b "]))  # "a, b"
 - Module constants are read-only all the way down. `DEFAULTS["tags"].append(x)`
   on an imported `DEFAULTS` is an error; copy it first.
 - Imported functions and constants are ordinary names in the importer
-  and can be renamed with `as`. Error classes are global and known by name,
-  so they are imported under their own name, and two modules may not define
-  the same error class.
+  and can be renamed with `as`. Records and error classes are global and known
+  by name, so they are imported under their own name, and two modules may not
+  define the same one.
+- A module's functions cannot read the program's `model`; pass it as a
+  parameter (`def solve(task: str, model: Model)`).
 - Not supported: `import lib` (write `from lib import name`), relative imports
   (`from . import x`), and `from lib import *`. Python's standard library is
   not available; the error names the Stone replacement.
@@ -501,6 +570,7 @@ Builtin error types, with their parents:
 | `FileNotFoundError`, `FileExistsError`, `PermissionError`, `IsADirectoryError`, `NotADirectoryError`, `TimeoutError` | `OSError` | the matching I/O failure; `TimeoutError` also for Gateway and model timeouts |
 | `ExpectationFailed` | `ToolError` | an `expect=` check that was not met, `must_run`, or an `edit` whose old text did not match as required (host only) |
 | `UndeclaredEffect` | `ToolError` | a call that attempted an effect it did not declare (host only; nothing raises it yet) |
+| `ModelOutputError` | `ToolError` | `model.ask(..., output=T)` got no answer of type `T` within its retries (host only) |
 | `ValueError` | `Exception` | bad values, such as `int("x")` |
 | `TypeError` | `Exception` | wrong operand or argument types, such as `1 + "a"` |
 | `LookupError` | `Exception` | |
@@ -518,7 +588,7 @@ failures. Each builtin type is also a constructor that takes one optional
 string message: `raise ValueError("bad row")` and `raise ValueError` both
 work.
 
-`ExpectationFailed` and `UndeclaredEffect` are host-only. A program can catch
+`ExpectationFailed`, `UndeclaredEffect`, and `ModelOutputError` are host-only. A program can catch
 them, test them with `isinstance`, and re-raise one it caught (`raise` or
 `raise error`, unchanged), but it cannot construct, raise, or subclass them,
 and a modified copy cannot be raised. A caught host-only error is read-only:
@@ -807,6 +877,41 @@ says so with `result.effects.enforced == False`.
   [`model_infer_repair.stone`](../examples/scripts/model_infer_repair.stone),
   and the reusable
   [`typed_react_agent.stone`](../examples/scripts/typed_react_agent.stone).
+- `model.ask(prompt, output=T, system="", retries=2, hooks={}, ...)`: ask the
+  Gateway model for an answer of type `T`, where `T` is a record, a union of
+  records, or any annotation type (`list[str]`, `Literal["yes", "no"]`, ...).
+  `prompt` is a string or a message list; `system` adds a system message, and
+  the other `model_call` options (`model_class`, `model`, `temperature`,
+  `max_output_tokens`, ...) pass through. Stone derives the JSON Schema from
+  `T` (nested records under `$defs`, docstrings as descriptions, no extra
+  fields) and adds it to the request as a system message. The answer is
+  parsed (a Markdown code fence is tolerated) and converted: objects become
+  records, a union of records is chosen by its `Literal` field (such as
+  `kind: Literal["read"]`) or else by the first member that matches. A type
+  whose values are not all objects is wrapped as `{"value": ...}` for the
+  model, and the inner value is returned. A wrong answer is sent back with
+  each problem and its path (`$.steps[1]: expected string, got 3`), up to
+  `retries` times (at most 4); every attempt is an ordinary traced model call
+  that hooks see. When no answer matches, `ModelOutputError` carries
+  `expected` (the schema), `issues`, `attempts`, and the last `answer`.
+  Without `output=`, `model.ask` returns the reply text. `model` is a value
+  bound in every program; functions take it as a `model: Model` parameter.
+  See `help("model.ask")`.
+
+  ```python
+  class Read(Record):
+      kind: Literal["read"]
+      path: str
+
+  class Finish(Record):
+      kind: Literal["finish"]
+      summary: str
+
+  action = model.ask(history, output=Read | Finish,
+                     system="Choose the next action.")
+  if isinstance(action, Read):
+      history.append({"role": "user", "content": read_text(action.path)})
+  ```
 - `workflow_patch(plan, target, replacement)` or
   `workflow_patch(plan, patch_record, allowed_replacement, ...)`: construct a
   new workflow with exactly one named stage replaced by a `workflow_stage`,

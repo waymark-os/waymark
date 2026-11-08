@@ -326,6 +326,10 @@ pub(crate) struct StoneSession {
     /// Re-raising one, or `isinstance(x, ExpectationFailed)`, checks the value
     /// against this list, so a program cannot forge one from a plain dict.
     pub(super) host_errors: Vec<nu_protocol::Value>,
+    /// Record types and type aliases defined so far.
+    pub(super) types: super::stone_records::TypeTable,
+    #[cfg(test)]
+    pub(crate) test_model: Option<std::rc::Rc<std::cell::RefCell<super::stone_model::TestModel>>>,
 }
 
 impl StoneSession {
@@ -334,6 +338,7 @@ impl StoneSession {
             .locals
             .keys()
             .chain(self.functions.keys())
+            .chain(self.types.names())
             .cloned()
             .collect::<Vec<_>>();
         names.sort();

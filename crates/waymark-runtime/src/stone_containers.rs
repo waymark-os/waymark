@@ -37,6 +37,7 @@ use indexmap::IndexMap;
 use nu_protocol::{Record, ShellError, Span, Value};
 
 use super::stone_error;
+use super::stone_records::RecordType;
 use super::stone_runtime_value::RuntimeValue;
 use crate::stone_builtins::normalize_index;
 
@@ -124,8 +125,46 @@ pub(super) struct DictObj {
     frozen: Cell<bool>,
 }
 
+/// A record (design L5): a fixed set of typed fields in declaration order,
+/// so a field is a slot offset rather than a hash lookup. Shared like a dict.
+pub(super) struct RecordObj {
+    pub(super) ty: Rc<RecordType>,
+    slots: RefCell<Vec<Item>>,
+    #[allow(dead_code)]
+    label: Cell<Label>,
+    frozen: Cell<bool>,
+}
+
 pub(super) type ListRef = Rc<ListObj>;
 pub(super) type DictRef = Rc<DictObj>;
+pub(super) type RecordRef = Rc<RecordObj>;
+
+/// A new record. `values` are already checked, one per field in order.
+pub(super) fn record_obj(ty: Rc<RecordType>, values: Vec<RuntimeValue>) -> RuntimeValue {
+    debug_assert_eq!(values.len(), ty.fields.len());
+    RuntimeValue::Record(Rc::new(RecordObj {
+        ty,
+        slots: RefCell::new(values.into_iter().map(Item::from_runtime).collect()),
+        label: Cell::new(Label::default()),
+        frozen: Cell::new(false),
+    }))
+}
+
+/// An element seen without copying it: plain values by reference, shared
+/// objects and runtime values as a (cheap) handle. For type checks.
+pub(super) enum ItemRef<'a> {
+    Plain(&'a Value),
+    Shared(RuntimeValue),
+}
+
+impl Item {
+    fn view(&self) -> ItemRef<'_> {
+        match self {
+            Item::Plain(value) => ItemRef::Plain(value),
+            other => ItemRef::Shared(other.to_runtime()),
+        }
+    }
+}
 
 fn list_obj(items: Vec<Item>) -> RuntimeValue {
     RuntimeValue::List(Rc::new(ListObj {
@@ -242,6 +281,12 @@ fn freeze_in_place(value: &RuntimeValue, depth: usize) {
                 freeze_in_place(&item, depth + 1);
             }
         }
+        RuntimeValue::Record(record) if !record.frozen.get() => {
+            record.frozen.set(true);
+            for item in record.shared_fields() {
+                freeze_in_place(&item, depth + 1);
+            }
+        }
         _ => {}
     }
 }
@@ -250,6 +295,7 @@ pub(super) fn is_frozen(value: &RuntimeValue) -> bool {
     match value {
         RuntimeValue::List(list) => list.frozen.get(),
         RuntimeValue::Dict(dict) => dict.frozen.get(),
+        RuntimeValue::Record(record) => record.frozen.get(),
         _ => false,
     }
 }
@@ -259,6 +305,7 @@ pub(super) fn ensure_mutable(container: &RuntimeValue, context: &str) -> Result<
     let (kind, copy) = match container {
         RuntimeValue::List(_) => ("list", "copy = list(items)"),
         RuntimeValue::Dict(_) => ("dict", "copy = {k: v for k, v in record.items()}"),
+        RuntimeValue::Record(_) => ("record", "copy = Name(field=value.field, ...)"),
         _ => return Ok(()),
     };
     if is_frozen(container) {
@@ -281,6 +328,7 @@ fn materialize_at(value: &RuntimeValue, context: &str, depth: usize) -> Result<V
     match value {
         RuntimeValue::List(list) => list.materialize(context, depth),
         RuntimeValue::Dict(dict) => dict.materialize(context, depth),
+        RuntimeValue::Record(record) => record.materialize(context, depth),
         other => other.clone().into_nu_value(context),
     }
 }
@@ -446,11 +494,78 @@ impl DictObj {
     }
 }
 
+impl ListObj {
+    /// Visit every element without copying plain values (type checks).
+    pub(super) fn try_for_each<E>(
+        &self,
+        mut visit: impl FnMut(usize, ItemRef<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let items = self.items.borrow();
+        for (index, item) in items.iter().enumerate() {
+            visit(index, item.view())?;
+        }
+        Ok(())
+    }
+}
+
+impl DictObj {
+    /// Visit every entry without copying plain values (type checks).
+    pub(super) fn try_for_each<E>(
+        &self,
+        mut visit: impl FnMut(&str, ItemRef<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let entries = self.entries.borrow();
+        for (key, item) in entries.iter() {
+            visit(key, item.view())?;
+        }
+        Ok(())
+    }
+}
+
+impl RecordObj {
+    /// The field in slot `index`, shared with the record.
+    pub(super) fn get(&self, index: usize) -> RuntimeValue {
+        self.slots.borrow_mut()[index].share()
+    }
+
+    /// Store an already checked value in slot `index`.
+    pub(super) fn set(&self, index: usize, value: RuntimeValue) {
+        self.slots.borrow_mut()[index] = Item::from_runtime(value);
+    }
+
+    /// Every field in declaration order, shared with the record.
+    pub(super) fn shared_fields(&self) -> Vec<RuntimeValue> {
+        let mut slots = self.slots.borrow_mut();
+        slots.iter_mut().map(Item::share).collect()
+    }
+
+    pub(super) fn is_persistable(&self) -> bool {
+        self.slots
+            .try_borrow()
+            .map(|slots| slots.iter().all(Item::is_persistable))
+            .unwrap_or(false)
+    }
+
+    /// A plain dict of the fields, for builtins and output.
+    fn materialize(&self, context: &str, depth: usize) -> Result<Value, ShellError> {
+        if depth > MAX_MATERIALIZE_DEPTH {
+            return Err(depth_error(context));
+        }
+        let slots = self.slots.borrow();
+        let mut record = Record::with_capacity(slots.len());
+        for (field, item) in self.ty.fields.iter().zip(slots.iter()) {
+            record.push(field.name.clone(), item.materialize(context, depth)?);
+        }
+        Ok(Value::record(record, Span::unknown()))
+    }
+}
+
 /// Python type name of a value as Stone's errors spell it.
 fn kind(value: &RuntimeValue) -> String {
     match value {
         RuntimeValue::List(_) => "list".to_string(),
         RuntimeValue::Dict(_) => "record".to_string(),
+        RuntimeValue::Record(record) => record.ty.name.clone(),
         RuntimeValue::Nu(value) => value.get_type().to_string(),
         _ => "value".to_string(),
     }
@@ -480,6 +595,13 @@ pub(super) fn child_for_mutation(
                 .map(Item::share)
                 .ok_or_else(|| stone_error(context, format!("record has no key `{key}`")))
         }
+        (
+            RuntimeValue::Record(record),
+            Value::String { val: key, .. } | Value::Glob { val: key, .. },
+        ) => match record.ty.field_index(key) {
+            Some(index) => Ok(record.get(index)),
+            None => Err(stone_error("attribute", record.ty.no_field_message(key))),
+        },
         (parent, index) => Err(stone_error(
             context,
             format!(
@@ -542,6 +664,7 @@ pub(super) fn containers_are_persistable(value: &RuntimeValue) -> bool {
             .try_borrow()
             .map(|entries| entries.values().all(Item::is_persistable))
             .unwrap_or(false),
+        RuntimeValue::Record(record) => record.is_persistable(),
         _ => true,
     }
 }

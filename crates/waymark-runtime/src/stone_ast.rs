@@ -63,6 +63,54 @@ pub enum Stmt {
     /// it. Running it defines the module's functions and error classes and
     /// freezes its constants. It never records session bindings.
     Module(Box<ModuleInit>),
+    /// `class Plan(Record):` with typed fields. Running it defines the record
+    /// type; its name is global, like an error type's.
+    RecordDef(Box<RecordDef>),
+}
+
+/// A record class: typed fields only (design L5).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordDef {
+    pub name: String,
+    pub doc: Option<String>,
+    pub fields: Vec<RecordFieldDef>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordFieldDef {
+    pub name: String,
+    pub ty: TypeExpr,
+    /// A literal default, evaluated afresh for each new record.
+    pub default: Option<Expr>,
+}
+
+/// A type written in an annotation: a record field, or a function parameter
+/// or return type that the simple `StoneType` cannot express.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeExpr {
+    Any,
+    Str,
+    Int,
+    Float,
+    Bool,
+    None,
+    /// `list[T]`; a bare `list` is `list[Any]`.
+    List(Box<TypeExpr>),
+    /// `dict[str, T]`; a bare `dict` is `dict[str, Any]`.
+    Dict(Box<TypeExpr>),
+    Literal(Vec<LiteralValue>),
+    Union(Vec<TypeExpr>),
+    /// A record type or a type alias, looked up by name when used.
+    Named(String),
+    /// The model capability (`def solve(task: str, model: Model)`).
+    Model,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LiteralValue {
+    Str(String),
+    Int(i64),
+    Bool(bool),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,6 +133,8 @@ pub enum ImportKind {
     /// An error class. Error types are global and known by name, so nothing
     /// is bound.
     ErrorClass,
+    /// A record class. Record types are global by name too.
+    Record,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -105,6 +155,9 @@ pub struct FunctionDef {
     pub is_async: bool,
     pub params: Vec<FunctionParam>,
     pub return_type: StoneType,
+    /// A return annotation `StoneType` cannot express (a record, a union,
+    /// a `Literal`); checked when the function returns.
+    pub return_check: Option<TypeExpr>,
     pub body: Vec<Stmt>,
     pub stage: Option<Box<StageDecorator>>,
     /// Set when this function is the constructor of a model-defined error
@@ -150,6 +203,9 @@ pub struct FunctionParam {
     pub name: String,
     pub ty: StoneType,
     pub default: Option<Expr>,
+    /// An annotation `StoneType` cannot express (a record, a union, a
+    /// `Literal`); `ty` is then `Any` and this is checked at the call.
+    pub check: Option<TypeExpr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +234,11 @@ pub enum AssignTarget {
     Subscript {
         value: Box<AssignTarget>,
         index: Expr,
+    },
+    /// `record.field = value`; only records have assignable attributes.
+    Attribute {
+        value: Box<AssignTarget>,
+        attr: String,
     },
 }
 
@@ -796,7 +857,7 @@ fn lower_stmt(statement: py::Stmt) -> Result<Stmt, ShellError> {
         py::Stmt::Continue(_) => Ok(Stmt::Continue),
         py::Stmt::For(for_stmt) => lower_for(for_stmt),
         py::Stmt::FunctionDef(function) => lower_function_def(function),
-        py::Stmt::ClassDef(class) => lower_error_class(class),
+        py::Stmt::ClassDef(class) => lower_class(class),
         py::Stmt::If(if_stmt) => lower_if(if_stmt),
         py::Stmt::Import(import) => Err(unsupported_import_statement(&import.names)),
         py::Stmt::ImportFrom(import) => lower_import_from(import),
@@ -848,25 +909,31 @@ fn lower_function_def(function: py::StmtFunctionDef) -> Result<Stmt, ShellError>
     let mut params = Vec::with_capacity(parameters.args.len());
     for parameter in parameters.args {
         let name = parameter.name().to_string();
-        let ty = match parameter.parameter.annotation.as_deref() {
-            Some(annotation) => lower_type_annotation(annotation)?,
-            None => StoneType::Any,
+        let (ty, check) = match parameter.parameter.annotation.as_deref() {
+            Some(annotation) => lower_annotation(annotation)?,
+            None => (StoneType::Any, None),
         };
         let default = parameter
             .default
             .map(|default| lower_function_default(&name, *default))
             .transpose()?;
-        params.push(FunctionParam { name, ty, default });
+        params.push(FunctionParam {
+            name,
+            ty,
+            default,
+            check,
+        });
     }
-    let return_type = match function.returns {
-        Some(return_type) => lower_type_annotation(&return_type)?,
-        None => StoneType::Any,
+    let (return_type, return_check) = match function.returns {
+        Some(return_type) => lower_annotation(&return_type)?,
+        None => (StoneType::Any, None),
     };
     Ok(Stmt::FunctionDef(FunctionDef {
         name: function.name.to_string(),
         is_async,
         params,
         return_type,
+        return_check,
         body: lower_stmt_block(function.body)?,
         stage: stage.map(Box::new),
         error_base: None,
@@ -1014,7 +1081,177 @@ pub(crate) const BARE_EXCEPT_UNSUPPORTED: &str = "bare `except:` is not supporte
 
 const EXCEPT_TYPE_SHAPE_UNSUPPORTED: &str = "an except handler names an error type or a tuple of error types, such as `except ValueError as error:` or `except (KeyError, IndexError) as error:`";
 
-const CLASS_UNSUPPORTED: &str = "classes are limited to error types: `class ConfigError(Exception):` followed by typed fields such as `path: str`. Use a record (dict) for plain data, and def functions for behavior";
+const CLASS_UNSUPPORTED: &str = "a class is a record (`class Plan(Record):` with typed fields such as `steps: list[str]`) or an error type (`class ConfigError(Exception):` with typed fields). Use def functions for behavior";
+
+/// Base names that make a class a record. `BaseModel` is accepted so that
+/// pydantic-style code works; only typed fields are supported.
+const RECORD_BASES: &[&str] = &["Record", "BaseModel"];
+
+/// `class X(Record):`, `class X(BaseModel):`, or `@dataclass class X:` is a
+/// record; any other base makes an error class.
+fn lower_class(class: py::StmtClassDef) -> Result<Stmt, ShellError> {
+    let base = match class.arguments.as_deref() {
+        None => None,
+        Some(arguments) if arguments.keywords.is_empty() && arguments.args.is_empty() => None,
+        Some(arguments) if arguments.keywords.is_empty() && arguments.args.len() == 1 => {
+            match &arguments.args[0] {
+                py::Expr::Name(base) => Some(base.id.to_string()),
+                _ => return Err(unsupported_message("class definition", CLASS_UNSUPPORTED)),
+            }
+        }
+        Some(arguments) if !arguments.keywords.is_empty() => {
+            return Err(unsupported_message(
+                "class definition",
+                format!(
+                    "class `{}` takes no keyword arguments: write `class {}(Record):` with typed fields",
+                    class.name, class.name
+                ),
+            ));
+        }
+        Some(_) => {
+            return Err(unsupported_message(
+                "class definition",
+                format!(
+                    "class `{}` has more than one base: a record has the single base `Record`, an error class a single error type",
+                    class.name
+                ),
+            ))
+        }
+    };
+    let dataclass = match class.decorator_list.as_slice() {
+        [] => false,
+        [decorator] if matches!(&decorator.expression, py::Expr::Name(name) if name.id.as_str() == "dataclass") => {
+            true
+        }
+        _ => {
+            return Err(unsupported_message(
+                "class definition",
+                format!(
+                    "class `{}` decorators are not supported; a record is `class {}(Record):` (plain `@dataclass` is accepted too)",
+                    class.name, class.name
+                ),
+            ))
+        }
+    };
+    if class.type_params.is_some() {
+        return Err(unsupported_message(
+            "class definition",
+            "generic classes (`class X[T]`) are not supported",
+        ));
+    }
+    match (dataclass, base.as_deref()) {
+        (true, None) => lower_record_class(class),
+        (true, Some(base)) => Err(unsupported_message(
+            "class definition",
+            format!(
+                "`@dataclass class {}({base})` is not supported: a record is `@dataclass class {}:` or `class {}(Record):`, and records do not inherit",
+                class.name, class.name, class.name
+            ),
+        )),
+        (false, Some(base)) if RECORD_BASES.contains(&base) => lower_record_class(class),
+        (false, Some(_)) => lower_error_class(class),
+        (false, None) => Err(unsupported_message("class definition", CLASS_UNSUPPORTED)),
+    }
+}
+
+fn lower_record_class(class: py::StmtClassDef) -> Result<Stmt, ShellError> {
+    let name = class.name.to_string();
+    let mut doc = None;
+    let mut fields: Vec<RecordFieldDef> = Vec::new();
+    for (index, statement) in class.body.into_iter().enumerate() {
+        match statement {
+            py::Stmt::Pass(_) => {}
+            py::Stmt::Expr(expr) if index == 0 => match *expr.value {
+                py::Expr::StringLiteral(text) => doc = Some(text.value.to_string()),
+                _ => return Err(record_body_error(&name)),
+            },
+            py::Stmt::AnnAssign(field) => {
+                let py::Expr::Name(target) = *field.target else {
+                    return Err(unsupported_message(
+                        "class definition",
+                        format!("record `{name}` fields are simple names: `path: str`"),
+                    ));
+                };
+                let field_name = target.id.to_string();
+                if fields.iter().any(|field| field.name == field_name) {
+                    return Err(unsupported_message(
+                        "class definition",
+                        format!("record `{name}` declares field `{field_name}` twice"),
+                    ));
+                }
+                let ty = lower_type_expr(&field.annotation)?;
+                let default = field
+                    .value
+                    .map(|value| lower_record_default(&name, &field_name, *value))
+                    .transpose()?;
+                fields.push(RecordFieldDef {
+                    name: field_name,
+                    ty,
+                    default,
+                });
+            }
+            py::Stmt::Assign(assign) => {
+                let target = match assign.targets.as_slice() {
+                    [py::Expr::Name(target)] => target.id.to_string(),
+                    _ => "name".to_string(),
+                };
+                return Err(unsupported_message(
+                    "class definition",
+                    format!(
+                        "record `{name}` field `{target}` needs a type: `{target}: int = ...`. Records have typed fields only"
+                    ),
+                ));
+            }
+            py::Stmt::FunctionDef(method) => {
+                return Err(unsupported_message(
+                    "class definition",
+                    format!(
+                        "record `{name}` cannot define method `{}`: records have typed fields only. Write a def function that takes the record: `def {}(item: {name}):`",
+                        method.name, method.name
+                    ),
+                ));
+            }
+            _ => return Err(record_body_error(&name)),
+        }
+    }
+    Ok(Stmt::RecordDef(Box::new(RecordDef { name, doc, fields })))
+}
+
+fn record_body_error(name: &str) -> ShellError {
+    unsupported_message(
+        "class definition",
+        format!(
+            "record `{name}` body may contain only a docstring, `pass`, and typed fields such as `path: str` or `retries: int = 0`"
+        ),
+    )
+}
+
+/// A record field default is a literal (`0`, `"x"`, `None`, `[]`, `{}`, or a
+/// list or dict of literals). It is evaluated for each new record, so a
+/// default list is never shared between records.
+fn lower_record_default(record: &str, field: &str, value: py::Expr) -> Result<Expr, ShellError> {
+    let expr = lower_expr(value)?;
+    if is_literal_expr(&expr) {
+        Ok(expr)
+    } else {
+        Err(unsupported_message(
+            "class definition",
+            format!(
+                "record `{record}` field `{field}` default must be a literal such as `0`, `\"\"`, `None`, `[]`, or `{{}}`; compute other values when you create the record"
+            ),
+        ))
+    }
+}
+
+fn is_literal_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::None | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::String(_) => true,
+        Expr::Neg(inner) => matches!(**inner, Expr::Int(_) | Expr::Float(_)),
+        Expr::List(items) | Expr::Tuple(items) => items.iter().all(is_literal_expr),
+        Expr::Record(entries) => entries.iter().all(|(_, value)| is_literal_expr(value)),
+        _ => false,
+    }
+}
 
 /// Lower a model-defined error class to the constructor function that builds
 /// its record. The class has fields only, so the constructor is the whole
@@ -1038,6 +1275,7 @@ fn lower_error_class(class: py::StmtClassDef) -> Result<Stmt, ShellError> {
         name: "message".to_string(),
         ty: StoneType::Str,
         default: Some(Expr::String(String::new())),
+        check: None,
     }];
     let mut fields = vec![
         ("type".to_string(), Expr::String(name.clone())),
@@ -1074,6 +1312,7 @@ fn lower_error_class(class: py::StmtClassDef) -> Result<Stmt, ShellError> {
                     name: field_name,
                     ty,
                     default,
+                    check: None,
                 });
             }
             py::Stmt::FunctionDef(method) => {
@@ -1100,6 +1339,7 @@ fn lower_error_class(class: py::StmtClassDef) -> Result<Stmt, ShellError> {
         is_async: false,
         params,
         return_type: StoneType::Record,
+        return_check: None,
         body: vec![Stmt::Return(Some(Expr::Record(fields)))],
         stage: None,
         error_base: Some(base),
@@ -1163,6 +1403,214 @@ fn lower_type_annotation(annotation: &py::Expr) -> Result<StoneType, ShellError>
     }
 }
 
+/// A parameter or return annotation: the simple `StoneType` when it can
+/// express it (unchanged behavior), otherwise a `TypeExpr` checked at the
+/// call (`Plan`, `Plan | None`, `Literal["a", "b"]`).
+fn lower_annotation(annotation: &py::Expr) -> Result<(StoneType, Option<TypeExpr>), ShellError> {
+    if let Ok(ty) = lower_type_annotation(annotation) {
+        return Ok((ty, None));
+    }
+    Ok((StoneType::Any, Some(lower_type_expr(annotation)?)))
+}
+
+const TUPLE_TYPE_UNSUPPORTED: &str = "tuple and set types are not supported in annotations; use `list[T]`, or a record for a fixed group of fields";
+
+/// A type annotation as a `TypeExpr` (record fields, `output=` types, and
+/// annotations `StoneType` cannot express).
+pub(crate) fn lower_type_expr(annotation: &py::Expr) -> Result<TypeExpr, ShellError> {
+    match annotation {
+        py::Expr::Name(name) => type_expr_for_name(name.id.as_str()),
+        py::Expr::NoneLiteral(_) => Ok(TypeExpr::None),
+        py::Expr::StringLiteral(text) => {
+            // A forward reference such as `children: list["Tree"]`.
+            let text = text.value.to_string();
+            if is_type_name(&text) {
+                type_expr_for_name(&text)
+            } else {
+                Err(unsupported_message(
+                    "type annotation",
+                    format!("the string annotation {text:?} is not a type name; write the type itself, such as `list[str]`"),
+                ))
+            }
+        }
+        py::Expr::BinOp(bin_op) if matches!(bin_op.op, py::Operator::BitOr) => Ok(type_union(vec![
+            lower_type_expr(&bin_op.left)?,
+            lower_type_expr(&bin_op.right)?,
+        ])),
+        py::Expr::Subscript(subscript) => {
+            let py::Expr::Name(base) = subscript.value.as_ref() else {
+                return Err(type_expr_shape_error());
+            };
+            let args = match subscript.slice.as_ref() {
+                py::Expr::Tuple(tuple) => tuple.elts.iter().collect::<Vec<_>>(),
+                other => vec![other],
+            };
+            let base = base.id.as_str();
+            match base {
+                "list" | "List" => match args.as_slice() {
+                    [element] => Ok(TypeExpr::List(Box::new(lower_type_expr(element)?))),
+                    _ => Err(unsupported_message(
+                        "type annotation",
+                        "`list[T]` takes one element type, such as `list[str]`",
+                    )),
+                },
+                "dict" | "Dict" => match args.as_slice() {
+                    [key, value] => {
+                        if lower_type_expr(key)? != TypeExpr::Str {
+                            return Err(unsupported_message(
+                                "type annotation",
+                                "dict keys are strings in Stone: write `dict[str, T]`",
+                            ));
+                        }
+                        Ok(TypeExpr::Dict(Box::new(lower_type_expr(value)?)))
+                    }
+                    _ => Err(unsupported_message(
+                        "type annotation",
+                        "`dict[K, V]` takes a key and a value type, such as `dict[str, int]`",
+                    )),
+                },
+                "Optional" => match args.as_slice() {
+                    [inner] => Ok(type_union(vec![lower_type_expr(inner)?, TypeExpr::None])),
+                    _ => Err(unsupported_message(
+                        "type annotation",
+                        "`Optional[T]` takes one type; it means `T | None`",
+                    )),
+                },
+                "Union" => Ok(type_union(
+                    args.into_iter()
+                        .map(lower_type_expr)
+                        .collect::<Result<Vec<_>, _>>()?,
+                )),
+                "Literal" => lower_literal_type(&args),
+                "tuple" | "Tuple" | "set" | "Set" | "frozenset" | "FrozenSet" => Err(
+                    unsupported_message("type annotation", TUPLE_TYPE_UNSUPPORTED),
+                ),
+                other => Err(unsupported_message(
+                    "type annotation",
+                    format!(
+                        "`{other}[...]` is not a supported type; use `list[T]`, `dict[str, T]`, `Literal[...]`, `Optional[T]`, or `A | B`"
+                    ),
+                )),
+            }
+        }
+        py::Expr::Attribute(attribute) => Err(unsupported_message(
+            "type annotation",
+            format!(
+                "write `{}` without the module prefix (add `from typing import {}` if you like; it is accepted and changes nothing)",
+                attribute.attr, attribute.attr
+            ),
+        )),
+        _ => Err(type_expr_shape_error()),
+    }
+}
+
+fn type_expr_shape_error() -> ShellError {
+    unsupported_message(
+        "type annotation",
+        "a type is a name (`str`, `int`, `float`, `bool`, `None`, `Any`, or a record), `list[T]`, `dict[str, T]`, `Literal[...]`, `Optional[T]`, or a union `A | B`",
+    )
+}
+
+fn type_expr_for_name(name: &str) -> Result<TypeExpr, ShellError> {
+    Ok(match name {
+        "Any" | "any" | "object" => TypeExpr::Any,
+        "str" => TypeExpr::Str,
+        "int" => TypeExpr::Int,
+        "float" => TypeExpr::Float,
+        "bool" => TypeExpr::Bool,
+        "None" => TypeExpr::None,
+        "Model" => TypeExpr::Model,
+        "list" | "List" => TypeExpr::List(Box::new(TypeExpr::Any)),
+        "dict" | "Dict" | "record" => TypeExpr::Dict(Box::new(TypeExpr::Any)),
+        "Optional" | "Union" | "Literal" => {
+            return Err(unsupported_message(
+                "type annotation",
+                format!("`{name}` needs its types in brackets, such as `{name}[str]`"),
+            ))
+        }
+        "tuple" | "Tuple" | "set" | "Set" | "frozenset" | "FrozenSet" => {
+            return Err(unsupported_message("type annotation", TUPLE_TYPE_UNSUPPORTED))
+        }
+        "attempt_acceptance" | "attempt_best" | "attempt_failure" | "attempt_handle"
+        | "attempt_outcome" | "attempt_scope" | "semantic_frontier" => {
+            return Err(unsupported_message(
+                "type annotation",
+                format!("`{name}` can be used only on its own as an annotation, not inside another type"),
+            ))
+        }
+        other => TypeExpr::Named(other.to_string()),
+    })
+}
+
+fn is_type_name(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn lower_literal_type(args: &[&py::Expr]) -> Result<TypeExpr, ShellError> {
+    let mut values = Vec::new();
+    let mut has_none = false;
+    for arg in args {
+        match lower_expr((*arg).clone())? {
+            Expr::String(text) => values.push(LiteralValue::Str(text)),
+            Expr::Bool(value) => values.push(LiteralValue::Bool(value)),
+            Expr::None => has_none = true,
+            Expr::Int(text) => values.push(LiteralValue::Int(parse_literal_int(&text)?)),
+            Expr::Neg(inner) => match *inner {
+                Expr::Int(text) => values.push(LiteralValue::Int(-parse_literal_int(&text)?)),
+                _ => return Err(literal_type_error()),
+            },
+            _ => return Err(literal_type_error()),
+        }
+    }
+    if values.is_empty() && !has_none {
+        return Err(literal_type_error());
+    }
+    let mut members = Vec::new();
+    if !values.is_empty() {
+        members.push(TypeExpr::Literal(values));
+    }
+    if has_none {
+        members.push(TypeExpr::None);
+    }
+    Ok(type_union(members))
+}
+
+fn parse_literal_int(text: &str) -> Result<i64, ShellError> {
+    text.parse::<i64>().map_err(|_| literal_type_error())
+}
+
+fn literal_type_error() -> ShellError {
+    unsupported_message(
+        "type annotation",
+        "`Literal[...]` takes strings, integers, booleans, or None, such as `Literal[\"read\", \"edit\"]`",
+    )
+}
+
+/// Flatten nested unions and drop duplicates; one member is just that type.
+pub(crate) fn type_union(members: Vec<TypeExpr>) -> TypeExpr {
+    let mut flat: Vec<TypeExpr> = Vec::new();
+    for member in members {
+        let parts = match member {
+            TypeExpr::Union(parts) => parts,
+            other => vec![other],
+        };
+        for part in parts {
+            if !flat.contains(&part) {
+                flat.push(part);
+            }
+        }
+    }
+    if flat.len() == 1 {
+        flat.pop().expect("one member")
+    } else {
+        TypeExpr::Union(flat)
+    }
+}
+
 fn lower_assign(assign: py::StmtAssign) -> Result<Stmt, ShellError> {
     let [target] = assign.targets.as_slice() else {
         return Err(unsupported_message(
@@ -1188,13 +1636,10 @@ fn lower_assign_target(target: &py::Expr) -> Result<AssignTarget, ShellError> {
             value: Box::new(lower_assign_target(subscript.value.as_ref())?),
             index: lower_expr(*subscript.slice.clone())?,
         }),
-        py::Expr::Attribute(attribute) => Err(unsupported_message(
-            "assignment",
-            format!(
-                "attribute assignment like record.{} = value is not supported; use item assignment record[\"{}\"] = value",
-                attribute.attr, attribute.attr
-            ),
-        )),
+        py::Expr::Attribute(attribute) => Ok(AssignTarget::Attribute {
+            value: Box::new(lower_assign_target(attribute.value.as_ref())?),
+            attr: attribute.attr.to_string(),
+        }),
         _ => Err(unsupported_message(
             "assignment",
             "only simple name, fixed tuple/list, and item assignment are supported yet",
@@ -1876,6 +2321,7 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
             if !matches!(
                 method.as_str(),
                 "append"
+                    | "ask"
                     | "add"
                     | "close"
                     | "find"
@@ -1974,6 +2420,7 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
                 } else if matches!(
                     method.as_str(),
                     "accept"
+                        | "ask"
                         | "branch"
                         | "discard"
                         | "inspect"
@@ -2083,6 +2530,25 @@ fn lower_import_from(import: py::StmtImportFrom) -> Result<Stmt, ShellError> {
             ),
         ));
     }
+    if let Some(accepted) = python_typing_imports(&module) {
+        // Python typing habits (design L10): these names are part of Stone's
+        // annotation syntax already, so importing them changes nothing.
+        if let Some(unknown) = names.iter().find(|name| !accepted.contains(&name.as_str())) {
+            return Err(unsupported_message(
+                "import",
+                format!(
+                    "`from {module} import {unknown}` is not supported. From `{module}`, Stone accepts {} (and needs none of them). {}",
+                    accepted
+                        .iter()
+                        .map(|name| format!("`{name}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    TYPING_IMPORT_HINT
+                ),
+            ));
+        }
+        return Ok(Stmt::Pass);
+    }
     Ok(Stmt::Import {
         module,
         names: import
@@ -2099,6 +2565,19 @@ fn lower_import_from(import: py::StmtImportFrom) -> Result<Stmt, ShellError> {
             })
             .collect(),
     })
+}
+
+const TYPING_IMPORT_HINT: &str = "Records are `class Plan(Record):` with typed fields; types are `str`, `int`, `float`, `bool`, `None`, `Any`, `list[T]`, `dict[str, T]`, `Literal[...]`, `Optional[T]`, and `A | B`";
+
+/// Modules whose imports are accepted as no-ops, with the names accepted.
+fn python_typing_imports(module: &str) -> Option<&'static [&'static str]> {
+    match module {
+        "typing" => Some(&["Any", "Dict", "List", "Literal", "Optional", "Union"]),
+        "pydantic" => Some(&["BaseModel"]),
+        "dataclasses" => Some(&["dataclass"]),
+        "__future__" => Some(&["annotations"]),
+        _ => None,
+    }
 }
 
 fn unsupported_import_statement(aliases: &[py::Alias]) -> ShellError {
@@ -2593,19 +3072,25 @@ for i, item in enumerate(items):
     }
 
     #[test]
-    fn attribute_assignment_suggests_item_assignment() {
-        let error = lower_source(
-            r#"record = {"status": "rejected"}
-record.status = "accepted"
-"#,
-        )
-        .expect_err("attribute assignment should explain the Stone form");
-        let text = format!("{error:?}");
-        assert!(
-            text.contains("record.status = value")
-                && text.contains(r#"record[\"status\"] = value"#),
-            "{text}"
-        );
+    fn attribute_assignment_lowers_for_record_fields() {
+        // Records have assignable fields; on a dict the runtime suggests
+        // item assignment instead.
+        let program = lower_source("plan.risky = True\nplan.steps[0] = \"x\"\n")
+            .expect("attribute assignment");
+        assert!(matches!(
+            &program.statements[0],
+            Stmt::Assign {
+                target: AssignTarget::Attribute { attr, .. },
+                ..
+            } if attr == "risky"
+        ));
+        assert!(matches!(
+            &program.statements[1],
+            Stmt::Assign {
+                target: AssignTarget::Subscript { value, .. },
+                ..
+            } if matches!(value.as_ref(), AssignTarget::Attribute { .. })
+        ));
     }
 
     #[test]
@@ -3330,11 +3815,8 @@ else:
             "{:?}",
             lower_source("class Point:\n    x: int").expect_err("plain class")
         );
-        assert!(
-            plain.contains("classes are limited to error types"),
-            "{plain}"
-        );
-        assert!(plain.contains("Use a record"), "{plain}");
+        assert!(plain.contains("a class is a record"), "{plain}");
+        assert!(plain.contains("or an error type"), "{plain}");
     }
 
     #[test]
@@ -3418,7 +3900,7 @@ else:
             "f(*args)",
             "f(**kwargs)",
             "a = b = 1",
-            "obj.items[0] = 1",
+            "f().x = 1",
             "for a, (b, c) in items:\n    emit(a)",
             "for item in items:\n    emit(item)\nelse:\n    emit(None)",
         ] {

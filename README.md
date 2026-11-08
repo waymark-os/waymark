@@ -131,6 +131,28 @@ For large values, bind the value and emit compact summaries such as
 previews large emitted values unless `allow_large_output` is set. One-shot CLI
 invocations still start fresh.
 
+## Records And Typed Model Answers
+
+A record is a value with fixed, typed fields, and `model.ask` returns one
+when given its class:
+
+```python
+class Plan(Record):
+    steps: list[str]
+    risky: bool = False
+
+plan = model.ask("Plan how to fix the failing test.", output=Plan)
+for step in plan.steps:
+    emit(step)
+```
+
+Building a record or assigning a field checks its type. `model.ask` derives
+the JSON Schema from the class, converts the answer, and sends a wrong
+answer back with each problem's path, a bounded number of times
+(`model.ask` needs the Gateway). `class Plan(BaseModel):` and
+`from typing import Literal` work as in Python. See
+[docs/STONE_LANGUAGE.md](./docs/STONE_LANGUAGE.md#records).
+
 ## Modules
 
 `from lib import name, other as alias` loads `lib.stone` (and `pkg.util` loads
@@ -143,7 +165,7 @@ invocations still start fresh.
 
 Set `WAYMARK_STONE_LIB_DIRS` to an OS path list to replace that search path.
 Imports are linked before the program runs, and a module's top level only
-defines functions, error classes, and constants. See
+defines functions, records, error classes, and constants. See
 [docs/STONE_LANGUAGE.md](./docs/STONE_LANGUAGE.md#modules).
 
 ## Helpers

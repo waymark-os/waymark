@@ -284,6 +284,7 @@ impl Analyzer<'_> {
             | Stmt::Continue
             | Stmt::Pass
             | Stmt::Import { .. }
+            | Stmt::RecordDef(_)
             | Stmt::Module(_) => Some(BTreeSet::new()),
         }
     }
