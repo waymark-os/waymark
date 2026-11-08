@@ -101,6 +101,8 @@ use crate::StoneGuest;
 use stone_model::ModelValue;
 use stone_records::{RecordType, TypeSpec, TypeTable};
 
+#[path = "stone_budget.rs"]
+mod stone_budget;
 #[path = "stone_containers.rs"]
 mod stone_containers;
 #[path = "stone_context.rs"]
@@ -189,6 +191,9 @@ pub struct EvalState {
     modules: Vec<JsonValue>,
     /// Record types and type aliases (design L5).
     types: TypeTable,
+    /// The attempt's model and tool-call budget (design 5.3), shared with
+    /// the session.
+    budget: Rc<stone_budget::Budget>,
     #[cfg(test)]
     test_model: Option<Rc<std::cell::RefCell<stone_model::TestModel>>>,
     profiler: EvalProfiler,
@@ -902,11 +907,24 @@ fn eval_program_with_source_options(
         .as_ref()
         .map(|session| session.root_scope())
         .unwrap_or_default();
+    let budget = options
+        .session
+        .as_ref()
+        .map(|session| session.budget.clone())
+        .unwrap_or_default();
+    // An attempt whose budget ran out has ended; nothing more runs in it.
+    if let Some(message) = budget.stop_message() {
+        return Err(budget_stop_error(message));
+    }
     // The Gateway model is a value, so functions can take it as a parameter.
     root_scope
         .locals
         .entry("model".to_string())
-        .or_insert(RuntimeValue::Model(ModelValue));
+        .or_insert_with(|| {
+            RuntimeValue::Model(ModelValue {
+                meter: budget.root(),
+            })
+        });
     let mut evaluator = Evaluator {
         engine_state,
         stack,
@@ -961,6 +979,7 @@ fn eval_program_with_source_options(
                 .as_ref()
                 .map(|session| session.types.clone())
                 .unwrap_or_default(),
+            budget,
             #[cfg(test)]
             test_model: options
                 .session
@@ -1007,6 +1026,12 @@ fn eval_program_with_source_options(
         session.update_transition_id(evaluator.state.next_transition_id);
         session.update_host_errors(&evaluator.state.host_errors);
     }
+    // What the program printed before its budget ran out belongs to the
+    // unfinished result.
+    evaluator
+        .state
+        .budget
+        .attach_stdout(&evaluator.state.stdout);
     let pipeline = match (pipeline, cleanup) {
         (Ok(pipeline), Ok(())) => pipeline,
         (Ok(_), Err(cleanup_error)) => return Err(cleanup_error),
@@ -1101,6 +1126,9 @@ fn eval_program_with_source_options(
     }
     if !evaluator.state.modules.is_empty() {
         diagnostics["modules"] = JsonValue::Array(std::mem::take(&mut evaluator.state.modules));
+    }
+    if let Some(budget) = evaluator.state.budget.diagnostics() {
+        diagnostics["budget"] = budget;
     }
     Ok(EvalProgramOutput {
         pipeline,
@@ -2037,6 +2065,8 @@ impl Evaluator<'_> {
     ) -> Result<EvalFlow, ShellError> {
         match self.eval_block(body, PipelineData::empty(), false) {
             Ok(flow) => Ok(flow),
+            // A budget stop ends the attempt; no handler sees it.
+            Err(err) if self.state.budget.is_stopped() => Err(err),
             Err(err) => {
                 let error_record = shell_error_record(&err);
                 let error_type = error_record_type(&error_record);
@@ -3851,15 +3881,28 @@ impl Evaluator<'_> {
                     ),
                 ));
             }
-            RuntimeValue::Model(_) => {
-                return Err(stone_error(
-                    "attribute",
-                    if attr == "ask" {
-                        "call the method: `model.ask(prompt, output=Type)`".to_string()
-                    } else {
-                        format!("the model has no attribute `{attr}`; use `model.ask(prompt, output=Type)`")
-                    },
-                ));
+            RuntimeValue::Model(model) => {
+                return match attr {
+                    "usage" => Ok(RuntimeValue::Nu(json_to_nu_value(
+                        model.meter.usage_json(),
+                        Span::unknown(),
+                    ))),
+                    "remaining" => {
+                        self.state.budget.ensure_loaded(gateway_attempt_limits);
+                        Ok(RuntimeValue::Nu(json_to_nu_value(
+                            self.state.budget.remaining_json(&model.meter),
+                            Span::unknown(),
+                        )))
+                    }
+                    "ask" | "limit" => Err(stone_error(
+                        "attribute",
+                        format!("call the method: `model.{attr}(...)`, such as {}", if attr == "ask" { "`model.ask(prompt, output=Type)`" } else { "`model.limit(calls=10)`" }),
+                    )),
+                    _ => Err(stone_error(
+                        "attribute",
+                        format!("the model has no attribute `{attr}`; it has model.ask(...), model.limit(...), model.usage, and model.remaining"),
+                    )),
+                };
             }
             _ => {}
         }
@@ -7400,6 +7443,7 @@ impl Evaluator<'_> {
                 format!("{context}() cannot be called from a transition hook"),
             ));
         }
+        self.check_tool_budget()?;
         let (mut positional, named, hooks) = self.eval_call_values_with_transition_hooks(call)?;
         let (named, expect, declared) = take_run_contract(named, context)?;
         let transition_id = self.state.next_transition_id();
@@ -7524,6 +7568,7 @@ impl Evaluator<'_> {
                 "must_run() cannot be called from a transition hook",
             ));
         }
+        self.check_tool_budget()?;
         let (positional, named) = self.eval_call_values(call)?;
         let (named, expect, declared) = take_run_contract(named, "must_run")?;
         let mut checks = Record::new();
@@ -7555,11 +7600,33 @@ impl Evaluator<'_> {
         complete: bool,
     ) -> Result<Record, ShellError> {
         let default_cwd = self.current_cwd_path(context)?;
+        // A command is a metered call: it counts against the attempt's
+        // tool-call budget and may not outlive its wall-clock budget.
+        let remaining_ms = self.check_tool_budget()?;
+        let bounded;
+        let named = match remaining_ms {
+            Some(remaining_ms) => {
+                bounded = bound_run_timeout(named, remaining_ms);
+                bounded.as_slice()
+            }
+            None => named,
+        };
         let clock = crate::stone_effects::effect_clock();
         let invocation =
             run_call_values(context, positional, named, default_cwd, complete, |path| {
                 self.resolve_script_path(path)
-            })?;
+            });
+        let invocation = match invocation {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                self.state.budget.after_tool_call(json!({
+                    "kind": "command",
+                    "argv": command_summary(positional),
+                    "ok": false,
+                }));
+                return Err(error);
+            }
+        };
         let mut record = invocation.record;
         // Tier-1 effects: what changed in the workspace while the command ran.
         let effects = if crate::gateway_runtime::enabled() {
@@ -7577,6 +7644,9 @@ impl Evaluator<'_> {
             crate::stone_effects::observed_effects(clock, &invocation.cwd)
         };
         record.insert("effects", effects);
+        self.state
+            .budget
+            .after_tool_call(command_budget_summary(positional, &record));
         #[cfg(not(target_os = "hermit"))]
         self.attach_run_helper_observations(
             &mut record,
@@ -7770,7 +7840,8 @@ impl Evaluator<'_> {
             ));
         };
         let request = model_request_from_values(messages, named, "model_call", true)?;
-        self.execute_model_request(request, &hooks)
+        let meter = self.state.budget.root();
+        self.execute_model_request(request, &hooks, &meter)
             .map(RuntimeValue::Nu)
     }
 
@@ -7886,8 +7957,9 @@ impl Evaluator<'_> {
 
         let mut failures = Vec::new();
         let mut aggregate_usage = ModelUsage::default();
+        let meter = self.state.budget.root();
         for attempt in 0..=retries {
-            let response = self.execute_model_request(request.clone(), &hooks)?;
+            let response = self.execute_model_request(request.clone(), &hooks, &meter)?;
             aggregate_usage.add_response(&response);
             let content = model_response_content(&response)?;
             let parsed = serde_json::from_str::<JsonValue>(&content);
@@ -7960,7 +8032,7 @@ impl Evaluator<'_> {
     /// Without `output=` the answer is the reply text.
     fn eval_model_ask(
         &mut self,
-        _model: ModelValue,
+        model: ModelValue,
         positional: &[Expr],
         named: &[(String, Expr)],
     ) -> Result<RuntimeValue, ShellError> {
@@ -8050,7 +8122,7 @@ impl Evaluator<'_> {
             message_values.insert(0, json!({"role": "system", "content": system}));
         }
         let Some(ty) = output else {
-            let response = self.execute_model_request(request, &hooks)?;
+            let response = self.execute_model_request(request, &hooks, &model.meter)?;
             return model_response_content(&response)
                 .map(|content| RuntimeValue::Nu(Value::string(content, Span::unknown())));
         };
@@ -8077,7 +8149,7 @@ impl Evaluator<'_> {
         let mut issues = Vec::new();
         let mut content = String::new();
         for attempt in 0..=retries {
-            let response = self.execute_model_request(request.clone(), &hooks)?;
+            let response = self.execute_model_request(request.clone(), &hooks, &model.meter)?;
             content = model_response_content(&response)?;
             issues = match stone_model::parse_answer(&content) {
                 Err(message) => vec![stone_model::parse_issue(message)],
@@ -8119,11 +8191,74 @@ impl Evaluator<'_> {
         )))
     }
 
+    /// `model.limit(calls=, input_tokens=, output_tokens=)`: a model value
+    /// whose calls are charged to a narrowed budget and to every budget
+    /// above it.
+    fn eval_model_limit(
+        &mut self,
+        model: ModelValue,
+        positional: &[Expr],
+        named: &[(String, Expr)],
+    ) -> Result<RuntimeValue, ShellError> {
+        let accepted = stone_budget::MODEL_LIMIT_NAMES.join("=, ") + "=";
+        if !positional.is_empty() || named.is_empty() {
+            return Err(model_limit_error(format!(
+                "model.limit() takes keyword limits: one or more of {accepted}, such as `model.limit(calls=10)`"
+            )));
+        }
+        let mut limits = stone_budget::ModelLimits::default();
+        for (name, expr) in named {
+            let value = self
+                .eval_expr_value(expr, PipelineData::empty())?
+                .into_nu_value("model.limit")?;
+            let amount = match value {
+                Value::Int { val, .. } if val > 0 => val as u64,
+                other => {
+                    return Err(model_limit_error(format!(
+                        "model.limit({name}=...) must be an int greater than zero, got {}",
+                        nu_to_json_value(&other)
+                    )))
+                }
+            };
+            let slot = match name.as_str() {
+                "calls" => &mut limits.calls,
+                "input_tokens" => &mut limits.input_tokens,
+                "output_tokens" => &mut limits.output_tokens,
+                other => {
+                    return Err(model_limit_error(format!(
+                        "model.limit() has no limit `{other}`; use {accepted}"
+                    )))
+                }
+            };
+            *slot = Some(amount);
+        }
+        Ok(RuntimeValue::Model(ModelValue {
+            meter: model.meter.narrow(limits),
+        }))
+    }
+
+    /// Check the attempt's command budget; returns the milliseconds left.
+    fn check_tool_budget(&mut self) -> Result<Option<u64>, ShellError> {
+        self.state.budget.ensure_loaded(gateway_attempt_limits);
+        self.state
+            .budget
+            .before_tool_call()
+            .map_err(budget_stop_error)
+    }
+
     fn execute_model_request(
         &mut self,
         mut request: serde_json::Map<String, JsonValue>,
         hooks: &TransitionHooks,
+        meter: &Rc<stone_budget::Meter>,
     ) -> Result<Value, ShellError> {
+        // Budgets are checked here, before any hook or effect runs.
+        self.state.budget.ensure_loaded(gateway_attempt_limits);
+        let output_cap = self
+            .state
+            .budget
+            .before_model_call(meter)
+            .map_err(budget_stop_error)?;
         let transition_id = self.state.next_transition_id();
         self.state.record_transition_event(json!({
             "id": transition_id,
@@ -8165,6 +8300,18 @@ impl Evaluator<'_> {
             }));
         }
 
+        if let Some(cap) = output_cap {
+            // The model may not write past what the budget has left.
+            let requested = request
+                .get("max_output_tokens")
+                .and_then(JsonValue::as_u64)
+                .filter(|tokens| *tokens > 0);
+            let tokens = requested.map_or(cap, |tokens| tokens.min(cap));
+            request.insert(
+                "max_output_tokens".to_string(),
+                json!(tokens.min(u64::from(u32::MAX))),
+            );
+        }
         let effective_input = json_to_nu_value(JsonValue::Object(request.clone()), Span::unknown());
         #[cfg(test)]
         let result = match &self.state.test_model {
@@ -8180,6 +8327,11 @@ impl Evaluator<'_> {
             attach_transition_id(&mut response, &transition_id, "model_call")?;
             Ok(response)
         });
+        let (input_tokens, output_tokens) =
+            result.as_ref().map(model_response_tokens).unwrap_or((0, 0));
+        self.state
+            .budget
+            .after_model_call(meter, input_tokens, output_tokens, result.is_ok());
         self.state.record_transition_event(json!({
             "id": transition_id,
             "kind": "model_call",
@@ -12364,6 +12516,18 @@ impl Evaluator<'_> {
                 )),
                 _ => None,
             };
+            if method == "limit" {
+                return match self.eval_expr_value(receiver, PipelineData::empty())? {
+                    RuntimeValue::Model(model) => self.eval_model_limit(model, positional, named),
+                    other => Err(stone_error(
+                        "method call",
+                        format!(
+                            "unsupported method `limit` on {}; `limit` is the model's method: `model.limit(calls=10)`",
+                            stone_records::runtime_kind(&other)
+                        ),
+                    )),
+                };
+            }
             if method == "ask" {
                 let model = match self.eval_expr_value(receiver, PipelineData::empty())? {
                     RuntimeValue::Model(model) => model,
@@ -16492,6 +16656,122 @@ pub(super) fn stone_error(kind: &str, message: impl Into<String>) -> ShellError 
     )
 }
 
+/// The error that unwinds a program whose budget ran out. Handlers never
+/// see it (`eval_try_stmt`); the host turns the attempt into an
+/// `unfinished` result.
+fn budget_stop_error(message: String) -> ShellError {
+    ShellError::Generic(
+        GenericError::new_internal("Stone attempt budget exhausted", message)
+            .with_code("stone_budget_exhausted"),
+    )
+}
+
+fn model_limit_error(message: String) -> ShellError {
+    ShellError::Generic(
+        GenericError::new_internal("Stone model.limit input error", message)
+            .with_code("stone_value_error"),
+    )
+}
+
+/// The current Gateway attempt's limits, read once per session.
+fn gateway_attempt_limits() -> Option<Result<stone_budget::AttemptLimits, String>> {
+    let config = gateway_runtime::config()?;
+    if config.attempt.is_empty() {
+        return None;
+    }
+    Some(
+        gateway_env::attempt_info(String::new())
+            .map_err(|error| error.to_string())
+            .map(|attempt| {
+                let attempt_json = nu_to_json_value(&attempt);
+                let limits = attempt_json
+                    .get("resource_limits")
+                    .and_then(JsonValue::as_object)
+                    .map(stone_budget::HostLimits::from_resource_limits)
+                    .unwrap_or_default();
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                let time_budget =
+                    nu_to_json_value(&agent_time_budget_value(&attempt, now_ms, Span::unknown()));
+                stone_budget::AttemptLimits {
+                    limits,
+                    remaining_ms: json_u64(time_budget.get("remaining_ms")),
+                }
+            }),
+    )
+}
+
+/// Input and output tokens a model response reports.
+fn model_response_tokens(response: &Value) -> (u64, u64) {
+    let response = nu_to_json_value(response);
+    let tokens = |name: &str| {
+        response
+            .get("usage")
+            .and_then(|usage| usage.get(name))
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0)
+    };
+    (tokens("input_tokens"), tokens("output_tokens"))
+}
+
+/// A command may not run past the attempt's wall-clock budget.
+fn bound_run_timeout(named: &[(String, Value)], remaining_ms: u64) -> Vec<(String, Value)> {
+    let background = named.iter().any(|(name, value)| {
+        name == "background" && matches!(value, Value::Bool { val: true, .. })
+    });
+    let mut bounded = named.to_vec();
+    if background {
+        return bounded;
+    }
+    let limit = i64::try_from(remaining_ms.max(1)).unwrap_or(i64::MAX);
+    match bounded.iter_mut().find(|(name, _)| name == "timeout_ms") {
+        Some((_, Value::Int { val, .. })) if *val > 0 => *val = (*val).min(limit),
+        Some(_) => {}
+        None => bounded.push(("timeout_ms".to_string(), Value::int(limit, Span::unknown()))),
+    }
+    bounded
+}
+
+/// The first words of a command, for the budget's record of recent calls.
+fn command_summary(positional: &[Value]) -> JsonValue {
+    let words = match positional.first() {
+        Some(Value::List { vals, .. }) => vals.iter().collect::<Vec<_>>(),
+        _ => positional.iter().collect::<Vec<_>>(),
+    };
+    JsonValue::Array(
+        words
+            .into_iter()
+            .take(6)
+            .map(|word| {
+                let text = match word {
+                    Value::String { val, .. } => val.clone(),
+                    other => nu_to_json_value(other).to_string(),
+                };
+                JsonValue::String(bounded_text(&text, 80))
+            })
+            .collect(),
+    )
+}
+
+fn command_budget_summary(positional: &[Value], record: &Record) -> JsonValue {
+    let record = nu_to_json_value(&Value::record(record.clone(), Span::unknown()));
+    let changed = record
+        .pointer("/effects/observed/changed")
+        .and_then(JsonValue::as_array)
+        .map(|changed| changed.iter().take(10).cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    json!({
+        "kind": "command",
+        "argv": command_summary(positional),
+        "exit_code": record.get("exit_code").cloned().unwrap_or(JsonValue::Null),
+        "ok": record.get("ok").cloned().unwrap_or(JsonValue::Null),
+        "changed": changed,
+    })
+}
+
 fn attach_cleanup_error(program_error: ShellError, cleanup_error: ShellError) -> ShellError {
     match program_error {
         ShellError::Generic(error) => ShellError::Generic(error.with_inner(vec![cleanup_error])),
@@ -19437,6 +19717,150 @@ emit(inc(5))
         }
         cleanup_dir(&root);
         Ok(())
+    }
+
+    #[test]
+    fn model_budgets_meter_calls_and_end_the_attempt() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("stone-model-budget")?;
+        let test_model = std::rc::Rc::new(std::cell::RefCell::new(
+            super::stone_model::TestModel::default(),
+        ));
+        let mut session = StoneSession {
+            test_model: Some(test_model.clone()),
+            ..StoneSession::default()
+        };
+        session
+            .configure_budget("model_calls=4,output_tokens=100")
+            .expect("budget");
+        let budget = session.budget.clone();
+        let mut run = |source: &str,
+                       replies: &[&str]|
+         -> (
+            Result<serde_json::Value, ShellError>,
+            Vec<serde_json::Value>,
+        ) {
+            {
+                let mut model = test_model.borrow_mut();
+                model.replies = replies.iter().map(|reply| reply.to_string()).collect();
+                model.requests.clear();
+            }
+            let result = crate::stone_frontend::eval_stone_source_with_output_and_session(
+                &engine_state,
+                &mut stack,
+                source,
+                PipelineData::empty(),
+                &mut session,
+            )
+            .and_then(|output| {
+                json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())
+            });
+            let requests = std::mem::take(&mut test_model.borrow_mut().requests);
+            (result, requests)
+        };
+
+        let (value, _) = run("emit([model.remaining, model.usage])", &[]);
+        assert_eq!(
+            value?,
+            json_value!([
+                {"calls": 4, "input_tokens": null, "output_tokens": 100, "seconds": null},
+                {"calls": 0, "input_tokens": 0, "output_tokens": 0}
+            ])
+        );
+
+        // Every model call is charged to its meter and to every meter above
+        // it; output tokens are capped by what is left.
+        let (value, requests) = run(
+            "small = model.limit(calls=2, output_tokens=8)\na = model.ask(\"one\", max_output_tokens=50)\nb = small.ask(\"two\")\nc = model_call([{\"role\": \"user\", \"content\": \"three\"}]).content\nemit([a, b, c, small.usage, small.remaining, model.usage, model.remaining.calls, model.remaining.output_tokens])",
+            &["x", "y", "z"],
+        );
+        assert_eq!(
+            value?,
+            json_value!([
+                "x", "y", "z",
+                {"calls": 1, "input_tokens": 10, "output_tokens": 5},
+                {"calls": 1, "input_tokens": null, "output_tokens": 3, "seconds": null},
+                {"calls": 3, "input_tokens": 30, "output_tokens": 15},
+                1, 85
+            ])
+        );
+        let caps = requests
+            .iter()
+            .map(|request| request["max_output_tokens"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(caps, vec![json_value!(50), json_value!(8), json_value!(90)]);
+
+        for (source, expected) in [
+            ("model.limit()", "model.limit() takes keyword limits"),
+            ("model.limit(3)", "model.limit() takes keyword limits"),
+            (
+                "model.limit(calls=0)",
+                "must be an int greater than zero, got 0",
+            ),
+            ("model.limit(steps=2)", "model.limit() has no limit `steps`"),
+            (
+                "emit(model.budget)",
+                "it has model.ask(...), model.limit(...), model.usage, and model.remaining",
+            ),
+            ("x = [1]\nx.limit(calls=1)", "`limit` is the model's method"),
+        ] {
+            let (value, requests) = run(source, &[]);
+            let text = format!("{:?}", value.expect_err(source));
+            assert!(text.contains(expected), "{source}: {text}");
+            assert!(requests.is_empty(), "{source}");
+        }
+
+        // Running out ends the attempt: the call does not happen, try does
+        // not catch it, and nothing after it runs.
+        let (value, requests) = run(
+            "small = model.limit(calls=1)\nseen = []\ntry:\n    small.ask(\"a\")\n    print(\"first done\")\n    seen.append(1)\n    small.ask(\"b\")\nexcept Exception as error:\n    seen.append(\"caught\")\nemit(seen)",
+            &["a", "b"],
+        );
+        let text = format!("{:?}", value.expect_err("budget stop"));
+        assert!(text.contains("stone_budget_exhausted"), "{text}");
+        assert!(
+            text.contains("a model.limit(calls=1) budget is used up (1 of 1)"),
+            "{text}"
+        );
+        assert_eq!(requests.len(), 1);
+        let unfinished = budget.stopped().expect("unfinished record");
+        assert_eq!(
+            unfinished["limit"],
+            json_value!({"name": "calls", "scope": "model.limit", "limit": 1, "used": 1})
+        );
+        assert_eq!(unfinished["usage"]["model_calls"], json_value!(4));
+        assert_eq!(unfinished["stdout"], json_value!("first done\n"));
+        assert_eq!(unfinished["recent"].as_array().map(Vec::len), Some(4));
+
+        // The attempt is over: later evaluations in the session do not run.
+        let (value, requests) = run("emit(1)", &[]);
+        assert!(format!("{:?}", value.expect_err("ended")).contains("budget is used up"));
+        assert!(requests.is_empty());
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn run_timeouts_are_bounded_by_the_wall_clock_budget() {
+        let span = nu_protocol::Span::unknown();
+        let bounded = super::bound_run_timeout(&[], 1500);
+        assert_eq!(
+            bounded,
+            vec![("timeout_ms".to_string(), Value::int(1500, span))]
+        );
+        let bounded =
+            super::bound_run_timeout(&[("timeout_ms".to_string(), Value::int(9000, span))], 1500);
+        assert_eq!(
+            bounded,
+            vec![("timeout_ms".to_string(), Value::int(1500, span))]
+        );
+        let bounded =
+            super::bound_run_timeout(&[("timeout_ms".to_string(), Value::int(800, span))], 1500);
+        assert_eq!(
+            bounded,
+            vec![("timeout_ms".to_string(), Value::int(800, span))]
+        );
+        let background = vec![("background".to_string(), Value::bool(true, span))];
+        assert_eq!(super::bound_run_timeout(&background, 1500), background);
     }
 
     #[test]

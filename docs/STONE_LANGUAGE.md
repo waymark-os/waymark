@@ -66,6 +66,10 @@ waymark eval --stdin-script < script.stone
 
 Stone is the frontend for `waymark eval -c`, script files, and `--stdin-script`.
 
+`--budget model_calls=40,output_tokens=60000,tool_calls=200,wall_time_ms=600000`
+gives the run a budget (any subset of those limits). See
+[Budgets](#budgets).
+
 ## Session Semantics
 
 One-shot CLI invocations start with a fresh Stone scope. Long-lived runtime
@@ -462,6 +466,50 @@ emit(str(plan.steps[0]))  # Step(title='read the failing test', done=True)
   they are imported under their own name, cannot be renamed with `as`, and
   two modules may not define the same record. Record classes persist in the
   session like functions.
+
+### Budgets
+
+A run can have a budget for model calls, tokens, commands, and wall-clock
+time. Budgets are checked only when the program calls a model or starts a
+command, so other code costs nothing extra.
+
+```python
+def calls_to_spend(model: Model) -> int:
+    left = model.remaining.calls
+    if left is None:
+        return 10
+    return left - 1    # keep one call for the final report
+
+helper = model.limit(calls=5, output_tokens=4000)
+emit({"plan": calls_to_spend(helper), "spent": model.usage})
+```
+
+- The host sets the run's budget with
+  `waymark eval --budget model_calls=40,input_tokens=...,output_tokens=...,tool_calls=200,wall_time_ms=600000`,
+  or through the Gateway attempt's resource limits (the same names). When
+  both are given, the tighter limit wins. `tool_calls` counts commands
+  started with `run`, `run_complete`, and `must_run`.
+- `model.limit(calls=, input_tokens=, output_tokens=)` returns a new `Model`
+  value. Its calls are charged to it and to every budget above it, so it can
+  never spend more than its parent has left. Pass it to a function as a
+  `model: Model` parameter.
+- `model.usage` is what that model value has spent (`calls`,
+  `input_tokens`, `output_tokens`). `model.remaining` is the smallest amount
+  left along its chain of budgets, plus `seconds` of wall-clock time; a
+  value is `None` when nothing limits it. Both are fresh snapshots.
+- An `output_tokens` budget also caps each call's `max_output_tokens` to what
+  is left, and `wall_time_ms` caps each command's `timeout_ms`. Token counts
+  are those the model provider reports.
+- **Running out of any budget ends the run.** The call that would go over
+  does not happen, `try` cannot catch the stop, nothing after it runs, and
+  later evaluations in the same session do not run either. The result is
+  not a program error: it has `"status": "unfinished"` and an `unfinished`
+  record with the limit that ran out, the
+  usage, the last few model calls and commands (with the files each command
+  changed), and the end of the printed output. `error.type` is
+  `"Unfinished"` for clients that only read `ok` and `error`.
+- To stop on the program's own terms, check `model.remaining` in the loop
+  and return a partial result while there is budget left.
 
 ### Modules
 
@@ -896,7 +944,8 @@ says so with `result.effects.enforced == False`.
   `expected` (the schema), `issues`, `attempts`, and the last `answer`.
   Without `output=`, `model.ask` returns the reply text. `model` is a value
   bound in every program; functions take it as a `model: Model` parameter.
-  See `help("model.ask")`.
+  Every attempt, including repairs, counts against the model's budget
+  ([Budgets](#budgets)). See `help("model.ask")`.
 
   ```python
   class Read(Record):

@@ -328,11 +328,26 @@ pub(crate) struct StoneSession {
     pub(super) host_errors: Vec<nu_protocol::Value>,
     /// Record types and type aliases defined so far.
     pub(super) types: super::stone_records::TypeTable,
+    /// The attempt's budget. It lives as long as the session, so every
+    /// evaluation in it draws on the same budget.
+    pub(crate) budget: Rc<super::stone_budget::Budget>,
     #[cfg(test)]
     pub(crate) test_model: Option<std::rc::Rc<std::cell::RefCell<super::stone_model::TestModel>>>,
 }
 
 impl StoneSession {
+    /// Limits from `waymark eval --budget ...`.
+    pub(crate) fn configure_budget(&self, text: &str) -> Result<(), String> {
+        let limits = super::stone_budget::HostLimits::parse(text)?;
+        self.budget.configure(limits);
+        Ok(())
+    }
+
+    /// The `unfinished` record when the attempt's budget ran out.
+    pub(crate) fn budget_stopped(&self) -> Option<serde_json::Value> {
+        self.budget.stopped()
+    }
+
     pub(crate) fn admission_bound_names(&self) -> Vec<String> {
         let mut names = self
             .locals

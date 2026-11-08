@@ -101,6 +101,17 @@ WAYMARK_START_DIR="$PWD" target/debug/waymark eval -c 'write_json("out.json", {"
 The command prints one JSON result envelope to stdout on success and one JSON
 error envelope to stderr on failure.
 
+Give a run a budget for model calls, tokens, commands, or wall-clock time:
+
+```sh
+target/debug/waymark eval --budget model_calls=40,tool_calls=200 agent.stone
+```
+
+Running out ends the run with `"status": "unfinished"` and a record of what
+ran out and what the program did last. Programs read `model.remaining` and
+narrow their share with `model.limit(calls=10)`. See
+[docs/STONE_LANGUAGE.md](./docs/STONE_LANGUAGE.md#budgets).
+
 ## Stone Example
 
 ```python

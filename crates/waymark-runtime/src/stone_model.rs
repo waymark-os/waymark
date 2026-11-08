@@ -15,9 +15,12 @@
 
 use serde_json::{json, Value as JsonValue};
 
-/// The Gateway model. Budgets (`model.limit(...)`) will add fields here.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct ModelValue;
+/// The Gateway model. Each value charges its calls to a budget meter:
+/// the attempt's for `model`, a narrowed one for `model.limit(...)`.
+#[derive(Clone)]
+pub(super) struct ModelValue {
+    pub(super) meter: std::rc::Rc<super::stone_budget::Meter>,
+}
 
 /// Default number of repairs after a wrong answer.
 pub(super) const DEFAULT_RETRIES: i64 = 2;

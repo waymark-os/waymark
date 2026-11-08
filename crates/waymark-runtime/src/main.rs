@@ -53,6 +53,19 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     strip_trailing_hermit_boot_args(&mut args);
+    match remove_value(&mut args, "--budget") {
+        Ok(Some(limits)) => {
+            if let Err(err) = guest.configure_budget(&limits) {
+                emit_json_error("usage error", format!("--budget: {err}"));
+                return ExitCode::from(2);
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            emit_json_error("usage error", err);
+            return ExitCode::from(2);
+        }
+    }
     let read_stdin = remove_flag(&mut args, "--stdin");
     let read_stdin_script = remove_flag(&mut args, "--stdin-script");
     let task_server = remove_flag(&mut args, "--task-server");
@@ -363,6 +376,20 @@ fn remove_flag(args: &mut Vec<String>, flag: &str) -> bool {
     }
 }
 
+fn remove_value(args: &mut Vec<String>, flag: &str) -> Result<Option<String>, String> {
+    let Some(index) = args.iter().position(|arg| arg == flag) else {
+        return Ok(None);
+    };
+    args.remove(index);
+    if args.get(index).is_some_and(|value| !value.starts_with('-')) {
+        Ok(Some(args.remove(index)))
+    } else {
+        Err(format!(
+            "{flag} needs a value, such as {flag} model_calls=40,tool_calls=200"
+        ))
+    }
+}
+
 fn remove_optional_value(args: &mut Vec<String>, flag: &str, default: &str) -> Option<String> {
     let index = args.iter().position(|arg| arg == flag)?;
     args.remove(index);
@@ -402,8 +429,8 @@ fn is_trailing_hermit_boot_arg(arg: &str) -> bool {
 
 fn usage(program_name: &str) -> String {
     format!(
-        "usage: {program_name} eval [--stdin] [--stone] -c <command> | \
-         {program_name} eval [--stdin] [--stone] <script.stone> | \
+        "usage: {program_name} eval [--budget <limits>] [--stdin] [--stone] -c <command> | \
+         {program_name} eval [--budget <limits>] [--stdin] [--stone] <script.stone> | \
          {program_name} eval [--stone] --stdin-script | \
          {program_name} help | \
          {program_name} --version | \

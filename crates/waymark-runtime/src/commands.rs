@@ -348,8 +348,32 @@ except ModelOutputError as error:
             "Types that are not records are wrapped for the model as {\"value\": ...}; the result is the inner value.",
             "Without output= the result is the reply text. Use model_call for the full response record.",
             "`model` is a value: pass it to functions as a parameter (def solve(task: str, model: Model)); module functions cannot read the program's `model`.",
+            "Every attempt, including repairs, counts against the model's budget; see help(\"model.limit\").",
         ],
         aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "model.limit",
+        signature: r#"model.limit(calls: int = None, input_tokens: int = None, output_tokens: int = None) -> Model; model.usage -> {calls, input_tokens, output_tokens}; model.remaining -> {calls, input_tokens, output_tokens, seconds}"#,
+        use_when: "Give a function or loop a smaller share of the model budget, or read what is spent and left before deciding whether to continue. Budgets are checked only when a model is called or a command starts.",
+        examples: &[
+            r#"small = model.limit(calls=3, output_tokens=2000)
+emit({"left": small.remaining, "spent": model.usage})"#,
+            r#"def calls_to_spend(model: Model) -> int:
+    left = model.remaining.calls
+    if left is None:
+        return 10
+    return left - 1    # keep one call for the final report
+emit(calls_to_spend(model.limit(calls=5)))"#,
+        ],
+        avoid: &[
+            "model.limit(...) returns a new Model; its calls are charged to it and to every budget above it, so it can never spend more than its parent has left. model.remaining is the smallest amount left along that chain, and None where nothing limits it.",
+            "Running out of any budget ends the run: the call does not happen, try/except cannot catch it, nothing after it runs, and later evaluations in the same session do not run either. The result has status \"unfinished\" with the limit, the usage, recent model calls and commands, and printed output. To stop on your own terms, check model.remaining in the loop and return a partial result.",
+            "output_tokens also caps each call's max_output_tokens to what is left, so the model cannot overrun it. Token counts are those the provider reports.",
+            "The host sets the attempt's budget: waymark eval --budget model_calls=40,output_tokens=60000,tool_calls=200,wall_time_ms=600000, or the Gateway attempt's resource limits. tool_calls counts commands started with run, run_complete, or must_run; wall_time_ms also bounds each command's timeout_ms.",
+            "model.usage and model.remaining are fresh snapshots each time they are read.",
+        ],
+        aliases: &["model.usage", "model.remaining", "budget"],
     },
     StoneHelpEntry {
         name: "Record",
@@ -389,6 +413,7 @@ emit([target(Read(path="a.py")), isinstance(Edit(path="b", new="c"), Action)])"#
             "Lists and dicts inside a record are checked when assigned, not when later changed in place (as in pydantic).",
             "Records compare equal with the same type and equal fields. str(record) is Python's form, Plan(steps=[], note=None); print, emit, and builtins see a plain dict of the fields.",
             "Record names are global, like error types: a module's records keep their names on import and cannot be renamed with as.",
+            "class Name(Exception): (or another error type) defines an error type instead of a record; see help(\"errors\").",
         ],
         aliases: &["BaseModel", "dataclass"],
     },
@@ -1994,6 +2019,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "Rejected before running: bare except:, BaseException, unknown type names, and except Exception: pass / except ToolError: pass. except KeyError: pass is fine.",
             "A ToolError caught without `as name` and not re-raised is counted in diagnostics.errors (and last_result()), so a swallowed tool failure stays visible.",
             "No finally: for your own cleanup use except Exception as error: + cleanup + raise error, and repeat the cleanup after the try.",
+            "Running out of a budget is not an error type: it ends the run, no handler sees it, and the result has status \"unfinished\". Check model.remaining to stop early; see help(\"model.limit\").",
         ],
     },
     StoneHelpTopic {
@@ -2095,7 +2121,10 @@ pub(crate) fn stone_help_topic(name: &str, span: Span) -> Value {
         "sys" | "sys_info" => "sysinfo",
         "sorted" => "sort",
         "gotchas" | "constraints" => "unsupported",
-        "exceptions" | "except" | "try" | "raise" | "class" => "errors",
+        "exceptions" | "except" | "try" | "raise" => "errors",
+        "class" | "record" | "records" | "BaseModel" | "dataclass" => "Record",
+        "model" | "ask" => "model.ask",
+        "model.usage" | "model.remaining" | "budget" | "budgets" | "limit" => "model.limit",
         other if crate::stone_errors::is_builtin_error_type(other) => "errors",
         other => other,
     };

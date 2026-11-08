@@ -33,6 +33,37 @@ pub(crate) fn success_response_with_output(
     })
 }
 
+/// The result of an attempt whose budget ran out (design 5.3): not a
+/// program error, so it carries the host's `unfinished` record as data.
+/// `error` is kept so clients that only read `ok` and `error` still see why.
+pub(crate) fn unfinished_response(
+    unfinished: JsonValue,
+    cwd: String,
+    output: Option<JsonValue>,
+) -> JsonValue {
+    let detail = unfinished
+        .get("message")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("the attempt's budget is used up")
+        .to_string();
+    let mut root = json!({
+        "ok": false,
+        "status": "unfinished",
+        "cwd": cwd,
+        "error": {
+            "type": "Unfinished",
+            "code": "stone_budget_exhausted",
+            "message": "Stone attempt budget exhausted",
+            "detail": detail,
+        },
+        "unfinished": unfinished,
+    });
+    if let Some(output) = output {
+        root["output"] = output;
+    }
+    root
+}
+
 pub(crate) fn error_response(err: &ShellError, cwd: Option<String>) -> JsonValue {
     error_response_inner(err, cwd, None)
 }

@@ -516,6 +516,43 @@ machinery for what a `model.remaining` check does. Draft v2's
 
 `model.usage` and `model.remaining` are runtime-owned and read-only.
 
+As implemented in M5 step 2 (L17; `stone_budget.rs`, user docs in
+`STONE_LANGUAGE.md`, "Budgets"):
+
+- The host's budget names are the Gateway attempt's resource-limit names:
+  `model_calls`, `input_tokens`, `output_tokens`, `tool_calls`,
+  `wall_time_ms`. The runtime reads the current attempt's limits once per
+  session, on the first metered call, and `waymark eval --budget ...` adds
+  limits for local runs; the tighter limit wins. The Gateway already refuses
+  a child attempt whose numeric limits exceed its parent's, so a child
+  process started with `attempt_spawn(..., limits=...)` gets a narrower
+  budget with no new protocol. The Gateway does not enforce these limits
+  itself; the Stone runtime does, at its metered calls.
+- Each `Model` value holds a meter. `model.limit(...)` adds a child meter;
+  a call checks and charges every meter from the value up to the attempt,
+  so the cost is a few counter updates per model call and nothing anywhere
+  else. An `output_tokens` limit also lowers the call's
+  `max_output_tokens` to what is left, so the limit holds for the call in
+  progress, not only for the next one. Input tokens are only known after
+  the call, so that limit is checked before the next call. `wall_time_ms`
+  lowers each command's `timeout_ms`.
+- `tool_calls` counts commands (`run`, `run_complete`, `must_run`). File
+  builtins are cheap, local, and not counted.
+- Running out raises an internal stop that unwinds the program. `try`
+  re-raises it without matching (the check is one flag read on the error
+  path only). The session keeps the stop, so later evaluations in the same
+  session return the same result without running. The host turns it into
+  an envelope with `"status": "unfinished"` and an `unfinished` record (the
+  limit, usage, the last eight metered calls with the files each command
+  changed, and the end of the printed output); `error.type` is
+  `"Unfinished"` for older clients.
+- Exhausting a `model.limit` budget also ends the whole attempt, because
+  child attempts with their own Stone budgets (P2) do not exist yet in the
+  language. Code that wants to continue after a sub-budget runs out checks
+  `model.remaining` first.
+- Not done: the `Unfinished(...)` value a program returns itself (P2 outcome
+  types), and a budget option in the MCP adapter.
+
 ### 5.4 Lifecycle: Scoped Resources And Host Compensation
 
 Owned processes, child attempts, and temporary workspaces live in `with`
@@ -1785,7 +1822,8 @@ evals updated.
   grants (D-1, R25a).
 - Tier-3 `effects=` vocabulary for `Exec`, with the network off unless
   declared (already S2).
-- L17 budgets checked at metered calls, and `model.limit` (D-3).
+- L17 budgets checked at metered calls, and `model.limit` (D-3). **Done in
+  M5 step 2** (5.3).
 - L9 modules with frozen module values.
 - Ablation harness set up (R27).
 

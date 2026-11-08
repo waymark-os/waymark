@@ -90,6 +90,13 @@ impl StoneGuest {
         })
     }
 
+    /// Give the attempt a budget, such as `model_calls=40,tool_calls=200`.
+    /// It applies to every evaluation in this guest; running out ends the
+    /// attempt with an `unfinished` result.
+    pub fn configure_budget(&mut self, limits: &str) -> Result<(), String> {
+        self.stone_session.configure_budget(limits)
+    }
+
     pub fn evaluate(&mut self, source: &str) -> Result<PipelineData, ShellError> {
         self.evaluate_with_input(source, PipelineData::empty())
     }
@@ -190,41 +197,52 @@ impl StoneGuest {
         entrypoint: Option<&str>,
     ) -> JsonValue {
         let response = if frontend == FrontendKind::Stone {
-            match stone_frontend::eval_stone_source_with_output_session_and_entrypoint(
-                &self.engine_state,
-                &mut self.stack,
-                source,
-                input,
-                &mut self.stone_session,
-                entrypoint,
-            ) {
-                Ok(output) => {
-                    match json::pipeline_to_json_value(output.pipeline, Span::unknown()) {
-                        Ok(value) => {
-                            let mut response = json::success_response_with_output(
-                                value,
-                                self.current_cwd(),
-                                output.stdout,
-                                String::new(),
-                            );
-                            let has_diagnostics = output
-                                .diagnostics
-                                .as_object()
-                                .map(|fields| !fields.is_empty())
-                                .unwrap_or(true);
-                            if has_diagnostics {
-                                response["diagnostics"] = output.diagnostics;
+            let response =
+                match stone_frontend::eval_stone_source_with_output_session_and_entrypoint(
+                    &self.engine_state,
+                    &mut self.stack,
+                    source,
+                    input,
+                    &mut self.stone_session,
+                    entrypoint,
+                ) {
+                    Ok(output) => {
+                        match json::pipeline_to_json_value(output.pipeline, Span::unknown()) {
+                            Ok(value) => {
+                                let mut response = json::success_response_with_output(
+                                    value,
+                                    self.current_cwd(),
+                                    output.stdout,
+                                    String::new(),
+                                );
+                                let has_diagnostics = output
+                                    .diagnostics
+                                    .as_object()
+                                    .map(|fields| !fields.is_empty())
+                                    .unwrap_or(true);
+                                if has_diagnostics {
+                                    response["diagnostics"] = output.diagnostics;
+                                }
+                                response
                             }
-                            response
-                        }
-                        Err(err) => {
-                            json::error_response_with_source(&err, Some(self.current_cwd()), source)
+                            Err(err) => json::error_response_with_source(
+                                &err,
+                                Some(self.current_cwd()),
+                                source,
+                            ),
                         }
                     }
-                }
-                Err(err) => {
-                    json::error_response_with_source(&err, Some(self.current_cwd()), source)
-                }
+                    Err(err) => {
+                        json::error_response_with_source(&err, Some(self.current_cwd()), source)
+                    }
+                };
+            match self.stone_session.budget_stopped() {
+                Some(unfinished) => json::unfinished_response(
+                    unfinished,
+                    self.current_cwd(),
+                    response.get("output").cloned(),
+                ),
+                None => response,
             }
         } else {
             match self.execute_json(frontend, source, input) {
@@ -512,6 +530,54 @@ mod tests {
             .to_string()
             .contains("vsock task server is not included"));
 
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn budget_exhaustion_returns_an_unfinished_result() -> Result<(), ShellError> {
+        let start_dir = test_root("budget-unfinished");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        guest.configure_budget("tool_calls=2").expect("budget");
+        let response = guest.command_response("r = run([\"true\"])\nemit(r.ok)");
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(
+            response["diagnostics"]["budget"]["limits"],
+            json!({"tool_calls": 2})
+        );
+        assert_eq!(
+            response["diagnostics"]["budget"]["used"]["tool_calls"],
+            json!(1)
+        );
+
+        let response = guest.command_response(
+            "for i in range(3):\n    try:\n        run([\"true\"])\n    except Exception as error:\n        pass_count = 1\nemit(\"done\")",
+        );
+        assert_eq!(response["ok"], json!(false));
+        assert_eq!(response["status"], json!("unfinished"));
+        assert_eq!(response["error"]["type"], json!("Unfinished"));
+        assert_eq!(
+            response["unfinished"]["limit"],
+            json!({"name": "tool_calls", "scope": "attempt", "limit": 2, "used": 2})
+        );
+        assert_eq!(response["unfinished"]["recent"][1]["argv"], json!(["true"]));
+
+        // The attempt has ended; nothing more runs in this guest.
+        let response = guest.command_response("emit(1)");
+        assert_eq!(response["status"], json!("unfinished"));
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        guest.configure_budget("wall_time_ms=1").expect("budget");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let response = guest.command_response("run([\"true\"])");
+        assert_eq!(
+            response["unfinished"]["limit"]["name"],
+            json!("wall_time_ms")
+        );
+
+        assert!(guest.configure_budget("turns=3").is_err());
         cleanup_dir(&start_dir);
         Ok(())
     }
