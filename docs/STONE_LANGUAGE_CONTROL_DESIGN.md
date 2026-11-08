@@ -707,6 +707,22 @@ As implemented in M5 step 1 (L5, L10, and this section; `stone_records.rs`,
   aliases with the same name and the later one wins; error messages inside
   module functions show qualified names (`shapes.describe()`).
 
+As implemented in M5 step 3 (pydantic `Field()`, `stone_records.rs`; user
+docs in `STONE_LANGUAGE.md`, "Records"):
+
+- A field default written as `Field(...)` sets limits: `ge`, `gt`, `le`,
+  `lt` for numbers, `min_length` and `max_length` for strings, lists, and
+  dicts, plus `description`, `default`, and `default_factory=list|dict`.
+  Limits are checked when a record is built, when a field is assigned, and
+  when a model answer is converted (so a limit problem is repaired like a
+  type problem), and they are written into the JSON Schema with the
+  standard keywords. A limit costs one comparison per check and nothing
+  when absent. Other `Field` options and `Annotated[...]` are rejected with
+  the accepted list.
+- The standard controller's action format needed these limits (one action
+  per turn, non-empty paths, timeout ranges). With them, its 299 lines of
+  hand-written schema and schema prompts became 94 lines of records.
+
 ### 5.7 Delegation And The Pass-Style Boundary
 
 - **Run a written function in isolation:** `scope.start(f, **args)` starts a
@@ -1829,6 +1845,18 @@ evals updated.
 
 Exit: the standard controller ported to P1 features, with task success equal
 or better on the existing suites and a smaller source.
+
+Measured in M5 step 3 (see `STONE_STANDARD_AGENT_CONTROL.md`, "V15"): V15
+replaces V14's schemas with records, its option parser with a range table,
+`model_infer` with `model.ask`, and its call arithmetic with `model.limit`
+and `model.remaining`. Code lines fell from 2,067 to 1,701 (18%); the rest
+of the controller is unchanged. On 12 scripted Gateway attempts covering
+the existing suites' sequences, V15 matched V14 exactly in outcome, model
+calls, commands, memory writes, workspace changes, and control counters. On
+three small live tasks (Qwen3.8-27B, one run each) both versions succeeded
+with the same call counts. The full derived schema costs about 1,300 more
+prompt tokens per call than V14's hand-written summary (1.6-2.0 times the
+input tokens live), which is the open cost of this exit.
 
 ### P2. Drift
 

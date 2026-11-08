@@ -108,6 +108,56 @@ The default dispatcher supports `read`, exact-replacement `edit`, `write`, short
 actions, and `finish`. Task-specific controls may replace it with another named
 function without changing `standard_agent_control`.
 
+## V15: Records And model.ask
+
+`examples/scripts/standard_attempt_agent_v15.stone` is V14 ported to the
+newer language features. V14 stays the default (the Gateway benchmarks
+point at it). The port changes four things and keeps everything else as
+V14 text:
+
+- The action and completion-audit formats are record classes
+  (`ActionTurn`, a union of one record per tool, and `CompletionAudit`),
+  with pydantic `Field()` limits for one action per turn, non-empty paths,
+  and timeout ranges. `model.ask` derives the JSON Schema from them and
+  repairs wrong answers, naming the exact path of each problem. This
+  replaces 299 lines of hand-written schema and schema prompts with 94.
+- Task options come from a range table instead of one clamp call per
+  option (254 lines to 102); out-of-range inputs are still clamped.
+- Model calls go through `model.limit(calls=max_model_calls)`, and the
+  checks before each call read `agent.remaining.calls`, so a Gateway
+  attempt limit tighter than `max_turns` is also respected.
+- Evidence links cite the program's model-call number
+  (`model_call:3`) instead of the transition id, because `model.ask` does
+  not return the transition id. The assistant message kept in history is
+  the checked answer as JSON, not the raw reply text.
+- Actions reach `dispatch_action` as records. An optional field the model
+  left out is `None`, so a custom dispatcher written for V14 as
+  `get(args, "timeout_ms", default)` gets `None`; write
+  `args.timeout_ms or default`.
+
+Code lines fell from 2,067 to 1,701 (18%, or 15% of characters). Run
+`python3 host/bench/eval_standard_agent_parity.py` to compare the two
+versions as Gateway attempts on 12 scripted tasks built from the existing
+suites' answer sequences (critique rejection and approval, budget
+checkpoint, model-call limit, run_complete, a timed-out run, answer repair,
+repeated failures, edits). V15 matches V14 in outcome, model calls,
+commands, Gateway operations, memory writes, workspace changes, and control
+counters on all 12. The one
+difference is the error when an answer cannot be repaired:
+`ModelOutputError` instead of `model_schema_validation_failed`.
+
+The cost is prompt size: the derived schema is about 6,000 characters per
+call, against 726 for V14's hand-written summary, so each call sends about
+1,300 more tokens.
+
+`--live` runs three small tasks against a real model (by default the local
+llama.cpp server). On Qwen3.8-27B (Q4, thinking off), one run each, both
+versions completed all three (write and verify a file, fix a bug so a test
+prints OK, sum a CSV column) with the same number of model calls (5, 6, 5)
+and no repair retries. V15 sent 1.6 to 2.0 times the input tokens (32,628
+against 20,214 in total). Three tasks with one run each cannot show a
+success difference; they show the port works with a real model.
+
 ## Validation
 
 The deterministic fixture and `gpt-5.6-terra` low-reasoning baselines both
@@ -368,6 +418,7 @@ Run the source checks with:
 
 ```sh
 python3 host/bench/test_standard_attempt_agent.py
+python3 host/bench/test_standard_attempt_agent_v15.py
 python3 host/bench/eval_standard_agent_runtime_learning.py --warm-build 1
 python3 host/bench/test_eval_standard_agent_completion_critique.py
 python3 host/bench/test_eval_standard_agent_context_pressure.py
