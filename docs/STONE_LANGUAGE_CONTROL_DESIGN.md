@@ -1864,8 +1864,11 @@ pydantic class definitions by default, with the JSON Schema kept as
 questions, 4 samples each, both formats) the class form was valid 44/44
 against 40/44 for the JSON Schema, with a third fewer input tokens; all
 four misses were the controller's finish action leaving out a required
-field. V15's extra prompt cost over V14 fell from about 2x to about 1.45x
-on the scripted tasks. `model.last` returns the last ask's transition ids,
+field. V15's input tokens over V14 fell from 2.04x to 1.48x on the
+scripted tasks. The extra text sits in the part of each prompt that does
+not change between calls, so with a server that reuses a matching prompt
+start the text left to process is 1.2x V14's; prompt order needed no
+change. `model.last` returns the last ask's transition ids,
 so V15 keeps V14's trace-id evidence links.
 
 ### P2. Drift

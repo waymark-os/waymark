@@ -274,7 +274,30 @@ def run_attempt(args, source: Path, task: dict[str, Any], live: bool) -> dict[st
         summary["elapsed_s"] = round(time.time() - started, 1)
         summary["request_characters"] = [
             sum(len(str(m.get("content", ""))) for m in r.get("messages", [])) for r in requests]
+        summary.update(prefix_reuse(requests))
         return summary
+
+
+def prefix_reuse(requests: list[dict[str, Any]]) -> dict[str, int]:
+    """How much of each prompt a prefix cache could skip: the leading
+    characters shared with the previous prompt (one cache slot) and with any
+    earlier prompt (a cache that keeps every prompt)."""
+    texts = ["".join(f"\x00{m.get('role')}\x00{m.get('content', '')}" for m in r.get("messages", []))
+             for r in requests]
+
+    def shared(a: str, b: str) -> int:
+        n = 0
+        for x, y in zip(a, b):
+            if x != y:
+                break
+            n += 1
+        return n
+
+    previous = sum(shared(texts[i - 1], texts[i]) for i in range(1, len(texts)))
+    any_earlier = sum(max((shared(t, texts[i]) for t in texts[:i]), default=0)
+                      for i in range(1, len(texts)))
+    return {"prompt_characters": sum(map(len, texts)), "prefix_reused_previous": previous,
+            "prefix_reused_any": any_earlier}
 
 
 def summarize(payload: dict[str, Any], gw: list[str], data: Path) -> dict[str, Any]:
@@ -388,7 +411,9 @@ def main() -> int:
         brief = {
             side: {k: run_result.get(k) for k in ("ok", "answer", "error", "error_type", "model_calls",
                                                    "commands", "gateway_errors",
-                                                   "input_tokens", "output_tokens", "elapsed_s")}
+                                                   "input_tokens", "output_tokens", "prompt_characters",
+                                                   "prefix_reused_previous", "prefix_reused_any",
+                                                   "elapsed_s")}
             for side, run_result in (("old", old), ("new", new))
         }
         print(json.dumps({"task": name, "same": not differences, **brief,

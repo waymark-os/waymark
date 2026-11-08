@@ -149,7 +149,23 @@ The cost is prompt size. `model.ask` shows the model the action records
 as pydantic class definitions, about 3,200 characters per call, against 726
 for V14's hand-written summary (a JSON Schema of the same records,
 `type_format="json_schema"`, is about 6,000). On the 12 scripted tasks V15
-sends about 1.45 times V14's input tokens.
+sends 1.48 times V14's input tokens (89,708 against 60,579 estimated
+tokens over 55 model calls each; 1.41 to 1.61 per task).
+
+Most of that extra text is the same on every call, and both versions
+already put it first: each action turn repeats the instructions, the
+action records, the task, and the earlier turns unchanged, and only the
+memory summary and the control frame, which change every call, come last.
+A model server that reuses a matching prompt start (llama.cpp does) only
+processes the rest. The eval reports this as `prefix_reused_previous`
+(characters shared with the previous call, as a server with one cache slot
+sees it) and `prefix_reused_any` (with any earlier call). The prompt text
+left to process is 205,768 characters for V15 against 167,114 for V14 with
+one slot (1.23 times), and 188,093 against 157,428 when every earlier
+prompt can be reused (1.19 times). The completion audit has a different
+start, so with one slot the action turn after it starts over. Reported
+input tokens do not show this: providers count reused tokens as input, and
+the Gateway does not record the reused count.
 
 `--live` runs three small tasks against a real model (by default the local
 llama.cpp server): write and verify a file, fix a bug so a test prints OK,
