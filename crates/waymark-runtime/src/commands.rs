@@ -318,8 +318,8 @@ emit(inference.value.ready)"#,
     },
     StoneHelpEntry {
         name: "model.ask",
-        signature: r#"model.ask(prompt: str | list[record], output: type = None, system: str = "", retries: int = 2, model_class: str = "agent", model: str = "", temperature: float? = None, max_output_tokens: int = 0, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> output type, or str without output="#,
-        use_when: "Gateway mode only. Ask the model for an answer of a declared type: a record class, a union of records, list[T], Literal[...], or any other annotation type. The JSON Schema comes from the type, and the answer comes back as a checked value, so no schema dict or JSON probing is needed.",
+        signature: r#"model.ask(prompt: str | list[record], output: type = None, system: str = "", retries: int = 2, type_format: "python" | "json_schema" = "python", model_class: str = "agent", model: str = "", temperature: float? = None, max_output_tokens: int = 0, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> output type, or str without output="#,
+        use_when: "Gateway mode only. Ask the model for an answer of a declared type: a record class, a union of records, list[T], Literal[...], or any other annotation type. The description the model sees comes from the type, and the answer comes back as a checked value, so no schema dict or JSON probing is needed.",
         examples: &[
             r#"class Plan(Record):
     steps: list[str]
@@ -342,10 +342,12 @@ except ModelOutputError as error:
     emit(error.issues)"#,
         ],
         avoid: &[
-            "Do not write a JSON Schema by hand or pass response_format; output= derives both from the type.",
+            "Do not write a JSON Schema by hand or pass response_format; output= derives the type description and the check from the type.",
             "A wrong answer is sent back to the model with each problem's path (such as $.steps[1]), up to retries times (default 2, at most 4); every attempt is a separate traced model call. If no answer matches, ModelOutputError (a ToolError) carries expected, issues, attempts, and the last answer.",
             "A union of records is decided by a Literal field such as kind: Literal[\"read\"]; give every record in a union one.",
             "Types that are not records are wrapped for the model as {\"value\": ...}; the result is the inner value.",
+            "The model is shown the answer's records as pydantic class definitions (docstrings, defaults, Field limits); type_format=\"json_schema\" sends a JSON Schema instead, about twice the size. Checking and repair are the same either way.",
+            "model.last is the most recent model.ask made through that model value: {attempts, transition_ids, reply, ok}, or None before the first one. Each program starts with a fresh model, and a model.limit(...) value keeps its own.",
             "Without output= the result is the reply text. Use model_call for the full response record.",
             "`model` is a value: pass it to functions as a parameter (def solve(task: str, model: Model)); module functions cannot read the program's `model`.",
             "Every attempt, including repairs, counts against the model's budget; see help(\"model.limit\").",
@@ -2136,7 +2138,7 @@ pub(crate) fn stone_help_topic(name: &str, span: Span) -> Value {
         "class" | "record" | "records" | "BaseModel" | "dataclass" | "Field" | "pydantic" => {
             "Record"
         }
-        "model" | "ask" => "model.ask",
+        "model" | "ask" | "model.last" | "type_format" => "model.ask",
         "model.usage" | "model.remaining" | "budget" | "budgets" | "limit" => "model.limit",
         other if crate::stone_errors::is_builtin_error_type(other) => "errors",
         other => other,

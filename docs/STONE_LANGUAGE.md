@@ -948,9 +948,14 @@ says so with `result.effects.enforced == False`.
   records, or any annotation type (`list[str]`, `Literal["yes", "no"]`, ...).
   `prompt` is a string or a message list; `system` adds a system message, and
   the other `model_call` options (`model_class`, `model`, `temperature`,
-  `max_output_tokens`, ...) pass through. Stone derives the JSON Schema from
-  `T` (nested records under `$defs`, docstrings as descriptions, no extra
-  fields) and adds it to the request as a system message. The answer is
+  `max_output_tokens`, ...) pass through. Stone describes `T` to the model in
+  a system message: by default as the pydantic class definitions of the
+  records it uses (each after the records it uses, with docstrings, defaults,
+  and `Field(...)` limits), or with `type_format="json_schema"` as a JSON
+  Schema (nested records under `$defs`, docstrings as descriptions, no extra
+  fields), about twice the size. On a live trial with Qwen3.8-27B the
+  Python form was valid on the first try more often (44/44 against 40/44)
+  with a third fewer input tokens. The answer is
   parsed (a Markdown code fence is tolerated) and converted: objects become
   records, a union of records is chosen by its `Literal` field (such as
   `kind: Literal["read"]`) or else by the first member that matches. A type
@@ -959,11 +964,14 @@ says so with `result.effects.enforced == False`.
   each problem and its path (`$.steps[1]: expected string, got 3`), up to
   `retries` times (at most 4); every attempt is an ordinary traced model call
   that hooks see. When no answer matches, `ModelOutputError` carries
-  `expected` (the schema), `issues`, `attempts`, and the last `answer`.
+  `expected` (the type), `issues`, `attempts`, and the last `answer`.
   Without `output=`, `model.ask` returns the reply text. `model` is a value
   bound in every program; functions take it as a `model: Model` parameter.
   Every attempt, including repairs, counts against the model's budget
-  ([Budgets](#budgets)). See `help("model.ask")`.
+  ([Budgets](#budgets)). `model.last` is the most recent `model.ask` made through that model value,
+  `{attempts, transition_ids, reply, ok}`, or `None` before the first one;
+  each program starts with a fresh `model`, and a `model.limit(...)` value
+  keeps its own. See `help("model.ask")`.
 
   ```python
   class Read(Record):

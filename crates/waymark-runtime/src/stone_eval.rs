@@ -920,11 +920,7 @@ fn eval_program_with_source_options(
     root_scope
         .locals
         .entry("model".to_string())
-        .or_insert_with(|| {
-            RuntimeValue::Model(ModelValue {
-                meter: budget.root(),
-            })
-        });
+        .or_insert_with(|| RuntimeValue::Model(ModelValue::new(budget.root())));
     let mut evaluator = Evaluator {
         engine_state,
         stack,
@@ -3908,13 +3904,17 @@ impl Evaluator<'_> {
                             Span::unknown(),
                         )))
                     }
+                    "last" => Ok(match model.last.borrow().as_ref() {
+                        Some(last) => RuntimeValue::Nu(json_to_nu_value(last.clone(), Span::unknown())),
+                        None => RuntimeValue::Nu(Value::nothing(Span::unknown())),
+                    }),
                     "ask" | "limit" => Err(stone_error(
                         "attribute",
                         format!("call the method: `model.{attr}(...)`, such as {}", if attr == "ask" { "`model.ask(prompt, output=Type)`" } else { "`model.limit(calls=10)`" }),
                     )),
                     _ => Err(stone_error(
                         "attribute",
-                        format!("the model has no attribute `{attr}`; it has model.ask(...), model.limit(...), model.usage, and model.remaining"),
+                        format!("the model has no attribute `{attr}`; it has model.ask(...), model.limit(...), model.usage, model.remaining, and model.last"),
                     )),
                 };
             }
@@ -8098,6 +8098,7 @@ impl Evaluator<'_> {
             }
         };
         let mut retries = stone_model::DEFAULT_RETRIES;
+        let mut type_format = stone_model::DEFAULT_TYPE_FORMAT;
         let mut system = None;
         let mut options = Vec::new();
         for (name, value) in named {
@@ -8119,6 +8120,18 @@ impl Evaluator<'_> {
                         model_ask_input_error(error.to_string())
                     })?)
                 }
+                "type_format" => {
+                    type_format = match &value {
+                        Value::String { val, .. } => stone_model::TypeFormat::parse(val),
+                        _ => None,
+                    }
+                    .ok_or_else(|| {
+                        model_ask_input_error(format!(
+                            "model.ask() type_format must be \"python\" or \"json_schema\", got {}",
+                            nu_to_json_value(&value)
+                        ))
+                    })?;
+                }
                 "response_format" | "schema" => {
                     return Err(model_ask_input_error(format!(
                         "model.ask() takes the answer's type as output=, such as `output=Plan`; remove `{name}=`"
@@ -8137,15 +8150,30 @@ impl Evaluator<'_> {
         }
         let Some(ty) = output else {
             let response = self.execute_model_request(request, &hooks, &model.meter)?;
-            return model_response_content(&response)
-                .map(|content| RuntimeValue::Nu(Value::string(content, Span::unknown())));
+            let content = model_response_content(&response)?;
+            model.record_last(
+                vec![model_response_transition_id(&response)],
+                &content,
+                true,
+            );
+            return Ok(RuntimeValue::Nu(Value::string(content, Span::unknown())));
         };
 
-        let schema = stone_records::output_schema(&ty, &self.state.types)?;
-        let instruction = stone_model::output_instruction(&schema.schema, schema.wrapped);
+        let wrapped = stone_records::is_wrapped_output(&ty);
+        let instruction = match type_format {
+            stone_model::TypeFormat::JsonSchema => {
+                let schema = stone_records::output_schema(&ty, &self.state.types)?;
+                stone_model::output_instruction(&schema.schema, wrapped)
+            }
+            stone_model::TypeFormat::Python => stone_model::python_instruction(
+                &ty.display(),
+                &stone_records::python_types(&ty, &self.state.types)?,
+                wrapped,
+            ),
+        };
         if instruction.len() > stone_model::MAX_SCHEMA_BYTES {
             return Err(model_ask_input_error(format!(
-                "the JSON Schema for `{}` is larger than {} bytes; split the answer into smaller records",
+                "the type description for `{}` is larger than {} bytes; split the answer into smaller records",
                 ty.display(),
                 stone_model::MAX_SCHEMA_BYTES
             )));
@@ -8162,13 +8190,15 @@ impl Evaluator<'_> {
 
         let mut issues = Vec::new();
         let mut content = String::new();
+        let mut transition_ids = Vec::new();
         for attempt in 0..=retries {
             let response = self.execute_model_request(request.clone(), &hooks, &model.meter)?;
+            transition_ids.push(model_response_transition_id(&response));
             content = model_response_content(&response)?;
             issues = match stone_model::parse_answer(&content) {
                 Err(message) => vec![stone_model::parse_issue(message)],
                 Ok(answer) => {
-                    let target = if schema.wrapped {
+                    let target = if wrapped {
                         match answer {
                             JsonValue::Object(mut object) if object.contains_key("value") => {
                                 object.remove("value").expect("checked")
@@ -8179,7 +8209,10 @@ impl Evaluator<'_> {
                         answer
                     };
                     match stone_records::convert_json(&target, &ty, &self.state.types) {
-                        Ok(value) => return Ok(value),
+                        Ok(value) => {
+                            model.record_last(transition_ids, &content, true);
+                            return Ok(value);
+                        }
                         Err(found) => found.iter().map(|issue| issue.to_json()).collect(),
                     }
                 }
@@ -8195,8 +8228,9 @@ impl Evaluator<'_> {
                 "role": "assistant",
                 "content": bounded_text(&content, stone_model::MAX_REPAIR_CONTENT_CHARS),
             }));
-            messages.push(json!({"role": "user", "content": stone_model::repair_message(&issues)}));
+            messages.push(json!({"role": "user", "content": stone_model::repair_message(&issues, type_format)}));
         }
+        model.record_last(transition_ids, &content, false);
         Err(host_error(model_output_error(
             &ty,
             retries + 1,
@@ -8246,9 +8280,9 @@ impl Evaluator<'_> {
             };
             *slot = Some(amount);
         }
-        Ok(RuntimeValue::Model(ModelValue {
-            meter: model.meter.narrow(limits),
-        }))
+        Ok(RuntimeValue::Model(ModelValue::new(
+            model.meter.narrow(limits),
+        )))
     }
 
     /// Check the attempt's command budget; returns the milliseconds left.
@@ -17389,6 +17423,16 @@ fn model_response_content(response: &Value) -> Result<String, ShellError> {
         .map_err(|error| model_infer_validation_error(error.to_string()))
 }
 
+fn model_response_transition_id(response: &Value) -> String {
+    match response {
+        Value::Record { val, .. } => match val.get("transition_id") {
+            Some(Value::String { val, .. }) => val.clone(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
 fn model_ask_input_error(message: impl Into<String>) -> ShellError {
     stone_error("model.ask", message)
 }
@@ -19579,6 +19623,130 @@ emit(inc(5))
     }
 
     #[test]
+    fn model_ask_shows_types_as_python_and_remembers_the_last_call() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("stone-type-format")?;
+        let test_model = std::rc::Rc::new(std::cell::RefCell::new(
+            super::stone_model::TestModel::default(),
+        ));
+        let mut session = StoneSession {
+            test_model: Some(test_model.clone()),
+            ..StoneSession::default()
+        };
+        let mut run = |source: &str,
+                       replies: &[&str]|
+         -> (
+            Result<serde_json::Value, ShellError>,
+            Vec<serde_json::Value>,
+        ) {
+            {
+                let mut model = test_model.borrow_mut();
+                model.replies = replies.iter().map(|reply| reply.to_string()).collect();
+                model.requests.clear();
+            }
+            let result = crate::stone_frontend::eval_stone_source_with_output_and_session(
+                &engine_state,
+                &mut stack,
+                source,
+                PipelineData::empty(),
+                &mut session,
+            )
+            .and_then(|output| {
+                json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())
+            });
+            let requests = std::mem::take(&mut test_model.borrow_mut().requests);
+            (result, requests)
+        };
+        run(
+            concat!(
+                "from pydantic import BaseModel, Field\nfrom typing import Literal, Optional\n",
+                "class Step(BaseModel):\n    title: str\n    done: bool = False\n",
+                "class Plan(BaseModel):\n    \"\"\"A work plan.\"\"\"\n",
+                "    steps: list[Step] = Field(min_length=1, max_length=3)\n",
+                "    note: Optional[str] = None\n",
+                "    kind: Literal[\"plan\"] = \"plan\"\n",
+            ),
+            &[],
+        )
+        .0?;
+
+        // The records are shown as pydantic classes, each after those it uses.
+        let (value, requests) = run(
+            "before = model.last\nplan = model.ask(\"plan it\", output=Plan, type_format=\"python\")\nemit([before, plan.steps[0].title, model.last.attempts, model.last.ok, model.last.reply])\n",
+            &[r#"{"steps": [{"title": "read"}]}"#],
+        );
+        assert_eq!(
+            value?,
+            json_value!([null, "read", 1, true, r#"{"steps": [{"title": "read"}]}"#])
+        );
+        let instruction = requests[0]["messages"][0]["content"]
+            .as_str()
+            .expect("instruction")
+            .to_string();
+        assert!(
+            instruction.starts_with("Answer with exactly one JSON object of type `Plan`."),
+            "{instruction}"
+        );
+        assert!(
+            instruction.ends_with(concat!(
+                "class Step(BaseModel):\n    title: str\n    done: bool = False\n\n",
+                "class Plan(BaseModel):\n    \"\"\"A work plan.\"\"\"\n",
+                "    steps: list[Step] = Field(min_length=1, max_length=3)\n",
+                "    note: str | None = None\n",
+                "    kind: Literal[\"plan\"] = 'plan'\n",
+            )),
+            "{instruction}"
+        );
+        assert!(!instruction.contains("JSON Schema"), "{instruction}");
+
+        // A wrapped answer names its type; a repair names the problem; every
+        // attempt's transition id is kept.
+        let (value, requests) = run(
+            "xs = model.ask(\"list\", output=list[int], type_format=\"python\")\nemit([xs, model.last.attempts, len(model.last.transition_ids)])\n",
+            &[r#"{"value": ["a"]}"#, r#"{"value": [1, 2]}"#],
+        );
+        assert_eq!(value?, json_value!([[1, 2], 2, 2]));
+        let instruction = requests[0]["messages"][0]["content"]
+            .as_str()
+            .expect("instruction");
+        assert_eq!(
+            instruction,
+            "Answer with exactly one JSON object of the form {\"value\": V}, where V has the Python type `list[int]`. Do not add prose or Markdown."
+        );
+        let repair = requests[1]["messages"]
+            .as_array()
+            .expect("messages")
+            .last()
+            .expect("repair")["content"]
+            .as_str()
+            .expect("text")
+            .to_string();
+        assert!(
+            repair.starts_with("Your answer does not match the required type."),
+            "{repair}"
+        );
+
+        // A failed ask is remembered too; a model.limit child has its own.
+        let (value, _) = run(
+            "small = model.limit(calls=5)\ntry:\n    small.ask(\"n\", output=int, retries=0)\nexcept ModelOutputError:\n    pass_marker = 1\nemit([small.last.ok, small.last.reply, model.last])\n",
+            &["nope"],
+        );
+        // `model` is bound afresh for each program, so its last ask is None here.
+        assert_eq!(value?, json_value!([false, "nope", null]));
+
+        let error = run("model.ask(\"x\", output=int, type_format=\"yaml\")\n", &[])
+            .0
+            .expect_err("bad format");
+        assert!(
+            format!("{error:?}")
+                .contains("type_format must be \\\"python\\\" or \\\"json_schema\\\""),
+            "{error:?}"
+        );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
     fn record_field_limits_are_checked_and_sent_to_the_model() -> Result<(), ShellError> {
         let (engine_state, mut stack, root) = test_engine("stone-field-limits")?;
         let test_model = std::rc::Rc::new(std::cell::RefCell::new(
@@ -19664,7 +19832,7 @@ emit(inc(5))
 
         // The schema carries the limits; an answer that breaks one is repaired.
         let (value, requests) = run(
-            "r = model.ask(\"run\", output=Run)\nemit([r.command, r.timeout_ms])\n",
+            "r = model.ask(\"run\", output=Run, type_format=\"json_schema\")\nemit([r.command, r.timeout_ms])\n",
             &[
                 r#"{"command": "", "target": "t", "timeout_ms": 999999}"#,
                 r#"{"command": "ls", "target": "t", "timeout_ms": 5000}"#,
@@ -19795,7 +19963,7 @@ emit(inc(5))
 
         // A good first answer becomes a record; the schema is in a system message.
         let (value, requests) = run(
-            "plan = model.ask(\"plan it\", output=Plan, system=\"Be brief.\")\nemit([type(plan), plan.steps[0].title, plan.risky])\n",
+            "plan = model.ask(\"plan it\", output=Plan, system=\"Be brief.\", type_format=\"json_schema\")\nemit([type(plan), plan.steps[0].title, plan.risky])\n",
             &[r#"{"steps": [{"title": "read"}]}"#],
         );
         assert_eq!(value?, json_value!(["Plan", "read", false]));
@@ -19991,7 +20159,7 @@ emit(inc(5))
             ("model.limit(steps=2)", "model.limit() has no limit `steps`"),
             (
                 "emit(model.budget)",
-                "it has model.ask(...), model.limit(...), model.usage, and model.remaining",
+                "it has model.ask(...), model.limit(...), model.usage, model.remaining, and model.last",
             ),
             ("x = [1]\nx.limit(calls=1)", "`limit` is the model's method"),
         ] {

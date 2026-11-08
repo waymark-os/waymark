@@ -20,8 +20,33 @@ use serde_json::{json, Value as JsonValue};
 #[derive(Clone)]
 pub(super) struct ModelValue {
     pub(super) meter: std::rc::Rc<super::stone_budget::Meter>,
+    /// `model.last`: the most recent `model.ask` made through this value
+    /// (shared by copies of the value, not by `model.limit(...)` children).
+    pub(super) last: std::rc::Rc<std::cell::RefCell<Option<JsonValue>>>,
 }
 
+impl ModelValue {
+    pub(super) fn new(meter: std::rc::Rc<super::stone_budget::Meter>) -> Self {
+        Self {
+            meter,
+            last: Default::default(),
+        }
+    }
+
+    /// Remember a finished `model.ask`: its transition ids (one per
+    /// attempt, repairs included) and the last reply text.
+    pub(super) fn record_last(&self, transition_ids: Vec<String>, reply: &str, ok: bool) {
+        *self.last.borrow_mut() = Some(json!({
+            "attempts": transition_ids.len(),
+            "transition_ids": transition_ids,
+            "reply": reply,
+            "ok": ok,
+        }));
+    }
+}
+
+/// How the answer's type is shown unless `type_format=` says otherwise.
+pub(super) const DEFAULT_TYPE_FORMAT: TypeFormat = TypeFormat::Python;
 /// Default number of repairs after a wrong answer.
 pub(super) const DEFAULT_RETRIES: i64 = 2;
 pub(super) const MAX_RETRIES: i64 = 4;
@@ -29,6 +54,48 @@ pub(super) const MAX_RETRIES: i64 = 4;
 pub(super) const MAX_SCHEMA_BYTES: usize = 64 * 1024;
 /// Longest wrong answer echoed back in a repair turn.
 pub(super) const MAX_REPAIR_CONTENT_CHARS: usize = 32 * 1024;
+
+/// How `model.ask` shows the answer's type to the model.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum TypeFormat {
+    /// Python (pydantic) class definitions, as the author wrote them.
+    Python,
+    /// A JSON Schema derived from the type.
+    JsonSchema,
+}
+
+impl TypeFormat {
+    pub(super) fn parse(text: &str) -> Option<Self> {
+        match text {
+            "python" => Some(Self::Python),
+            "json_schema" => Some(Self::JsonSchema),
+            _ => None,
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Python => "required type",
+            Self::JsonSchema => "required JSON Schema",
+        }
+    }
+}
+
+/// The system message for `type_format="python"`: the type's name and the
+/// pydantic definitions of the records it uses.
+pub(super) fn python_instruction(type_name: &str, classes: &str, wrapped: bool) -> String {
+    let shape = if wrapped {
+        format!("Answer with exactly one JSON object of the form {{\"value\": V}}, where V has the Python type `{type_name}`.")
+    } else {
+        format!("Answer with exactly one JSON object of type `{type_name}`.")
+    };
+    if classes.is_empty() {
+        return format!("{shape} Do not add prose or Markdown.");
+    }
+    format!(
+        "{shape} The record types are these pydantic models; write each as a JSON object with its field names, and leave a field out to use its default. Do not add prose or Markdown.\n\n{classes}"
+    )
+}
 
 /// The system message that states the answer's shape.
 pub(super) fn output_instruction(schema: &JsonValue, wrapped: bool) -> String {
@@ -42,9 +109,11 @@ pub(super) fn output_instruction(schema: &JsonValue, wrapped: bool) -> String {
 }
 
 /// The user turn that asks for a corrected answer.
-pub(super) fn repair_message(issues: &[JsonValue]) -> String {
-    let mut message =
-        String::from("Your answer does not match the required JSON Schema. Problems:\n");
+pub(super) fn repair_message(issues: &[JsonValue], format: TypeFormat) -> String {
+    let mut message = format!(
+        "Your answer does not match the {}. Problems:\n",
+        format.noun()
+    );
     for issue in issues {
         let path = issue.get("path").and_then(JsonValue::as_str).unwrap_or("$");
         let text = issue
@@ -120,10 +189,13 @@ mod tests {
 
     #[test]
     fn repair_lists_each_problem() {
-        let message = repair_message(&[
-            json!({"path": "$.steps[1]", "message": "expected string, got 3"}),
-            json!({"path": "$", "message": "missing required field `risky` (boolean)"}),
-        ]);
+        let message = repair_message(
+            &[
+                json!({"path": "$.steps[1]", "message": "expected string, got 3"}),
+                json!({"path": "$", "message": "missing required field `risky` (boolean)"}),
+            ],
+            super::TypeFormat::JsonSchema,
+        );
         assert!(message.contains("- $.steps[1]: expected string, got 3"));
         assert!(message.contains("missing required field `risky`"));
     }

@@ -1189,7 +1189,12 @@ fn literal_json(literal: &LiteralValue) -> JsonValue {
 /// `{"value": ...}`, and `wrapped` says so.
 pub(super) struct OutputSchema {
     pub(super) schema: JsonValue,
-    pub(super) wrapped: bool,
+}
+
+/// Whether an answer of this type is wrapped as `{"value": ...}` (any
+/// type that is not a record or a union of records).
+pub(super) fn is_wrapped_output(ty: &TypeSpec) -> bool {
+    !is_object_type(ty)
 }
 
 pub(super) fn output_schema(ty: &TypeSpec, table: &TypeTable) -> Result<OutputSchema, ShellError> {
@@ -1225,7 +1230,103 @@ pub(super) fn output_schema(ty: &TypeSpec, table: &TypeTable) -> Result<OutputSc
             .expect("output schemas are objects")
             .insert("$defs".to_string(), JsonValue::Object(defs));
     }
-    Ok(OutputSchema { schema, wrapped })
+    Ok(OutputSchema { schema })
+}
+
+/// The answer's types written as Python (pydantic) class definitions, for
+/// `model.ask(..., type_format="python")`: every record the type reaches,
+/// each after the records it uses, with docstrings, defaults, and
+/// `Field(...)` limits as the author wrote them.
+pub(super) fn python_types(ty: &TypeSpec, table: &TypeTable) -> Result<String, ShellError> {
+    fn collect(
+        ty: &TypeSpec,
+        table: &TypeTable,
+        seen: &mut Vec<String>,
+        out: &mut Vec<Rc<RecordType>>,
+    ) -> Result<(), ShellError> {
+        match ty {
+            TypeSpec::List(inner) | TypeSpec::Dict(inner) => collect(inner, table, seen, out),
+            TypeSpec::Union(members) => {
+                for member in members.iter() {
+                    collect(member, table, seen, out)?;
+                }
+                Ok(())
+            }
+            TypeSpec::Record(record) => {
+                if seen.contains(&record.name) {
+                    return Ok(());
+                }
+                seen.push(record.name.clone());
+                for field_ty in record.field_types(table)? {
+                    collect(field_ty, table, seen, out)?;
+                }
+                out.push(record.clone());
+                Ok(())
+            }
+            TypeSpec::Model => Err(record_error(
+                "a model answer cannot contain a Model; use a record of plain fields",
+            )),
+            _ => Ok(()),
+        }
+    }
+    let mut records = Vec::new();
+    collect(ty, table, &mut Vec::new(), &mut records)?;
+    let mut text = String::new();
+    for record in records {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!("class {}(BaseModel):\n", record.name));
+        if let Some(doc) = &record.doc {
+            text.push_str(&format!("    \"\"\"{}\"\"\"\n", doc.trim()));
+        }
+        if record.fields.is_empty() {
+            text.push_str("    pass\n");
+        }
+        for (field, field_ty) in record.fields.iter().zip(record.field_types(table)?) {
+            let default = field
+                .default
+                .as_ref()
+                .map(|default| literal_default(default).and_then(|value| python_repr(&value)))
+                .transpose()?;
+            let limits = &field.limits;
+            let mut options = Vec::new();
+            for (name, bound) in [
+                ("ge", limits.ge),
+                ("gt", limits.gt),
+                ("le", limits.le),
+                ("lt", limits.lt),
+            ] {
+                if let Some(bound) = bound {
+                    options.push(format!("{name}={}", format_number_bound(bound)));
+                }
+            }
+            if let Some(min) = limits.min_length {
+                options.push(format!("min_length={min}"));
+            }
+            if let Some(max) = limits.max_length {
+                options.push(format!("max_length={max}"));
+            }
+            if let Some(description) = &limits.description {
+                options.push(format!(
+                    "description={}",
+                    serde_json::to_string(description).unwrap_or_default()
+                ));
+            }
+            let value = match (default, options.is_empty()) {
+                (None, true) => String::new(),
+                (Some(default), true) => format!(" = {default}"),
+                (None, false) => format!(" = Field({})", options.join(", ")),
+                (Some(default), false) => format!(" = Field({default}, {})", options.join(", ")),
+            };
+            text.push_str(&format!(
+                "    {}: {}{value}\n",
+                field.name,
+                field_ty.display()
+            ));
+        }
+    }
+    Ok(text)
 }
 
 fn is_object_type(ty: &TypeSpec) -> bool {
