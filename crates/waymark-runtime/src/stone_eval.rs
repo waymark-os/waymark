@@ -9473,6 +9473,7 @@ impl Evaluator<'_> {
                         generation: String::new(),
                         attempt: frontier.owner_attempt.clone(),
                         checkpoint: frontier.checkpoint.clone(),
+                        ..Default::default()
                     }),
                     start,
                     ..gateway_env::AttemptSpawnV1::default()
@@ -17732,6 +17733,7 @@ fn task_spec_from_value(value: &Value, context: &str) -> Result<GatewayTaskSpec,
         success: Vec::new(),
         constraints: Vec::new(),
         metadata: Default::default(),
+        ..Default::default()
     })
 }
 
@@ -17742,6 +17744,7 @@ fn program_from_value(value: &Value, context: &str) -> Result<AttemptProgram, Sh
             program: Some(attempt_program::Program::Stone(StoneProgram {
                 source: record_string_field(stone, "source", context)?,
                 entrypoint: record_string_field(stone, "entrypoint", context)?,
+                ..Default::default()
             })),
         });
     }
@@ -17772,6 +17775,7 @@ fn program_from_value(value: &Value, context: &str) -> Result<AttemptProgram, Sh
             program: Some(attempt_program::Program::Stone(StoneProgram {
                 source,
                 entrypoint: record_string_field(record, "entrypoint", context)?,
+                ..Default::default()
             })),
         }),
         "builtin" => Ok(AttemptProgram {
@@ -17791,6 +17795,7 @@ fn program_from_value(value: &Value, context: &str) -> Result<AttemptProgram, Sh
             program: Some(attempt_program::Program::Stone(StoneProgram {
                 source,
                 entrypoint: record_string_field(record, "entrypoint", context)?,
+                ..Default::default()
             })),
         }),
         "" if !name.is_empty() => Ok(AttemptProgram {
@@ -17853,6 +17858,7 @@ fn workspace_source_from_value(
         generation: record_string_field(record, "generation", context)?,
         attempt: record_string_field(record, "attempt", context)?,
         checkpoint: record_string_field(record, "checkpoint", context)?,
+        ..Default::default()
     })
 }
 

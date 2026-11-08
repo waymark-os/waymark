@@ -3175,6 +3175,7 @@ mod tests {
                     program: Some(attempt_program::Program::Stone(StoneProgram {
                         source: "def worker(input):\n    return input".to_string(),
                         entrypoint: "worker".to_string(),
+                        ..Default::default()
                     })),
                 }),
                 task_input_json: r#"{"value":21}"#.to_string(),

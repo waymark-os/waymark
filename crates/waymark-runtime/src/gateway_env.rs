@@ -115,6 +115,7 @@ pub(crate) fn attempt_inspect(
             include_details,
             trace_limit,
             max_bytes,
+            ..Default::default()
         })
     })?;
     attempt_inspect_value(inspection, Span::unknown())
@@ -231,6 +232,7 @@ pub(crate) fn attempt_spawn(
                 .context_prompt_required_keys
                 .clone()
                 .map(|required_keys| AttemptContextPromptView { required_keys }),
+            ..Default::default()
         })
     })?;
     attempt_record_value(attempt, Span::unknown())
@@ -271,6 +273,7 @@ pub(crate) fn attempt_fork(
             context_prompt_view: context_prompt_required_keys
                 .clone()
                 .map(|required_keys| AttemptContextPromptView { required_keys }),
+            ..Default::default()
         })
     })?;
     attempt_record_value(attempt, Span::unknown())
