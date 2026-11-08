@@ -427,7 +427,7 @@ emit(str(plan.steps[0]))  # Step(title='read the failing test', done=True)
 - `class Name(Record):` defines a record. The Python spellings
   `class Name(BaseModel):` and `@dataclass class Name:` define the same thing.
   `from typing import Any, Dict, List, Literal, Optional, Union`,
-  `from pydantic import BaseModel`, `from dataclasses import dataclass`, and
+  `from pydantic import BaseModel, Field`, `from dataclasses import dataclass`, and
   `from __future__ import annotations` are accepted and do nothing; any other
   name from those modules is an error that lists the accepted ones.
 - The class body holds a docstring and typed fields with optional defaults.
@@ -435,6 +435,24 @@ emit(str(plan.steps[0]))  # Step(title='read the failing test', done=True)
   fresh for each record, so a default list is never shared. Methods,
   inheritance, and class keywords are rejected; write functions that take the
   record.
+- pydantic's `Field()` as a default adds limits:
+  `timeout_ms: Optional[int] = Field(None, ge=1, le=120000)`,
+  `command: str = Field(min_length=1, description="Shell command")`,
+  `paths: list[str] = Field(default_factory=list, max_length=8)`.
+  The accepted options are the default (positional or `default=`; `...` or
+  none means required), `default_factory=list` or `dict`, `ge`, `gt`, `le`,
+  `lt`, `min_length`, `max_length`, and `description`; any other option is
+  an error that lists these. Number limits apply to `int` and `float`
+  values, length limits to strings (in characters), lists, and dicts; other
+  values, such as `None` in an `Optional` field, pass. A limit that cannot
+  apply to the field's type, or a default that breaks its own limits, is an
+  error where the record is defined. Limits are checked when a record is
+  built or a field assigned (`Run() field command: expected at least 1
+  character, got 0`) and when a model answer is read, and `model.ask` sends
+  them in the JSON Schema as `minimum`, `exclusiveMinimum`, `maximum`,
+  `exclusiveMaximum`, `minLength`/`maxLength`, `minItems`/`maxItems`, or
+  `minProperties`/`maxProperties`, with the description. `Annotated[...]` is
+  not supported; its error shows the `Field()` form.
 - Field types: `str`, `int`, `float`, `bool`, `None`, `Any`, `list[T]`,
   `dict[str, T]`, `Literal["a", "b"]`, `Optional[T]`, unions (`A | B`,
   `Union[A, B]`), `Model`, and other records. A quoted name such as

@@ -2165,6 +2165,20 @@ impl Evaluator<'_> {
             record.doc.clone(),
             record.fields.clone(),
         ));
+        for field in &record.fields {
+            if let Some(default) = &field.default {
+                let value = stone_records::literal_default(default)?;
+                if let Err(message) = stone_records::check_limits(&value, &field.limits) {
+                    return Err(stone_error(
+                        "class",
+                        format!(
+                            "record `{name}` field `{}`: its default breaks its own Field() limits: {message}",
+                            field.name
+                        ),
+                    ));
+                }
+            }
+        }
         self.state.types.define(name.clone(), TypeSpec::Record(ty));
         Ok(())
     }
@@ -19560,6 +19574,184 @@ emit(inc(5))
             let text = format!("{error:?}");
             assert!(text.contains(expected), "{source}: {text}");
         }
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn record_field_limits_are_checked_and_sent_to_the_model() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("stone-field-limits")?;
+        let test_model = std::rc::Rc::new(std::cell::RefCell::new(
+            super::stone_model::TestModel::default(),
+        ));
+        let mut session = StoneSession {
+            test_model: Some(test_model.clone()),
+            ..StoneSession::default()
+        };
+        let mut run = |source: &str,
+                       replies: &[&str]|
+         -> (
+            Result<serde_json::Value, ShellError>,
+            Vec<serde_json::Value>,
+        ) {
+            {
+                let mut model = test_model.borrow_mut();
+                model.replies = replies.iter().map(|reply| reply.to_string()).collect();
+                model.requests.clear();
+            }
+            let result = crate::stone_frontend::eval_stone_source_with_output_and_session(
+                &engine_state,
+                &mut stack,
+                source,
+                PipelineData::empty(),
+                &mut session,
+            )
+            .and_then(|output| {
+                json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())
+            });
+            let requests = std::mem::take(&mut test_model.borrow_mut().requests);
+            (result, requests)
+        };
+        run(
+            concat!(
+                "from pydantic import BaseModel, Field\nfrom typing import Optional\n",
+                "class Run(BaseModel):\n",
+                "    command: str = Field(min_length=1, description=\"Shell command\")\n",
+                "    timeout_ms: Optional[int] = Field(None, ge=1, le=120000)\n",
+                "    paths: list[str] = Field(default_factory=list, max_length=2)\n",
+                "    ratio: float = Field(0.5, gt=0, lt=1)\n",
+                "    target: str = Field(...)\n",
+                "def error(f):\n    try:\n        f()\n    except TypeError as e:\n        return e.message\n",
+            ),
+            &[],
+        )
+        .0?;
+
+        // Building and assigning check the limits; None passes an Optional limit.
+        let (value, _) = run(
+            concat!(
+                "r = Run(command=\"ls\", target=\"t\")\n",
+                "emit([r.paths, r.ratio, r.timeout_ms,\n",
+                "      error(lambda: Run(command=\"\", target=\"t\")),\n",
+                "      error(lambda: Run(command=\"x\", target=\"t\", timeout_ms=0)),\n",
+                "      error(lambda: Run(command=\"x\", target=\"t\", paths=[\"a\", \"b\", \"c\"])),\n",
+                "      error(lambda: Run(command=\"x\", target=\"t\", ratio=1.0)),\n",
+                "      error(lambda: Run(command=\"x\"))])\n",
+            ),
+            &[],
+        );
+        assert_eq!(
+            value?,
+            json_value!([
+                [],
+                0.5,
+                null,
+                "Run() field command: expected at least 1 character, got 0",
+                "Run() field timeout_ms: expected at least 1, got 0",
+                "Run() field paths: expected at most 2 items, got 3",
+                "Run() field ratio: expected less than 1, got 1.0",
+                "Run() is missing required field(s): target"
+            ])
+        );
+        let (value, _) = run(
+            "def set_timeout(n):\n    r.timeout_ms = n\nset_timeout(7)\nset_timeout(None)\nemit(error(lambda: set_timeout(200000)))\n",
+            &[],
+        );
+        assert_eq!(
+            value?,
+            json_value!("cannot set Run.timeout_ms: expected at most 120000, got 200000")
+        );
+
+        // The schema carries the limits; an answer that breaks one is repaired.
+        let (value, requests) = run(
+            "r = model.ask(\"run\", output=Run)\nemit([r.command, r.timeout_ms])\n",
+            &[
+                r#"{"command": "", "target": "t", "timeout_ms": 999999}"#,
+                r#"{"command": "ls", "target": "t", "timeout_ms": 5000}"#,
+            ],
+        );
+        assert_eq!(value?, json_value!(["ls", 5000]));
+        let instruction = requests[0]["messages"][0]["content"]
+            .as_str()
+            .expect("instruction");
+        let schema: serde_json::Value =
+            serde_json::from_str(instruction.split("JSON Schema: ").nth(1).expect("schema"))
+                .expect("schema json");
+        let properties = &schema["properties"];
+        assert_eq!(
+            properties["command"],
+            json_value!({"type": "string", "minLength": 1, "description": "Shell command"})
+        );
+        assert_eq!(
+            properties["timeout_ms"],
+            json_value!({"anyOf": [{"type": "integer", "minimum": 1, "maximum": 120000}, {"type": "null"}], "default": null})
+        );
+        assert_eq!(
+            properties["paths"],
+            json_value!({"type": "array", "items": {"type": "string"}, "maxItems": 2, "default": []})
+        );
+        assert_eq!(
+            properties["ratio"],
+            json_value!({"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1, "default": 0.5})
+        );
+        assert_eq!(schema["required"], json_value!(["command", "target"]));
+        let repair = requests[1]["messages"]
+            .as_array()
+            .expect("messages")
+            .last()
+            .expect("repair")["content"]
+            .as_str()
+            .expect("text")
+            .to_string();
+        assert!(
+            repair.contains("$.command: expected at least 1 character, got 0"),
+            "{repair}"
+        );
+        assert!(
+            repair.contains("$.timeout_ms: expected at most 120000, got 999999"),
+            "{repair}"
+        );
+
+        // Mistakes in Field() itself are reported where the record is defined.
+        for (source, expected) in [
+            (
+                "class A(BaseModel):\n    x: int = Field(1, ge=2)\n",
+                "its default breaks its own Field() limits: expected at least 2, got 1",
+            ),
+            (
+                "class A(BaseModel):\n    x: str = Field(ge=2)\n",
+                "the field's type has no int or float",
+            ),
+            (
+                "class A(BaseModel):\n    x: int = Field(min_length=1)\n",
+                "the field's type has none of them",
+            ),
+            (
+                "class A(BaseModel):\n    x: int = Field(1, alias=\"y\")\n",
+                "Field() option `alias` is not supported; Stone accepts default, default_factory",
+            ),
+            (
+                "class A(BaseModel):\n    x: int = Field(default_factory=set)\n",
+                "default_factory may be `list` or `dict`",
+            ),
+            (
+                "class A(BaseModel):\n    x: int = Field(1, 2)\n",
+                "Field() takes at most one positional value",
+            ),
+            (
+                "class A(BaseModel):\n    x: int = Field(ge=\"1\")\n",
+                "ge= must be a number literal",
+            ),
+            (
+                "from typing import Annotated\n",
+                "write limits as the field's default: `count: int = Field(ge=0)`",
+            ),
+        ] {
+            let error = run(source, &[]).0.expect_err(source);
+            let text = format!("{error:?}");
+            assert!(text.contains(expected), "{source}: {text}");
+        }
+
         cleanup_dir(&root);
         Ok(())
     }

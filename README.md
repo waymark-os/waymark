@@ -160,8 +160,9 @@ for step in plan.steps:
 Building a record or assigning a field checks its type. `model.ask` derives
 the JSON Schema from the class, converts the answer, and sends a wrong
 answer back with each problem's path, a bounded number of times
-(`model.ask` needs the Gateway). `class Plan(BaseModel):` and
-`from typing import Literal` work as in Python. See
+(`model.ask` needs the Gateway). `class Plan(BaseModel):`,
+`from typing import Literal`, and pydantic limits such as
+`timeout_ms: int = Field(1000, ge=1, le=120000)` work as in Python. See
 [docs/STONE_LANGUAGE.md](./docs/STONE_LANGUAGE.md#records).
 
 ## Modules

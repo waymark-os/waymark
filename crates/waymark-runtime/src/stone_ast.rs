@@ -82,6 +82,33 @@ pub struct RecordFieldDef {
     pub ty: TypeExpr,
     /// A literal default, evaluated afresh for each new record.
     pub default: Option<Expr>,
+    /// Limits and a description from pydantic's `Field(...)`.
+    pub limits: FieldLimits,
+}
+
+/// `x: int = Field(None, ge=1, le=120000, description="...")`. Number
+/// bounds apply to int and float values, length bounds to strings (in
+/// characters), lists, and dicts; other values (such as `None` in an
+/// `Optional` field) are not limited.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FieldLimits {
+    pub ge: Option<f64>,
+    pub gt: Option<f64>,
+    pub le: Option<f64>,
+    pub lt: Option<f64>,
+    pub min_length: Option<u64>,
+    pub max_length: Option<u64>,
+    pub description: Option<String>,
+}
+
+impl FieldLimits {
+    pub fn has_number_bounds(&self) -> bool {
+        self.ge.is_some() || self.gt.is_some() || self.le.is_some() || self.lt.is_some()
+    }
+
+    pub fn has_length_bounds(&self) -> bool {
+        self.min_length.is_some() || self.max_length.is_some()
+    }
 }
 
 /// A type written in an annotation: a record field, or a function parameter
@@ -1180,14 +1207,21 @@ fn lower_record_class(class: py::StmtClassDef) -> Result<Stmt, ShellError> {
                     ));
                 }
                 let ty = lower_type_expr(&field.annotation)?;
-                let default = field
-                    .value
-                    .map(|value| lower_record_default(&name, &field_name, *value))
-                    .transpose()?;
+                let (default, limits) = match field.value.map(|value| *value) {
+                    Some(py::Expr::Call(call)) if is_field_call(&call) => {
+                        lower_field_call(&name, &field_name, &ty, call)?
+                    }
+                    Some(value) => (
+                        Some(lower_record_default(&name, &field_name, value)?),
+                        FieldLimits::default(),
+                    ),
+                    None => (None, FieldLimits::default()),
+                };
                 fields.push(RecordFieldDef {
                     name: field_name,
                     ty,
                     default,
+                    limits,
                 });
             }
             py::Stmt::Assign(assign) => {
@@ -1240,6 +1274,150 @@ fn lower_record_default(record: &str, field: &str, value: py::Expr) -> Result<Ex
                 "record `{record}` field `{field}` default must be a literal such as `0`, `\"\"`, `None`, `[]`, or `{{}}`; compute other values when you create the record"
             ),
         ))
+    }
+}
+
+fn is_field_call(call: &py::ExprCall) -> bool {
+    matches!(call.func.as_ref(), py::Expr::Name(name) if name.id.as_str() == "Field")
+}
+
+const FIELD_KEYWORDS: &str =
+    "default, default_factory, ge, gt, le, lt, min_length, max_length, description";
+
+/// pydantic's `Field(default, ge=..., le=..., min_length=..., max_length=...,
+/// description=...)` as a record field's default. `Field(...)` and
+/// `Field()` without a default mean the field is required.
+fn lower_field_call(
+    record: &str,
+    field: &str,
+    ty: &TypeExpr,
+    call: py::ExprCall,
+) -> Result<(Option<Expr>, FieldLimits), ShellError> {
+    let error = |message: String| {
+        unsupported_message(
+            "class definition",
+            format!("record `{record}` field `{field}`: {message}"),
+        )
+    };
+    let mut default = None;
+    let mut limits = FieldLimits::default();
+    let set_default = |value: py::Expr, default: &mut Option<Expr>| -> Result<(), ShellError> {
+        if default.is_some() {
+            return Err(error("Field() got its default twice".to_string()));
+        }
+        if !matches!(value, py::Expr::EllipsisLiteral(_)) {
+            *default = Some(lower_record_default(record, field, value)?);
+        }
+        Ok(())
+    };
+    let arguments = call.arguments;
+    let mut positional = arguments.args.into_vec().into_iter();
+    if let Some(value) = positional.next() {
+        set_default(value, &mut default)?;
+    }
+    if positional.next().is_some() {
+        return Err(error(format!(
+            "Field() takes at most one positional value, the default; name the others: {FIELD_KEYWORDS}"
+        )));
+    }
+    for keyword in arguments.keywords.into_vec() {
+        let Some(name) = keyword.arg.map(|arg| arg.to_string()) else {
+            return Err(error(
+                "Field(**options) is not supported; write each option".to_string(),
+            ));
+        };
+        let value = keyword.value;
+        match name.as_str() {
+            "default" => set_default(value, &mut default)?,
+            "default_factory" => {
+                let empty = match &value {
+                    py::Expr::Name(factory) if factory.id.as_str() == "list" => Expr::List(Vec::new()),
+                    py::Expr::Name(factory) if factory.id.as_str() == "dict" => Expr::Record(Vec::new()),
+                    _ => {
+                        return Err(error(
+                            "default_factory may be `list` or `dict`; for other values use a literal default".to_string(),
+                        ))
+                    }
+                };
+                if default.replace(empty).is_some() {
+                    return Err(error("Field() got its default twice".to_string()));
+                }
+            }
+            "ge" | "gt" | "le" | "lt" => {
+                let bound = match lower_expr(value)? {
+                    Expr::Int(text) => text.parse::<f64>().ok(),
+                    Expr::Float(number) => Some(number),
+                    Expr::Neg(inner) => match *inner {
+                        Expr::Int(text) => text.parse::<f64>().ok().map(|number| -number),
+                        Expr::Float(number) => Some(-number),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some(bound) = bound else {
+                    return Err(error(format!("{name}= must be a number literal")));
+                };
+                let slot = match name.as_str() {
+                    "ge" => &mut limits.ge,
+                    "gt" => &mut limits.gt,
+                    "le" => &mut limits.le,
+                    _ => &mut limits.lt,
+                };
+                *slot = Some(bound);
+            }
+            "min_length" | "max_length" => {
+                let length = match lower_expr(value)? {
+                    Expr::Int(text) => text.parse::<u64>().ok(),
+                    _ => None,
+                };
+                let Some(length) = length else {
+                    return Err(error(format!(
+                        "{name}= must be a whole number, zero or more"
+                    )));
+                };
+                if name == "min_length" {
+                    limits.min_length = Some(length);
+                } else {
+                    limits.max_length = Some(length);
+                }
+            }
+            "description" => match lower_expr(value)? {
+                Expr::String(text) => limits.description = Some(text),
+                _ => return Err(error("description= must be a string literal".to_string())),
+            },
+            other => {
+                return Err(error(format!(
+                    "Field() option `{other}` is not supported; Stone accepts {FIELD_KEYWORDS}"
+                )))
+            }
+        }
+    }
+    if limits.has_number_bounds()
+        && !type_expr_has(ty, &|ty| matches!(ty, TypeExpr::Int | TypeExpr::Float))
+    {
+        return Err(error(
+            "ge/gt/le/lt limit numbers, but the field's type has no int or float".to_string(),
+        ));
+    }
+    if limits.has_length_bounds()
+        && !type_expr_has(ty, &|ty| {
+            matches!(ty, TypeExpr::Str | TypeExpr::List(_) | TypeExpr::Dict(_))
+        })
+    {
+        return Err(error(
+            "min_length/max_length limit strings, lists, and dicts, but the field's type has none of them".to_string(),
+        ));
+    }
+    Ok((default, limits))
+}
+
+/// Whether a type, or a member of a union, satisfies `test`. A named type
+/// may be an alias, so it is given the benefit of the doubt.
+fn type_expr_has(ty: &TypeExpr, test: &dyn Fn(&TypeExpr) -> bool) -> bool {
+    match ty {
+        TypeExpr::Union(members) => members.iter().any(|member| type_expr_has(member, test)),
+        TypeExpr::Named(_) | TypeExpr::Any => true,
+        other => test(other),
     }
 }
 
@@ -1482,6 +1660,10 @@ pub(crate) fn lower_type_expr(annotation: &py::Expr) -> Result<TypeExpr, ShellEr
                         .collect::<Result<Vec<_>, _>>()?,
                 )),
                 "Literal" => lower_literal_type(&args),
+                "Annotated" => Err(unsupported_message(
+                    "type annotation",
+                    "`Annotated[T, Field(...)]` is not supported; in a record write the limits as the default: `count: int = Field(ge=0)`",
+                )),
                 "tuple" | "Tuple" | "set" | "Set" | "frozenset" | "FrozenSet" => Err(
                     unsupported_message("type annotation", TUPLE_TYPE_UNSUPPORTED),
                 ),
@@ -2536,6 +2718,12 @@ fn lower_import_from(import: py::StmtImportFrom) -> Result<Stmt, ShellError> {
         // Python typing habits (design L10): these names are part of Stone's
         // annotation syntax already, so importing them changes nothing.
         if let Some(unknown) = names.iter().find(|name| !accepted.contains(&name.as_str())) {
+            if unknown == "Annotated" {
+                return Err(unsupported_message(
+                    "import",
+                    "`Annotated` is not supported; in a record, write limits as the field's default: `count: int = Field(ge=0)` (with `from pydantic import BaseModel, Field`)",
+                ));
+            }
             return Err(unsupported_message(
                 "import",
                 format!(
@@ -2575,7 +2763,7 @@ const TYPING_IMPORT_HINT: &str = "Records are `class Plan(Record):` with typed f
 fn python_typing_imports(module: &str) -> Option<&'static [&'static str]> {
     match module {
         "typing" => Some(&["Any", "Dict", "List", "Literal", "Optional", "Union"]),
-        "pydantic" => Some(&["BaseModel"]),
+        "pydantic" => Some(&["BaseModel", "Field"]),
         "dataclasses" => Some(&["dataclass"]),
         "__future__" => Some(&["annotations"]),
         _ => None,

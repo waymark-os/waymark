@@ -34,7 +34,7 @@ use serde_json::{json, Map as JsonMap, Value as JsonValue};
 use super::stone_containers::{dict_from_entries, list_from_values, record_obj, ItemRef};
 use super::stone_runtime_value::RuntimeValue;
 use crate::json::json_to_nu_value;
-use crate::stone_ast::{Expr, LiteralValue, RecordFieldDef, TypeExpr};
+use crate::stone_ast::{Expr, FieldLimits, LiteralValue, RecordFieldDef, TypeExpr};
 use crate::stone_builtins::value_type_name;
 
 /// Most problems reported for one model answer.
@@ -586,15 +586,17 @@ pub(super) fn construct(
     for ((field, slot), ty) in record.fields.iter().zip(slots).zip(types) {
         let value = match slot {
             Some(value) => {
-                check(&value, ty, table).map_err(|issue| {
-                    record_error(format!(
-                        "{name}() field {}",
-                        issue
-                            .at_key(&field.name)
-                            .describe("")
-                            .trim_start_matches('.')
-                    ))
-                })?;
+                check(&value, ty, table)
+                    .and_then(|()| check_limits(&value, &field.limits).map_err(TypeIssue::new))
+                    .map_err(|issue| {
+                        record_error(format!(
+                            "{name}() field {}",
+                            issue
+                                .at_key(&field.name)
+                                .describe("")
+                                .trim_start_matches('.')
+                        ))
+                    })?;
                 value
             }
             None => match &field.default {
@@ -614,6 +616,122 @@ pub(super) fn construct(
         )));
     }
     Ok(record_obj(record.clone(), values))
+}
+
+/// A `Field(...)` limit, checked after the value's type. Number bounds
+/// apply to ints and floats, length bounds to strings (in characters),
+/// lists, and dicts; other values, such as `None`, pass.
+pub(super) fn check_limits(value: &RuntimeValue, limits: &FieldLimits) -> Result<(), String> {
+    if limits.has_number_bounds() {
+        let number = match value {
+            RuntimeValue::Nu(Value::Int { val, .. }) => Some((*val as f64, val.to_string())),
+            RuntimeValue::Nu(Value::Float { val, .. }) => {
+                Some((*val, crate::stone_builtins::python_float_repr(*val)))
+            }
+            _ => None,
+        };
+        if let Some((number, got)) = number {
+            let broken = [
+                (limits.ge.filter(|bound| number < *bound), "at least"),
+                (limits.gt.filter(|bound| number <= *bound), "more than"),
+                (limits.le.filter(|bound| number > *bound), "at most"),
+                (limits.lt.filter(|bound| number >= *bound), "less than"),
+            ];
+            if let Some((Some(bound), words)) =
+                broken.into_iter().find(|(bound, _)| bound.is_some())
+            {
+                return Err(format!(
+                    "expected {words} {}, got {got}",
+                    format_number_bound(bound)
+                ));
+            }
+        }
+    }
+    if limits.has_length_bounds() {
+        let measured = match value {
+            RuntimeValue::Nu(Value::String { val, .. }) => Some((val.chars().count(), "character")),
+            RuntimeValue::Nu(Value::List { vals, .. }) => Some((vals.len(), "item")),
+            RuntimeValue::Nu(Value::Record { val, .. }) => Some((val.len(), "key")),
+            RuntimeValue::List(list) => Some((list.len(), "item")),
+            RuntimeValue::Dict(dict) => Some((dict.len(), "key")),
+            _ => None,
+        };
+        if let Some((length, unit)) = measured {
+            let count = |n: u64| format!("{n} {unit}{}", if n == 1 { "" } else { "s" });
+            if let Some(min) = limits.min_length.filter(|min| (length as u64) < *min) {
+                return Err(format!("expected at least {}, got {length}", count(min)));
+            }
+            if let Some(max) = limits.max_length.filter(|max| length as u64 > *max) {
+                return Err(format!("expected at most {}, got {length}", count(max)));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write `Field(...)` limits into a field's JSON Schema with the standard
+/// keywords. In an `anyOf` (an `Optional` field), each limit goes on the
+/// members it applies to.
+fn add_limit_keywords(schema: &mut JsonValue, limits: &FieldLimits) {
+    fn apply(schema: &mut JsonValue, limits: &FieldLimits) {
+        let Some(object) = schema.as_object_mut() else {
+            return;
+        };
+        if let Some(JsonValue::Array(members)) = object.get_mut("anyOf") {
+            for member in members {
+                apply(member, limits);
+            }
+            return;
+        }
+        let number = |bound: f64| {
+            if bound.fract() == 0.0 && bound.abs() < 9.0e15 {
+                json!(bound as i64)
+            } else {
+                json!(bound)
+            }
+        };
+        match object.get("type").and_then(JsonValue::as_str) {
+            Some("integer" | "number") => {
+                for (key, bound) in [
+                    ("minimum", limits.ge),
+                    ("exclusiveMinimum", limits.gt),
+                    ("maximum", limits.le),
+                    ("exclusiveMaximum", limits.lt),
+                ] {
+                    if let Some(bound) = bound {
+                        object.insert(key.to_string(), number(bound));
+                    }
+                }
+            }
+            Some(kind @ ("string" | "array" | "object")) => {
+                let (min_key, max_key) = match kind {
+                    "string" => ("minLength", "maxLength"),
+                    "array" => ("minItems", "maxItems"),
+                    _ => ("minProperties", "maxProperties"),
+                };
+                if let Some(min) = limits.min_length {
+                    object.insert(min_key.to_string(), json!(min));
+                }
+                if let Some(max) = limits.max_length {
+                    object.insert(max_key.to_string(), json!(max));
+                }
+            }
+            _ => {}
+        }
+    }
+    apply(schema, limits);
+    if let (Some(description), Some(object)) = (&limits.description, schema.as_object_mut()) {
+        object.insert("description".to_string(), json!(description));
+    }
+}
+
+/// A bound as Python prints it: `120000`, `0.5`.
+fn format_number_bound(bound: f64) -> String {
+    if bound.fract() == 0.0 && bound.abs() < 9.0e15 {
+        format!("{}", bound as i64)
+    } else {
+        format!("{bound}")
+    }
 }
 
 /// `record.field = value`, checked against the field's type.
@@ -644,18 +762,21 @@ pub(super) fn assign_field(
     };
     super::stone_containers::ensure_mutable(value, "assignment")?;
     let ty = &record.ty.field_types(table)?[index];
-    check(&new_value, ty, table).map_err(|issue| {
-        record_error(format!(
-            "cannot set {}.{field}: {}{}",
-            record.ty.name,
-            issue.path.trim_start_matches('.'),
-            if issue.path.is_empty() {
-                issue.message.clone()
-            } else {
-                format!(": {}", issue.message)
-            }
-        ))
-    })?;
+    let limits = &record.ty.fields[index].limits;
+    check(&new_value, ty, table)
+        .and_then(|()| check_limits(&new_value, limits).map_err(TypeIssue::new))
+        .map_err(|issue| {
+            record_error(format!(
+                "cannot set {}.{field}: {}{}",
+                record.ty.name,
+                issue.path.trim_start_matches('.'),
+                if issue.path.is_empty() {
+                    issue.message.clone()
+                } else {
+                    format!(": {}", issue.message)
+                }
+            ))
+        })?;
     record.set(index, new_value);
     Ok(())
 }
@@ -910,7 +1031,10 @@ fn convert_record(
             Some(item) => {
                 let mut item_issues = Vec::new();
                 if let Some(value) = convert(item, ty, table, &mut item_issues) {
-                    values.push(value);
+                    match check_limits(&value, &field.limits) {
+                        Ok(()) => values.push(value),
+                        Err(message) => item_issues.push(TypeIssue::new(message)),
+                    }
                 }
                 issues.extend(
                     item_issues
@@ -1176,6 +1300,7 @@ fn record_schema(
     let mut required = Vec::new();
     for (field, ty) in record.fields.iter().zip(types) {
         let mut schema = schema_for(ty, table, defs)?;
+        add_limit_keywords(&mut schema, &field.limits);
         match &field.default {
             Some(default) => {
                 let default = literal_default(default)?.into_nu_value("schema")?;

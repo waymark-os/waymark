@@ -403,19 +403,30 @@ Action = Read | Edit
 def target(action: Action) -> str:
     return action.path
 emit([target(Read(path="a.py")), isinstance(Edit(path="b", new="c"), Action)])"#,
+            r#"from pydantic import BaseModel, Field
+from typing import Optional
+class Run(BaseModel):
+    command: str = Field(min_length=1, description="Shell command to run")
+    timeout_ms: Optional[int] = Field(None, ge=1, le=120000)
+    paths: list[str] = Field(default_factory=list, max_length=8)
+try:
+    Run(command="")
+except TypeError as e:
+    emit([Run(command="ls").paths, e.message])"#,
         ],
         avoid: &[
             "Field types: str, int, float, bool, None, Any, list[T], dict[str, T], Literal[...], Optional[T], A | B, Model, and other records (a quoted name such as list[\"Tree\"] refers ahead or to the record itself). A top-level alias such as Action = Read | Edit can be used in annotations.",
             "Build with keywords or positionally in field order. A missing field, an unknown field, or a value of the wrong type is a TypeError naming the field and path; a dict is not converted into a record.",
             "Read and assign fields as attributes (plan.note), not plan[\"note\"]; records cannot be iterated. A record is shared like a dict: b = a refers to the same record.",
             "Defaults are literals (0, \"\", None, [], {}) and are fresh for each record, so a default list is never shared.",
+            "pydantic's Field() sets limits as the default: Field(default, ge=, gt=, le=, lt=, min_length=, max_length=, description=); Field(...) means required and default_factory=list or dict means an empty one. Number limits apply to int and float values, length limits to str (characters), list, and dict; None passes. Limits are checked when a record is built or assigned and when a model answer is read, and model.ask sends them in the JSON Schema. Annotated[...] and other Field options are not supported.",
             "No methods, inheritance, or class keywords: write def functions that take the record. class X(BaseModel): and @dataclass class X: are accepted as records; from typing/pydantic/dataclasses imports of those names are accepted and change nothing.",
             "Lists and dicts inside a record are checked when assigned, not when later changed in place (as in pydantic).",
             "Records compare equal with the same type and equal fields. str(record) is Python's form, Plan(steps=[], note=None); print, emit, and builtins see a plain dict of the fields.",
             "Record names are global, like error types: a module's records keep their names on import and cannot be renamed with as.",
             "class Name(Exception): (or another error type) defines an error type instead of a record; see help(\"errors\").",
         ],
-        aliases: &["BaseModel", "dataclass"],
+        aliases: &["BaseModel", "dataclass", "Field"],
     },
     StoneHelpEntry {
         name: "context_write",
@@ -2122,7 +2133,9 @@ pub(crate) fn stone_help_topic(name: &str, span: Span) -> Value {
         "sorted" => "sort",
         "gotchas" | "constraints" => "unsupported",
         "exceptions" | "except" | "try" | "raise" => "errors",
-        "class" | "record" | "records" | "BaseModel" | "dataclass" => "Record",
+        "class" | "record" | "records" | "BaseModel" | "dataclass" | "Field" | "pydantic" => {
+            "Record"
+        }
         "model" | "ask" => "model.ask",
         "model.usage" | "model.remaining" | "budget" | "budgets" | "limit" => "model.limit",
         other if crate::stone_errors::is_builtin_error_type(other) => "errors",
