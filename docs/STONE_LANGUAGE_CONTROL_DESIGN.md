@@ -1858,6 +1858,16 @@ with the same call counts. The full derived schema costs about 1,300 more
 prompt tokens per call than V14's hand-written summary (1.6-2.0 times the
 input tokens live), which is the open cost of this exit.
 
+After M5 (type format): `model.ask` now shows the answer's records as
+pydantic class definitions by default, with the JSON Schema kept as
+`type_format="json_schema"`. On a live first-try trial with Qwen3.8-27B (11
+questions, 4 samples each, both formats) the class form was valid 44/44
+against 40/44 for the JSON Schema, with a third fewer input tokens; all
+four misses were the controller's finish action leaving out a required
+field. V15's extra prompt cost over V14 fell from about 2x to about 1.45x
+on the scripted tasks. `model.last` returns the last ask's transition ids,
+so V15 keeps V14's trace-id evidence links.
+
 ### P2. Drift
 
 - L8 sealed `Verified[T]` and `Evidence`; verifier in its own attempt on a

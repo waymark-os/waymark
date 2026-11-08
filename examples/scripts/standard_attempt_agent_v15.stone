@@ -461,7 +461,7 @@ def standard_available_retries(agent, options, reserved_after):
 def standard_ask(agent, prompt, output, state, retries, max_output_tokens, hooks=None):
     # One model.ask: returns the checked answer, adds the model calls it
     # took (repairs included) to state, and remembers the last call's
-    # number for evidence links.
+    # transition id for evidence links.
     before = agent.usage.calls
     answer = agent.ask(
         prompt,
@@ -473,7 +473,7 @@ def standard_ask(agent, prompt, output, state, retries, max_output_tokens, hooks
     calls = agent.usage.calls - before
     state["model_calls"] += calls
     state["validation_retries"] += calls - 1
-    state["last_model_call"] = model.usage.calls
+    state["last_transition_id"] = agent.last.transition_ids[-1]
     return answer
 
 
@@ -1028,7 +1028,7 @@ def standard_outcome_evidence(action, outcome, state, options):
         "step": state.actions,
         "action": standard_action_summary(action),
         "result": result,
-        "model_call": state.last_model_call,
+        "transition_id": state.last_transition_id,
     }
 
 
@@ -1041,7 +1041,7 @@ def standard_record_evidence(action, outcome, state, options):
         "evidence",
         standard_outcome_evidence(action, outcome, state, options),
         status=status,
-        evidence=["model_call:" + str(state.last_model_call)],
+        evidence=["transition:" + state.last_transition_id],
     )
 
 
@@ -1075,7 +1075,7 @@ def standard_record_task_requirement(session, options, status):
 
 
 def standard_record_completion_audit(critique, status):
-    evidence = ["critic:model_call:" + str(critique.model_call)]
+    evidence = ["critic:" + critique.transition_id]
     return context_write(
         "requirement.audit",
         "requirement",
@@ -1147,7 +1147,7 @@ def standard_requirement_critique(
         "summary": audit.summary,
         "repair_objective": audit.repair_objective,
         "requirements": audit.requirements,
-        "model_call": state.last_model_call,
+        "transition_id": state.last_transition_id,
         "audit_mode": audit_mode,
         "claimed_approved": audit.approved,
     }
@@ -1294,9 +1294,9 @@ def standard_verify_finish(candidate, session, state):
 
 def standard_record_progress(event):
     evidence = ["control:stone.standard_action_v15"]
-    model_call = get(event, "model_call", 0)
-    if model_call > 0:
-        evidence.append("model_call:" + str(model_call))
+    transition_id = get(event, "transition_id", "")
+    if len(transition_id) > 0:
+        evidence.append("transition:" + transition_id)
     context_write(
         "progress.agent_control",
         "progress",
@@ -1362,7 +1362,7 @@ def standard_result(candidate, state):
             state.max_action_context_characters
         ),
         "validation_retries": state.validation_retries,
-        "last_model_call": state.last_model_call,
+        "last_transition_id": state.last_transition_id,
         "time_budget_phase": state.time_budget_phase,
         "time_budget_warnings": state.time_budget_warnings,
         "last_time_remaining_ms": state.last_time_remaining_ms,
@@ -1393,7 +1393,7 @@ def standard_needs_review(reason, state, options, record_progress):
         "model_calls": state.model_calls,
         "tool_calls": state.tool_calls,
         "failed_tools": state.failed_tools,
-        "model_call": state.last_model_call,
+        "transition_id": state.last_transition_id,
     })
     return standard_result(
         {
@@ -1477,7 +1477,7 @@ def standard_agent_control(
             options.max_action_context_characters
         ),
         "validation_retries": 0,
-        "last_model_call": 0,
+        "last_transition_id": "",
         "last_tool": "",
         "time_budget_phase": "unbounded",
         "time_budget_warnings": 0,
@@ -1563,7 +1563,7 @@ def standard_agent_control(
                 "failed_tools": state.failed_tools,
                 "budget_checkpoints": state.budget_checkpoints,
                 "checkpoint_rejections": state.checkpoint_rejections,
-                "model_call": state.last_model_call,
+                "transition_id": state.last_transition_id,
             })
             if critique.approved:
                 state = standard_set_control(
@@ -1645,7 +1645,7 @@ def standard_agent_control(
             "actions": state.actions,
             "tool_calls": state.tool_calls,
             "failed_tools": state.failed_tools,
-            "model_call": state.last_model_call,
+            "transition_id": state.last_transition_id,
         })
 
         final = None
@@ -1665,7 +1665,7 @@ def standard_agent_control(
                     "actions": state.actions,
                     "model_calls": state.model_calls,
                     "tool_calls": state.tool_calls,
-                    "model_call": state.last_model_call,
+                    "transition_id": state.last_transition_id,
                 })
                 state = standard_set_control(
                     state,
@@ -1721,7 +1721,7 @@ def standard_agent_control(
                         "failed_tools": state.failed_tools,
                         "completion_critiques": state.completion_critiques,
                         "critic_rejections": state.critic_rejections,
-                        "model_call": state.last_model_call,
+                        "transition_id": state.last_transition_id,
                     })
                     state = standard_set_control(
                         state,
@@ -1742,7 +1742,7 @@ def standard_agent_control(
                     "approved": True,
                     "summary": critique.summary,
                     "requirements": critique.requirements,
-                    "model_call": critique.model_call,
+                    "transition_id": critique.transition_id,
                 }
             record_progress({
                 "stage": "finished",
@@ -1754,7 +1754,7 @@ def standard_agent_control(
                 "failed_tools": state.failed_tools,
                 "completion_critiques": state.completion_critiques,
                 "critic_rejections": state.critic_rejections,
-                "model_call": state.last_model_call,
+                "transition_id": state.last_transition_id,
             })
             return standard_result(candidate, state)
 
@@ -1803,7 +1803,7 @@ def standard_agent_control(
             "mode": state.control_mode,
             "progress": state.progress_class,
             "unchanged_streak": state.unchanged_streak,
-            "model_call": state.last_model_call,
+            "transition_id": state.last_transition_id,
         })
         if state.unchanged_streak >= options.max_stagnant_actions:
             return standard_needs_review(
@@ -1838,7 +1838,7 @@ def standard_agent_control(
         "model_calls": state.model_calls,
         "tool_calls": state.tool_calls,
         "failed_tools": state.failed_tools,
-        "model_call": state.last_model_call,
+        "transition_id": state.last_transition_id,
     })
     if options.report_partial_on_limit:
         return standard_result(

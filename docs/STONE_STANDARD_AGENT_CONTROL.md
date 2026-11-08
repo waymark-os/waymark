@@ -126,10 +126,9 @@ V14 text:
 - Model calls go through `model.limit(calls=max_model_calls)`, and the
   checks before each call read `agent.remaining.calls`, so a Gateway
   attempt limit tighter than `max_turns` is also respected.
-- Evidence links cite the program's model-call number
-  (`model_call:3`) instead of the transition id, because `model.ask` does
-  not return the transition id. The assistant message kept in history is
-  the checked answer as JSON, not the raw reply text.
+- Evidence links keep V14's transition ids, read from `agent.last` after
+  each `model.ask`. The assistant message kept in history is the checked
+  answer as JSON, not the raw reply text.
 - Actions reach `dispatch_action` as records. An optional field the model
   left out is `None`, so a custom dispatcher written for V14 as
   `get(args, "timeout_ms", default)` gets `None`; write
@@ -146,17 +145,24 @@ counters on all 12. The one
 difference is the error when an answer cannot be repaired:
 `ModelOutputError` instead of `model_schema_validation_failed`.
 
-The cost is prompt size: the derived schema is about 6,000 characters per
-call, against 726 for V14's hand-written summary, so each call sends about
-1,300 more tokens.
+The cost is prompt size. `model.ask` shows the model the action records
+as pydantic class definitions, about 3,200 characters per call, against 726
+for V14's hand-written summary (a JSON Schema of the same records,
+`type_format="json_schema"`, is about 6,000). On the 12 scripted tasks V15
+sends about 1.45 times V14's input tokens.
 
 `--live` runs three small tasks against a real model (by default the local
-llama.cpp server). On Qwen3.8-27B (Q4, thinking off), one run each, both
-versions completed all three (write and verify a file, fix a bug so a test
-prints OK, sum a CSV column) with the same number of model calls (5, 6, 5)
-and no repair retries. V15 sent 1.6 to 2.0 times the input tokens (32,628
-against 20,214 in total). Three tasks with one run each cannot show a
-success difference; they show the port works with a real model.
+llama.cpp server): write and verify a file, fix a bug so a test prints OK,
+and sum a CSV column. On Qwen3.8-27B (Q4, thinking off), one run each:
+
+| Run | V14 | V15 |
+|---|---|---|
+| With the JSON Schema | 3/3, 20,214 input tokens | 3/3, 32,628 input tokens |
+| With the Python class form | 2/3 (one model transport failure), 5,574 and 5,186 tokens on the two it finished | 3/3, 25,849 input tokens (8,411 and 8,300 on the same two) |
+
+Neither version needed a repair retry. Three tasks with one run each cannot
+show a success difference; they show the port works with a real model and
+that the class form cuts V15's extra prompt cost roughly in half.
 
 ## Validation
 
