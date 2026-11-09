@@ -92,7 +92,8 @@ Two consequences:
   world (the diff is empty, the file was not changed) is certain. A check
   against something the model made (the model's own reproduction script
   passes) only borrows certainty from the model. The pilot in 11.3 shows
-  the difference.
+  the difference. 11.4 states, as a hypothesis to test (H-16), how the two
+  uncertain inputs, the environment and the LLM, might be modeled.
 
 **The three roles of checking.** Static and dynamic checks and the errors
 they produce are one feedback system with three parts:
@@ -1746,6 +1747,7 @@ boundaries), so L2 and R9 are one piece of M4 work, not two.
 | H-13 | A cheap static plan check (L12 proposal, 5.2) helps models write per-task programs that work: it catches plans that cannot fit together, models fix them from the errors, and checked plans succeed more often | Models write a program per task under three conditions: no check; the static check with repair before running; the static check plus the dynamic checks. Same tasks, model, and budget (1.1, 11.3) |
 | H-14 | Lowering `model.ask` action unions to native tool calls in the Gateway stops OpenAI reasoning models from finishing on the first move, and raises their success | Rerun 11.3's Luna arms with the Gateway lowering, both arms unchanged (5.6) |
 | H-15 | Program checks as a gate, followed by an LLM reviewer, beat either alone: invention is caught by the checks and narrow fixes by the reviewer | A typed-plus-reviewer arm in 11.3's setup |
+| H-16 | A harness has two uncertain inputs, the environment and the LLM, and they should be modeled differently: environment observations are facts, LLM output is a claim, a proposal, or a judgment, and only a check against the environment turns a claim into a fact. Tracking that status in types, and listing the judgments a result rests on, makes false success claims predictable and preventable | The four experiments in 11.4 |
 
 ### 11.1 The Outcome-Prediction Ablation (Set Up, Not Run)
 
@@ -2087,6 +2089,115 @@ both arms, with 32 against 49 calls per run.
 - a typed-plus-reviewer arm;
 - the plan check (L12, 5.2) with model-written programs;
 - the Gateway lowering of action unions to tool calls (5.6).
+
+### 11.4 Hypothesis: Modeling The Two Uncertain Inputs (H-16)
+
+Status: a hypothesis, written down on 2026-11-08 for experiments to confirm
+or replace. Nothing here is decided. It would be the central idea of a
+formal core for Stone (a small core language with typing rules and a
+soundness theorem), if one is written.
+
+**The two inputs.** Apart from the program itself, a harness has two
+sources of uncertainty:
+
+| | Environment (repository, tools, OS) | LLM |
+|---|---|---|
+| Role | The ground truth, partly known | An advisor: it proposes, claims, and judges |
+| What it gives the program | Observations: exit codes, file contents, diffs | Proposals (a patch, a script, a plan); claims ("I changed X", "the tests pass"); judgments ("this script captures the issue") |
+| How it goes wrong | Not in the assumed state: a missing tool, a flaky test, truncated output | Wrong shape, invented claims, plausible but wrong judgments |
+| What a check can establish | Its state, by probing it | The shape of the output only |
+
+Both are checked for shape at the boundary, as with ordinary input
+validation: records for model replies, typed results for tools. Content is
+where they differ. An observation is a fact once made, though it can go
+stale. LLM output is not a fact until it is checked against the
+environment:
+
+- a **claim** about the world is checked by looking;
+- a **proposal** is tested by running it in the environment;
+- a **judgment** usually cannot be checked by the environment at all.
+  Another model can cross-check it, which lowers the risk without removing
+  it.
+
+**The model to test:**
+
+1. Every value from outside carries a status: *observed* (from the
+   environment, through the host), *claimed* (from the model), or *verified*
+   (a claim the host checked against the environment). This generalizes
+   Elba's `Trusted` (Section 2) and the provenance labels of D-3.
+2. Only a check against the environment turns a claimed value into a
+   verified one. A decision that needs a fact (a stage completing, a
+   submit) accepts only observed or verified values. A static check enforces
+   this, in the style of taint tracking.
+3. Assumptions about the environment are stated:
+   - what each tool needs, returns, may change, and may raise (the syscall
+     signatures of 5.8);
+   - what a stage assumes when it starts, which can be probed then;
+   - what is expected after each call or stage, which is checked (`expect=`,
+     `ensure`).
+4. The LLM's contract covers shape only. When an outcome rests on a model
+   judgment, the result names it as an assumption ("verified, assuming the
+   reproduction captures the issue") instead of hiding it inside a check.
+
+**The guarantee it would give,** in assume-guarantee form: assuming the
+environment behaves as its tool signatures say, every run either reaches
+its goal, resting only on the listed judgment assumptions, or stops at a
+named check failure that blames one side, the environment or the model.
+This is the blame form of gradual-typing soundness (Wadler and Findler,
+"Well-typed programs can't be blamed", 2009), with two parties.
+
+**What the pilot (11.3) already suggests:**
+
+- Luna: the untyped arm treated a model claim ("done, tests pass") as a
+  fact. The typed arm demanded verification, which caught every one.
+- Haiku: the typed arm treated a proposal (the reproduction script) as if
+  testing it settled a judgment (that the script captures the issue). Under
+  this model the result would read "verified, assuming the reproduction
+  captures the issue", which is where all 11 wrong claims came from.
+- Environment assumptions failed silently four times, each one costing
+  model budget or a run before anyone noticed:
+  - `git` refused the repository (ownership);
+  - the sympy image ran no tests with the commands the model chose;
+  - a repository copy was incomplete;
+  - an output was truncated.
+
+**Experiments to confirm or replace it:**
+
+1. **Classify what failed.** Rerun 11.3's arms, logging every model output
+   in full and every check with what it checked against: the environment,
+   or a model artifact. Label each model output that a decision used as a
+   claim, a proposal, or a judgment. Then attribute each false success
+   claim and each wasted round to an input and a kind. The hypothesis
+   predicts:
+   - false claims come from unverified claims (weak models) and from
+     judgments (capable models);
+   - wasted rounds come from environment assumptions that were never probed.
+2. **A status-tracking arm.** The typed arm, written as a workflow (1.1),
+   with statuses on values and a final report that lists its judgment
+   assumptions. Two questions:
+   - Do results with listed judgment assumptions fail more often than
+     results without them?
+   - Does adding a check for a listed judgment close that gap? Examples: a
+     reviewer, a second reproduction written without seeing the first, or
+     the existing tests that cover the changed code.
+3. **Environment probes at stage entry.** Probe each stage's stated
+   assumptions when it starts (the tools exist, the test command runs, the
+   repository is clean) and count how much budget is saved compared with
+   finding the failure later.
+4. **The static rule with model-written programs.** Seed programs with a
+   decision that consumes a claimed value without a check, and run
+   authorship evals. Measure whether models write programs that keep the
+   rule, whether the checker's errors let them repair the rest, and how
+   often it raises false alarms.
+
+**What would count against it:**
+
+- false claims that fit none of the three kinds;
+- status tracking that adds authoring friction without reducing false
+  claims;
+- judgment assumptions that do not predict failure;
+- a static rule too coarse to separate legitimate uses of model output
+  (choosing which file to read next) from decisions that need facts.
 
 ## 12. Uncertainties
 
