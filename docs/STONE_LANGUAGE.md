@@ -108,6 +108,11 @@ accepts the JSON spellings `true`, `false`, and `null`. This narrow compatibilit
 rule keeps an otherwise valid agent-authored record from failing when generated
 code crosses the Python/JSON boundary.
 
+Some Python forms are not in Stone: `del`, `assert`, `match`, `:=`, `**`,
+`@`, `*` unpacking in calls and literals, `yield`, `...`, bytes literals, and
+annotations outside record fields (`x: int = 5`). Each is rejected before the
+program runs with one sentence saying what to write instead.
+
 Truthiness follows Python's common data model: `False`, `None`, numeric zero,
 empty strings, empty lists, and empty records are falsey; non-empty values and
 non-zero numbers are truthy. Boolean operators short-circuit and, as in
@@ -115,13 +120,12 @@ Python, yield an operand: `a or b` is `a` when `a` is truthy and `b`
 otherwise, and `a and b` is `a` when `a` is falsey and `b` otherwise. So
 `name = given or "default"` works. Conditions only test truthiness.
 
-Text built from values follows Python inside programs: `str()`, `repr()`,
-f-string fields, and `format()` placeholders give `"None"`, `"True"`,
-`"1.0"`, `"[1, 'x']"`, and `"{'a': None}"`. Text the model reads stays JSON:
-`emit`, returned values, observations, error envelopes, and `print()` of a list
-or record (`print([1, "x"])` writes `[1,"x"]`). `print()` of a scalar follows
-Python (`print(None)` writes `None`). Use `json_dumps(value)` when a program
-builds text that must be JSON, such as a model prompt that embeds a record.
+Text built from values follows Python: `str()`, `repr()`, f-string fields,
+`format()` placeholders, and `print()` give `"None"`, `"True"`, `"1.0"`,
+`"[1, 'x']"`, and `"{'a': None}"` (`print([1, "x"])` writes `[1, 'x']`).
+Structured output stays JSON: `emit`, returned values, observations, and error
+envelopes. Use `json_dumps(value)` when a program builds text that must be
+JSON, such as a model prompt that embeds a record.
 `round(x)` returns an int and rounds halfway cases to even (`round(2.5)` is
 2); `round(x, n)` returns a float and rounds the stored binary value
 (`round(2.675, 2)` is 2.67), as in Python.
@@ -147,9 +151,12 @@ runtime behavior.
 
 Comparisons support numeric ordering across ints and floats, lexicographic
 string ordering, and lexicographic list ordering. Equality is recursive for
-lists and records, numeric across ints/floats, and strongly typed for booleans:
-`2 == 2.0` is true, but `True == 1` is false. Ordering unrelated types, such as
-`"1" < 2`, is an error.
+lists and records, and numeric across ints/floats: `2 == 2.0` is true.
+Booleans are not numbers. Python answers `True == 1` with `True`; Stone raises
+for any comparison that mixes a bool with an int or float, at any depth
+(`[True] == [1]`, `1 in [True, 2]`, `[1, True].count(1)`, `.index(True)`), and
+the error says to convert with `int(flag)` or `bool(count)`. Ordering
+unrelated types, such as `"1" < 2`, is an error.
 
 Membership supports strings, lists, and record keys: `"mark" in "waymark"`,
 `2 in [1, 2, 3]`, and `"path" in record`. Other containers are an error.
@@ -246,7 +253,13 @@ close/release remains idempotent. Values introduced inside the lexical block
 follow Python's block rule: `with` does not create a name scope. The target and
 body assignments remain visible after exit, but owned resources are already
 closed or released. A file target likewise remains bound as a closed file.
-This separates value visibility from resource authority.
+This separates value visibility from resource authority. Only `open(...)`,
+`attempt_scope()`, and `semantic_frontier()` can be used in `with`; any other
+value (`with 5:`, `with some_dict as d:`) is an error, as in Python.
+
+As in Python, `for line in f` and `f.readlines()` keep each line's `"\n"`
+(`["a\n", "b\n", "c"]`), so strip it with `line.rstrip("\n")` or
+`line.strip()`. `f.splitlines()` and `text.splitlines()` drop it.
 
 Nominal methods are intentionally thin spellings of the functional kernel:
 `scope.branch` -> `attempt_branch`, `scope.wait_any`/`wait_all` -> the Gateway
@@ -365,6 +378,13 @@ emit(counter())  # 2
 
 ### Lists And Dicts
 
+Dict keys are strings, because dicts are JSON objects. A dict literal must
+write its keys as strings: `{1: "a"}` and `{True: "a"}` are rejected before
+the program runs (Python would key them by the number or bool), and so is a
+computed key such as `{name: 1}`; build that dict with `d = {}` and
+`d[name] = 1`, or with a comprehension. An int key at run time
+(`d[1] = "x"`, `{i: x for ...}`, `d.get(1)`) is an error.
+
 Lists and dicts are shared objects, as in Python. Assigning one to another
 name, passing it to a function, or storing it inside another list or dict
 does not copy it, so a change made through one name is visible through every
@@ -383,8 +403,12 @@ emit(rows)  # both rows now have "seen": True
 - `xs += ys` extends `xs` in place, including `d["xs"] += ys`.
 - `list(xs)`, `xs[:]`, and comprehensions make a new outer list; the elements
   are still shared. `{k: v for k, v in d.items()}` copies a dict the same way.
-- `a is b` is true only when both names refer to the same list or dict;
-  `a == b` compares contents.
+- `a is b` is true only when both names refer to the same list, dict, or
+  record; `a == b` compares contents. `is` also works with None, True,
+  False, and types (`type(error) is ValueError`). `is` with any other
+  literal (`x is 1`, `x is "a"`, `x is []`), which Python warns about, is
+  rejected before the program runs, and `is` between two numbers or strings
+  raises; both errors say to use `==`.
 - `x or y` and `x and y` return one of the operands itself, not a copy.
 - `for`, `enumerate`, `sorted`, `filter`, `where`, `first`, `last`,
   slicing, and a dict's `.get`, `.values`, and `.items` hand out the same
@@ -476,10 +500,12 @@ emit(str(plan.steps[0]))  # Step(title='read the failing test', done=True)
 - Lists and dicts held by a record are checked when assigned, not when later
   changed in place: `plan.steps.append(3)` is not caught, as in pydantic.
 - `==` is true for two records of the same type with equal fields; a record
-  never equals a dict. `type(plan)` is `"Plan"`. A record is always true.
-- `str()`, `repr()`, and f-strings give Python's dataclass form,
-  `Plan(steps=[...], risky=False, note=None)`. `print`, `emit`, JSON, and
-  builtins such as `len` see a plain dict of the fields.
+  never equals a dict. `type(plan)` is the class `Plan`, so
+  `type(plan) == Plan` is true; comparing it with the string `"Plan"` raises,
+  since a type never equals its name. A record is always true.
+- `str()`, `repr()`, f-strings, and `print` give Python's dataclass form,
+  `Plan(steps=[...], risky=False, note=None)`. `emit`, JSON, and builtins
+  such as `len` see a plain dict of the fields.
 - Record names are global, like error classes. A module may define records;
   they are imported under their own name, cannot be renamed with `as`, and
   two modules may not define the same record. Record classes persist in the
@@ -663,9 +689,10 @@ true only for an error the host raised, never for a dict that merely has
 `type="ExpectationFailed"`. A parent deciding what to do after a failure can
 therefore trust that the failure came from a checked call.
 
-Error types are values. A bare type name evaluates to the type's name, so
-types can be stored in lists and records and passed to functions, and the
-`type` field of a caught error compares equal to it:
+Error types are values. A bare type name such as `ValueError` is the type
+itself, so types can be stored in lists and records and passed to functions.
+As `type(error)` is in Python, `error.type` is the caught error's type, and it
+compares equal only to that type:
 
 ```python
 retry_on = [TimeoutError, ExpectationFailed]
@@ -680,13 +707,21 @@ except Exception as error:
 
 `isinstance(value, T)` accepts `str`, `int`, `float`, `bool`, `list`,
 `dict`, an error type, or a tuple or list of these. As in Python,
-`isinstance(True, int)` is true. Stone has no separate tuple or set type, so
-`isinstance(x, tuple)` is an error that suggests `list`. An unknown type name
+`isinstance(True, int)` is true. `tuple` and `set` are their own types, so
+`isinstance((1, 2), list)` is false. An unknown type name
 is an error, so a misspelled type never silently fails to match. A record is
 an error only if its `type` names a known error type, so
-`isinstance({"type": "user"}, Exception)` is false. A deliberate deviation
-from Python: `ValueError == "ValueError"` is true, because a type's value is
-its name.
+`isinstance({"type": "user"}, Exception)` is false.
+
+A type never equals its name. Python answers `ValueError == "ValueError"` and
+`error.type in ["KeyError"]` with a silent `False`; Stone raises, saying to
+drop the quotes or use `isinstance`. Where a type leaves the program (emitted
+JSON, an error record sent to another attempt, `error["type"]`) it is written
+as its name, `"ValueError"`.
+
+A caught error prints as Python prints it: `str(error)` and `f"{error}"` are
+the message, and `repr(error)` is `ValueError('message')`. Its fields
+(`error.message`, `error.code`, and any declared fields) stay available.
 
 Models may define their own error types as field-only classes deriving from an
 error type:
@@ -709,8 +744,8 @@ persist in the session like functions.
 Rules checked before anything runs:
 
 - Bare `except:` is rejected. Use `except Exception as error:` or a narrower
-  type. `BaseException` does not exist in Stone: budget exhaustion and policy
-  stops end the attempt and are not catchable. `IOError` is spelled `OSError`.
+  type. `BaseException` does not exist in Stone (see "Control stops and
+  denials" below). `IOError` is spelled `OSError`.
 - A handler for `Exception` or `ToolError` whose body is only `pass` is
   rejected, because it discards failed commands, missing files, and failed
   model calls without a trace. Bind the error and use it, or catch the narrow
@@ -718,6 +753,22 @@ Rules checked before anything runs:
 - A handler naming an unknown type is rejected with the list of builtin types.
 - `except error:` (a lowercase name) does not bind `error` in Python or
   Stone. Stone rejects it with a correction to `except Exception as error:`.
+
+Control stops and denials. The test is who decided:
+
+- **Control stop: the host ends the attempt.** A budget or deadline is used
+  up, the parent or host cancelled the attempt, or the attempt has already
+  finished. The program stops, and no `except` handler runs, however broad.
+  Runtime cleanup still happens: open attempt scopes are cancelled and
+  joined, and frontiers are released. The Gateway refuses every further
+  effect of a stopped attempt, so a program could not continue anyway.
+- **Denial: one call is refused.** A pre-hook vetoes a `run(...)` or
+  `model.ask(...)`, which returns `ok=False` with `kind="policy_rejected"`,
+  or the host refuses one effect. Nothing ran, and the program can handle it
+  like any other failure. Every denial is counted in the result's
+  `diagnostics.denials` (`count` and the `last` one), whether or not the
+  program noticed it. If the program fails, the count is attached to its
+  error.
 
 Each tool's `help()` entry lists what it raises. `run()` does not raise for
 a failed, timed-out, or missing command (unlike Python's `subprocess`): it
@@ -870,8 +921,15 @@ says so with `result.effects.enforced == False`.
   `set(iterable)`: aggregate lists or supported generator expressions with
   Stone truthiness, typed numeric semantics, or deterministic first-seen
   uniqueness.
-- `set()` and `set(iterable)`: materialize a deterministic unique list. The
-  `.add(value)` method appends only values not already present.
+- `set()` and `set(iterable)`: a set, as in Python. Members must be hashable
+  (None, bools, numbers, strings, and tuples of those); a list member raises.
+  Sets have `add`, `discard`, `remove`, `update`, `pop`, `clear`, `copy`,
+  `union`, `intersection`, `difference`, `symmetric_difference`, `issubset`,
+  `issuperset`, `isdisjoint`, the operators `|`, `&`, `-`, `^`, and `<=`/`<`
+  for subsets. Iteration follows first-insertion order. A set cannot be
+  indexed, and mixing bools with numbers in one set raises. There is no
+  `{1, 2}` literal; write `set([1, 2])`. `unique(xs)` gives a de-duplicated
+  list instead. Lists have no `.add()`.
 - `str(value)` and `repr(value)`: Python's text forms (`str(None)` is
   `"None"`, `repr("x")` is `"'x'"`, `str({"a": 1})` is `"{'a': 1}"`); use
   `json_dumps(value)` when valid JSON text is required.
@@ -890,8 +948,13 @@ says so with `result.effects.enforced == False`.
   `text.count("x")`, `",".join(items)`, `open(path).readlines()`,
   `items.extend(other)`, `items.count(value)`, and mutating
   `items.sort(key=..., reverse=...)` are also supported.
-- `list(value)` and `tuple(value)`: materialize a list view. In Stone,
-  `tuple()` is an agent-compatibility alias for `list()`.
+- `list(value)` makes a new list and `tuple(value)` an immutable tuple.
+  Tuples (`(1, 2)`, `return a, b`) index, slice, iterate, unpack, compare
+  element by element, join with `+`, and can be set members; they have
+  `count` and `index` and cannot change. A tuple or set never equals a list:
+  `(1, 2) == [1, 2]` raises (Python says `False`), and the error says to
+  convert with `list(t)`. Emitted JSON and builtins that take plain data see
+  tuples and sets as arrays; `enumerate` and `d.items()` give lists.
 - `run(argv, cwd=None, stdin=None, timeout_ms=None, env=None, expect=None,
   effects=None, background=False, stdout="capture", stderr="capture",
   max_stdout_bytes=1048576, max_stderr_bytes=1048576, hooks={})`: Linux command

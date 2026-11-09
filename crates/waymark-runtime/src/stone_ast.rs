@@ -903,7 +903,7 @@ fn lower_stmt(statement: py::Stmt) -> Result<Stmt, ShellError> {
             "nonlocal",
             "Stone has no `nonlocal`: closures read enclosing variables but do not rebind them. Keep the state in a list or dict (`count = [0]`, then `count[0] += 1`), or return the new value",
         )),
-        unsupported => Err(unsupported_error("statement", &unsupported)),
+        unsupported => Err(unsupported_statement(&unsupported)),
     }
 }
 
@@ -1577,7 +1577,13 @@ fn lower_type_annotation(annotation: &py::Expr) -> Result<StoneType, ShellError>
                 "only list[T] generic annotations are supported",
             )),
         },
-        unsupported => Err(unsupported_error("type annotation", unsupported)),
+        unsupported => Err(unsupported_message(
+            "type annotation",
+            format!(
+                "`{}` cannot be used as an annotation; use str, int, float, bool, None, list[T], dict, a record class, or a union such as `str | None`",
+                python_node_name(unsupported)
+            ),
+        )),
     }
 }
 
@@ -1863,10 +1869,16 @@ fn lower_aug_assign(assign: py::StmtAugAssign) -> Result<Stmt, ShellError> {
         py::Operator::BitXor => AugOp::BitXor,
         py::Operator::LShift => AugOp::LShift,
         py::Operator::RShift => AugOp::RShift,
+        py::Operator::Pow => {
+            return Err(unsupported_message(
+                "augmented assignment",
+                "Stone has no `**=` (no power operator); multiply instead, such as `x = x * x`",
+            ));
+        }
         unsupported => {
             return Err(unsupported_message(
                 "augmented assignment",
-                format!("unsupported augmented assignment operator: {unsupported:?}"),
+                format!("Stone has no `{}=` operator", operator_text(&unsupported)),
             ));
         }
     };
@@ -2179,7 +2191,7 @@ fn lower_expr(expression: py::Expr) -> Result<Expr, ShellError> {
             attr: attribute.attr.to_string(),
         }),
         py::Expr::Slice(slice) => lower_slice(slice),
-        unsupported => Err(unsupported_error("expression", &unsupported)),
+        unsupported => Err(unsupported_expression(&unsupported)),
     }
 }
 
@@ -2267,11 +2279,52 @@ fn lower_compare(compare: py::ExprCompare) -> Result<Expr, ShellError> {
         .into_iter()
         .map(lower_expr)
         .collect::<Result<Vec<_>, _>>()?;
+    let left = lower_expr(*compare.left)?;
+    // `is` asks for identity. Against a literal other than None, True, or
+    // False (`x is 1`, `x is "a"`, `x is []`) it is meant as `==`; Python
+    // warns, Stone rejects before running.
+    let mut previous = &left;
+    for (op, comparator) in ops.iter().zip(&comparators) {
+        if matches!(op, CompareOp::Is | CompareOp::IsNot)
+            && (is_value_literal(previous) || is_value_literal(comparator))
+        {
+            let (word, replacement) = if *op == CompareOp::Is {
+                ("is", "==")
+            } else {
+                ("is not", "!=")
+            };
+            return Err(unsupported_message(
+                "identity comparison",
+                format!(
+                    "`{word}` with a literal asks whether two objects are the same object, not whether they are equal; use `{replacement}`. `{word}` is for None, True, False (`x {word} None`) and for asking whether two names hold the same list, dict, or record"
+                ),
+            ));
+        }
+        previous = comparator;
+    }
     Ok(Expr::Compare {
-        left: Box::new(lower_expr(*compare.left)?),
+        left: Box::new(left),
         ops,
         comparators,
     })
+}
+
+/// A literal whose identity means nothing: numbers, strings, and new
+/// containers. None, True, and False are not in it.
+fn is_value_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::String(_)
+        | Expr::FormattedString(_)
+        | Expr::List(_)
+        | Expr::Tuple(_)
+        | Expr::Record(_)
+        | Expr::ListComprehension { .. }
+        | Expr::DictComprehension { .. } => true,
+        Expr::Neg(operand) => is_value_literal(operand),
+        _ => false,
+    }
 }
 
 fn lower_compare_op(op: py::CmpOp) -> Result<CompareOp, ShellError> {
@@ -2437,14 +2490,24 @@ fn lower_dict(dict: py::ExprDict) -> Result<Expr, ShellError> {
             ));
         };
 
+        // Dict keys are strings (they are JSON object keys). Python would
+        // keep `{1: "a"}` keyed by the int 1; turning it into "1" silently
+        // breaks `d[1]` later, so a non-string key is rejected here.
         let key = match key {
             py::Expr::StringLiteral(string) => string.value.to_string(),
-            py::Expr::NumberLiteral(number) => record_number_key(number.value)?,
-            py::Expr::BooleanLiteral(boolean) => boolean.value.to_string(),
-            unsupported => {
+            py::Expr::NumberLiteral(_) | py::Expr::BooleanLiteral(_) => {
+                let written = source_key_text(&key);
                 return Err(unsupported_message(
-                    "record literal",
-                    format!("unsupported record key expression: {unsupported:?}"),
+                    "dict key",
+                    format!(
+                        "dict keys in Stone are strings, so `{{{written}: ...}}` cannot keep {written} as a key; write the key as a string (`{{\"{written}\": ...}}`) and look it up with that string, or use a list if the numbers are positions"
+                    ),
+                ));
+            }
+            _ => {
+                return Err(unsupported_message(
+                    "dict key",
+                    "a dict literal's keys must be written as strings, such as {\"name\": value}; for a key held in a variable, build the dict with `d = {}` then `d[key] = value`, or use a comprehension `{key: value for ...}`",
                 ));
             }
         };
@@ -2455,14 +2518,18 @@ fn lower_dict(dict: py::ExprDict) -> Result<Expr, ShellError> {
     Ok(Expr::Record(items))
 }
 
-fn record_number_key(number: py::Number) -> Result<String, ShellError> {
-    match number {
-        py::Number::Int(value) => Ok(value.to_string()),
-        py::Number::Float(value) => Ok(value.to_string()),
-        py::Number::Complex { .. } => Err(unsupported_message(
-            "record literal",
-            "complex number keys are not supported yet",
-        )),
+/// How a literal key was written, for messages.
+fn source_key_text(key: &py::Expr) -> String {
+    match key {
+        py::Expr::NumberLiteral(number) => match &number.value {
+            py::Number::Int(value) => value.to_string(),
+            py::Number::Float(value) => value.to_string(),
+            py::Number::Complex { .. } => "a complex number".to_string(),
+        },
+        py::Expr::BooleanLiteral(boolean) => {
+            if boolean.value { "True" } else { "False" }.to_string()
+        }
+        _ => "the key".to_string(),
     }
 }
 
@@ -2541,6 +2608,18 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
                     | "endswith"
                     | "upper"
                     | "values"
+                    | "remove"
+                    | "update"
+                    | "pop"
+                    | "clear"
+                    | "copy"
+                    | "union"
+                    | "intersection"
+                    | "difference"
+                    | "symmetric_difference"
+                    | "issubset"
+                    | "issuperset"
+                    | "isdisjoint"
                     | "write"
                     | "zfill"
             ) {
@@ -2670,13 +2749,118 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
         }
         unsupported => Err(unsupported_message(
             "command call",
-            format!("unsupported call target: {unsupported:?}"),
+            format!(
+                "Stone can call a name, a method, an index, or a call result, not `{}`; assign the function to a name first",
+                python_node_name(&unsupported)
+            ),
         )),
     }
 }
 
-fn unsupported_error(kind: &str, value: &impl std::fmt::Debug) -> ShellError {
-    unsupported_message(kind, format!("unsupported {kind}: {value:?}"))
+/// The parser's name for a node (`Yield`, `Match`), never its full dump.
+fn python_node_name(value: &impl std::fmt::Debug) -> String {
+    let text = format!("{value:?}");
+    text.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("this form")
+        .to_string()
+}
+
+fn operator_text(op: &py::Operator) -> &'static str {
+    match op {
+        py::Operator::Add => "+",
+        py::Operator::Sub => "-",
+        py::Operator::Mult => "*",
+        py::Operator::MatMult => "@",
+        py::Operator::Div => "/",
+        py::Operator::Mod => "%",
+        py::Operator::Pow => "**",
+        py::Operator::LShift => "<<",
+        py::Operator::RShift => ">>",
+        py::Operator::BitOr => "|",
+        py::Operator::BitXor => "^",
+        py::Operator::BitAnd => "&",
+        py::Operator::FloorDiv => "//",
+    }
+}
+
+/// A Python statement Stone does not have, with what to write instead.
+fn unsupported_statement(statement: &py::Stmt) -> ShellError {
+    let (kind, message) = match statement {
+        py::Stmt::Delete(_) => (
+            "del",
+            "Stone has no `del`. To drop a dict key, rebuild the dict: `d = {k: v for k, v in d.items() if k != key}`; to drop a list item, `xs = xs[:i] + xs[i + 1:]`".to_string(),
+        ),
+        py::Stmt::Assert(_) => (
+            "assert",
+            "Stone has no `assert` statement; raise explicitly: `if not ok: raise AssertionError(\"why\")`, or check a command with expect=Expect(...)".to_string(),
+        ),
+        py::Stmt::AnnAssign(_) => (
+            "annotated assignment",
+            "annotations like `x: int = 5` are only for record fields (`class Plan(Record):`); write `x = 5`".to_string(),
+        ),
+        py::Stmt::Match(_) => (
+            "match",
+            "Stone has no `match` statement; use `if`/`elif` chains".to_string(),
+        ),
+        py::Stmt::TypeAlias(_) => (
+            "type alias",
+            "Stone has no `type X = ...` statement; write `X = A | B`".to_string(),
+        ),
+        other => {
+            let name = python_node_name(other);
+            ("statement", format!("Stone does not support Python's `{name}` statement"))
+        }
+    };
+    unsupported_message(kind, message)
+}
+
+/// A Python expression Stone does not have, with what to write instead.
+fn unsupported_expression(expression: &py::Expr) -> ShellError {
+    let (kind, message) = match expression {
+        py::Expr::Set(_) => (
+            "set literal",
+            "Stone has no `{1, 2}` set literal; write `set([1, 2])`".to_string(),
+        ),
+        py::Expr::SetComp(_) => (
+            "set comprehension",
+            "Stone has no set comprehension; write `set(x for x in xs)`".to_string(),
+        ),
+        py::Expr::Starred(_) => (
+            "star unpacking",
+            "Stone has no `*` unpacking in calls or literals; pass the list itself, or join lists with `xs + ys`".to_string(),
+        ),
+        py::Expr::BinOp(bin_op) if matches!(bin_op.op, py::Operator::Pow) => (
+            "power operator",
+            "Stone has no `**` power operator; multiply instead, such as `x * x`".to_string(),
+        ),
+        py::Expr::BinOp(bin_op) => (
+            "operator",
+            format!("Stone has no `{}` operator", operator_text(&bin_op.op)),
+        ),
+        py::Expr::Named(_) => (
+            "assignment expression",
+            "Stone has no `:=`; assign on its own line first (`m = find(x)`), then test it (`if m:`)".to_string(),
+        ),
+        py::Expr::Yield(_) | py::Expr::YieldFrom(_) => (
+            "yield",
+            "Stone has no generator functions; build a list and return it".to_string(),
+        ),
+        py::Expr::EllipsisLiteral(_) => (
+            "ellipsis",
+            "Stone has no `...` value; use `pass` for an empty body and None for a placeholder".to_string(),
+        ),
+        py::Expr::BytesLiteral(_) => (
+            "bytes literal",
+            "Stone has no bytes literals; use a str".to_string(),
+        ),
+        other => {
+            let name = python_node_name(other);
+            ("expression", format!("Stone does not support Python's `{name}` expression"))
+        }
+    };
+    unsupported_message(kind, message)
 }
 
 fn lower_import_from(import: py::StmtImportFrom) -> Result<Stmt, ShellError> {
@@ -2929,14 +3113,6 @@ mod tests {
                     ("kind".to_string(), Expr::String("file".to_string())),
                 ]),
             ),
-            (
-                r#"{1: "one", 2.5: "two", True: "yes"}"#,
-                Expr::Record(vec![
-                    ("1".to_string(), Expr::String("one".to_string())),
-                    ("2.5".to_string(), Expr::String("two".to_string())),
-                    ("true".to_string(), Expr::String("yes".to_string())),
-                ]),
-            ),
         ];
 
         for (source, expected) in cases {
@@ -2948,6 +3124,49 @@ mod tests {
                 },
                 "source: {source}"
             );
+        }
+    }
+
+    #[test]
+    fn unsupported_python_forms_get_a_correction_not_a_parser_dump() {
+        for (source, needle) in [
+            ("d = {}\ndel d[\"a\"]", "Stone has no `del`"),
+            ("assert x, \"why\"", "raise AssertionError"),
+            ("x: int = 5", "write `x = 5`"),
+            ("match x:\n    case 1:\n        pass", "`if`/`elif`"),
+            ("def g():\n    yield 1", "build a list"),
+            ("emit(...)", "no `...` value"),
+            ("x **= 2", "`**=`"),
+            ("emit(2 ** 3)", "no `**` power operator"),
+            ("emit(b\"a\")", "no bytes literals"),
+            ("emit({1, 2})", "set([1, 2])"),
+            ("emit({x for x in xs})", "set(x for x in xs)"),
+            ("emit(f(*xs))", "no `*` unpacking"),
+            ("if (n := 3):\n    pass", "no `:=`"),
+            ("emit(a @ b)", "no `@` operator"),
+        ] {
+            let err = lower_source(source).expect_err(source);
+            let text = format!("{err:?}");
+            assert!(text.contains(needle), "{source}: {text}");
+            assert!(!text.contains("NodeIndex") && !text.contains("range:"), "{source}: {text}");
+        }
+    }
+
+    #[test]
+    fn dict_literals_reject_non_string_keys() {
+        for (source, needle) in [
+            (r#"{1: "one"}"#, r#"`{"1": ...}`"#),
+            (r#"{2.5: "two"}"#, r#"`{"2.5": ...}`"#),
+            (r#"{True: "yes"}"#, r#"`{"True": ...}`"#),
+            (r#"k = "a"
+{k: 1}"#, "d[key] = value"),
+            (r#"{(1, 2): 1}"#, "d[key] = value"),
+        ] {
+            let source = source.replace("\\n", "\n");
+            let err = lower_source(&source).expect_err(&source);
+            let text = format!("{err:?}").replace('\\', "");
+            assert!(text.contains(needle), "{source}: {text}");
+            assert!(!text.contains("ExprName") && !text.contains("NodeIndex"), "{source}: {text}");
         }
     }
 

@@ -46,7 +46,7 @@ pub(crate) const BUILTIN_ERROR_TYPES: &[(&str, Option<&str>)] = &[
 pub(crate) const REJECTED_ERROR_TYPES: &[(&str, &str)] = &[
     (
         "BaseException",
-        "`BaseException` does not exist in Stone: budget exhaustion and policy stops end the attempt and are not catchable. Use `except Exception as error:`",
+        "`BaseException` does not exist in Stone: when the host ends the attempt (budget or deadline used up, cancelled, already finished), the program stops and no handler runs. A call the host or a hook denies is not such a stop: nothing ran, and it is an ordinary error or an `ok=False` result the program can handle. Use `except Exception as error:`",
     ),
     (
         "KeyboardInterrupt",
@@ -425,6 +425,9 @@ pub(crate) fn classify_error(kind: &str, code: &str, message: &str) -> &'static 
             | "augmented assignment"
             | "function call"
             | "record"
+            | "set"
+            | "tuple"
+            | "with"
     ) || message.starts_with("cannot ")
         || message.contains(" expects ")
         || message.contains(" requires ")

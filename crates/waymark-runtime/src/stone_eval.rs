@@ -62,10 +62,10 @@ use crate::stone_builtins::{
     index_method_builtin, int_builtin, join_builtin, last_builtin, len_builtin, list_builtin,
     map_builtin_value, min_max_builtin, mod_values, mul_values, neg_value, parse_float_builtin,
     parse_int_builtin, python_str, range_builtin, record_method_builtin, repr_builtin,
-    round_builtin, set_builtin, shift_value, slice_builtin, sort_builtin_values,
+    round_builtin, shift_value, slice_builtin, sort_builtin_values,
     sort_key_for_value, sort_keyed, split_builtin, starts_with_builtin, str_builtin,
     string_method_builtin, sub_values, sum_builtin, unique_builtin, value_identity_key,
-    value_to_bool, value_to_display_string, value_to_f64, value_to_i64, value_to_limit,
+    value_to_bool, value_to_f64, value_to_i64, value_to_limit,
     value_to_operator_i64, value_to_path_string, value_to_string, value_to_u64, value_truthy,
     value_type_name, where_builtin, where_compare_builtin, zfill_text,
 };
@@ -103,6 +103,8 @@ use stone_records::{RecordType, TypeSpec, TypeTable};
 
 #[path = "stone_budget.rs"]
 mod stone_budget;
+#[path = "stone_collections.rs"]
+mod stone_collections;
 #[path = "stone_containers.rs"]
 mod stone_containers;
 #[path = "stone_context.rs"]
@@ -127,6 +129,7 @@ mod stone_vm_interp;
 mod stone_vm_jsonl_runtime;
 #[path = "stone_vm/runtime.rs"]
 mod stone_vm_runtime;
+use stone_collections::{tuple_value, SetObj};
 use stone_containers::{
     assign_item, child_for_mutation, dict_from_entries, ensure_mutable, freeze, is_frozen,
     is_plain_container, list_from_values, materialize, share, unshare, ListRef,
@@ -171,6 +174,10 @@ pub struct EvalState {
     caught_errors: Vec<Value>,
     swallowed_tool_errors: u64,
     last_swallowed_tool_error: Option<Value>,
+    /// Calls the host or a pre-hook refused (nothing ran for them). Counted
+    /// whether or not the program noticed, and reported in the result.
+    denials: u64,
+    last_denial: Option<JsonValue>,
     host_errors: Vec<Value>,
     handler_warnings: Vec<String>,
     async_functions_entered: u64,
@@ -759,9 +766,18 @@ impl EvalState {
             if Some(name.as_str()) == exclude {
                 continue;
             }
+            // Plain values leave the handler; scope-bound ones (open files
+            // and their views) do not.
             if matches!(
                 value,
-                RuntimeValue::Nu(_) | RuntimeValue::List(_) | RuntimeValue::Dict(_)
+                RuntimeValue::Nu(_)
+                    | RuntimeValue::List(_)
+                    | RuntimeValue::Dict(_)
+                    | RuntimeValue::Record(_)
+                    | RuntimeValue::Tuple(_)
+                    | RuntimeValue::Set(_)
+                    | RuntimeValue::Type(_)
+                    | RuntimeValue::Model(_)
             ) {
                 parent.locals.insert(name, value);
             }
@@ -792,7 +808,22 @@ impl EvalState {
     }
 
     fn record_transition_event(&mut self, event: JsonValue) {
+        if event.get("rejected").and_then(JsonValue::as_bool) == Some(true) {
+            self.denials = self.denials.saturating_add(1);
+            self.last_denial = Some(event.clone());
+        }
         self.transition_events.push(event);
+    }
+
+    /// The `denials` diagnostics record, when any call was refused.
+    fn denials_json(&self) -> Option<JsonValue> {
+        (self.denials > 0).then(|| {
+            json!({
+                "count": self.denials,
+                "last": self.last_denial.clone().unwrap_or(JsonValue::Null),
+                "note": "calls a pre-hook or the host refused; nothing ran for them",
+            })
+        })
     }
 
     fn file_mut(&mut self, handle: FileHandle) -> Result<&mut RuntimeFile, ShellError> {
@@ -945,6 +976,8 @@ fn eval_program_with_source_options(
             caught_errors: Vec::new(),
             swallowed_tool_errors: 0,
             last_swallowed_tool_error: None,
+            denials: 0,
+            last_denial: None,
             host_errors: options
                 .session
                 .as_ref()
@@ -1028,12 +1061,16 @@ fn eval_program_with_source_options(
         .state
         .budget
         .attach_stdout(&evaluator.state.stdout);
+    let denials = evaluator.state.denials_json();
     let pipeline = match (pipeline, cleanup) {
         (Ok(pipeline), Ok(())) => pipeline,
-        (Ok(_), Err(cleanup_error)) => return Err(cleanup_error),
-        (Err(program_error), Ok(())) => return Err(program_error),
+        (Ok(_), Err(cleanup_error)) => return Err(attach_denials(cleanup_error, denials)),
+        (Err(program_error), Ok(())) => return Err(attach_denials(program_error, denials)),
         (Err(program_error), Err(cleanup_error)) => {
-            return Err(attach_cleanup_error(program_error, cleanup_error));
+            return Err(attach_denials(
+                attach_cleanup_error(program_error, cleanup_error),
+                denials,
+            ));
         }
     };
     let mut diagnostics = match hot_loop_diagnostics {
@@ -1048,6 +1085,9 @@ fn eval_program_with_source_options(
     }
     if !evaluator.state.handler_warnings.is_empty() {
         diagnostics["warnings"] = json!(evaluator.state.handler_warnings);
+    }
+    if let Some(denials) = evaluator.state.denials_json() {
+        diagnostics["denials"] = denials;
     }
     if evaluator.state.swallowed_tool_errors > 0 {
         let last = evaluator
@@ -2020,6 +2060,20 @@ impl Evaluator<'_> {
                 Err(error) => Err(error),
             };
         }
+        if !matches!(
+            value,
+            RuntimeValue::AttemptScope(_) | RuntimeValue::SemanticFrontier(_) | RuntimeValue::File(_)
+        ) {
+            // Python raises for `with 5:`; running the body anyway would
+            // hide that nothing gets released at the end.
+            return Err(stone_error(
+                "with",
+                format!(
+                    "a {} value cannot be used in `with`: only open(...), attempt_scope(), and semantic_frontier() release something at the end. Assign it instead (`x = ...`)",
+                    runtime_type_name(&value)
+                ),
+            ));
+        }
         let owned_value = value.clone();
         if let Some(target) = target {
             self.state.set_local(target.to_owned(), value);
@@ -2061,8 +2115,8 @@ impl Evaluator<'_> {
     ) -> Result<EvalFlow, ShellError> {
         match self.eval_block(body, PipelineData::empty(), false) {
             Ok(flow) => Ok(flow),
-            // A budget stop ends the attempt; no handler sees it.
-            Err(err) if self.state.budget.is_stopped() => Err(err),
+            // A control stop (the host ended the attempt) is never caught.
+            Err(err) if self.is_control_stop(&err) => Err(err),
             Err(err) => {
                 let error_record = shell_error_record(&err);
                 let error_type = error_record_type(&error_record);
@@ -2109,6 +2163,11 @@ impl Evaluator<'_> {
         }
     }
 
+    /// Did the host end this attempt? Then no program handler may run.
+    fn is_control_stop(&self, err: &ShellError) -> bool {
+        self.state.budget.is_stopped() || is_attempt_over_error(err)
+    }
+
     /// Record a host-only error the program has received, so re-raising it
     /// unchanged is allowed. Bounded: old entries fall off.
     fn remember_host_error(&mut self, record: &Value) {
@@ -2139,6 +2198,62 @@ impl Evaluator<'_> {
 
     fn is_error_type_name(&self, name: &str) -> bool {
         is_builtin_error_type(name) || self.error_class_base(name).is_some()
+    }
+
+    /// The type name when `value` is an error (a caught or constructed error
+    /// record), else `None`. A JSON object such as `{"type": "message"}` is
+    /// not an error, and a host-only type counts only for a genuine host
+    /// error, as in isinstance().
+    fn error_value_type(&self, value: &RuntimeValue) -> Option<String> {
+        let name = match value {
+            RuntimeValue::Nu(Value::Record { val, .. }) => match val.get("type") {
+                Some(Value::String { val, .. }) => val.clone(),
+                _ => return None,
+            },
+            RuntimeValue::Dict(dict) => match dict.get("type") {
+                Some(RuntimeValue::Nu(Value::String { val, .. })) => val,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if !self.is_error_type_name(&name) {
+            return None;
+        }
+        if is_host_only_error_type(&name) {
+            let plain = unshare(value.clone(), "error").ok()?;
+            let RuntimeValue::Nu(record) = plain else {
+                return None;
+            };
+            if !self.is_genuine_host_error(&record) {
+                return None;
+            }
+        }
+        Some(name)
+    }
+
+    /// Python's text for an error: `str(e)` is the message and `repr(e)` is
+    /// `ValueError('message')`. `None` when `value` is not an error.
+    fn error_value_text(&self, value: &RuntimeValue, repr: bool) -> Option<String> {
+        let name = self.error_value_type(value)?;
+        let message = match value {
+            RuntimeValue::Nu(Value::Record { val, .. }) => match val.get("message") {
+                Some(Value::String { val, .. }) => val.clone(),
+                _ => String::new(),
+            },
+            RuntimeValue::Dict(dict) => match dict.get("message") {
+                Some(RuntimeValue::Nu(Value::String { val, .. })) => val,
+                _ => String::new(),
+            },
+            _ => String::new(),
+        };
+        if !repr {
+            return Some(message);
+        }
+        if message.is_empty() {
+            return Some(format!("{name}()"));
+        }
+        let quoted = crate::stone_builtins::python_repr(&Value::string(message, Span::unknown())).ok()?;
+        Some(format!("{name}({quoted})"))
     }
 
     /// `class Plan(Record):` defines (or, re-run, redefines) a record type.
@@ -2497,8 +2612,7 @@ impl Evaluator<'_> {
                         self.state.record_session_binding(target);
                     }
                 }
-                if let RuntimeValue::List(list) = &value {
-                    let items = list.shared_items();
+                if let Some(items) = shared_sequence_items(&value) {
                     if items.len() != targets.len() {
                         return Err(stone_error(
                             "assignment",
@@ -2526,10 +2640,16 @@ impl Evaluator<'_> {
                 if !matches!(container, RuntimeValue::List(_) | RuntimeValue::Dict(_))
                     && !matches!(container, RuntimeValue::Nu(_))
                 {
-                    return Err(stone_error(
-                        "assignment",
-                        format!("{name} does not support item assignment"),
-                    ));
+                    let message = match &container {
+                        RuntimeValue::Tuple(_) => format!(
+                            "a tuple cannot change, so `{name}[...] = ...` is not allowed (in Python either); build a new tuple or use a list"
+                        ),
+                        RuntimeValue::Set(_) => format!(
+                            "a set has no positions, so `{name}[...] = ...` is not allowed; use {name}.add(x) and {name}.discard(x)"
+                        ),
+                        _ => format!("{name} does not support item assignment"),
+                    };
+                    return Err(stone_error("tuple", message));
                 }
                 assign_item(&container, index, value)
             }
@@ -2680,8 +2800,7 @@ impl Evaluator<'_> {
             self.state.set_local(target.clone(), value);
             return Ok(());
         }
-        if let RuntimeValue::List(list) = &value {
-            let items = list.shared_items();
+        if let Some(items) = shared_sequence_items(&value) {
             if items.len() != targets.len() {
                 return Err(stone_error(
                     "for",
@@ -2843,15 +2962,21 @@ impl Evaluator<'_> {
                 FormattedStringPart::Literal(text) => output.push_str(text),
                 FormattedStringPart::Expr(expr) => {
                     let value = self.eval_expr_value(expr, PipelineData::empty())?;
+                    if let Some(text) = self.error_value_text(&value, false) {
+                        output.push_str(&text);
+                        continue;
+                    }
                     match value {
                         RuntimeValue::Nu(value) => output.push_str(&python_str(&value)?),
                         other => output.push_str(&stone_records::python_str(&other)?),
                     }
                 }
                 FormattedStringPart::Formatted { expr, spec } => {
-                    let value = self
-                        .eval_expr_value(expr, PipelineData::empty())?
-                        .into_nu_value("f-string")?;
+                    let value = self.eval_expr_value(expr, PipelineData::empty())?;
+                    let value = match self.error_value_text(&value, false) {
+                        Some(text) => Value::string(text, Span::unknown()),
+                        None => value.into_nu_value("f-string")?,
+                    };
                     output.push_str(&format_fstring_value(&value, spec)?);
                 }
             }
@@ -2903,7 +3028,8 @@ impl Evaluator<'_> {
                 Expr::Float(value) => Ok(RuntimeValue::Nu(Value::float(*value, span))),
                 Expr::String(value) => Ok(RuntimeValue::Nu(Value::string(value.clone(), span))),
                 Expr::FormattedString(parts) => self.eval_formatted_string(parts),
-                Expr::List(items) | Expr::Tuple(items) => {
+                Expr::Tuple(items) => self.eval_tuple_literal(items),
+                Expr::List(items) => {
                     // Plain elements (the common case) build a plain list
                     // directly; the first runtime element switches to a
                     // shared list.
@@ -2946,10 +3072,11 @@ impl Evaluator<'_> {
                     if let Some(value) = self.state.get_local(name) {
                         Ok(value)
                     } else if self.is_error_type_name(name) {
-                        // An error type is a value: its name. It can be stored
-                        // in lists and records, compared with `error.type`, sent
-                        // to a child attempt, and passed to isinstance().
-                        Ok(RuntimeValue::Nu(Value::string(name.clone(), span)))
+                        // An error type is a type value. It can be stored in
+                        // lists and records, compared with `error.type`, and
+                        // passed to isinstance(); it crosses JSON (emit, a
+                        // child attempt) as its name.
+                        Ok(error_type_value(name))
                     } else if let Some(function) = self.state.functions.get(name).cloned() {
                         Ok(RuntimeValue::Callable(CallableValue::named(
                             self.state.next_callable_id(),
@@ -2991,6 +3118,9 @@ impl Evaluator<'_> {
                                             upper,
                                         )?;
                                         return Ok(select_shared(list, &picked));
+                                    }
+                                    if let RuntimeValue::Tuple(items) = &value {
+                                        return slice_tuple(items, lower, upper);
                                     }
                                     let value = value.into_nu_value("subscript")?;
                                     slice_builtin(&value, lower, upper).map(RuntimeValue::Nu)
@@ -3052,33 +3182,9 @@ impl Evaluator<'_> {
                     Ok(RuntimeValue::Nu(Value::int(!value, span)))
                 }
                 Expr::Await(value) => self.eval_await_expr(value),
-                Expr::Add { left, right } => {
-                    let left = self
-                        .eval_expr_value(left, PipelineData::empty())?
-                        .into_nu_value("addition")?;
-                    let right = self
-                        .eval_expr_value(right, PipelineData::empty())?
-                        .into_nu_value("addition")?;
-                    add_values(&left, &right).map(RuntimeValue::Nu)
-                }
-                Expr::Sub { left, right } => {
-                    let left = self
-                        .eval_expr_value(left, PipelineData::empty())?
-                        .into_nu_value("subtraction")?;
-                    let right = self
-                        .eval_expr_value(right, PipelineData::empty())?
-                        .into_nu_value("subtraction")?;
-                    sub_values(&left, &right).map(RuntimeValue::Nu)
-                }
-                Expr::Mul { left, right } => {
-                    let left = self
-                        .eval_expr_value(left, PipelineData::empty())?
-                        .into_nu_value("multiplication")?;
-                    let right = self
-                        .eval_expr_value(right, PipelineData::empty())?
-                        .into_nu_value("multiplication")?;
-                    mul_values(&left, &right).map(RuntimeValue::Nu)
-                }
+                Expr::Add { left, right } => self.eval_collection_aware_binop("addition", left, right),
+                Expr::Sub { left, right } => self.eval_collection_aware_binop("subtraction", left, right),
+                Expr::Mul { left, right } => self.eval_collection_aware_binop("multiplication", left, right),
                 Expr::Div { left, right } => {
                     let left = self
                         .eval_expr_value(left, PipelineData::empty())?
@@ -3106,38 +3212,9 @@ impl Evaluator<'_> {
                         .into_nu_value("modulo")?;
                     mod_values(&left, &right).map(RuntimeValue::Nu)
                 }
-                Expr::BitAnd { left, right } => {
-                    let left = self
-                        .eval_expr_value(left, PipelineData::empty())?
-                        .into_nu_value("bitwise and")?;
-                    let right = self
-                        .eval_expr_value(right, PipelineData::empty())?
-                        .into_nu_value("bitwise and")?;
-                    bitwise_int_values(&left, &right, "bitwise and", |left, right| left & right)
-                        .map(RuntimeValue::Nu)
-                }
-                Expr::BitOr { left, right } => {
-                    let left = self.eval_expr_value(left, PipelineData::empty())?;
-                    let right = self.eval_expr_value(right, PipelineData::empty())?;
-                    // `Read | Edit` on types (held in variables) is a union.
-                    if let Some(union) = type_union_value(&left, &right) {
-                        return Ok(union);
-                    }
-                    let left = left.into_nu_value("bitwise or")?;
-                    let right = right.into_nu_value("bitwise or")?;
-                    bitwise_int_values(&left, &right, "bitwise or", |left, right| left | right)
-                        .map(RuntimeValue::Nu)
-                }
-                Expr::BitXor { left, right } => {
-                    let left = self
-                        .eval_expr_value(left, PipelineData::empty())?
-                        .into_nu_value("bitwise xor")?;
-                    let right = self
-                        .eval_expr_value(right, PipelineData::empty())?
-                        .into_nu_value("bitwise xor")?;
-                    bitwise_int_values(&left, &right, "bitwise xor", |left, right| left ^ right)
-                        .map(RuntimeValue::Nu)
-                }
+                Expr::BitAnd { left, right } => self.eval_collection_aware_binop("bitwise and", left, right),
+                Expr::BitOr { left, right } => self.eval_collection_aware_binop("bitwise or", left, right),
+                Expr::BitXor { left, right } => self.eval_collection_aware_binop("bitwise xor", left, right),
                 Expr::LShift { left, right } => {
                     let left = self
                         .eval_expr_value(left, PipelineData::empty())?
@@ -3405,6 +3482,14 @@ impl Evaluator<'_> {
                         dict.len() as i64,
                         Span::unknown(),
                     ))),
+                    RuntimeValue::Tuple(items) => Ok(RuntimeValue::Nu(Value::int(
+                        items.len() as i64,
+                        Span::unknown(),
+                    ))),
+                    RuntimeValue::Set(set) => Ok(RuntimeValue::Nu(Value::int(
+                        set.len() as i64,
+                        Span::unknown(),
+                    ))),
                     _ => len_builtin(&value.into_nu_value("len")?).map(RuntimeValue::Nu),
                 }
             }
@@ -3424,6 +3509,9 @@ impl Evaluator<'_> {
                     ));
                 }
                 let value = self.eval_expr_value(arg, PipelineData::empty())?;
+                if let Some(text) = self.error_value_text(&value, name == "repr") {
+                    return Ok(RuntimeValue::Nu(Value::string(text, Span::unknown())));
+                }
                 if !matches!(value, RuntimeValue::Nu(_)) {
                     // Records inside are written as Python writes them.
                     let text = if name == "repr" {
@@ -3874,6 +3962,13 @@ impl Evaluator<'_> {
         receiver: RuntimeValue,
         attr: &str,
     ) -> Result<RuntimeValue, ShellError> {
+        if attr == "type" {
+            // A caught error's type is the type itself, as type(e) is in
+            // Python, so `error.type == ValueError` compares types.
+            if let Some(name) = self.error_value_type(&receiver) {
+                return Ok(error_type_value(&name));
+            }
+        }
         match &receiver {
             RuntimeValue::Record(record) => {
                 return match record.ty.field_index(attr) {
@@ -5499,17 +5594,15 @@ impl Evaluator<'_> {
         }
         let values = match call.positional.as_slice() {
             [] => Vec::new(),
-            [Expr::Generator { .. }] => {
-                self.eval_generator_values(call.positional.first().unwrap())?
-            }
-            [iterable] => self
-                .eval_iterable_expr(iterable)?
+            [Expr::Generator { .. }] => self
+                .eval_generator_values(call.positional.first().unwrap())?
                 .into_iter()
-                .map(|value| value.into_nu_value("set"))
-                .collect::<Result<Vec<_>, _>>()?,
+                .map(RuntimeValue::Nu)
+                .collect(),
+            [iterable] => self.eval_iterable_expr(iterable)?,
             _ => unreachable!(),
         };
-        set_builtin(values).map(RuntimeValue::Nu)
+        Ok(RuntimeValue::Set(SetObj::from_values(values)?))
     }
 
     fn eval_unique_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -11804,7 +11897,7 @@ impl Evaluator<'_> {
                     last_value = Some(value);
                     last_error = None;
                 }
-                Err(err) if ignore_errors => {
+                Err(err) if ignore_errors && !self.is_control_stop(&err) => {
                     last_error = Some(format!("{err:?}"));
                     last_value = None;
                 }
@@ -11839,12 +11932,26 @@ impl Evaluator<'_> {
             ));
         };
         let value = self.eval_expr_value(value, PipelineData::empty())?;
-        if let RuntimeValue::List(list) = &value {
-            // A shallow copy, as in Python: a new list holding the same
+        let items = match &value {
+            // A shallow copy, as in Python: a new sequence holding the same
             // elements.
-            return Ok(list_from_values(list.shared_items()));
+            RuntimeValue::List(list) => Some(list.shared_items()),
+            RuntimeValue::Tuple(items) => Some(items.as_ref().clone()),
+            RuntimeValue::Set(set) => Some(set.values()),
+            _ => None,
+        };
+        let items = match items {
+            Some(items) => items,
+            None => match list_builtin(&value.into_nu_value(name)?)? {
+                Value::List { vals, .. } => vals.into_iter().map(RuntimeValue::Nu).collect(),
+                other => return Ok(RuntimeValue::Nu(other)),
+            },
+        };
+        if name == "tuple" {
+            Ok(tuple_value(items))
+        } else {
+            Ok(list_from_values(items))
         }
-        list_builtin(&value.into_nu_value(name)?).map(RuntimeValue::Nu)
     }
 
     fn eval_hash_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -11966,6 +12073,9 @@ impl Evaluator<'_> {
             None => self.eval_expr_value(spec, PipelineData::empty())?,
         };
         if let RuntimeValue::Type(ty) = &spec_value {
+            if let TypeSpec::Error(name) = &**ty {
+                return self.isinstance_error_type(value, name);
+            }
             return stone_records::isinstance(value, ty)
                 .map_err(|message| stone_error("isinstance", message));
         }
@@ -12029,10 +12139,14 @@ impl Evaluator<'_> {
             ));
         }
         let value = self.eval_expr_value(arg, PipelineData::empty())?;
-        let name = match &value {
-            RuntimeValue::Record(record) => record.ty.name.clone(),
-            other => runtime_type_name(other).to_string(),
-        };
+        if let Some(name) = self.error_value_type(&value) {
+            return Ok(error_type_value(&name));
+        }
+        if let RuntimeValue::Record(record) = &value {
+            // The record class itself, so `type(plan) == Plan` compares types.
+            return Ok(RuntimeValue::Type(Rc::new(TypeSpec::Record(record.ty.clone()))));
+        }
+        let name = runtime_type_name(&value).to_string();
         Ok(RuntimeValue::Nu(Value::string(name, Span::unknown())))
     }
 
@@ -12232,10 +12346,11 @@ impl Evaluator<'_> {
             .into_nu_value("format")?;
         let mut args = Vec::with_capacity(call.positional.len().saturating_sub(1));
         for arg in call.positional.iter().skip(1) {
-            args.push(
-                self.eval_expr_value(arg, PipelineData::empty())?
-                    .into_nu_value("format")?,
-            );
+            let value = self.eval_expr_value(arg, PipelineData::empty())?;
+            args.push(match self.error_value_text(&value, false) {
+                Some(text) => Value::string(text, Span::unknown()),
+                None => value.into_nu_value("format")?,
+            });
         }
         format_builtin(&template, &args).map(RuntimeValue::Nu)
     }
@@ -12254,11 +12369,17 @@ impl Evaluator<'_> {
         let mut values = Vec::with_capacity(call.positional.len());
         let mut parts = Vec::with_capacity(call.positional.len());
         for arg in &call.positional {
-            let value = self
-                .eval_expr_value(arg, PipelineData::empty())?
-                .into_nu_value("print")?;
-            parts.push(value_to_display_string(&value)?);
-            values.push(value);
+            // print writes str(value) as Python does; emit() is the JSON path.
+            let value = self.eval_expr_value(arg, PipelineData::empty())?;
+            let text = match self.error_value_text(&value, false) {
+                Some(text) => text,
+                None => match &value {
+                    RuntimeValue::Nu(plain) => python_str(plain)?,
+                    other => stone_records::python_str(other)?,
+                },
+            };
+            parts.push(text);
+            values.push(value.into_nu_value("print")?);
         }
         self.state.stdout.push_str(&parts.join(" "));
         self.state.stdout.push('\n');
@@ -12419,8 +12540,15 @@ impl Evaluator<'_> {
                         if *closed {
                             return Err(stone_error(method, "I/O operation on closed file"));
                         }
+                        // readlines() keeps each line's "\n", as in Python;
+                        // splitlines() drops it, as str.splitlines() does.
+                        let lines = if method == "readlines" {
+                            lines_keeping_newlines(text)
+                        } else {
+                            text.lines().map(str::to_owned).collect()
+                        };
                         Ok(RuntimeValue::TextLines(TextLines {
-                            lines: text.lines().map(str::to_owned).collect(),
+                            lines,
                             source: format!("open(...).{method}()"),
                         }))
                     }
@@ -12507,6 +12635,20 @@ impl Evaluator<'_> {
     ) -> Result<RuntimeValue, ShellError> {
         let started = self.state.profiler.start();
         let result = (|| {
+            // A set or tuple receiver answers its own methods (`s.add(x)`,
+            // `s.discard(x)`) before the names that mean attempt control.
+            if is_side_effect_free_receiver(receiver) && named.is_empty() {
+                let value = self.eval_expr_value(receiver, PipelineData::empty())?;
+                if matches!(value, RuntimeValue::Set(_) | RuntimeValue::Tuple(_)) {
+                    return self.eval_collection_method(value, method, positional);
+                }
+                if method == "add" && matches!(value, RuntimeValue::List(_) | RuntimeValue::Nu(Value::List { .. })) {
+                    return Err(stone_error(
+                        "attribute",
+                        "a list has no attribute `add` (in Python either): use xs.append(x), or make a set with `s = set()` and then `s.add(x)`",
+                    ));
+                }
+            }
             let resource_call = match method {
                 "branch" => {
                     let mut named = named.to_vec();
@@ -12715,6 +12857,168 @@ impl Evaluator<'_> {
         result
     }
 
+    /// `+ - * | & ^`: tuples and sets first, then numbers and strings.
+    /// Kept out of eval_expr_value so its frame stays small.
+    #[inline(never)]
+    fn eval_collection_aware_binop(
+        &mut self,
+        op: &'static str,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<RuntimeValue, ShellError> {
+        let left = self.eval_expr_value(left, PipelineData::empty())?;
+        let right = self.eval_expr_value(right, PipelineData::empty())?;
+        if op == "bitwise or" {
+            // `Read | Edit` on types (held in variables) is a union.
+            if let Some(union) = type_union_value(&left, &right) {
+                return Ok(union);
+            }
+        }
+        if let Some(value) = collection_binop(op, &left, &right)? {
+            return Ok(value);
+        }
+        let left = left.into_nu_value(op)?;
+        let right = right.into_nu_value(op)?;
+        match op {
+            "addition" => add_values(&left, &right),
+            "subtraction" => sub_values(&left, &right),
+            "multiplication" => mul_values(&left, &right),
+            "bitwise and" => bitwise_int_values(&left, &right, op, |left, right| left & right),
+            "bitwise or" => bitwise_int_values(&left, &right, op, |left, right| left | right),
+            _ => bitwise_int_values(&left, &right, op, |left, right| left ^ right),
+        }
+        .map(RuntimeValue::Nu)
+    }
+
+    #[inline(never)]
+    fn eval_tuple_literal(&mut self, items: &[Expr]) -> Result<RuntimeValue, ShellError> {
+        let mut values = Vec::with_capacity(items.len());
+        for item in items {
+            values.push(self.eval_expr_value(item, PipelineData::empty())?);
+        }
+        Ok(tuple_value(values))
+    }
+
+    /// Methods of a set or tuple receiver.
+    fn eval_collection_method(
+        &mut self,
+        receiver: RuntimeValue,
+        method: &str,
+        positional: &[Expr],
+    ) -> Result<RuntimeValue, ShellError> {
+        let mut args = Vec::with_capacity(positional.len());
+        for arg in positional {
+            args.push(self.eval_expr_value(arg, PipelineData::empty())?);
+        }
+        let none = || RuntimeValue::Nu(Value::nothing(Span::unknown()));
+        let boolean = |value: bool| RuntimeValue::Nu(Value::bool(value, Span::unknown()));
+        let one = |args: &[RuntimeValue], kind: &str| -> Result<RuntimeValue, ShellError> {
+            match args {
+                [value] => Ok(value.clone()),
+                _ => Err(stone_error(kind, format!("{method}() takes exactly one argument"))),
+            }
+        };
+        match receiver {
+            RuntimeValue::Tuple(items) => match method {
+                "count" | "index" => {
+                    let needle = one(&args, "tuple")?;
+                    let mut count = 0i64;
+                    for (position, item) in items.iter().enumerate() {
+                        if runtime_values_equal(item, &needle)? {
+                            if method == "index" {
+                                return Ok(RuntimeValue::Nu(Value::int(position as i64, Span::unknown())));
+                            }
+                            count += 1;
+                        }
+                    }
+                    if method == "index" {
+                        return Err(stone_error("index", "tuple.index(x): x is not in tuple (value out of range)"));
+                    }
+                    Ok(RuntimeValue::Nu(Value::int(count, Span::unknown())))
+                }
+                _ => Err(stone_error(
+                    "attribute",
+                    format!("a tuple has no attribute `{method}`: tuples cannot change; they have count() and index(). Build a new tuple (`t + (x,)`) or use a list"),
+                )),
+            },
+            RuntimeValue::Set(set) => {
+                // The other operand of union() and friends may be any iterable.
+                let other_set = |evaluator: &mut Self, value: RuntimeValue| -> Result<stone_collections::SetRef, ShellError> {
+                    match value {
+                        RuntimeValue::Set(set) => Ok(set),
+                        other => SetObj::from_values(evaluator.eval_iterable_value(other)?),
+                    }
+                };
+                match method {
+                    "add" => {
+                        set.add(one(&args, "set")?)?;
+                        Ok(none())
+                    }
+                    "discard" => {
+                        set.discard(&one(&args, "set")?)?;
+                        Ok(none())
+                    }
+                    "remove" => {
+                        let value = one(&args, "set")?;
+                        if !set.discard(&value)? {
+                            return Err(stone_error(
+                                "set",
+                                format!(
+                                    "remove(): the set has no key {}; use discard() to ignore a missing value",
+                                    stone_records::python_repr(&value)?
+                                ),
+                            ));
+                        }
+                        Ok(none())
+                    }
+                    "update" => {
+                        for value in args {
+                            for item in self.eval_iterable_value(value)? {
+                                set.add(item)?;
+                            }
+                        }
+                        Ok(none())
+                    }
+                    "clear" => {
+                        set.clear();
+                        Ok(none())
+                    }
+                    "pop" => set.pop().ok_or_else(|| {
+                        stone_error("set", "pop from an empty set: the set has no key to pop")
+                    }),
+                    "copy" => Ok(RuntimeValue::Set(SetObj::from_values(set.values())?)),
+                    "union" | "intersection" | "difference" | "symmetric_difference" => {
+                        let mut result = SetObj::from_values(set.values())?;
+                        for value in args {
+                            let other = other_set(self, value)?;
+                            result = match method {
+                                "union" => result.union(&other)?,
+                                "intersection" => result.intersection(&other),
+                                "difference" => result.difference(&other),
+                                _ => result.symmetric_difference(&other)?,
+                            };
+                        }
+                        Ok(RuntimeValue::Set(result))
+                    }
+                    "issubset" | "issuperset" | "isdisjoint" => {
+                        let other = one(&args, "set")?;
+                        let other = other_set(self, other)?;
+                        Ok(boolean(match method {
+                            "issubset" => set.is_subset(&other),
+                            "issuperset" => other.is_subset(&set),
+                            _ => set.intersection(&other).len() == 0,
+                        }))
+                    }
+                    _ => Err(stone_error(
+                        "attribute",
+                        format!("a set has no attribute `{method}`; sets have add, discard, remove, update, pop, clear, copy, union, intersection, difference, symmetric_difference, issubset, issuperset, and isdisjoint, and the operators | & - ^"),
+                    )),
+                }
+            }
+            _ => unreachable!("called only for sets and tuples"),
+        }
+    }
+
     fn eval_append_call(
         &mut self,
         receiver: &Expr,
@@ -12835,14 +13139,12 @@ impl Evaluator<'_> {
                 string_method_builtin(&receiver, "count", args).map(RuntimeValue::Nu)
             }
             Value::List { vals, .. } => {
-                let needle_key = value_identity_key(needle, "count")?;
-                let count = vals
-                    .iter()
-                    .map(|value| value_identity_key(value, "count"))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .filter(|key| key == &needle_key)
-                    .count();
+                let mut count = 0usize;
+                for value in &vals {
+                    if crate::stone_builtins::checked_values_equal(value, needle)? {
+                        count += 1;
+                    }
+                }
                 let count =
                     i64::try_from(count).map_err(|_| stone_error("count", "count is too large"))?;
                 Ok(RuntimeValue::Nu(Value::int(count, Span::unknown())))
@@ -13085,11 +13387,10 @@ impl Evaluator<'_> {
                     if *closed {
                         return Err(stone_error("iteration", "I/O operation on closed file"));
                     }
-                    Ok(text
-                        .lines()
-                        .map(|line| {
-                            RuntimeValue::Nu(Value::string(line.to_owned(), Span::unknown()))
-                        })
+                    // `for line in f` keeps each line's "\n", as in Python.
+                    Ok(lines_keeping_newlines(text)
+                        .into_iter()
+                        .map(|line| RuntimeValue::Nu(Value::string(line, Span::unknown())))
                         .collect())
                 }
                 RuntimeFile::Write { .. } => {
@@ -13106,6 +13407,8 @@ impl Evaluator<'_> {
             // Elements are shared with the list, so `for row in rows:
             // row["seen"] = True` updates the rows themselves.
             RuntimeValue::List(list) => Ok(list.shared_items()),
+            RuntimeValue::Tuple(items) => Ok(items.as_ref().clone()),
+            RuntimeValue::Set(set) => Ok(set.values()),
             RuntimeValue::Dict(dict) => Ok(dict
                 .keys()
                 .into_iter()
@@ -13152,6 +13455,8 @@ impl Evaluator<'_> {
                     // `a is b` on lists and dicts asks whether they are the
                     // same object, as in Python.
                     identical == (*op == CompareOp::Is)
+                } else if matches!(op, CompareOp::Is | CompareOp::IsNot) {
+                    identity_comparison(*op, &left_value, &right_value)?
                 } else if let (
                     CompareOp::In | CompareOp::NotIn,
                     RuntimeValue::Nu(Value::String { val: key, .. }),
@@ -13159,6 +13464,12 @@ impl Evaluator<'_> {
                 ) = (op, &left_value, &right_value)
                 {
                     dict.contains_key(key) == (*op == CompareOp::In)
+                } else if let Some(result) =
+                    collection_comparison(*op, &left_value, &right_value)?
+                {
+                    result
+                } else if let Some(result) = type_comparison(*op, &left_value, &right_value)? {
+                    result
                 } else if let Some(result) = record_comparison(*op, &left_value, &right_value)? {
                     result
                 } else {
@@ -16294,6 +16605,8 @@ fn runtime_type_name(value: &RuntimeValue) -> &'static str {
         RuntimeValue::List(_) => "list",
         RuntimeValue::Dict(_) => "dict",
         RuntimeValue::Record(_) => "record",
+        RuntimeValue::Tuple(_) => "tuple",
+        RuntimeValue::Set(_) => "set",
         RuntimeValue::Type(_) => "type",
         RuntimeValue::Model(_) => "Model",
         RuntimeValue::File(_) => "file",
@@ -16369,17 +16682,372 @@ fn select_shared_matching(
 /// is not a shared container.
 /// `==` on values that may be records: records are equal when they have the
 /// same type and equal fields; a record never equals a dict.
+#[inline(never)]
+fn slice_tuple(
+    items: &[RuntimeValue],
+    lower: Option<i64>,
+    upper: Option<i64>,
+) -> Result<RuntimeValue, ShellError> {
+    let picked = slice_builtin(&list_positions(items.len()), lower, upper)?;
+    let Value::List { vals, .. } = picked else {
+        unreachable!("a list slice is a list");
+    };
+    let mut out = Vec::with_capacity(vals.len());
+    for position in vals {
+        let Value::Int { val, .. } = position else {
+            unreachable!("positions are ints");
+        };
+        out.push(items[val as usize].clone());
+    }
+    Ok(tuple_value(out))
+}
+
+/// A receiver that can be evaluated twice without effect: a name, or
+/// attribute and subscript steps on a name with plain indices.
+fn is_side_effect_free_receiver(expr: &Expr) -> bool {
+    match expr {
+        Expr::Name(_) => true,
+        Expr::Attribute { value, .. } => is_side_effect_free_receiver(value),
+        Expr::Subscript { value, index } => {
+            is_side_effect_free_receiver(value)
+                && matches!(index.as_ref(), Expr::String(_) | Expr::Int(_) | Expr::Name(_))
+        }
+        _ => false,
+    }
+}
+
+/// The elements of a list or tuple, shared, for unpacking.
+fn shared_sequence_items(value: &RuntimeValue) -> Option<Vec<RuntimeValue>> {
+    match value {
+        RuntimeValue::List(list) => Some(list.shared_items()),
+        RuntimeValue::Tuple(items) => Some(items.as_ref().clone()),
+        _ => None,
+    }
+}
+
 fn runtime_values_equal(left: &RuntimeValue, right: &RuntimeValue) -> Result<bool, ShellError> {
+    if let Some(error) = stone_collections::sequence_kind_mismatch(left, right) {
+        return Err(error);
+    }
     match (left, right) {
+        (RuntimeValue::Tuple(left), RuntimeValue::Tuple(right)) => {
+            stone_collections::tuples_equal(left, right, &mut runtime_values_equal)
+        }
+        (RuntimeValue::Set(left), RuntimeValue::Set(right)) => Ok(left.equals(right)),
+        (RuntimeValue::Tuple(_) | RuntimeValue::Set(_), _)
+        | (_, RuntimeValue::Tuple(_) | RuntimeValue::Set(_)) => Ok(false),
         (RuntimeValue::Record(left), RuntimeValue::Record(right)) => {
             stone_records::records_equal(left, right, &mut runtime_values_equal)
         }
         (RuntimeValue::Record(_), _) | (_, RuntimeValue::Record(_)) => Ok(false),
-        _ => Ok(crate::stone_builtins::values_equal(
+        _ => crate::stone_builtins::checked_values_equal(
             &materialize(left, "comparison")?,
             &materialize(right, "comparison")?,
-        )),
+        ),
     }
+}
+
+/// Comparisons with a tuple or set on either side, or `None` for other
+/// values. Tuples compare element by element and in order; sets compare by
+/// membership, and `<=`/`<` ask for a subset, as in Python. A tuple or set
+/// never equals a list: comparing them raises.
+fn collection_comparison(
+    op: CompareOp,
+    left: &RuntimeValue,
+    right: &RuntimeValue,
+) -> Result<Option<bool>, ShellError> {
+    let is_collection =
+        |value: &RuntimeValue| matches!(value, RuntimeValue::Tuple(_) | RuntimeValue::Set(_));
+    if !is_collection(left) && !is_collection(right) {
+        return Ok(None);
+    }
+    Ok(Some(match op {
+        CompareOp::Eq => runtime_values_equal(left, right)?,
+        CompareOp::NotEq => !runtime_values_equal(left, right)?,
+        CompareOp::Is | CompareOp::IsNot => return Ok(None),
+        CompareOp::In | CompareOp::NotIn => {
+            let found = match right {
+                RuntimeValue::Set(set) => set.contains(left)?,
+                RuntimeValue::Tuple(items) => {
+                    let mut found = false;
+                    for item in items.iter() {
+                        if runtime_values_equal(item, left)? {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                }
+                RuntimeValue::List(list) => {
+                    let mut found = false;
+                    for item in list.shared_items() {
+                        if runtime_values_equal(&item, left)? {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                }
+                _ => return Ok(None),
+            };
+            found == (op == CompareOp::In)
+        }
+        CompareOp::Lt | CompareOp::LtE | CompareOp::Gt | CompareOp::GtE => match (left, right) {
+            (RuntimeValue::Set(left), RuntimeValue::Set(right)) => match op {
+                CompareOp::LtE => left.is_subset(right),
+                CompareOp::Lt => left.is_subset(right) && left.len() < right.len(),
+                CompareOp::GtE => right.is_subset(left),
+                _ => right.is_subset(left) && right.len() < left.len(),
+            },
+            (RuntimeValue::Tuple(_), RuntimeValue::Tuple(_)) => {
+                let left = materialize(left, "comparison")?;
+                let right = materialize(right, "comparison")?;
+                compare_values(&left, op, &right)?
+            }
+            _ => {
+                if let Some(error) = stone_collections::sequence_kind_mismatch(left, right) {
+                    return Err(error);
+                }
+                return Err(stone_error(
+                    "comparison",
+                    format!(
+                        "cannot order a {} and a {}",
+                        runtime_type_name(left),
+                        runtime_type_name(right)
+                    ),
+                ));
+            }
+        },
+    }))
+}
+
+/// `+`, `*`, `-`, `|`, `&`, `^` with a tuple or set (or two lists used as
+/// sets), or `None` to fall through to the number and string operators.
+fn collection_binop(
+    op: &str,
+    left: &RuntimeValue,
+    right: &RuntimeValue,
+) -> Result<Option<RuntimeValue>, ShellError> {
+    let symbol = match op {
+        "addition" => "+",
+        "multiplication" => "*",
+        "subtraction" => "-",
+        "bitwise or" => "|",
+        "bitwise and" => "&",
+        _ => "^",
+    };
+    let is_list = |value: &RuntimeValue| {
+        matches!(value, RuntimeValue::List(_) | RuntimeValue::Nu(Value::List { .. }))
+    };
+    match (left, right) {
+        (RuntimeValue::Set(left), RuntimeValue::Set(right)) => {
+            let set = match op {
+                "bitwise or" => left.union(right)?,
+                "bitwise and" => left.intersection(right),
+                "subtraction" => left.difference(right),
+                "bitwise xor" => left.symmetric_difference(right)?,
+                _ => {
+                    return Err(stone_error(
+                        "set",
+                        format!(
+                            "sets have no `{symbol}`; use `a | b` for the union, `a & b` for the intersection, `a - b` for the difference"
+                        ),
+                    ))
+                }
+            };
+            Ok(Some(RuntimeValue::Set(set)))
+        }
+        (RuntimeValue::Set(_), _) | (_, RuntimeValue::Set(_)) => Err(stone_error(
+            "set",
+            format!(
+                "`{symbol}` needs a set on both sides (a {} and a {}); convert the other side with set(xs)",
+                runtime_type_name(left),
+                runtime_type_name(right)
+            ),
+        )),
+        (RuntimeValue::Tuple(left), RuntimeValue::Tuple(right)) if op == "addition" => {
+            let mut items = left.as_ref().clone();
+            items.extend(right.iter().cloned());
+            Ok(Some(tuple_value(items)))
+        }
+        (RuntimeValue::Tuple(items), RuntimeValue::Nu(Value::Int { val, .. }))
+        | (RuntimeValue::Nu(Value::Int { val, .. }), RuntimeValue::Tuple(items))
+            if op == "multiplication" =>
+        {
+            let times = usize::try_from(*val).unwrap_or(0);
+            let mut out = Vec::with_capacity(items.len().saturating_mul(times));
+            for _ in 0..times {
+                out.extend(items.iter().cloned());
+            }
+            Ok(Some(tuple_value(out)))
+        }
+        (RuntimeValue::Tuple(_), _) | (_, RuntimeValue::Tuple(_)) => Err(stone_error(
+            "tuple",
+            format!(
+                "`{symbol}` is not defined for a {} and a {}; a tuple joins only another tuple (`t + (x,)`), or convert with list(t)",
+                runtime_type_name(left),
+                runtime_type_name(right)
+            ),
+        )),
+        _ if is_list(left) && is_list(right) && matches!(symbol, "|" | "&" | "^" | "-") => {
+            Err(stone_error(
+                "set",
+                format!(
+                    "lists have no `{symbol}` (in Python either); for set arithmetic convert first: `set(a) {symbol} set(b)`"
+                ),
+            ))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `is` between values that are not None or shared containers: a bool is
+/// itself (`flag is True`), a type is itself (`type(e) is ValueError`).
+/// Numbers and strings have no identity programs can rely on (Python's
+/// answer depends on caching), so `x is y` on them raises.
+fn identity_comparison(
+    op: CompareOp,
+    left: &RuntimeValue,
+    right: &RuntimeValue,
+) -> Result<bool, ShellError> {
+    let same = match (left, right) {
+        (RuntimeValue::Nu(Value::Bool { val: left, .. }), RuntimeValue::Nu(Value::Bool { val: right, .. })) => {
+            left == right
+        }
+        (RuntimeValue::Nu(Value::Bool { .. }), _) | (_, RuntimeValue::Nu(Value::Bool { .. })) => false,
+        (RuntimeValue::Type(left), RuntimeValue::Type(right)) => stone_records::same_type(left, right),
+        _ => {
+            let (word, replacement) = if op == CompareOp::Is {
+                ("is", "==")
+            } else {
+                ("is not", "!=")
+            };
+            return Err(stone_error(
+                "comparison",
+                format!(
+                    "`{word}` between a {} and a {} asks whether they are the same object, which Stone does not define for numbers and strings; use `{replacement}`. `{word}` is for None, True, False, and for asking whether two names hold the same list, dict, or record",
+                    runtime_type_name(left),
+                    runtime_type_name(right)
+                ),
+            ));
+        }
+    };
+    Ok(same == (op == CompareOp::Is))
+}
+
+/// A file's lines as Python's file iteration and readlines() give them:
+/// each keeps its "\n"; the last has none if the file does not end in one.
+fn lines_keeping_newlines(text: &str) -> Vec<String> {
+    text.split_inclusive('\n').map(str::to_owned).collect()
+}
+
+/// An error type as a value.
+fn error_type_value(name: &str) -> RuntimeValue {
+    RuntimeValue::Type(Rc::new(TypeSpec::Error(Rc::from(name))))
+}
+
+/// A type compared with a string is a mistake Python answers silently with
+/// `False`; Stone says so.
+fn type_string_comparison_error(ty: &TypeSpec, text: &str) -> ShellError {
+    let name = ty.display();
+    let check = if matches!(ty, TypeSpec::Error(_)) {
+        format!(
+            "; to test a caught error use `isinstance(error, {name})`, which also matches subclasses, or `error.type == {name}` for this exact type"
+        )
+    } else {
+        String::new()
+    };
+    stone_error(
+        "comparison",
+        format!(
+            "`{name}` is a type and {text:?} is a string, so they are never equal (in Python either): compare a type with a type, as in `== {name}` without quotes{check}"
+        ),
+    )
+}
+
+fn as_type(value: &RuntimeValue) -> Option<&TypeSpec> {
+    match value {
+        RuntimeValue::Type(spec) => Some(spec),
+        _ => None,
+    }
+}
+
+fn as_text(value: &RuntimeValue) -> Option<&str> {
+    match value {
+        RuntimeValue::Nu(Value::String { val, .. }) => Some(val),
+        _ => None,
+    }
+}
+
+/// Comparisons with a type on either side, or `None` for other values.
+/// Types are equal only to the same type; a type and a string never compare.
+fn type_comparison(
+    op: CompareOp,
+    left: &RuntimeValue,
+    right: &RuntimeValue,
+) -> Result<Option<bool>, ShellError> {
+    let (left_type, right_type) = (as_type(left), as_type(right));
+    if left_type.is_none() && right_type.is_none() {
+        // `"ValueError" in [ValueError]`: a string looked up among types.
+        if let (CompareOp::In | CompareOp::NotIn, Some(text), RuntimeValue::List(list)) =
+            (op, as_text(left), right)
+        {
+            if let Some(RuntimeValue::Type(ty)) = list.first_type_item() {
+                return Err(type_string_comparison_error(&ty, text));
+            }
+        }
+        return Ok(None);
+    }
+    let equal = |left: &RuntimeValue, right: &RuntimeValue| -> Result<bool, ShellError> {
+        match (as_type(left), as_type(right)) {
+            (Some(left), Some(right)) => Ok(stone_records::same_type(left, right)),
+            (Some(ty), None) | (None, Some(ty)) => {
+                match as_text(left).or_else(|| as_text(right)) {
+                    Some(text) => Err(type_string_comparison_error(ty, text)),
+                    None => Ok(false),
+                }
+            }
+            (None, None) => Ok(false),
+        }
+    };
+    Ok(Some(match op {
+        CompareOp::Eq => equal(left, right)?,
+        CompareOp::NotEq => !equal(left, right)?,
+        CompareOp::Is | CompareOp::IsNot => return Ok(None),
+        CompareOp::In | CompareOp::NotIn => {
+            if let Some(ty) = right_type {
+                return Err(stone_error(
+                    "membership",
+                    format!(
+                        "the type `{}` is not a container; to test a value's type use isinstance(value, {})",
+                        ty.display(),
+                        ty.display()
+                    ),
+                ));
+            }
+            let items = match right {
+                RuntimeValue::List(list) => list.shared_items(),
+                RuntimeValue::Nu(Value::List { vals, .. }) => {
+                    vals.iter().cloned().map(RuntimeValue::Nu).collect()
+                }
+                _ => return Ok(None),
+            };
+            let mut found = false;
+            for item in &items {
+                if equal(left, item)? {
+                    found = true;
+                    break;
+                }
+            }
+            found == (op == CompareOp::In)
+        }
+        CompareOp::Lt | CompareOp::LtE | CompareOp::Gt | CompareOp::GtE => {
+            return Err(stone_error(
+                "comparison",
+                "types cannot be ordered with <, <=, >, or >=",
+            ));
+        }
+    }))
 }
 
 /// Comparisons with a record on either side, or `None` for other values.
@@ -16420,10 +17088,24 @@ fn shared_identity(left: &RuntimeValue, right: &RuntimeValue) -> Option<bool> {
         (RuntimeValue::List(left), RuntimeValue::List(right)) => Some(Rc::ptr_eq(left, right)),
         (RuntimeValue::Dict(left), RuntimeValue::Dict(right)) => Some(Rc::ptr_eq(left, right)),
         (RuntimeValue::Record(left), RuntimeValue::Record(right)) => Some(Rc::ptr_eq(left, right)),
-        (RuntimeValue::List(_) | RuntimeValue::Dict(_) | RuntimeValue::Record(_), _)
-        | (_, RuntimeValue::List(_) | RuntimeValue::Dict(_) | RuntimeValue::Record(_)) => {
-            Some(false)
-        }
+        (RuntimeValue::Tuple(left), RuntimeValue::Tuple(right)) => Some(Rc::ptr_eq(left, right)),
+        (RuntimeValue::Set(left), RuntimeValue::Set(right)) => Some(Rc::ptr_eq(left, right)),
+        (
+            RuntimeValue::List(_)
+            | RuntimeValue::Dict(_)
+            | RuntimeValue::Record(_)
+            | RuntimeValue::Tuple(_)
+            | RuntimeValue::Set(_),
+            _,
+        )
+        | (
+            _,
+            RuntimeValue::List(_)
+            | RuntimeValue::Dict(_)
+            | RuntimeValue::Record(_)
+            | RuntimeValue::Tuple(_)
+            | RuntimeValue::Set(_),
+        ) => Some(false),
         _ => None,
     }
 }
@@ -16435,6 +17117,8 @@ fn runtime_truthy(value: &RuntimeValue, context: &str) -> Result<bool, ShellErro
         RuntimeValue::Nu(value) => Ok(value_truthy(value)),
         RuntimeValue::List(list) => Ok(list.len() > 0),
         RuntimeValue::Dict(dict) => Ok(dict.len() > 0),
+        RuntimeValue::Tuple(items) => Ok(!items.is_empty()),
+        RuntimeValue::Set(set) => Ok(set.len() > 0),
         // Records, types, and the model are objects: always true, as in Python.
         RuntimeValue::Callable(_)
         | RuntimeValue::Record(_)
@@ -16588,7 +17272,10 @@ fn runtime_value_record_string_field(
 
 fn value_to_iter_values(value: &RuntimeValue) -> Result<Vec<Value>, ShellError> {
     match value {
-        RuntimeValue::List(_) | RuntimeValue::Dict(_) => {
+        RuntimeValue::List(_)
+        | RuntimeValue::Dict(_)
+        | RuntimeValue::Tuple(_)
+        | RuntimeValue::Set(_) => {
             value_to_iter_values(&RuntimeValue::Nu(materialize(value, "iteration")?))
         }
         RuntimeValue::Nu(Value::List { vals, .. }) => Ok(vals.clone()),
@@ -16818,6 +17505,58 @@ fn command_budget_summary(positional: &[Value], record: &Record) -> JsonValue {
         "ok": record.get("ok").cloned().unwrap_or(JsonValue::Null),
         "changed": changed,
     })
+}
+
+/// A failed program still reports the calls that were refused before it
+/// stopped, as a related error the parent can read.
+fn attach_denials(program_error: ShellError, denials: Option<JsonValue>) -> ShellError {
+    let Some(denials) = denials else {
+        return program_error;
+    };
+    let note = ShellError::Generic(
+        GenericError::new_internal(
+            "Stone calls were denied before the program stopped",
+            denials.to_string(),
+        )
+        .with_code("stone_denials"),
+    );
+    match program_error {
+        ShellError::Generic(error) => ShellError::Generic(error.with_inner(vec![note])),
+        other => other,
+    }
+}
+
+/// Error codes and Gateway messages meaning the host has ended this attempt
+/// (budget or deadline used up, cancelled by the parent or host, finished).
+/// Such an error is a control stop: no `except` handler runs for it. A call
+/// the host or a hook refuses is not one; it stays an ordinary error.
+const ATTEMPT_STOPPED_CODE: &str = "stone_attempt_stopped";
+const ATTEMPT_OVER_MESSAGES: [&str; 2] = [
+    " is terminal (",
+    "already reported a result; no new compute may be dispatched",
+];
+
+pub(super) fn is_attempt_over_error(err: &ShellError) -> bool {
+    let record = shell_error_record(err);
+    let field = |name: &str| {
+        record
+            .get_data_by_key(name)
+            .and_then(|value| value.as_str().ok().map(str::to_owned))
+            .unwrap_or_default()
+    };
+    let code = field("code");
+    if code == "stone_budget_exhausted" || code == ATTEMPT_STOPPED_CODE {
+        return true;
+    }
+    // A program's own `raise` (code `task_failure`) never ends the attempt,
+    // whatever its message says.
+    if code == "task_failure" {
+        return false;
+    }
+    let text = format!("{} {}", field("message"), field("detail"));
+    ATTEMPT_OVER_MESSAGES
+        .iter()
+        .any(|marker| text.contains(marker))
 }
 
 fn attach_cleanup_error(program_error: ShellError, cleanup_error: ShellError) -> ShellError {
@@ -18504,14 +19243,8 @@ fn builtin_isinstance(name: &str, value: &RuntimeValue) -> Result<Option<bool>, 
                 | RuntimeValue::Dict(_)
                 | RuntimeValue::JsonObjectView(_)
         ),
-        "tuple" | "set" => {
-            return Err(stone_error(
-                "isinstance",
-                format!(
-                    "Stone has no separate {name} type: {name} values are lists. Use isinstance(x, list)"
-                ),
-            ));
-        }
+        "tuple" => matches!(value, RuntimeValue::Tuple(_)),
+        "set" => matches!(value, RuntimeValue::Set(_)),
         _ => return Ok(None),
     };
     Ok(Some(matches))
@@ -18885,7 +19618,7 @@ seen.add("alice")
 seen.add("alice")
 seen.add("bob")
 rows = [{"name": "alice", "score": 3}, {"name": "bob", "score": 5}]
-groups = {"alice": [], "bob": []}
+groups = {"alice": [], "bob": set()}
 groups["alice"].append("first")
 groups.alice.append("second")
 rows[0]["tags"] = []
@@ -18921,7 +19654,7 @@ emit({
                 "tags": ["blue"],
                 "bob": ["only"],
                 "score_type": "int",
-                "seen_type": "list",
+                "seen_type": "set",
                 "stdout": "ok",
                 "prefix": "abc",
                 "zfill": "05",
@@ -18945,6 +19678,65 @@ emit({
             "unexpected error: {text}"
         );
 
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn caught_errors_print_as_python_and_types_never_equal_names() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("error-text")?;
+        let program = lower_source(
+            r#"class Flaky(TimeoutError):
+    attempt: int = 0
+
+try:
+    raise ValueError("bad 'x'")
+except Exception as error:
+    text = [str(error), f"{error}", repr(error), format("{}", error), error.message, error["type"]]
+    types = [error.type == ValueError, type(error) == ValueError, error.type in [KeyError, ValueError], error.type != KeyError]
+    kept = error.type
+try:
+    raise Flaky("slow", attempt=2)
+except TimeoutError as error:
+    flaky = [error.type == Flaky, error.type == TimeoutError, isinstance(error, error.type), repr(error), str(error.type)]
+try:
+    raise KeyError
+except KeyError as error:
+    empty = [str(error), repr(error)]
+emit({"text": text, "types": types, "kept": kept, "flaky": flaky, "empty": empty,
+      "plain": [str({"type": "user", "message": "hi"}), {"type": "ValueError"}["type"] == "ValueError"]})"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(
+            value["text"],
+            json_value!(["bad 'x'", "bad 'x'", "ValueError(\"bad 'x'\")", "bad 'x'", "bad 'x'", "ValueError"])
+        );
+        assert_eq!(value["types"], json_value!([true, true, true, true]));
+        assert_eq!(value["kept"], json_value!("ValueError"));
+        assert_eq!(
+            value["flaky"],
+            json_value!([true, false, true, "Flaky('slow')", "<class 'Flaky'>"])
+        );
+        assert_eq!(value["empty"], json_value!(["", "KeyError()"]));
+        assert_eq!(
+            value["plain"],
+            json_value!(["{'type': 'user', 'message': 'hi'}", true])
+        );
+
+        for source in [
+            r#"emit(ValueError == "ValueError")"#,
+            r#"emit(ValueError in ["ValueError"])"#,
+            r#"emit("ValueError" in [ValueError])"#,
+            "try:\n    raise ValueError(\"x\")\nexcept Exception as error:\n    emit(error.type == \"ValueError\")\n",
+        ] {
+            let program = lower_source(source)?;
+            let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+                .expect_err(source);
+            let text = format!("{err:?}");
+            assert!(text.contains("never equal"), "{source}: {text}");
+            assert!(text.contains("isinstance(error, ValueError)"), "{source}: {text}");
+        }
         cleanup_dir(&root);
         Ok(())
     }
@@ -18978,10 +19770,13 @@ emit({
         );
         assert_eq!(value["plain_dict"], json_value!(false));
 
-        let program = lower_source(r#"emit(isinstance([1], tuple))"#)?;
-        let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
-            .expect_err("tuple is not a separate type");
-        assert!(format!("{err:?}").contains("isinstance(x, list)"));
+        // tuple and set are their own types, as in Python.
+        let program = lower_source(
+            r#"emit([isinstance([1], tuple), isinstance((1,), tuple), isinstance((1,), list), isinstance(set(), set), isinstance([1], set)])"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value, json_value!([false, true, false, true, false]));
         let program = lower_source(r#"emit(isinstance(1, "TimeoutEror"))"#)?;
         let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
             .expect_err("unknown type names are errors");
@@ -20268,10 +21063,11 @@ emit(inc(5))
                 "a = [[1]]\nb = list(a)\nc = a[:]\nb.append(9)\nc[0].append(2)\nemit(a)\n",
                 json_value!([[1, 2]]),
             ),
-            // `is` compares identity.
+            // `is` compares identity; a fresh literal is never the same
+            // object, so `a is [1]` is rejected before running (below).
             (
-                "a = [1]\nb = a\nemit([a is b, a is [1], a == [1]])\n",
-                json_value!([true, false, true]),
+                "a = [1]\nb = a\nc = [1]\nemit([a is b, a is c, a is not c, a == c])\n",
+                json_value!([true, false, true, true]),
             ),
             // Lists and dicts can hold functions, and calls can chain.
             (
@@ -20282,6 +21078,9 @@ emit(inc(5))
         for (source, expected) in cases {
             assert_eq!(&run(&mut stack, source)?, expected, "{source}");
         }
+
+        let error = run(&mut stack, "a = [1]\nemit(a is [1])\n").expect_err("is literal");
+        assert!(format!("{error:?}").contains("use `==`"), "{error:?}");
 
         let error = run(&mut stack, "xs = [1]\nxs[0](2)\n").expect_err("int call");
         assert!(format!("{error:?}").contains("gives a int value, not a function"));
@@ -21138,7 +21937,15 @@ print()
     fn print_records_stdout_while_preserving_value() -> Result<(), ShellError> {
         let (engine_state, mut stack, root) = test_engine("print-stdout")?;
         let program = lower_source(
-            r#"print("alpha")
+            r#"class P(Record):
+    x: int
+print("alpha")
+print({"name": "beta", "count": 2})
+print([1, None, True], P(x=1), ValueError)
+try:
+    raise ValueError("bad")
+except Exception as error:
+    print("caught:", error)
 print({"name": "beta", "count": 2})
 "#,
         )?;
@@ -21149,7 +21956,11 @@ print({"name": "beta", "count": 2})
             json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())?,
             json_value!({"name": "beta", "count": 2})
         );
-        assert_eq!(output.stdout, "alpha\n{\"count\":2,\"name\":\"beta\"}\n");
+        // print writes Python's str(); emit() is the JSON path.
+        assert_eq!(
+            output.stdout,
+            "alpha\n{'name': 'beta', 'count': 2}\n[1, None, True] P(x=1) <class 'ValueError'>\ncaught: bad\n{'name': 'beta', 'count': 2}\n"
+        );
 
         cleanup_dir(&root);
         Ok(())
@@ -24422,7 +25233,7 @@ emit({
                 "mixed_alnum": false,
                 "rsplit": ["a/b", "c"],
                 "rsplit_words": ["alpha beta", "gamma"],
-                "lines": ["alpha", "beta"],
+                "lines": ["alpha\n", "beta\n"],
             })
         );
 
@@ -24607,6 +25418,63 @@ emit(out)
         );
         // The class persists in the session like a function.
         assert!(session.functions.contains_key("ConfigError"));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn attempt_over_errors_are_control_stops_but_denials_are_not() {
+        // The Gateway refuses effects from a finished or cancelled attempt
+        // with these messages; no `except` handler may run for them.
+        assert!(super::is_attempt_over_error(&super::stone_error(
+            "gateway rpc",
+            "task attempt a-1 is terminal (cancelled)"
+        )));
+        assert!(super::is_attempt_over_error(&super::stone_error(
+            "gateway rpc",
+            "task attempt a-1 already reported a result; no new compute may be dispatched"
+        )));
+        assert!(super::is_attempt_over_error(&super::budget_stop_error(
+            "the attempt's tool_calls budget is used up".to_string()
+        )));
+        // An ordinary failure, including a refused call, stays catchable.
+        assert!(!super::is_attempt_over_error(&super::stone_error(
+            "gateway rpc",
+            "connection refused"
+        )));
+    }
+
+    #[test]
+    fn denials_are_counted_and_program_raises_stay_catchable() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("control-stops")?;
+        let source = r#"out = {}
+result = run(["printf", "x"], hooks={"pre": lambda step: {"allow": False, "reason": "outside policy"}})
+out["vetoed"] = [result.ok, result.kind]
+try:
+    raise ValueError("attempt a-1 is terminal (cancelled)")
+except ValueError as error:
+    out["own_raise_caught"] = True
+emit(out)
+"#;
+        let program = lower_source(source)?;
+        let output = eval_program_with_output_and_session(
+            &engine_state,
+            &mut stack,
+            &program,
+            PipelineData::empty(),
+            None,
+            Some(source),
+            None,
+        )?;
+        assert_eq!(
+            json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())?,
+            json_value!({"vetoed": [false, "policy_rejected"], "own_raise_caught": true})
+        );
+        assert_eq!(output.diagnostics["denials"]["count"], json_value!(1));
+        assert_eq!(
+            output.diagnostics["denials"]["last"]["reason"],
+            json_value!("outside policy")
+        );
         cleanup_dir(&root);
         Ok(())
     }
@@ -25980,7 +26848,6 @@ present = 0
 emit({
     "eq": 2 == 2,
     "eq_int_float": 2 == 2.0,
-    "eq_bool_int_strong": True == 1,
     "eq_string": "a" == "a",
     "eq_list": [1, "a", [2]] == [1, "a", [2]],
     "eq_record": {"a": 1, "b": [2]} == {"b": [2], "a": 1},
@@ -26054,7 +26921,6 @@ emit({
         let expected = [
             ("eq", json_value!(true)),
             ("eq_int_float", json_value!(true)),
-            ("eq_bool_int_strong", json_value!(false)),
             ("eq_string", json_value!(true)),
             ("eq_list", json_value!(true)),
             ("eq_record", json_value!(true)),
@@ -26125,6 +26991,172 @@ emit({
             assert_eq!(actual[key], expected, "{key}");
         }
 
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn identity_is_for_none_bools_types_and_shared_objects() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("identity")?;
+        let program = lower_source(
+            r#"class P(Record):
+    x: int
+missing = None
+flag = True
+p = P(x=1)
+q = p
+try:
+    raise ValueError("x")
+except Exception as error:
+    t = [type(error) is ValueError, error.type is not KeyError]
+emit([missing is None, flag is True, flag is not False, p is q, p is not P(x=1)] + t)"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value, json_value!([true, true, true, true, true, true, true]));
+
+        // A literal operand is rejected before anything runs.
+        for source in ["x = 1\nemit(x is 1)", "emit(\"a\" is not name)", "x = []\nemit(x is [])"] {
+            let err = lower_source(source).expect_err(source);
+            assert!(format!("{err:?}").contains("use `"), "{source}: {err:?}");
+        }
+        // Numbers and strings have no identity at run time either.
+        for source in ["x = 1\ny = 1\nemit(x is y)", "a = \"s\"\nb = a\nemit(a is not b)"] {
+            let program = lower_source(source)?;
+            let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+                .expect_err(source);
+            assert!(format!("{err:?}").contains("same object"), "{source}: {err:?}");
+        }
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn file_lines_keep_newlines_and_with_needs_a_resource() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("file-lines")?;
+        fs::write(root.join("in.txt"), "a\nb\n\nc").expect("write fixture");
+        let program = lower_source(
+            r#"with open("in.txt") as f:
+    looped = [line for line in f]
+with open("in.txt") as f:
+    read = f.readlines()
+with open("in.txt") as f:
+    split = f.splitlines()
+total = 0
+for line in open("in.txt"):
+    total += len(line)
+emit({"looped": looped, "read": read, "split": split, "total": total, "stripped": [line.rstrip("\n") for line in read]})"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value["looped"], json_value!(["a\n", "b\n", "\n", "c"]));
+        assert_eq!(value["read"], json_value!(["a\n", "b\n", "\n", "c"]));
+        assert_eq!(value["split"], json_value!(["a", "b", "", "c"]));
+        assert_eq!(value["total"], json_value!(6));
+        assert_eq!(value["stripped"], json_value!(["a", "b", "", "c"]));
+
+        for source in ["with 5 as x:\n    emit(x)", "with [1]:\n    pass", "with {\"a\": 1} as d:\n    pass"] {
+            let program = lower_source(source)?;
+            let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+                .expect_err(source);
+            assert!(format!("{err:?}").contains("cannot be used in `with`"), "{source}: {err:?}");
+        }
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn tuples_and_sets_have_python_meaning() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("tuples-sets")?;
+        let program = lower_source(
+            r#"t = (1, "a", [2])
+a, b, c = t
+c.append(3)
+def pair():
+    return 1, 2
+x = set([1, 2, 3])
+y = set([2, 3, 4])
+seen = set()
+seen.add((1, 2))
+seen.add((1, 2))
+seen.discard((9, 9))
+d = {"k": set()}
+d["k"].add("v")
+emit({
+    "tuple": [repr(t), repr((1,)), repr(()), len(t), t[-1], repr(t[1:]), type(t), repr(pair()), repr((1, 2) + (3,)), (1, 2, 1).count(1), (1, 2).index(2)],
+    "tuple_cmp": [(1, 2) == (1, 2), (1, 2) < (1, 3), 2 in (1, 2), isinstance(t, tuple), isinstance(t, list)],
+    "set": [repr(x | y), repr(x & y), repr(x - y), repr(x ^ y), set([1, 2]) == set([2, 1]), x <= set([1, 2, 3, 4]), 1 in x, repr(set()), type(x), repr(x.union([9]))],
+    "pairs": [len(seen), (1, 2) in seen, repr(seen)],
+    "json": [t, x, d],
+})"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(
+            value["tuple"],
+            json_value!(["(1, 'a', [2, 3])", "(1,)", "()", 3, [2, 3], "('a', [2, 3])", "tuple", "(1, 2)", "(1, 2, 3)", 2, 1])
+        );
+        assert_eq!(value["tuple_cmp"], json_value!([true, true, true, true, false]));
+        assert_eq!(
+            value["set"],
+            json_value!(["{1, 2, 3, 4}", "{2, 3}", "{1}", "{1, 4}", true, true, true, "set()", "set", "{1, 2, 3, 9}"])
+        );
+        assert_eq!(value["pairs"], json_value!([1, true, "{(1, 2)}"]));
+        // Tuples and sets become JSON arrays where values leave the program.
+        assert_eq!(value["json"], json_value!([[1, "a", [2, 3]], [1, 2, 3], {"k": ["v"]}]));
+
+        for (source, needle) in [
+            ("emit((1, 2) == [1, 2])", "comparing a tuple with a list"),
+            ("emit(set([1]) == [1])", "comparing a set with a list"),
+            ("t = (1, 2)\nt[0] = 5", "a tuple cannot change"),
+            ("t = (1,)\nt.append(2)", "tuples cannot change"),
+            ("emit(set([[1]]))", "unhashable type: 'list'"),
+            ("emit(set([1, True]))", "keeps bool and int apart"),
+            ("s = set([1])\ns.remove(2)", "use discard()"),
+            ("emit(set([1])[0])", "cannot be indexed"),
+            ("emit([1] | [2])", "set(a) | set(b)"),
+            ("xs = []\nxs.add(1)", "use xs.append(x)"),
+            ("emit(set([1]) + set([2]))", "use `a | b`"),
+            ("emit((1, 2) + [3])", "a tuple joins only another tuple"),
+        ] {
+            let program = lower_source(source)?;
+            let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+                .expect_err(source);
+            assert!(format!("{err:?}").contains(needle), "{source}: {err:?}");
+        }
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn comparisons_that_mix_bool_and_number_raise() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("bool-number")?;
+        let program = lower_source(
+            r#"emit([True == True, 1 == 1.0, [1, 1.0].count(1), [1, 2] == [1, 2, 3], None == 0, "1" == 1, False in [False], [1, 2].index(2)])"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value, json_value!([true, true, 2, false, false, false, true, 1]));
+
+        for source in [
+            "emit(True == 1)",
+            "emit(1 != True)",
+            "emit(0 == False)",
+            "emit(1.0 == True)",
+            "emit([True] == [1])",
+            r#"emit({"a": True} == {"a": 1})"#,
+            "emit(1 in [True, 2])",
+            "emit([1, 2].index(True))",
+            "emit([1, True].count(1))",
+            "flags = [True, False]\nhits = 0\nfor i in range(3):\n    if i in flags:\n        hits += 1\nemit(hits)\n",
+        ] {
+            let program = lower_source(source)?;
+            let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+                .expect_err(source);
+            let text = format!("{err:?}");
+            assert!(text.contains("keeps bool and int apart"), "{source}: {text}");
+            assert!(text.contains("int(flag) or bool(count)"), "{source}: {text}");
+        }
         cleanup_dir(&root);
         Ok(())
     }

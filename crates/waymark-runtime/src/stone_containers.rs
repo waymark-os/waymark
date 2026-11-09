@@ -329,6 +329,23 @@ fn materialize_at(value: &RuntimeValue, context: &str, depth: usize) -> Result<V
         RuntimeValue::List(list) => list.materialize(context, depth),
         RuntimeValue::Dict(dict) => dict.materialize(context, depth),
         RuntimeValue::Record(record) => record.materialize(context, depth),
+        // A tuple or set becomes a JSON array; a tuple can hold a list that
+        // holds the tuple, so the depth guard applies.
+        RuntimeValue::Tuple(_) | RuntimeValue::Set(_) => {
+            if depth > MAX_MATERIALIZE_DEPTH {
+                return Err(depth_error(context));
+            }
+            let items = match value {
+                RuntimeValue::Tuple(items) => items.as_ref().clone(),
+                RuntimeValue::Set(set) => set.values(),
+                _ => unreachable!("matched above"),
+            };
+            let mut vals = Vec::with_capacity(items.len());
+            for item in &items {
+                vals.push(materialize_at(item, context, depth + 1)?);
+            }
+            Ok(Value::list(vals, Span::unknown()))
+        }
         other => other.clone().into_nu_value(context),
     }
 }
@@ -391,6 +408,17 @@ pub(super) fn unshare(value: RuntimeValue, context: &str) -> Result<RuntimeValue
 impl ListObj {
     pub(super) fn len(&self) -> usize {
         self.items.borrow().len()
+    }
+
+    /// The first element that is a type value (such as `ValueError`), for
+    /// rejecting `"ValueError" in [ValueError]`.
+    pub(super) fn first_type_item(&self) -> Option<RuntimeValue> {
+        self.items.borrow().iter().find_map(|item| match item {
+            Item::Runtime(value) if matches!(**value, RuntimeValue::Type(_)) => {
+                Some((**value).clone())
+            }
+            _ => None,
+        })
     }
 
     /// The element at a Python index (negative counts from the end), shared

@@ -116,6 +116,9 @@ pub(super) enum TypeSpec {
     Union(Rc<Vec<TypeSpec>>),
     Record(Rc<RecordType>),
     Model,
+    /// An error type used as a value (`ValueError`, `error.type`). It is
+    /// only a value: annotations name error types through records instead.
+    Error(Rc<str>),
 }
 
 impl TypeSpec {
@@ -173,16 +176,18 @@ impl TypeSpec {
                 .join(" | "),
             TypeSpec::Record(record) => record.name.clone(),
             TypeSpec::Model => "Model".to_string(),
+            TypeSpec::Error(name) => name.to_string(),
         }
     }
 }
 
-fn same_type(left: &TypeSpec, right: &TypeSpec) -> bool {
+pub(super) fn same_type(left: &TypeSpec, right: &TypeSpec) -> bool {
     match (left, right) {
         (TypeSpec::Record(left), TypeSpec::Record(right)) => Rc::ptr_eq(left, right),
         (TypeSpec::List(left), TypeSpec::List(right))
         | (TypeSpec::Dict(left), TypeSpec::Dict(right)) => same_type(left, right),
         (TypeSpec::Literal(left), TypeSpec::Literal(right)) => left == right,
+        (TypeSpec::Error(left), TypeSpec::Error(right)) => left == right,
         (TypeSpec::Union(left), TypeSpec::Union(right)) => {
             left.len() == right.len() && left.iter().zip(right.iter()).all(|(l, r)| same_type(l, r))
         }
@@ -441,7 +446,7 @@ fn check_plain(value: &Value, ty: &TypeSpec) -> Result<(), TypeIssue> {
             }
             false
         }
-        TypeSpec::Model => false,
+        TypeSpec::Model | TypeSpec::Error(_) => false,
     };
     if ok {
         Ok(())
@@ -802,6 +807,8 @@ pub(super) fn isinstance(value: &RuntimeValue, ty: &TypeSpec) -> Result<bool, St
         TypeSpec::Float => matches!(value, RuntimeValue::Nu(Value::Float { .. })),
         TypeSpec::Bool => matches!(value, RuntimeValue::Nu(Value::Bool { .. })),
         TypeSpec::Model => matches!(value, RuntimeValue::Model(_)),
+        // The evaluator answers error types, which need the class table.
+        TypeSpec::Error(_) => false,
         TypeSpec::List(element) if matches!(**element, TypeSpec::Any) => {
             runtime_kind(value) == "list"
         }
@@ -999,7 +1006,7 @@ fn convert(
         }
         TypeSpec::Record(record) => convert_record(value, record, table, issues),
         TypeSpec::Union(members) => convert_union(value, ty, members, table, issues),
-        TypeSpec::Model => wrong(issues),
+        TypeSpec::Model | TypeSpec::Error(_) => wrong(issues),
     }
 }
 
@@ -1170,6 +1177,7 @@ fn schema_word(ty: &TypeSpec) -> String {
             .join(" or "),
         TypeSpec::Record(record) => format!("a {} object", record.name),
         TypeSpec::Model => "a model".to_string(),
+        TypeSpec::Error(name) => format!("a {name} error type"),
     }
 }
 
@@ -1265,6 +1273,9 @@ pub(super) fn python_types(ty: &TypeSpec, table: &TypeTable) -> Result<String, S
             }
             TypeSpec::Model => Err(record_error(
                 "a model answer cannot contain a Model; use a record of plain fields",
+            )),
+            TypeSpec::Error(_) => Err(record_error(
+                "a model answer cannot contain an error type; use a str field",
             )),
             _ => Ok(()),
         }
@@ -1388,6 +1399,11 @@ fn schema_for(
                 "a model answer cannot contain a Model; use a record of plain fields",
             ))
         }
+        TypeSpec::Error(_) => {
+            return Err(record_error(
+                "a model answer cannot contain an error type; use a str field",
+            ))
+        }
     })
 }
 
@@ -1457,6 +1473,34 @@ fn write_repr(value: &RuntimeValue, out: &mut String, depth: usize) -> Result<()
         ));
     }
     match value {
+        RuntimeValue::Tuple(items) => {
+            out.push('(');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                write_repr(item, out, depth + 1)?;
+            }
+            if items.len() == 1 {
+                out.push(',');
+            }
+            out.push(')');
+        }
+        RuntimeValue::Set(set) => {
+            let items = set.values();
+            if items.is_empty() {
+                out.push_str("set()");
+            } else {
+                out.push('{');
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    write_repr(item, out, depth + 1)?;
+                }
+                out.push('}');
+            }
+        }
         RuntimeValue::Record(record) => {
             out.push_str(&record.ty.name);
             out.push('(');
@@ -1505,6 +1549,7 @@ fn write_repr(value: &RuntimeValue, out: &mut String, depth: usize) -> Result<()
         }
         RuntimeValue::Type(spec) => match &**spec {
             TypeSpec::Record(record) => out.push_str(&format!("<class '{}'>", record.name)),
+            TypeSpec::Error(name) => out.push_str(&format!("<class '{name}'>")),
             other => out.push_str(&other.display()),
         },
         RuntimeValue::Model(_) => out.push_str("<model>"),

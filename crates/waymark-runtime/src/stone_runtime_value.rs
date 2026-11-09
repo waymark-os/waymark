@@ -33,6 +33,10 @@ pub(super) enum RuntimeValue {
     Dict(DictRef),
     /// A record (`class Plan(Record):`), shared like a dict.
     Record(RecordRef),
+    /// An immutable tuple (stone_collections).
+    Tuple(super::stone_collections::TupleRef),
+    /// A set of hashable values, shared like a list.
+    Set(super::stone_collections::SetRef),
     /// A type used as a value: a record class, or a union such as
     /// `Read | Edit`, for `output=`, `isinstance`, and aliases.
     Type(std::rc::Rc<TypeSpec>),
@@ -66,6 +70,8 @@ pub(super) enum RuntimeValueTag {
     Dict,
     Record,
     Type,
+    Tuple,
+    Set,
     Model,
     File,
     TextLines,
@@ -117,6 +123,8 @@ impl RuntimeValueTag {
             RuntimeValueTag::Record => 23,
             RuntimeValueTag::Type => 24,
             RuntimeValueTag::Model => 25,
+            RuntimeValueTag::Tuple => 26,
+            RuntimeValueTag::Set => 27,
         }
     }
 }
@@ -141,6 +149,8 @@ impl RuntimeValue {
                 containers_are_persistable(self)
             }
             RuntimeValue::Type(_) => true,
+            RuntimeValue::Tuple(items) => items.iter().all(RuntimeValue::is_session_persistable),
+            RuntimeValue::Set(_) => true,
             RuntimeValue::Model(_) => false,
             RuntimeValue::TextLines(_) => true,
             RuntimeValue::JsonlRows(_) => true,
@@ -172,6 +182,8 @@ impl RuntimeValue {
             RuntimeValue::Dict(_) => RuntimeValueTag::Dict,
             RuntimeValue::Record(_) => RuntimeValueTag::Record,
             RuntimeValue::Type(_) => RuntimeValueTag::Type,
+            RuntimeValue::Tuple(_) => RuntimeValueTag::Tuple,
+            RuntimeValue::Set(_) => RuntimeValueTag::Set,
             RuntimeValue::Model(_) => RuntimeValueTag::Model,
             RuntimeValue::File(_) => RuntimeValueTag::File,
             RuntimeValue::TextLines(_) => RuntimeValueTag::TextLines,
@@ -204,6 +216,8 @@ impl RuntimeValue {
             // A record crosses as a plain dict of its fields (JSON output,
             // builtins), as pydantic's model_dump() gives.
             value @ RuntimeValue::Record(_) => materialize(&value, context),
+            // Tuples and sets cross as JSON arrays.
+            value @ (RuntimeValue::Tuple(_) | RuntimeValue::Set(_)) => materialize(&value, context),
             // A type crosses as its name, as an error type does.
             RuntimeValue::Type(spec) => Ok(Value::string(spec.display(), Span::unknown())),
             RuntimeValue::Model(_) => Err(stone_error(

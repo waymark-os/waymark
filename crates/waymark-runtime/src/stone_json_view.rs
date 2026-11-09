@@ -154,6 +154,21 @@ pub(super) fn eval_runtime_subscript(
                 }
             }
         }
+        RuntimeValue::Tuple(items) if matches!(index, Value::Int { .. }) => {
+            let Value::Int { val, .. } = index else {
+                unreachable!("guarded by matches!");
+            };
+            let len = items.len() as i64;
+            let position = if *val < 0 { val + len } else { *val };
+            if (0..len).contains(&position) {
+                return Ok(items[position as usize].clone());
+            }
+            Err(stone_error("subscript", "tuple index out of range"))
+        }
+        RuntimeValue::Set(_) => Err(stone_error(
+            "set",
+            "a set has no positions, so it cannot be indexed (in Python either); use sorted(s)[i] or list(s)[i], or test membership with `x in s`",
+        )),
         other => {
             let value = other.into_nu_value("subscript")?;
             subscript_builtin(&value, index).map(RuntimeValue::Nu)

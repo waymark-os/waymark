@@ -32,10 +32,12 @@ pub(crate) fn index_method_builtin(receiver: &Value, args: &[Value]) -> Result<V
                     "list index() requires exactly one argument",
                 ));
             };
-            vals.iter()
-                .position(|value| values_equal(value, needle))
-                .map(|index| Value::int(index as i64, Span::unknown()))
-                .ok_or_else(|| stone_error("index", "value is not in list"))
+            for (index, value) in vals.iter().enumerate() {
+                if checked_values_equal(value, needle)? {
+                    return Ok(Value::int(index as i64, Span::unknown()));
+                }
+            }
+            Err(stone_error("index", "value is not in list"))
         }
         Value::String { val, .. } | Value::Glob { val, .. } => {
             let ([needle] | [needle, _]) = args else {
@@ -119,8 +121,8 @@ pub(crate) fn compare_values(
     right: &Value,
 ) -> Result<bool, ShellError> {
     match op {
-        CompareOp::Eq => Ok(values_equal(left, right)),
-        CompareOp::NotEq => Ok(!values_equal(left, right)),
+        CompareOp::Eq => checked_values_equal(left, right),
+        CompareOp::NotEq => checked_values_equal(left, right).map(|equal| !equal),
         CompareOp::Is => Ok(values_equal(left, right)),
         CompareOp::IsNot => Ok(!values_equal(left, right)),
         CompareOp::In => value_contains(right, left),
@@ -653,10 +655,6 @@ pub(crate) fn sum_builtin(values: Vec<Value>) -> Result<Value, ShellError> {
     }
 }
 
-pub(crate) fn set_builtin(values: Vec<Value>) -> Result<Value, ShellError> {
-    unique_values(values, "set").map(|values| Value::list(values, Span::unknown()))
-}
-
 pub(crate) fn unique_builtin(value: &Value) -> Result<Value, ShellError> {
     let Value::List { vals, .. } = value else {
         return Err(stone_error(
@@ -875,19 +873,6 @@ pub(crate) fn value_to_path_string(value: &Value, context: &str) -> Result<Strin
 
 /// Text for `print`: scalars follow Python (`None`, `True`, `1.0`), and
 /// containers stay compact JSON because the model reads printed output.
-pub(crate) fn value_to_display_string(value: &Value) -> Result<String, ShellError> {
-    match value {
-        Value::Nothing { .. }
-        | Value::Bool { .. }
-        | Value::Int { .. }
-        | Value::Float { .. }
-        | Value::String { .. }
-        | Value::Glob { .. } => python_str(value),
-        other => serde_json::to_string(&nu_to_json_value(other))
-            .map_err(|err| stone_error("str", err.to_string())),
-    }
-}
-
 pub(crate) fn value_type_name(value: &Value) -> &'static str {
     match value {
         Value::Nothing { .. } => "NoneType",
@@ -900,6 +885,54 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
         Value::Binary { .. } => "bytes",
         _ => "value",
     }
+}
+
+/// Equality for program comparisons (`==`, `!=`, `in`, `index`, `count`).
+/// Python says `True == 1`; Stone keeps bool and number apart, so a
+/// comparison that mixes them, at any depth, raises instead of answering.
+pub(crate) fn checked_values_equal(left: &Value, right: &Value) -> Result<bool, ShellError> {
+    match (left, right) {
+        (Value::Bool { .. }, Value::Int { .. } | Value::Float { .. })
+        | (Value::Int { .. } | Value::Float { .. }, Value::Bool { .. }) => {
+            Err(bool_number_comparison_error(left, right))
+        }
+        (Value::List { vals: left, .. }, Value::List { vals: right, .. }) => {
+            if left.len() != right.len() {
+                return Ok(false);
+            }
+            for (left, right) in left.iter().zip(right.iter()) {
+                if !checked_values_equal(left, right)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        (Value::Record { val: left, .. }, Value::Record { val: right, .. }) => {
+            if left.len() != right.len() {
+                return Ok(false);
+            }
+            for (key, left_value) in left.iter() {
+                match right.get(key) {
+                    Some(right_value) if checked_values_equal(left_value, right_value)? => {}
+                    _ => return Ok(false),
+                }
+            }
+            Ok(true)
+        }
+        _ => Ok(values_equal(left, right)),
+    }
+}
+
+fn bool_number_comparison_error(left: &Value, right: &Value) -> ShellError {
+    let show = |value: &Value| python_repr(value).unwrap_or_else(|_| "?".to_string());
+    stone_error(
+        "comparison",
+        format!(
+            "comparing the bool {} with the number {}: Python treats True as 1, but Stone keeps bool and int apart, so this comparison has no answer. Compare a bool with True/False and a number with a number, or convert first with int(flag) or bool(count)",
+            show(if matches!(left, Value::Bool { .. }) { left } else { right }),
+            show(if matches!(left, Value::Bool { .. }) { right } else { left }),
+        ),
+    )
 }
 
 pub(crate) fn values_equal(left: &Value, right: &Value) -> bool {
@@ -971,7 +1004,14 @@ fn value_contains(container: &Value, needle: &Value) -> Result<bool, ShellError>
             let needle = value_to_string(needle, "membership")?;
             Ok(val.contains(&needle))
         }
-        Value::List { vals, .. } => Ok(vals.iter().any(|value| values_equal(value, needle))),
+        Value::List { vals, .. } => {
+            for value in vals {
+                if checked_values_equal(value, needle)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
         Value::Record { val, .. } => {
             let needle = value_to_string(needle, "membership")?;
             Ok(val.get(&needle).is_some())
