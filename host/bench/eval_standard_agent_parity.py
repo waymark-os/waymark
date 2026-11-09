@@ -275,7 +275,21 @@ def run_attempt(args, source: Path, task: dict[str, Any], live: bool) -> dict[st
         summary["request_characters"] = [
             sum(len(str(m.get("content", ""))) for m in r.get("messages", [])) for r in requests]
         summary.update(prefix_reuse(requests))
+        remove_task_containers(root)
         return summary
+
+
+def remove_task_containers(root: Path) -> None:
+    """Remove the command containers the Gateway started for this run. The
+    Gateway keeps one per transaction (attempts get their own), and stopping
+    the server does not remove them."""
+    ids = subprocess.run(["docker", "ps", "-aq", "--filter", "name=waymark-gateway-"],
+                         text=True, capture_output=True).stdout.split()
+    mine = [i for i in ids if str(root) in subprocess.run(
+        ["docker", "inspect", i, "--format", "{{range .Mounts}}{{.Source}} {{end}}"],
+        text=True, capture_output=True).stdout]
+    if mine:
+        subprocess.run(["docker", "rm", "-f", *mine], capture_output=True)
 
 
 def prefix_reuse(requests: list[dict[str, Any]]) -> dict[str, int]:
