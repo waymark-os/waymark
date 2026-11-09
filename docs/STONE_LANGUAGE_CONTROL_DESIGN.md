@@ -1,13 +1,16 @@
 # Stone As An Agent Control Language (Draft)
 
-Status: draft v3.1 (2026-11-07). Decisions S1-S3 are settled. Draft v3 adds
+Status: draft v3.2 (2026-11-08). Decisions S1-S3 are settled. Draft v3 adds
 the decisions from the literature review (Section 3). Each one is marked
 **from review** or **deviates from review because ...**. One review decision
 (mandatory declared writes) conflicted with S2. D-1 (Section 3.1) resolves it
 after an LLM pilot (11.2): effects fall into three tiers, and models declare
-only irreversible effects. Nothing is
-implemented. Items marked **H-n** are hypotheses to test, **L-n** are language
-decisions (Section 7), and **R-n** are review decisions (Section 3).
+only irreversible effects. Milestones M1-M5 have implemented part of P1
+(Section 14 marks each item **done**). Draft v3.2 adds the checks-as-feedback
+framing (1.1), the typed-workflow pilot on SWE-bench (11.3), and the
+plan-check proposal it motivates (L12, 5.2). Items marked **H-n** are
+hypotheses to test, **L-n** are language decisions (Section 7), and **R-n**
+are review decisions (Section 3).
 
 Review: "Literature review: language-level control for the Waymark agent
 shell" (2026-11-06). Its questions are cited here as **RQ1-RQ6**, to keep them
@@ -56,6 +59,129 @@ errors.
 
 The language must also stay easy to optimize (see
 `docs/STONE_VM_PERFORMANCE_PLAN.md`).
+
+### 1.1 Checks As Feedback
+
+This section states the model the rest of the design follows. It was stated
+by the user on 2026-11-08. Most of its parts were already here, framed as
+safety:
+
+- "admission checks it before running where it can, and the runtime
+  enforces it where it cannot" (above);
+- "Check, then run; feed errors back" (Section 2, idea 5);
+- "Errors contain the fix" (Settled Constraints);
+- typed workflows (below).
+
+Here they are framed as feedback to the model.
+
+**Computer use is using or writing neuro-symbolic programs.** The neural
+part handles what varies from task to task: reading unfamiliar code,
+choosing the next step, writing a fix, judging whether a test captures an
+issue. The symbolic part gives certainty and reliability: bookkeeping,
+checking claims against the world, metering budgets, connecting steps. A
+human used to be the neural part. For an agent it is the LLM. Stone is
+designed for that: make programs easy for LLMs to use and write, amplify
+what LLMs do well, and cover for what they do badly, such as verifying
+their own work.
+
+Two consequences:
+
+- Whatever the outcome depends on should be symbolic where it can be. The
+  model is used where the task really varies.
+- A symbolic check is only as certain as its inputs. A check against the
+  world (the diff is empty, the file was not changed) is certain. A check
+  against something the model made (the model's own reproduction script
+  passes) only borrows certainty from the model. The pilot in 11.3 shows
+  the difference.
+
+**The three roles of checking.** Static and dynamic checks and the errors
+they produce are one feedback system with three parts:
+
+| Role | Question | When | Cost | Errors correct |
+|---|---|---|---|---|
+| Static check | Does the plan make sense, under assumptions about the environment? | Before running | Nearly free: no model calls, no commands | The plan (the program) |
+| Dynamic check | Does the environment match expectations? Is the run on track? | At tool and model calls | Cheap: only at metered operations | The run, within the same plan |
+| Errors | What is wrong, and how is it fixed? | Whenever a check fails | — | Both, by telling the model what to change |
+
+Programmers work this way: write a program for a task, type check it as a
+cheap test of whether it could work, run it, and let the run show whether
+its assumptions hold. Python's optional type hints and TypeScript's types
+over JavaScript show that static checks fit a Python-shaped language. A
+static check passing means the plan is coherent: every step gets what it
+needs, and the end produces what the task asks for. It does not mean the
+plan works. That is the dynamic checks' job, as tests are in programming.
+
+Dynamic errors correct the run: the check fails and the model tries again
+under the same plan. Static errors, and dynamic errors that repeat, revise
+the plan. When the model wrote the program, that is the level-B loop
+(Section 8, Q1).
+
+**Feedback sources differ in cost and in what they can catch.** Catch each
+kind of error with the cheapest feedback that can catch it, and spend model
+judgment only on questions that need judgment:
+
+| Feedback | Catches | Cannot catch |
+|---|---|---|
+| Static check | Missing steps, claims never checked, unchecked results, loops that ignore the budget | Anything about the environment |
+| Dynamic check | Facts about the world: exit codes, diffs, files, schemas | Whether a model-made artifact is adequate |
+| Reviewer (an LLM) | Meaning: does this fix address the issue? | Reliably anything; it can be fooled and can be too strict |
+
+**The plan form already exists: typed workflows.**
+`docs/STONE_TYPED_WORKFLOWS.md` implements a plan as `workflow` and `stage`
+blocks with `ensure` postconditions. The frontend lowers them to the
+evidence-gated stage kernel (`@stage`, `workflow_stage`, `workflow_run`).
+Example: `examples/references/staged_doom_harness.stone`. That layer was
+built before this draft's records and `model.ask`, and this draft did not
+refer to it until now. It covers all three roles:
+
+| Role | What typed workflows already do |
+|---|---|
+| Static | Workflow admission rejects a stage input that names a missing producer field, or a field whose kind differs from the producer's declared finding (field-typed `inputs=`). Patches that name an unlisted stage fail before the run. |
+| Dynamic | A stage advances only when its evidence holds (`ensure artifact(...)`, `command_succeeded(...)`, `decision_recorded(...)`). Exit status is not completion evidence. Findings carry a runtime-owned `basis` (for example `runtime:action:11:ensure_command`). |
+| Errors and plan revision | Stage-scoped repair, terminal diagnostics, and `workflow_patch`, which replaces exactly one named stage: a bounded form of revising the plan. |
+
+That doc also records the lesson of 11.3 in its own words: "Typed transport
+prevents forgetting; it cannot strengthen an underspecified finding." Its
+Caffe runs found that "evidence must measure the saved artifact rather than
+a nearby in-training state."
+
+So the open work is to connect the two tracks, not to invent a third:
+
+- Stage outputs are findings with kinds (`path`, `command`, ...), and
+  records are this draft's typed data. Findings could be records, so that
+  stage inputs, `model.ask(output=T)`, and functions share one type
+  vocabulary.
+- `ensure` predicates are runtime-owned checks against the world, the
+  certain kind above. A predicate that checks a model-made artifact (such as
+  "the reproduction passes") should say so in its `basis`.
+- Workflow admission is the static plan check (L12) at the stage level. It
+  checks stage dataflow. It does not yet check that the workflow's final
+  `ensure` establishes the task's goal.
+
+**What exists, and what is missing**, by role:
+
+- **Static.**
+  - Exists: name and module linking before the program runs; handler rules
+    (R14, R15); warnings for handlers that can never run (item 28);
+    workflow admission of stage inputs (above).
+  - Missing: one type vocabulary for stage findings and records; a check
+    that the final stage establishes the task's goal; a report of the
+    assumptions a claim rests on (5.2); warnings for an unchecked `run()`
+    result and for a model loop that never reads `model.remaining`.
+- **Dynamic.**
+  - Exists: `expect=` and `must_run` (5.8); record validation of model
+    output, with `Field` limits (5.6); budgets at metered calls (5.3);
+    typed errors (5.5); stage evidence and `ensure` (typed workflows).
+  - Missing: provenance labels that mark data the model made (D-3); a
+    loud signal when output is cut at `max_stdout_bytes`.
+- **Errors.**
+  - Exist: prescriptive admission errors; `ModelOutputError` issues, which
+    feed the repair turn; `ExpectationFailed` with `.diff` (R12); the
+    feedback shape (5.8).
+  - Missing: correct error kinds from the Gateway (11.3). Budget
+    exhaustion ends the attempt by design (5.3), so a loop keeps its
+    partial work only if it checks `model.remaining`. That check is easy
+    to forget (11.3), which is what the static warning above is for.
 
 ### Settled Constraints
 
@@ -479,6 +605,40 @@ child's `Verified` only if its verifier is one the parent passed to that child
 results) and carry provenance. A model can quote evidence but cannot create
 it.
 
+**Checked conditions inside a plan (proposal, 2026-11-08; not decided).**
+`Verified[T]` is about trust: only the host can mint one, so an attempt
+cannot claim an outcome it does not hold. A plan also needs intermediate
+conditions, such as "a reproduction that was run and seen to fail" or "a fix
+whose checks passed". These are about coherence, not trust: the plan should
+not be able to skip the step that establishes them.
+
+Typed workflows already give this at the stage level (1.1): a stage
+advances only when its `ensure` evidence holds, and workflow admission
+checks that each stage's inputs name fields an earlier stage produces. The
+proposal builds on that and does not add a parallel mechanism:
+
+- Stage findings become records, so a stage's output, a stage's declared
+  inputs, `model.ask(output=T)`, and ordinary function annotations share
+  one type vocabulary. Workflow admission then matches record types where
+  it matches finding kinds today.
+- Workflow admission also checks that the last stage's `ensure` establishes
+  the goal type the task states. Without a stated goal there is nothing to
+  check the plan against.
+- A claim lists what it rests on, as the `claim` field of `Verified` and the
+  `basis` of a finding already do: for each `ensure`, whether it checked the
+  world or something the model made. Provenance labels (D-3) can fill this
+  in. In 11.3, "verified" rested on four conditions. Three were checked
+  against the world, and one ("the reproduction captures the issue") was
+  trusted to the model. All of the typed arm's false claims came from that
+  one.
+- Trust still comes only from `Verified[T]`. A finding a stage makes is the
+  plan's own, and the program could build it any way it likes.
+
+This is the form of Lean4Agent's per-step pre- and post-conditions that fits
+D-3: each condition is checked at run time, where its evidence is produced,
+and the static part only matches declared types. There is no proof search
+and no whole-program inference.
+
 ### 5.3 Resources: Metered Capabilities And Budgets
 
 Simplified by D-3. Budgets are checked only at metered calls, so ordinary
@@ -722,6 +882,26 @@ docs in `STONE_LANGUAGE.md`, "Records"):
 - The standard controller's action format needed these limits (one action
   per turn, non-empty paths, timeout ranges). With them, its 299 lines of
   hand-written schema and schema prompts became 94 lines of records.
+
+Found in the SWE-bench pilot (11.3), and not changed yet:
+
+- **An action union sent as a JSON reply can read as "give your final
+  answer".** Asked to explore, GPT-5.6 Luna answered with the finishing
+  action on its first move in 10 of 10 samples, with a confident report and
+  no file read. A framing line in the system prompt lowered that only to 8
+  of 10. When the same actions were offered as native tool calls, it
+  explored on its first move in 10 of 10. Haiku did not show the problem.
+  The fix belongs in the Gateway, which owns backend differences: lower
+  `model.ask(output=A | B | ...)` to the provider's tool calls where that
+  serves the model better, with the Stone program unchanged. Luna rejects
+  function tools on chat completions while reasoning, so for it this means
+  the Responses API. Two things are untested: whether the effect holds past
+  the first move, and how much of it comes from the API endpoint rather
+  than from tools.
+- **`model.ask` has no default cap on reply length.** One runaway Haiku
+  reply ran into the Gateway's 5-minute timeout and ended a run. A program
+  can pass `max_output_tokens`, but a default cap would remove a failure
+  every agent loop has to remember.
 
 ### 5.7 Delegation And The Pass-Style Boundary
 
@@ -1102,7 +1282,7 @@ keeping reference semantics.
 | L9 | Modules: `from lib import name` for pure Stone modules (top-level `def`, records, and constants only; no effects). Module-level values are deep-frozen (R5). | Adopt | Agent libraries without pasted bundles; pure modules hold no authority | Compiled prototypes and frozen constants can be cached per module |
 | L10 | `from typing import Literal`, `from pydantic import BaseModel` | Accept known names as no-ops; reject unknown names loudly | Absorbs strong Python priors (H-6) | None |
 | L11 | `match` statement | Defer | `isinstance` chains suffice | — |
-| L12 | Static checking at admission | Linear pass per command: ambient authority, unknown record fields, unknown capability methods, visibly wrong return types, bare `except`, `pass` handlers. 0-CFA reachability (R23) only for delegated bodies and library loops, in P3. | Agents run many small commands | Per-command cost stays linear |
+| L12 | Static checking at admission: the cheap plan check (1.1) | Linear pass per program: ambient authority, unknown record fields, unknown capability methods, visibly wrong return types, bare `except`, `pass` handlers. **Done:** name and module linking, handler rules, unreachable-handler warnings, and workflow admission of field-typed stage inputs (`STONE_TYPED_WORKFLOWS.md`). **Proposed (2026-11-08, not decided):** one type vocabulary for stage findings and records, and a check that the final stage establishes the task's goal type (5.2); warn on an unchecked `run()` result and on a model loop that never reads `model.remaining`; report the assumptions a claim rests on. 0-CFA stays dropped (D-3). | Agents run many small commands; a model checking its own plan needs feedback before spending budget | Per-program cost stays linear; annotations are matched, not inferred |
 | L13 | Effects as internal handlers (record, replay, mock, approval); hooks become one handler kind | Adopt, no user syntax | Replay and durable loops without new constructs | Effect calls are already off the hot path |
 | L14 | Syscall contracts: Gateway-owned effect signatures for every syscall; models declare only tier-3 effects of `Exec` (`effects=`); `expect=` optional on any syscall | Adopt (R25a-R25c, R26; D-1) | Safeguards each syscall and gives checked feedback with the fewest declarations | Checks run on syscalls only; tier-1 diff cost per command is one diff (Section 12) |
 | L15 | `ExpectationFailed` and `UndeclaredEffect` are `ToolError` subclasses carrying the full result | Adopt (R12) | Loud by default, recoverable, one handler in loops | None |
@@ -1563,6 +1743,9 @@ boundaries), so L2 and R9 are one piece of M4 work, not two.
 | H-12 | Deferred. Whether models can predict a command's effects. The pilot (11.2) is weak evidence (recall 89-100% on short tasks). Under D-1 this matters only for tier-3 `Exec` declarations. | Revisit if tier-3 `UndeclaredEffect` rates are high |
 | H-10 | Target models produce well-formed `expect` and tier-3 `effects` with near-zero errors as structured-output fields, provided the field sits flat in the schema | Measured within the ablation; the pilot (11.2) found nesting mattered for Qwen |
 | H-11 | Rejecting `pass` handlers and bare `except` costs about one repair and does not push models toward worse patterns (for example `except Exception as e: e`) | Authorship eval; inspect handler bodies after repair |
+| H-13 | A cheap static plan check (L12 proposal, 5.2) helps models write per-task programs that work: it catches plans that cannot fit together, models fix them from the errors, and checked plans succeed more often | Models write a program per task under three conditions: no check; the static check with repair before running; the static check plus the dynamic checks. Same tasks, model, and budget (1.1, 11.3) |
+| H-14 | Lowering `model.ask` action unions to native tool calls in the Gateway stops OpenAI reasoning models from finishing on the first move, and raises their success | Rerun 11.3's Luna arms with the Gateway lowering, both arms unchanged (5.6) |
+| H-15 | Program checks as a gate, followed by an LLM reviewer, beat either alone: invention is caught by the checks and narrow fixes by the reviewer | A typed-plus-reviewer arm in 11.3's setup |
 
 ### 11.1 The Outcome-Prediction Ablation (Set Up, Not Run)
 
@@ -1752,9 +1935,164 @@ Not yet tested:
 - the Gateway's real checkpoint cost (about 300 ms per 50 MB) in place of the
   harness's copy-restore.
 
+### 11.3 Typed Workflow Pilot On SWE-bench (2026-11-08)
+
+**Question.** Does a typed workflow help, with the language as the only
+thing that changes? This is the Stone form of the claim behind Lean4Agent
+(Wang et al., arXiv 2606.06523) and of Elba's `Trusted` result (Section 2).
+
+**Setup.** Both arms run the same workflow, Lean4Agent's SWE-bench shape:
+explore, reproduce, fix, verify, submit. Each step is a bounded loop in which
+the model picks one action per turn (read, search, shell, edit, write, or
+finish) through `model.ask(output=...)` over a union of records. The arms
+share the tasks, the model, the Gateway and task containers, the tools, the
+step limits, the budget (`model.limit(calls=60)`), and the instructions.
+They differ only at step boundaries:
+
+- **Typed.** Steps hand each other records (`Diagnosis`, `FixReport`), and
+  the program checks each handoff:
+  - every file named in the diagnosis exists;
+  - the model's reproduction script fails on the unfixed code;
+  - the test commands run, and at least one passes before the change
+    (added after the first round; see below);
+  - after the fix, the reproduction passes, every test that passed before
+    still passes, and every file the model lists as changed appears in
+    `git diff`.
+
+  Failures go back to the model as feedback, for up to 3 fix rounds.
+  "Verified" means every check passed.
+- **Untyped.** Steps hand each other free-text reports. After each fix
+  round, an LLM reviewer (the same model) sees the diff and the report and
+  answers VERIFIED or NOT VERIFIED; a rejection goes back as feedback.
+
+Five SWE-bench Verified tasks, chosen because GPT-5.6-terra solved each in
+1 to 3 of 5 runs on balin: django-11087, matplotlib-23299, pytest-7205,
+sphinx-10673, sympy-12489. Patches were graded by the official harness. The
+Gateway ran on the host and commands ran in each task's image. Models:
+Haiku 5.5 through a new `anthropic` Gateway provider (branch
+`anthropic-provider` of waymark-gateway), and GPT-5.6 Luna.
+
+**Results: Luna, one run per task and arm.**
+
+| | Typed | Untyped |
+|---|---|---|
+| Resolved | 0/5 | 0/5 |
+| Claimed "verified" | 1 (the pytest case below) | 5, four of them with an empty patch |
+| Honest "not verified" | 4 | 0 |
+| Model calls per run, mean | 14 | 10 |
+
+Luna usually picked "finish" on its first move, with a confident made-up
+report ("changed `permutations.py`, tests pass"). The untyped reviewer
+accepted these, even with an empty diff in front of it. The typed checks
+rejected every one, with messages such as "git diff is empty", "you listed X
+as changed, but git diff does not show it", and "the reproduction still
+fails". They did not make Luna do the work: told exactly what was wrong, it
+finished on its first move again, round after round. The first-move probe
+in 5.6 points to how actions are presented as the cause.
+
+**Results: Haiku, three runs per task and arm** (after the fix below).
+
+| | Typed | Untyped |
+|---|---|---|
+| Resolved | 2/15 | 5/15 |
+| Claimed "verified" | 13: 2 correct, 11 wrong | 2: both wrong (pytest) |
+| Correct fixes rejected | 0 | 5 |
+| Model calls per run, mean | 25 | 48 |
+
+An earlier round of one run per cell, before the fix, gave 2/5 resolved for
+both arms, with 32 against 49 calls per run.
+
+- **The typed check accepted fixes that passed the model's own
+  reproduction.** Haiku tended to write that script for the same narrow case
+  its fix handled, so the check passed and the program stopped after one
+  round. Of the 11 wrong claims, 8 were fixes narrower than the hidden
+  tests require (matplotlib 3, django 2, sympy 2, sphinx 1). The other 3
+  are pytest-7205: there the fix is right for the issue as written, but the
+  hidden tests expect a wider change of behavior that the issue does not
+  mention. No check written from the issue could catch that. The untyped
+  arm's two wrong claims are the same pytest case.
+- **The untyped reviewer was skeptical,** sometimes too skeptical: it
+  rejected 5 fixes that the harness accepted. Its extra rounds also produced
+  broader fixes, at twice the model calls.
+- With 15 runs per arm, the 5-versus-2 resolve gap could be chance. The gap
+  in claims (13 versus 2) and in effort (25 versus 48 calls) is not.
+
+**Reading.**
+
+- **Checks against the world catch made-up work.** This supports H-3's
+  mechanism for the case Elba measured. A weak model invents finished work,
+  and only claims checked against the environment stop it. An LLM reviewer
+  believed the inventions.
+- **A check against a model-made artifact gives false confidence.** 12
+  already warns that "`Verified` is only as strong as its verifier"; this is
+  that warning measured. The program called a fix "verified" on the strength
+  of the model's own test. This is the case for the claim report in 5.2: it
+  would have listed "the reproduction captures the issue" as trusted to the
+  model, before any run. It also argues for combining the two: program
+  checks as a gate that catches invention, then a reviewer for whether the
+  fix is adequate (untested).
+- **Lean4Agent's main effect is not reproduced yet.** Its largest gains come
+  from rewriting the workflow from formal diagnostics, and they are largest
+  for weaker models. That is the level-B loop (static and repeated dynamic
+  errors revise the plan; 1.1). This pilot reproduced per-step checking
+  only. Its headline comparison (58% versus 43%) is between workflows that
+  passed or failed its checks, so it does not separate the checks' effect
+  from workflow quality. The setup here holds the workflow fixed.
+
+**Language and runtime problems found while running it:**
+
+- **Silent failures.** A `git` command that failed for repository ownership
+  returned empty output through `run()`, and the program carried on. The
+  final patch was cut at exactly `max_stdout_bytes` (1,000,000) with no sign
+  it was incomplete. Both fit the 1.1 gaps: a static warning for unchecked
+  `run()` results, and a loud truncation signal.
+- **A check with nothing to check passed silently.** The typed program's
+  regression guard reruns the tests that passed before the change. When
+  none of the model's test commands passed beforehand, the guard was empty
+  and the check passed. A sympy fix that broke 5 existing tests was called
+  "verified". The fix (diagnosis rejected unless at least one test passes
+  first) went into the three-run round. More generally, an empty check
+  should be visible.
+- **Budget exhaustion lost a run.** One run used all 60 calls. The attempt
+  ended as designed (5.3), but the program had not checked
+  `model.remaining`, so it never wrote its patch. The help text documents
+  this, and it was still missed. A step can also cost up to 3 calls, because
+  `model.ask` retries invalid replies, so a correct floor has to allow for
+  retries.
+- **No default reply cap** (5.6).
+- **The Gateway mislabels timeouts.** A provider timeout comes back as
+  `invalid_request`, not retryable, with "revise the request fields named in
+  the message", which is wrong advice for a timeout. This needs a Gateway
+  fix.
+- **Good errors.** A module that used a constant it did not define failed at
+  link time, naming the constant, before any effect. Six runs started
+  against a half-edited module and stopped this way at no cost.
+
+**Caveats.**
+
+- Five tasks, and Luna has one run per cell.
+- The typed check changed between the first round and the three-run round.
+- The reviewer is the same model as the worker.
+- The typed arm also stops at its first passing round, so the arms differ in
+  effort as well as in who judges.
+- The typed arm was written by hand with records, `model.ask`, and `expect=`.
+  It did not use the typed-workflow layer (`workflow`, `stage`, `ensure`,
+  and the standard stage agent; 1.1). So it tested per-step checking, not
+  that layer as built.
+- The harness and the workflow programs are not in this repository yet.
+
+**Not yet tested:**
+
+- the same typed arm written as a `workflow` with `ensure` stages;
+- a typed-plus-reviewer arm;
+- the plan check (L12, 5.2) with model-written programs;
+- the Gateway lowering of action unions to tool calls (5.6).
+
 ## 12. Uncertainties
 
-- No experiment has been run for any proposal here.
+- Few proposals have been measured. The write-prediction pilot (11.2), the
+  V15 parity runs (13, P1), and the typed-workflow pilot (11.3) are small
+  and use few tasks.
 - The Gateway was reviewed only for D-1 (3.1): protected-path mounts,
   network control, eBPF egress enforcement, and a syscall effect manifest
   do not exist yet. How `Exec.within`, `Dir`
@@ -1769,7 +2107,9 @@ Not yet tested:
   maintain. A wrong signature (an irreversible tool marked recoverable) is
   a hole the runtime cannot detect.
 - `Verified` is only as strong as its verifier. The claim field makes weak
-  verifiers visible; it does not make them strong.
+  verifiers visible; it does not make them strong. The pilot in 11.3
+  measured this: a program check against the model's own reproduction
+  called 13 fixes "verified", and 11 of them were wrong.
 - The utility cost of capability confinement is unmeasured. Elba reports
   policy-versus-no-policy only for IFC.
 - The compatibility cost of L1-L4, L6a, and L18 is unmeasured.
@@ -1881,6 +2221,10 @@ so V15 keeps V14's trace-id evidence links.
 - Host obligation registry, including daemons (R19).
 - Helpers in an isolated evaluator (R7).
 - Runtime stuck signal from repeated mismatches.
+- Static plan check (L12 proposal, 5.2): stage findings as records, a goal
+  check on the final stage in workflow admission, the claim's assumption
+  report, and warnings for unchecked `run()` results and budget-blind model
+  loops. Pending a decision; H-13 measures it.
 
 Exit: measured drop in false "done" claims, test tampering, and stuck loops
 (H-1, H-3).
