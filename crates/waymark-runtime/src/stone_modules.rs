@@ -263,9 +263,9 @@ impl Linker {
                     let names = match target {
                         AssignTarget::Name(name) => vec![name.clone()],
                         AssignTarget::Tuple(names) => names.clone(),
-                        AssignTarget::Subscript { .. } | AssignTarget::Attribute { .. } => {
-                            Vec::new()
-                        }
+                        AssignTarget::Subscript { .. }
+                        | AssignTarget::Attribute { .. }
+                        | AssignTarget::Expr(_) => Vec::new(),
                     };
                     for name in names {
                         if let Some(short) = name.strip_prefix(&prefix) {

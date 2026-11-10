@@ -289,6 +289,10 @@ pub enum AssignTarget {
         value: Box<AssignTarget>,
         attr: String,
     },
+    /// The base of `f()[0] = v` or `d.setdefault(k, {})[j] = v`: any
+    /// expression other than a name, evaluated once to the object that
+    /// the rest of the target changes. Never a whole target by itself.
+    Expr(Expr),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1845,17 +1849,30 @@ fn lower_assign_target(target: &py::Expr) -> Result<AssignTarget, ShellError> {
         py::Expr::Tuple(tuple) => lower_tuple_assign_targets(&tuple.elts),
         py::Expr::List(list) => lower_tuple_assign_targets(&list.elts),
         py::Expr::Subscript(subscript) => Ok(AssignTarget::Subscript {
-            value: Box::new(lower_assign_target(subscript.value.as_ref())?),
+            value: Box::new(lower_assign_base(subscript.value.as_ref())?),
             index: lower_expr(*subscript.slice.clone())?,
         }),
         py::Expr::Attribute(attribute) => Ok(AssignTarget::Attribute {
-            value: Box::new(lower_assign_target(attribute.value.as_ref())?),
+            value: Box::new(lower_assign_base(attribute.value.as_ref())?),
             attr: attribute.attr.to_string(),
         }),
         _ => Err(unsupported_message(
             "assignment",
-            "only simple name, fixed tuple/list, and item assignment are supported yet",
+            "cannot assign to this expression; assign to a name, `x[key]`, `x.field`, or unpack into `a, b`",
         )),
+    }
+}
+
+/// The object `base[...] = v` or `base.f = v` changes: a name or a chain of
+/// items and fields of one, or any other expression (`f()`, `d.get(k)`),
+/// evaluated once.
+fn lower_assign_base(base: &py::Expr) -> Result<AssignTarget, ShellError> {
+    match base {
+        py::Expr::Name(_) | py::Expr::Subscript(_) | py::Expr::Attribute(_) => {
+            lower_assign_target(base)
+        }
+        py::Expr::Tuple(_) | py::Expr::List(_) => lower_assign_target(base),
+        other => Ok(AssignTarget::Expr(lower_expr(other.clone())?)),
     }
 }
 
@@ -2635,6 +2652,9 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
                     | "remove"
                     | "update"
                     | "pop"
+                    | "insert"
+                    | "reverse"
+                    | "setdefault"
                     | "clear"
                     | "copy"
                     | "union"
@@ -2719,6 +2739,7 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
                         | "wait"
                         | "wait_any"
                         | "wait_all"
+                        | "update"
                 ) {
                     for keyword in call.arguments.keywords.into_vec() {
                         let Some(name) = keyword.arg else {
@@ -2740,7 +2761,7 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
                         return Err(unsupported_message(
                             "method call",
                             format!(
-                                "unsupported {method}() keyword argument `{name}`; keyword arguments are supported on split, sort, and nominal attempt-resource methods"
+                                "unsupported {method}() keyword argument `{name}`; keyword arguments are supported on split, sort, dict update, and nominal attempt-resource methods"
                             ),
                         ));
                     }
@@ -4337,7 +4358,6 @@ else:
             "f(*args)",
             "f(**kwargs)",
             "a = b = 1",
-            "f().x = 1",
             "for a, (b, c) in items:\n    emit(a)",
             "for item in items:\n    emit(item)\nelse:\n    emit(None)",
         ] {

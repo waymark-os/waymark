@@ -665,6 +665,7 @@ fn collect_assign_target(target: &AssignTarget, names: &mut HashSet<String>) {
             collect_expr_bindings(index, names);
         }
         AssignTarget::Attribute { value, .. } => collect_assign_target(value, names),
+        AssignTarget::Expr(expr) => collect_expr_bindings(expr, names),
     }
 }
 

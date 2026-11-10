@@ -1480,7 +1480,8 @@ impl Evaluator<'_> {
                 Ok(EvalFlow::Output(PipelineData::empty()))
             }
             Stmt::AugAssign { target, op, value } => {
-                let left = self.eval_assign_target_value(target)?;
+                let place = self.resolve_place(target, "augmented assignment")?;
+                let left = self.read_place(&place)?;
                 if let (AugOp::Add, RuntimeValue::List(list)) = (op, &left) {
                     // `xs += ys` extends the list in place, as in Python, so
                     // every alias of `xs` (or of `d["xs"]`) sees the new items.
@@ -1494,7 +1495,12 @@ impl Evaluator<'_> {
                     .eval_expr_value(value, input)?
                     .into_nu_value("augmented assignment")?;
                 let value = apply_aug_op(*op, &left, &right)?;
-                self.assign_value(target, RuntimeValue::Nu(value), record_session_bindings)?;
+                if let Place::Name(name) = &place {
+                    if record_session_bindings {
+                        self.state.record_session_binding(name);
+                    }
+                }
+                self.write_place(place, RuntimeValue::Nu(value))?;
                 Ok(EvalFlow::Output(PipelineData::empty()))
             }
             Stmt::Pass => Ok(EvalFlow::Output(PipelineData::empty())),
@@ -1794,12 +1800,19 @@ impl Evaluator<'_> {
             // error, as in Python.
             RuntimeValue::Dict(dict) => {
                 let size = dict.len();
+                let removals = dict.removals();
                 let keys = dict
                     .keys()
                     .into_iter()
                     .map(|key| RuntimeValue::Nu(Value::string(key, Span::unknown())))
                     .collect::<Vec<_>>();
-                self.eval_for_values_sized(targets, keys, body, || dict.len() == size, "dictionary")
+                self.eval_for_values_sized(
+                    targets,
+                    keys,
+                    body,
+                    || dict.len() == size && dict.removals() == removals,
+                    "dictionary",
+                )
             }
             RuntimeValue::Set(set) => {
                 let size = set.len();
@@ -2771,33 +2784,14 @@ impl Evaluator<'_> {
                 let value = value.into_nu_value("assignment")?;
                 self.assign_unpack_targets("assignment", targets, value)
             }
-            AssignTarget::Subscript { .. } => {
-                let (name, indices) = self.eval_assign_target_path(target, "assignment")?;
-                let Some((index, parents)) = indices.split_last() else {
-                    return Err(stone_error("assignment", "missing assignment index"));
-                };
-                let container = self.mutable_container(&name, parents, "assignment")?;
-                if !matches!(container, RuntimeValue::List(_) | RuntimeValue::Dict(_))
-                    && !matches!(container, RuntimeValue::Nu(_))
-                {
-                    let message = match &container {
-                        RuntimeValue::Tuple(_) => format!(
-                            "a tuple cannot change, so `{name}[...] = ...` is not allowed (in Python either); build a new tuple or use a list"
-                        ),
-                        RuntimeValue::Set(_) => format!(
-                            "a set has no positions, so `{name}[...] = ...` is not allowed; use {name}.add(x) and {name}.discard(x)"
-                        ),
-                        _ => format!("{name} does not support item assignment"),
-                    };
-                    return Err(stone_error("tuple", message));
-                }
-                assign_item(&container, index, value)
+            AssignTarget::Subscript { .. } | AssignTarget::Attribute { .. } => {
+                let place = self.resolve_place(target, "assignment")?;
+                self.write_place(place, value)
             }
-            AssignTarget::Attribute { value: base, attr } => {
-                let (name, indices) = self.eval_assign_target_path(base, "assignment")?;
-                let container = self.mutable_container(&name, &indices, "assignment")?;
-                stone_records::assign_field(&container, attr, value, &self.state.types)
-            }
+            AssignTarget::Expr(_) => Err(stone_error(
+                "assignment",
+                "cannot assign to an expression; assign to an item or field of it",
+            )),
         };
         self.state
             .profiler
@@ -2813,6 +2807,25 @@ impl Evaluator<'_> {
         indices: &[Value],
         context: &str,
     ) -> Result<RuntimeValue, ShellError> {
+        self.mutable_container_at(&TargetRoot::Name(name.to_string()), indices, context)
+    }
+
+    fn mutable_container_at(
+        &mut self,
+        root: &TargetRoot,
+        indices: &[Value],
+        context: &str,
+    ) -> Result<RuntimeValue, ShellError> {
+        let name = match root {
+            TargetRoot::Name(name) => name.as_str(),
+            TargetRoot::Value(value) => {
+                let mut current = share(value.clone());
+                for index in indices {
+                    current = child_for_mutation(&current, index, context)?;
+                }
+                return Ok(current);
+            }
+        };
         {
             let mut slot = self
                 .state
@@ -2836,40 +2849,71 @@ impl Evaluator<'_> {
         Ok(current)
     }
 
-    fn eval_assign_target_value(
+    /// Work out where an assignment writes, evaluating every expression in
+    /// the target once (Python order: the base, then each index), so that
+    /// `xs[i()] += 1` calls `i()` once and `f()[0] = v` calls `f()` once.
+    fn resolve_place(
         &mut self,
         target: &AssignTarget,
-    ) -> Result<RuntimeValue, ShellError> {
-        let started = self.state.profiler.start();
-        let result = match target {
-            AssignTarget::Name(name) => self.state.get_local(name).ok_or_else(|| {
-                stone_error("augmented assignment", format!("unknown name `{name}`"))
-            }),
+        context: &str,
+    ) -> Result<Place, ShellError> {
+        match target {
+            AssignTarget::Name(name) => Ok(Place::Name(name.clone())),
             AssignTarget::Subscript { .. } => {
-                let (name, indices) =
-                    self.eval_assign_target_path(target, "augmented assignment")?;
-                let mut value = self.state.get_local(&name).ok_or_else(|| {
-                    stone_error("augmented assignment", format!("unknown name `{name}`"))
-                })?;
-                for index in indices {
-                    value = path_step(value, &index)?;
+                let (root, indices) = self.eval_assign_target_path(target, context)?;
+                let Some((index, parents)) = indices.split_last() else {
+                    return Err(stone_error(context, "missing assignment index"));
+                };
+                let container = self.mutable_container_at(&root, parents, context)?;
+                if !matches!(
+                    container,
+                    RuntimeValue::List(_) | RuntimeValue::Dict(_) | RuntimeValue::Nu(_)
+                ) {
+                    let name = root.label();
+                    let message = match &container {
+                        RuntimeValue::Tuple(_) => format!(
+                            "a tuple cannot change, so `{name}[...] = ...` is not allowed (in Python either); build a new tuple or use a list"
+                        ),
+                        RuntimeValue::Set(_) => format!(
+                            "a set has no positions, so `{name}[...] = ...` is not allowed; use {name}.add(x) and {name}.discard(x)"
+                        ),
+                        _ => format!("{name} does not support item assignment"),
+                    };
+                    return Err(stone_error("tuple", message));
                 }
-                Ok(value)
+                Ok(Place::Item {
+                    container,
+                    index: index.clone(),
+                })
             }
             AssignTarget::Attribute { value: base, attr } => {
-                let (name, indices) = self.eval_assign_target_path(base, "augmented assignment")?;
-                let mut value = self.state.get_local(&name).ok_or_else(|| {
-                    stone_error("augmented assignment", format!("unknown name `{name}`"))
-                })?;
-                for index in indices {
-                    value = path_step(value, &index)?;
-                }
-                self.attribute_of(value, attr)
+                let (root, indices) = self.eval_assign_target_path(base, context)?;
+                let container = self.mutable_container_at(&root, &indices, context)?;
+                Ok(Place::Field {
+                    container,
+                    attr: attr.clone(),
+                })
             }
             AssignTarget::Tuple(_) => Err(stone_error(
-                "augmented assignment",
+                context,
                 "tuple/list destructuring cannot be used with augmented assignment",
             )),
+            AssignTarget::Expr(_) => Err(stone_error(
+                context,
+                "cannot assign to an expression; assign to an item or field of it",
+            )),
+        }
+    }
+
+    /// The current value at a place, for `+=` and friends.
+    fn read_place(&mut self, place: &Place) -> Result<RuntimeValue, ShellError> {
+        let started = self.state.profiler.start();
+        let result = match place {
+            Place::Name(name) => self.state.get_local(name).ok_or_else(|| {
+                stone_error("augmented assignment", format!("unknown name `{name}`"))
+            }),
+            Place::Item { container, index } => path_step(container.clone(), index),
+            Place::Field { container, attr } => self.attribute_of(container.clone(), attr),
         };
         self.state
             .profiler
@@ -2877,29 +2921,48 @@ impl Evaluator<'_> {
         result
     }
 
+    /// Store into an item or field place. Names go through assign_value,
+    /// which also records session bindings.
+    fn write_place(&mut self, place: Place, value: RuntimeValue) -> Result<(), ShellError> {
+        match place {
+            Place::Name(name) => {
+                self.state.set_local(name, value);
+                Ok(())
+            }
+            Place::Item { container, index } => assign_item(&container, &index, value),
+            Place::Field { container, attr } => {
+                stone_records::assign_field(&container, &attr, value, &self.state.types)
+            }
+        }
+    }
+
     fn eval_assign_target_path(
         &mut self,
         target: &AssignTarget,
         context: &str,
-    ) -> Result<(String, Vec<Value>), ShellError> {
+    ) -> Result<(TargetRoot, Vec<Value>), ShellError> {
         match target {
-            AssignTarget::Name(name) => Ok((name.clone(), Vec::new())),
+            AssignTarget::Name(name) => Ok((TargetRoot::Name(name.clone()), Vec::new())),
+            AssignTarget::Expr(expr) => Ok((
+                TargetRoot::Value(self.eval_expr_value(expr, PipelineData::empty())?),
+                Vec::new(),
+            )),
             AssignTarget::Tuple(_) => Err(stone_error(
                 context,
                 "tuple/list destructuring does not support item assignment",
             )),
             AssignTarget::Subscript { value, index } => {
-                let (name, mut indices) = self.eval_assign_target_path(value, context)?;
+                let (root, mut indices) = self.eval_assign_target_path(value, context)?;
                 let index = self
                     .eval_expr_value(index, PipelineData::empty())?
                     .into_nu_value(context)?;
                 indices.push(index);
-                Ok((name, indices))
+                Ok((root, indices))
             }
             AssignTarget::Attribute { value, attr } => {
-                let (name, mut indices) = self.eval_assign_target_path(value, context)?;
+                let (root, mut indices) = self.eval_assign_target_path(value, context)?;
                 indices.push(Value::string(attr.clone(), Span::unknown()));
-                Ok((name, indices))
+                Ok((root, indices))
             }
         }
     }
@@ -13146,11 +13209,17 @@ impl Evaluator<'_> {
                     _ => unreachable!("resource method lowering must name a lifecycle builtin"),
                 };
             }
+            if matches!(
+                method,
+                "pop" | "insert" | "remove" | "clear" | "copy" | "reverse" | "update" | "setdefault"
+            ) {
+                return self.eval_container_method(receiver, method, positional, named);
+            }
             if !named.is_empty() && method != "sort" {
                 return Err(stone_error(
                     "method call",
                     format!(
-                        "{method}() keyword arguments are not supported; method keyword arguments are supported only for split(maxsplit=...) and sort(key=..., reverse=...)"
+                        "{method}() keyword arguments are not supported; method keyword arguments are supported only for split(sep=..., maxsplit=...), sort(key=..., reverse=...), and dict update(key=value)"
                     ),
                 ));
             }
@@ -13520,19 +13589,245 @@ impl Evaluator<'_> {
         }
     }
 
+    /// The object a mutating method changes: a variable's own list or dict
+    /// (shared from then on), or whatever object an expression such as
+    /// `groups()[0]` gives; lists and dicts are shared objects.
+    fn mutable_method_receiver(
+        &mut self,
+        receiver: &Expr,
+        context: &str,
+    ) -> Result<RuntimeValue, ShellError> {
+        if is_variable_path(receiver) {
+            let (name, indices) = self.eval_mutable_expr_path(receiver, context)?;
+            self.mutable_container(&name, &indices, context)
+        } else {
+            Ok(share(self.eval_expr_value(receiver, PipelineData::empty())?))
+        }
+    }
+
+    /// Python's list and dict methods that change or copy the container:
+    /// `xs.pop()`, `xs.insert(i, x)`, `xs.remove(x)`, `xs.reverse()`,
+    /// `d.pop(k)`, `d.setdefault(k, v)`, `d.update(...)`, and `clear()` and
+    /// `copy()` on both. Sets and tuples answer their own methods.
+    fn eval_container_method(
+        &mut self,
+        receiver: &Expr,
+        method: &str,
+        positional: &[Expr],
+        named: &[(String, Expr)],
+    ) -> Result<RuntimeValue, ShellError> {
+        let target = self.mutable_method_receiver(receiver, method)?;
+        if matches!(target, RuntimeValue::Set(_) | RuntimeValue::Tuple(_)) && named.is_empty() {
+            return self.eval_collection_method(target, method, positional);
+        }
+        let mut args = Vec::with_capacity(positional.len());
+        for arg in positional {
+            args.push(self.eval_expr_value(arg, PipelineData::empty())?);
+        }
+        let none = || RuntimeValue::Nu(Value::nothing(Span::unknown()));
+        let arity = |expected: &str| {
+            stone_typed_error(
+                "TypeError",
+                method,
+                format!("{method}() takes {expected}, got {}", args.len()),
+            )
+        };
+        if !named.is_empty() && !(method == "update" && matches!(target, RuntimeValue::Dict(_))) {
+            return Err(stone_typed_error(
+                "TypeError",
+                method,
+                format!("{method}() takes no keyword arguments"),
+            ));
+        }
+        if method != "copy" {
+            ensure_mutable(&target, method)?;
+        }
+        match &target {
+            RuntimeValue::List(list) => match method {
+                "pop" => {
+                    let index = match args.as_slice() {
+                        [] => -1,
+                        [index] => method_int_arg(index, "pop")?,
+                        _ => return Err(arity("at most 1 argument")),
+                    };
+                    if list.len() == 0 {
+                        return Err(stone_typed_error("IndexError", "pop", "pop from empty list"));
+                    }
+                    list.pop_at(index).ok_or_else(|| {
+                        stone_typed_error("IndexError", "pop", "pop index out of range")
+                    })
+                }
+                "insert" => {
+                    let [index, value] = args.as_slice() else {
+                        return Err(arity("exactly 2 arguments (index, value)"));
+                    };
+                    list.insert_at(method_int_arg(index, "insert")?, value.clone());
+                    Ok(none())
+                }
+                "remove" => {
+                    let [needle] = args.as_slice() else {
+                        return Err(arity("exactly 1 argument"));
+                    };
+                    for (index, item) in list.shared_items().iter().enumerate() {
+                        if runtime_values_equal(item, needle)? {
+                            list.pop_at(index as i64);
+                            return Ok(none());
+                        }
+                    }
+                    Err(stone_typed_error(
+                        "ValueError",
+                        "remove",
+                        format!(
+                            "list.remove(x): x not in list (x is {})",
+                            stone_records::python_repr(needle)?
+                        ),
+                    ))
+                }
+                "clear" | "reverse" | "copy" => {
+                    if !args.is_empty() {
+                        return Err(arity("no arguments"));
+                    }
+                    Ok(match method {
+                        "clear" => {
+                            list.clear();
+                            none()
+                        }
+                        "reverse" => {
+                            list.reverse();
+                            none()
+                        }
+                        _ => list_from_values(list.shared_items()),
+                    })
+                }
+                _ => Err(stone_typed_error(
+                    "AttributeError",
+                    method,
+                    format!("a list has no attribute `{method}` (in Python either)"),
+                )),
+            },
+            RuntimeValue::Dict(dict) => match method {
+                "pop" | "setdefault" => {
+                    let (key, default) = match args.as_slice() {
+                        [key] => (key, None),
+                        [key, default] => (key, Some(default.clone())),
+                        _ => return Err(arity("1 or 2 arguments (key, default)")),
+                    };
+                    let RuntimeValue::Nu(Value::String { val: key, .. }) = key else {
+                        return Err(stone_typed_error(
+                            "TypeError",
+                            method,
+                            format!("dict keys are strings, got {}", runtime_type_name(key)),
+                        ));
+                    };
+                    if method == "setdefault" {
+                        if !dict.contains_key(key) {
+                            dict.insert(key.clone(), default.unwrap_or_else(none));
+                        }
+                        return Ok(dict.get(key).unwrap_or_else(none));
+                    }
+                    match (dict.remove(key), default) {
+                        (Some(value), _) => Ok(value),
+                        (None, Some(default)) => Ok(default),
+                        (None, None) => Err(stone_typed_error(
+                            "KeyError",
+                            "pop",
+                            crate::stone_builtins::python_repr(&Value::string(
+                                key.clone(),
+                                Span::unknown(),
+                            ))?,
+                        )),
+                    }
+                }
+                "update" => {
+                    let mut entries = match args.as_slice() {
+                        [] => Vec::new(),
+                        [other] => self.update_entries(other)?,
+                        _ => return Err(arity("at most 1 positional argument")),
+                    };
+                    for (name, value) in named {
+                        entries.push((name.clone(), self.eval_expr_value(value, PipelineData::empty())?));
+                    }
+                    for (key, value) in entries {
+                        dict.insert(key, value);
+                    }
+                    Ok(none())
+                }
+                "clear" | "copy" => {
+                    if !args.is_empty() {
+                        return Err(arity("no arguments"));
+                    }
+                    if method == "clear" {
+                        dict.clear();
+                        Ok(none())
+                    } else {
+                        Ok(stone_containers::dict_from_entries(dict.shared_entries()))
+                    }
+                }
+                _ => Err(stone_typed_error(
+                    "AttributeError",
+                    method,
+                    format!("a dict has no attribute `{method}` (in Python either)"),
+                )),
+            },
+            other => Err(stone_typed_error(
+                "AttributeError",
+                method,
+                format!(
+                    "{} has no attribute `{method}`",
+                    match other {
+                        RuntimeValue::Record(record) => format!("a {} record", record.ty.name),
+                        other => runtime_type_name(other).to_string(),
+                    }
+                ),
+            )),
+        }
+    }
+
+    /// The (key, value) pairs `d.update(other)` copies in: another dict, or
+    /// a list of [key, value] pairs.
+    fn update_entries(
+        &mut self,
+        other: &RuntimeValue,
+    ) -> Result<Vec<(String, RuntimeValue)>, ShellError> {
+        if let RuntimeValue::Dict(other) = other {
+            return Ok(other.shared_entries());
+        }
+        if let RuntimeValue::Nu(Value::Record { val, .. }) = other {
+            return Ok(val
+                .iter()
+                .map(|(key, value)| (key.clone(), RuntimeValue::Nu(value.clone())))
+                .collect());
+        }
+        let mut entries = Vec::new();
+        for pair in self.eval_iterable_value(other.clone())? {
+            let items = match &pair {
+                RuntimeValue::Nu(Value::List { vals, .. }) => {
+                    vals.iter().cloned().map(RuntimeValue::Nu).collect()
+                }
+                other => shared_sequence_items(other).unwrap_or_default(),
+            };
+            match items.as_slice() {
+                [RuntimeValue::Nu(Value::String { val: key, .. }), value] => {
+                    entries.push((key.clone(), value.clone()))
+                }
+                _ => {
+                    return Err(stone_typed_error(
+                        "TypeError",
+                        "update",
+                        "update() takes a dict, a list of [key, value] pairs with string keys, or key=value arguments",
+                    ))
+                }
+            }
+        }
+        Ok(entries)
+    }
+
     fn mutable_list_method_target(
         &mut self,
         receiver: &Expr,
         context: &str,
     ) -> Result<ListRef, ShellError> {
-        let target = if is_variable_path(receiver) {
-            let (name, indices) = self.eval_mutable_expr_path(receiver, context)?;
-            self.mutable_container(&name, &indices, context)?
-        } else {
-            // Any expression that gives a list, such as `groups()[0]`, can be
-            // changed in place: lists are shared objects.
-            share(self.eval_expr_value(receiver, PipelineData::empty())?)
-        };
+        let target = self.mutable_method_receiver(receiver, context)?;
         let name = "this value";
         match target {
             RuntimeValue::List(list) => {
@@ -13903,6 +14198,41 @@ fn dict_attribute_error(receiver: &RuntimeValue, attr: &str) -> ShellError {
     stone_typed_error("AttributeError", "attribute", message)
 }
 
+/// An int argument of a list method (`xs.pop(i)`, `xs.insert(i, x)`).
+fn method_int_arg(value: &RuntimeValue, context: &str) -> Result<i64, ShellError> {
+    match value {
+        RuntimeValue::Nu(Value::Int { val, .. }) => Ok(*val),
+        other => Err(stone_typed_error(
+            "TypeError",
+            context,
+            format!("{context}() index must be an int, got {}", runtime_type_name(other)),
+        )),
+    }
+}
+
+/// Where an assignment target starts: a variable, or the object an
+/// expression such as `f()` gave.
+enum TargetRoot {
+    Name(String),
+    Value(RuntimeValue),
+}
+
+impl TargetRoot {
+    fn label(&self) -> String {
+        match self {
+            TargetRoot::Name(name) => name.clone(),
+            TargetRoot::Value(value) => runtime_type_name(value).to_string(),
+        }
+    }
+}
+
+/// An assignment target with every expression in it already evaluated.
+enum Place {
+    Name(String),
+    Item { container: RuntimeValue, index: Value },
+    Field { container: RuntimeValue, attr: String },
+}
+
 /// The value of an expression statement. A value that only lives inside
 /// the program (a function, the model, an open file) is not an error when
 /// it stands alone as a statement: it becomes its Python repr text, as a
@@ -14139,11 +14469,12 @@ fn type_host_result(builtin: &str, value: RuntimeValue) -> RuntimeValue {
 
 fn changed_size_error(what: &str) -> ShellError {
     let copy = if what == "set" { "for x in list(s):" } else { "for k in list(d):" };
+    let change = if what == "set" { "changed size" } else { "keys changed" };
     stone_typed_error(
         "RuntimeError",
         "iteration",
         format!(
-            "{what} changed size during iteration. Loop over a copy (`{copy}`), or collect the changes and apply them after the loop"
+            "{what} {change} during iteration. Loop over a copy (`{copy}`), or collect the changes and apply them after the loop"
         ),
     )
 }
@@ -27887,7 +28218,7 @@ emit({"queue": queue, "seen": seen, "d": d, "errors": errors, "made": make(), "h
         assert_eq!(value["d"], json_value!({"a": 10, "b": 20, "c": 3}));
         let errors = value["errors"].as_array().expect("errors");
         assert_eq!(errors.len(), 2, "{value}");
-        assert!(errors[0].as_str().unwrap().contains("dictionary changed size"), "{value}");
+        assert!(errors[0].as_str().unwrap().contains("dictionary keys changed"), "{value}");
         assert!(errors[1].as_str().unwrap().contains("set changed size"), "{value}");
         assert_eq!(value["made"], json_value!([0, 1, 2]));
         assert_eq!(value["h"], json_value!(5));
@@ -28055,6 +28386,121 @@ emit({
                 "{source}"
             );
         }
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn assignment_targets_are_evaluated_once_and_may_start_from_any_expression(
+    ) -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("assign-places")?;
+        let program = lower_source(
+            r#"calls = []
+def i():
+    calls.append("i")
+    return 0
+xs = [10, 20]
+xs[i()] += 1
+rows = [{"k": 1}]
+def f():
+    calls.append("f")
+    return rows
+f()[0]["k"] = 2
+f()[0]["k"] += 5
+class P(BaseModel):
+    x: int
+ps = {"a": P(x=1)}
+ps.get("a").x = 7
+ps.get("a").x += 1
+d = {"a": [1]}
+(d["a"] or [])[0] = 9
+errors = []
+def t():
+    return (1, 2)
+try:
+    t()[0] = 5
+except TypeError as e:
+    errors.append(str(e))
+emit({"xs": xs, "rows": rows, "calls": calls, "p": ps["a"].x, "d": d, "errors": errors})"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value["xs"], json_value!([11, 20]));
+        assert_eq!(value["rows"], json_value!([{"k": 7}]));
+        assert_eq!(value["calls"], json_value!(["i", "f", "f"]));
+        assert_eq!(value["p"], json_value!(8));
+        assert_eq!(value["d"], json_value!({"a": [9]}));
+        assert!(value["errors"][0].as_str().unwrap().contains("a tuple cannot change"), "{value}");
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn list_and_dict_methods_follow_python() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("container-methods")?;
+        let program = lower_source(
+            r#"out = []
+xs = [1, 2, 3, 4]
+out.append(xs.pop())
+out.append(xs.pop(0))
+xs.insert(0, 9)
+xs.insert(-1, 8)
+xs.insert(100, 7)
+xs.remove(2)
+ys = xs.copy()
+ys.append(0)
+xs.reverse()
+out.append(xs)
+out.append(ys)
+rows = [{"a": 1}]
+cp = rows.copy()
+cp[0]["b"] = 2
+out.append(rows)
+d = {"a": 1, "b": 2, "c": 3}
+out.append(d.pop("b"))
+out.append(d.pop("zz", 0))
+out.append(d.setdefault("a", 5))
+groups = {}
+groups.setdefault("x", []).append(1)
+groups.setdefault("x", []).append(2)
+groups.setdefault("y", {})["k"] = 3
+out.append(groups)
+d.update({"z": 26}, q=1)
+d.update([["w", 0]])
+out.append(d.copy())
+e = d.copy()
+e["new"] = 1
+d.clear()
+out.append([d, len(e)])
+errors = []
+for bad in [lambda: [].pop(), lambda: [1].pop(5), lambda: [1].remove(9), lambda: {}.pop("k")]:
+    try:
+        bad()
+    except (IndexError, ValueError, KeyError) as ex:
+        errors.append(str(type(ex)))
+out.append(errors)
+loop = {"a": 1, "b": 2}
+try:
+    for k in loop:
+        loop.pop(k)
+        loop["n" + k] = 1
+except RuntimeError as ex:
+    out.append(str(ex))
+emit(out)"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(
+            value,
+            json_value!([
+                4, 1, [7, 3, 8, 9], [9, 8, 3, 7, 0], [{"a": 1, "b": 2}], 2, 0, 1,
+                {"x": [1, 2], "y": {"k": 3}},
+                {"a": 1, "c": 3, "z": 26, "q": 1, "w": 0},
+                [{}, 6],
+                ["<class 'IndexError'>", "<class 'IndexError'>", "<class 'ValueError'>", "<class 'KeyError'>"],
+                "dictionary keys changed during iteration. Loop over a copy (`for k in list(d):`), or collect the changes and apply them after the loop"
+            ])
+        );
         cleanup_dir(&root);
         Ok(())
     }

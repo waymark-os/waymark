@@ -447,6 +447,14 @@ emit(rows)  # both rows now have "seen": True
   `list("ab")`, `set("aab")`, and `xs.extend("ab")` see `"a"` and `"b"`.
   Use `text.splitlines()` or `for line in open(path)` for lines.
 - `xs += ys` extends `xs` in place, including `d["xs"] += ys`.
+- Lists have Python's `append`, `extend`, `insert`, `pop`, `remove`,
+  `clear`, `reverse`, `copy`, `count`, `index`, and `sort`. Dicts have
+  `get`, `keys`, `values`, `items`, `pop`, `setdefault`, `update` (a dict, a
+  list of `[key, value]` pairs, or `key=value` arguments), `clear`, and
+  `copy`. `copy()` is shallow, as in Python: the copy shares nested lists and
+  dicts. Missing items raise as Python does: `[].pop()` is an `IndexError`,
+  `xs.remove(x)` without `x` is a `ValueError`, `d.pop(k)` without `k` is a
+  `KeyError`.
 - `xs * n` and `"ab" * n` repeat a list or string, as in Python. The
   repeated elements are shared: `grid = [[]] * 2` holds one inner list twice,
   so `grid[0].append(1)` gives `[[1], [1]]`. Build independent rows with a
@@ -464,6 +472,10 @@ emit(rows)  # both rows now have "seen": True
   slicing, and a dict's `.get`, `.values`, and `.items` hand out the same
   elements, and a list method such as `.append` changes the list it is
   called on even when that list came from a call: `groups()[0].append(x)`.
+  Assignment works the same way: `f()[0]["k"] = v` and
+  `by_name.get("a").score = 1` change the object the call returned. Each
+  expression in an assignment target runs once, so `xs[i()] += 1` calls
+  `i()` once, as in Python.
   The function forms `get(d, k)`, `values(d)`, `items(d)`, `slice`,
   `unique`, `map`, `min`, and `max` hand out the same elements too. The JSON
   helpers return copies.

@@ -123,6 +123,9 @@ pub(super) struct DictObj {
     #[allow(dead_code)]
     label: Cell<Label>,
     frozen: Cell<bool>,
+    /// Counts removed keys, so a loop over the keys notices `d.pop(k)`
+    /// followed by `d[new] = v` (same size, different keys), as Python does.
+    removals: Cell<u64>,
 }
 
 /// A record (design L5): a fixed set of typed fields in declaration order,
@@ -179,6 +182,7 @@ fn dict_obj(entries: IndexMap<String, Item>) -> RuntimeValue {
         entries: RefCell::new(entries),
         label: Cell::new(Label::default()),
         frozen: Cell::new(false),
+        removals: Cell::new(0),
     }))
 }
 
@@ -445,6 +449,30 @@ impl ListObj {
             .extend(values.into_iter().map(Item::from_runtime));
     }
 
+    /// `xs.pop(i)`: remove and return the element at a Python index.
+    pub(super) fn pop_at(&self, index: i64) -> Option<RuntimeValue> {
+        let mut items = self.items.borrow_mut();
+        let index = python_index(index, items.len())?;
+        Some(items.remove(index).share())
+    }
+
+    /// `xs.insert(i, x)`: an index past either end inserts at that end, as
+    /// in Python.
+    pub(super) fn insert_at(&self, index: i64, value: RuntimeValue) {
+        let mut items = self.items.borrow_mut();
+        let len = i64::try_from(items.len()).unwrap_or(i64::MAX);
+        let index = if index < 0 { (len + index).max(0) } else { index.min(len) };
+        items.insert(index as usize, Item::from_runtime(value));
+    }
+
+    pub(super) fn clear(&self) {
+        self.items.borrow_mut().clear();
+    }
+
+    pub(super) fn reverse(&self) {
+        self.items.borrow_mut().reverse();
+    }
+
     pub(super) fn replace_items(&self, values: Vec<RuntimeValue>) {
         *self.items.borrow_mut() = values.into_iter().map(Item::from_runtime).collect();
     }
@@ -499,6 +527,25 @@ impl DictObj {
         self.entries
             .borrow_mut()
             .insert(key, Item::from_runtime(value));
+    }
+
+    /// `d.pop(key)`: remove the entry, keeping the order of the rest.
+    pub(super) fn remove(&self, key: &str) -> Option<RuntimeValue> {
+        let removed = self.entries.borrow_mut().shift_remove(key)?;
+        self.removals.set(self.removals.get() + 1);
+        let mut removed = removed;
+        Some(removed.share())
+    }
+
+    pub(super) fn clear(&self) {
+        self.entries.borrow_mut().clear();
+        self.removals.set(self.removals.get() + 1);
+    }
+
+    /// How many times a key was removed; with len(), tells whether the
+    /// keys changed.
+    pub(super) fn removals(&self) -> u64 {
+        self.removals.get()
     }
 
     /// Replace the contents with plain values (loop-engine results).
