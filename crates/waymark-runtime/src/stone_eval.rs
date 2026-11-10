@@ -857,6 +857,7 @@ fn transition_id_for_scope(sequence: u64, controller_run: Option<u64>) -> String
     }
 }
 
+#[cfg(test)]
 pub fn eval_program(
     engine_state: &EngineState,
     stack: &mut Stack,
@@ -872,6 +873,7 @@ pub struct EvalProgramOutput {
     pub diagnostics: JsonValue,
 }
 
+#[cfg(test)]
 pub fn eval_program_with_output(
     engine_state: &EngineState,
     stack: &mut Stack,
@@ -1042,7 +1044,12 @@ fn eval_program_with_source_options(
         Some(entrypoint) if !entrypoint.is_empty() => {
             evaluator.eval_entrypoint_program(program, input, entrypoint)
         }
-        _ => evaluator.eval_program(program, input),
+        // Input reaches a program only as its entrypoint's argument.
+        _ if !input.is_nothing() => Err(stone_error(
+            "input",
+            "program input needs an entrypoint: name a function that takes the input as its parameter, e.g. `def main(input): ...`",
+        )),
+        _ => evaluator.eval_program(program),
     };
     // An emitted value is the result, whatever the last statement was.
     let pipeline = pipeline.map(|output| match evaluator.state.emitted.take() {
@@ -1309,12 +1316,8 @@ impl WorkflowCheckpointResult {
 }
 
 impl Evaluator<'_> {
-    fn eval_program(
-        &mut self,
-        program: &Program,
-        input: PipelineData,
-    ) -> Result<PipelineData, ShellError> {
-        match self.eval_block(&program.statements, input, true)? {
+    fn eval_program(&mut self, program: &Program) -> Result<PipelineData, ShellError> {
+        match self.eval_block(&program.statements, true)? {
             EvalFlow::Output(output) => Ok(output),
             EvalFlow::Break => Err(stone_error("break", "break outside loop")),
             EvalFlow::Continue => Err(stone_error("continue", "continue outside loop")),
@@ -1427,15 +1430,13 @@ impl Evaluator<'_> {
     fn eval_block(
         &mut self,
         statements: &[Stmt],
-        mut input: PipelineData,
         record_session_bindings: bool,
     ) -> Result<EvalFlow, ShellError> {
         let started = self.state.profiler.start();
         let mut output = PipelineData::empty();
         let result = (|| {
             for statement in statements {
-                let flow = self.eval_stmt(statement, input, record_session_bindings)?;
-                input = PipelineData::empty();
+                let flow = self.eval_stmt(statement, record_session_bindings)?;
                 match flow {
                     // Only an expression statement has a value: a program
                     // that never emits returns its final expression, and a
@@ -1463,7 +1464,6 @@ impl Evaluator<'_> {
     fn eval_stmt(
         &mut self,
         statement: &Stmt,
-        input: PipelineData,
         record_session_bindings: bool,
     ) -> Result<EvalFlow, ShellError> {
         let started = self.state.profiler.start();
@@ -1471,7 +1471,7 @@ impl Evaluator<'_> {
             Stmt::Assign { target, value } => {
                 let value = match self.static_type_value(value) {
                     Some(spec) => RuntimeValue::Type(Rc::new(spec?)),
-                    None => self.eval_expr_value(value, input)?,
+                    None => self.eval_expr_value(value)?,
                 };
                 if let (AssignTarget::Name(name), RuntimeValue::Type(spec)) = (target, &value) {
                     self.define_type_alias(name, spec)?;
@@ -1492,7 +1492,7 @@ impl Evaluator<'_> {
                 }
                 let left = left.into_nu_value("augmented assignment")?;
                 let right = self
-                    .eval_expr_value(value, input)?
+                    .eval_expr_value(value)?
                     .into_nu_value("augmented assignment")?;
                 let value = apply_aug_op(*op, &left, &right)?;
                 if let Place::Name(name) = &place {
@@ -1506,7 +1506,7 @@ impl Evaluator<'_> {
             Stmt::Pass => Ok(EvalFlow::Output(PipelineData::empty())),
             Stmt::Module(module) => {
                 for statement in &module.body {
-                    self.eval_stmt(statement, PipelineData::empty(), false)?;
+                    self.eval_stmt(statement, false)?;
                 }
                 // Module values are read-only all the way down, so no
                 // importer can change what another importer sees.
@@ -1645,7 +1645,7 @@ impl Evaluator<'_> {
             }
             Stmt::Return(value) => {
                 let value = match value {
-                    Some(value) => self.eval_expr_value(value, input)?,
+                    Some(value) => self.eval_expr_value(value)?,
                     None => RuntimeValue::Nu(Value::nothing(Span::unknown())),
                 };
                 Ok(EvalFlow::Return(value))
@@ -1659,11 +1659,11 @@ impl Evaluator<'_> {
             Stmt::While { condition, body } => {
                 let mut output = PipelineData::empty();
                 for _ in 0..1_000_000 {
-                    let condition = self.eval_expr_value(condition, PipelineData::empty())?;
+                    let condition = self.eval_expr_value(condition)?;
                     if !runtime_truthy(&condition, "while")? {
                         return Ok(EvalFlow::Output(output));
                     }
-                    match self.eval_block(body, PipelineData::empty(), false)? {
+                    match self.eval_block(body, false)? {
                         EvalFlow::Output(value) => output = value,
                         EvalFlow::Break => return Ok(EvalFlow::Output(output)),
                         EvalFlow::Continue => continue,
@@ -1685,13 +1685,13 @@ impl Evaluator<'_> {
                 {
                     return Ok(EvalFlow::Output(PipelineData::empty()));
                 }
-                let condition = self.eval_expr_value(condition, input)?;
+                let condition = self.eval_expr_value(condition)?;
                 let branch = if runtime_truthy(&condition, "if")? {
                     then_branch
                 } else {
                     else_branch
                 };
-                self.eval_block(branch, PipelineData::empty(), false)
+                self.eval_block(branch, false)
             }
             Stmt::With {
                 is_async,
@@ -1703,7 +1703,7 @@ impl Evaluator<'_> {
             Stmt::Break => Ok(EvalFlow::Break),
             Stmt::Continue => Ok(EvalFlow::Continue),
             Stmt::Expr(expression) => self
-                .eval_expr_pipeline(expression, input)
+                .eval_expr_pipeline(expression)
                 .map(EvalFlow::Output),
         };
         self.state.profiler.finish(EvalProfileBucket::Stmt, started);
@@ -1746,7 +1746,7 @@ impl Evaluator<'_> {
                 return Ok(flow);
             }
         }
-        let iterable = self.eval_expr_value(iter, PipelineData::empty())?;
+        let iterable = self.eval_expr_value(iter)?;
         match iterable {
             RuntimeValue::JsonlRows(rows) => {
                 if let Some(plan) = generic_loop_plan.as_ref() {
@@ -1907,7 +1907,7 @@ impl Evaluator<'_> {
             let value = jsonl_row_view(&rows, line);
             self.assign_loop_targets(targets, value)?;
             let started = self.state.profiler.start();
-            let flow = self.eval_block(body, PipelineData::empty(), false);
+            let flow = self.eval_block(body, false);
             self.state
                 .profiler
                 .finish(EvalProfileBucket::ForJsonlBody, started);
@@ -1944,7 +1944,7 @@ impl Evaluator<'_> {
             };
             self.execute_hot_loop_prefix(plan, &view)?;
             let started = self.state.profiler.start();
-            let flow = self.eval_block(remaining_body, PipelineData::empty(), false);
+            let flow = self.eval_block(remaining_body, false);
             self.state
                 .profiler
                 .finish(EvalProfileBucket::ForJsonlBody, started);
@@ -1971,7 +1971,7 @@ impl Evaluator<'_> {
         for value in values {
             self.assign_loop_targets(targets, value)?;
             let started = self.state.profiler.start();
-            let flow = self.eval_block(body, PipelineData::empty(), false);
+            let flow = self.eval_block(body, false);
             self.state
                 .profiler
                 .finish(EvalProfileBucket::ForValuesBody, started);
@@ -2006,14 +2006,14 @@ impl Evaluator<'_> {
             return Ok(None);
         };
         let RuntimeValue::List(list) =
-            self.eval_expr_value(&call.positional[0], PipelineData::empty())?
+            self.eval_expr_value(&call.positional[0])?
         else {
             return Ok(None);
         };
         let start = match call.positional.get(1) {
             Some(start) => {
                 let start = self
-                    .eval_expr_value(start, PipelineData::empty())?
+                    .eval_expr_value(start)?
                     .into_nu_value("enumerate")?;
                 value_to_i64(&start, "enumerate")?
             }
@@ -2050,7 +2050,7 @@ impl Evaluator<'_> {
                 return Err(changed_size_error(what));
             }
             self.assign_loop_targets(targets, value)?;
-            match self.eval_block(body, PipelineData::empty(), false)? {
+            match self.eval_block(body, false)? {
                 EvalFlow::Output(value) => output = value,
                 EvalFlow::Break => return Ok(EvalFlow::Output(output)),
                 EvalFlow::Continue => continue,
@@ -2085,7 +2085,7 @@ impl Evaluator<'_> {
             .updates
             .iter()
             .map(|update| {
-                self.eval_expr_value(&update.addend, PipelineData::empty())?
+                self.eval_expr_value(&update.addend)?
                     .into_nu_value("addition")
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -2197,7 +2197,7 @@ impl Evaluator<'_> {
                 "async with is only valid inside async def",
             ));
         }
-        let value = self.eval_expr_value(context, PipelineData::empty())?;
+        let value = self.eval_expr_value(context)?;
         if is_async
             && !matches!(
                 value,
@@ -2231,7 +2231,7 @@ impl Evaluator<'_> {
         if let Some(target) = target {
             self.state.set_local(target.to_owned(), value);
         }
-        let result = self.eval_block(body, PipelineData::empty(), false);
+        let result = self.eval_block(body, false);
         let cleanup = self.close_with_resource(&owned_value);
         match (result, cleanup) {
             (Ok(flow), Ok(())) => Ok(flow),
@@ -2266,7 +2266,7 @@ impl Evaluator<'_> {
         body: &[Stmt],
         handlers: &[ExceptHandler],
     ) -> Result<EvalFlow, ShellError> {
-        match self.eval_block(body, PipelineData::empty(), false) {
+        match self.eval_block(body, false) {
             Ok(flow) => Ok(flow),
             // A control stop (the host ended the attempt) is never caught.
             Err(err) if self.is_control_stop(&err) => Err(err),
@@ -2299,7 +2299,7 @@ impl Evaluator<'_> {
                     self.state.set_local(name.clone(), value);
                 }
                 self.state.caught_errors.push(error_record);
-                let result = self.eval_block(&handler.body, PipelineData::empty(), false);
+                let result = self.eval_block(&handler.body, false);
                 let caught = self.state.caught_errors.pop();
                 self.state
                     .pop_scope_merging_nu_locals(handler.name.as_deref())?;
@@ -2598,7 +2598,7 @@ impl Evaluator<'_> {
                 .resolve(&ty)
                 .map_err(|message| stone_error("type", message));
         }
-        match self.eval_expr_value(expr, PipelineData::empty())? {
+        match self.eval_expr_value(expr)? {
             RuntimeValue::Type(spec) => Ok((*spec).clone()),
             other => Err(stone_error(
                 "type",
@@ -2641,12 +2641,12 @@ impl Evaluator<'_> {
     ) -> Result<RuntimeValue, ShellError> {
         let args = positional
             .iter()
-            .map(|arg| self.eval_expr_value(arg, PipelineData::empty()))
+            .map(|arg| self.eval_expr_value(arg))
             .collect::<Result<Vec<_>, _>>()?;
         let named = named
             .iter()
             .map(|(name, arg)| {
-                self.eval_expr_value(arg, PipelineData::empty())
+                self.eval_expr_value(arg)
                     .map(|value| (name.clone(), value))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -2685,7 +2685,7 @@ impl Evaluator<'_> {
         let message = match message {
             Some(expression) => {
                 let value = self
-                    .eval_expr_value(expression, PipelineData::empty())?
+                    .eval_expr_value(expression)?
                     .into_nu_value(name)?;
                 match value {
                     Value::String { val, .. } => val,
@@ -2725,7 +2725,7 @@ impl Evaluator<'_> {
                 .into_nu_value("raise")?
             }
             Some(expression) => self
-                .eval_expr_value(expression, PipelineData::empty())?
+                .eval_expr_value(expression)?
                 .into_nu_value("raise")?,
             None => self.state.caught_errors.last().cloned().ok_or_else(|| {
                 stone_error("raise", "bare raise is only valid inside an except handler")
@@ -2944,7 +2944,7 @@ impl Evaluator<'_> {
         match target {
             AssignTarget::Name(name) => Ok((TargetRoot::Name(name.clone()), Vec::new())),
             AssignTarget::Expr(expr) => Ok((
-                TargetRoot::Value(self.eval_expr_value(expr, PipelineData::empty())?),
+                TargetRoot::Value(self.eval_expr_value(expr)?),
                 Vec::new(),
             )),
             AssignTarget::Tuple(_) => Err(stone_error(
@@ -2954,7 +2954,7 @@ impl Evaluator<'_> {
             AssignTarget::Subscript { value, index } => {
                 let (root, mut indices) = self.eval_assign_target_path(value, context)?;
                 let index = self
-                    .eval_expr_value(index, PipelineData::empty())?
+                    .eval_expr_value(index)?
                     .into_nu_value(context)?;
                 indices.push(index);
                 Ok((root, indices))
@@ -2977,7 +2977,7 @@ impl Evaluator<'_> {
             Expr::Subscript { value, index } => {
                 let (name, mut indices) = self.eval_mutable_expr_path(value, context)?;
                 let index = self
-                    .eval_expr_value(index, PipelineData::empty())?
+                    .eval_expr_value(index)?
                     .into_nu_value(context)?;
                 indices.push(index);
                 Ok((name, indices))
@@ -3080,7 +3080,7 @@ impl Evaluator<'_> {
     ) -> Result<RuntimeValue, ShellError> {
         let mut output = Vec::new();
         self.eval_comprehension_clauses("list comprehension", clauses, 0, &mut |evaluator| {
-            output.push(evaluator.eval_expr_value(elt, PipelineData::empty())?);
+            output.push(evaluator.eval_expr_value(elt)?);
             Ok(false)
         })?;
         Ok(list_from_values(output))
@@ -3095,10 +3095,10 @@ impl Evaluator<'_> {
         let mut entries = Vec::new();
         self.eval_comprehension_clauses("dict comprehension", clauses, 0, &mut |evaluator| {
             let key = evaluator
-                .eval_expr_value(key, PipelineData::empty())?
+                .eval_expr_value(key)?
                 .into_nu_value("dict comprehension")?;
             let key = value_to_string(&key, "dict comprehension key")?;
-            let value = evaluator.eval_expr_value(value, PipelineData::empty())?;
+            let value = evaluator.eval_expr_value(value)?;
             entries.push((key, value));
             Ok(false)
         })?;
@@ -3122,7 +3122,7 @@ impl Evaluator<'_> {
             let mut keep = true;
             for filter in &clause.filters {
                 let value = self
-                    .eval_expr_value(filter, PipelineData::empty())?
+                    .eval_expr_value(filter)?
                     .into_nu_value(context)?;
                 if !value_truthy(&value) {
                     keep = false;
@@ -3164,7 +3164,7 @@ impl Evaluator<'_> {
             match part {
                 FormattedStringPart::Literal(text) => output.push_str(text),
                 FormattedStringPart::Expr(expr) => {
-                    let value = self.eval_expr_value(expr, PipelineData::empty())?;
+                    let value = self.eval_expr_value(expr)?;
                     if let Some(text) = self.error_value_text(&value, false) {
                         output.push_str(&text);
                         continue;
@@ -3175,7 +3175,7 @@ impl Evaluator<'_> {
                     }
                 }
                 FormattedStringPart::Formatted { expr, spec } => {
-                    let value = self.eval_expr_value(expr, PipelineData::empty())?;
+                    let value = self.eval_expr_value(expr)?;
                     let value = match self.error_value_text(&value, false) {
                         Some(text) => Value::string(text, Span::unknown()),
                         None => value.into_nu_value("f-string")?,
@@ -3190,7 +3190,6 @@ impl Evaluator<'_> {
     fn eval_expr_pipeline(
         &mut self,
         expression: &Expr,
-        input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         match expression {
             Expr::Call(call)
@@ -3200,17 +3199,16 @@ impl Evaluator<'_> {
                     || self.state.types.record(&call.name).is_some()
                     || self.state.get_local(&call.name).is_some() =>
             {
-                statement_value(self.eval_expr_value(expression, input)?)
+                statement_value(self.eval_expr_value(expression)?)
             }
             Expr::Call(call) => Err(unknown_stone_call_error(&call.name)),
-            other => statement_value(self.eval_expr_value(other, input)?),
+            other => statement_value(self.eval_expr_value(other)?),
         }
     }
 
     fn eval_expr_value(
         &mut self,
         expression: &Expr,
-        input: PipelineData,
     ) -> Result<RuntimeValue, ShellError> {
         let started = self.state.profiler.start();
         let result = (|| {
@@ -3232,14 +3230,14 @@ impl Evaluator<'_> {
                     // shared list.
                     let mut plain = Vec::with_capacity(items.len());
                     for (position, item) in items.iter().enumerate() {
-                        match self.eval_expr_value(item, PipelineData::empty())? {
+                        match self.eval_expr_value(item)? {
                             RuntimeValue::Nu(value) => plain.push(value),
                             other => {
                                 let mut values = Vec::with_capacity(items.len());
                                 values.extend(plain.drain(..).map(RuntimeValue::Nu));
                                 values.push(other);
                                 for item in &items[position + 1..] {
-                                    values.push(self.eval_expr_value(item, PipelineData::empty())?);
+                                    values.push(self.eval_expr_value(item)?);
                                 }
                                 return Ok(list_from_values(values));
                             }
@@ -3260,7 +3258,7 @@ impl Evaluator<'_> {
                     for (key, value) in items {
                         entries.push((
                             key.clone(),
-                            self.eval_expr_value(value, PipelineData::empty())?,
+                            self.eval_expr_value(value)?,
                         ));
                     }
                     Ok(dict_from_entries(entries))
@@ -3302,7 +3300,7 @@ impl Evaluator<'_> {
                     match self.try_eval_json_object_literal_subscript(value, index)? {
                         Some(value) => Ok(value),
                         None => {
-                            let value = self.eval_expr_value(value, PipelineData::empty())?;
+                            let value = self.eval_expr_value(value)?;
                             match index.as_ref() {
                                 Expr::Slice { lower, upper } => {
                                     let lower = self.eval_optional_index(lower.as_deref())?;
@@ -3324,7 +3322,7 @@ impl Evaluator<'_> {
                                 }
                                 index => {
                                     let index = self
-                                        .eval_expr_value(index, PipelineData::empty())?
+                                        .eval_expr_value(index)?
                                         .into_nu_value("subscript")?;
                                     if let RuntimeValue::Record(record) = &value {
                                         return Err(record_subscript_error(record, &index));
@@ -3351,15 +3349,15 @@ impl Evaluator<'_> {
                     condition,
                     else_expr,
                 } => {
-                    let condition = self.eval_expr_value(condition, PipelineData::empty())?;
+                    let condition = self.eval_expr_value(condition)?;
                     if runtime_truthy(&condition, "conditional expression")? {
-                        self.eval_expr_value(then_expr, PipelineData::empty())
+                        self.eval_expr_value(then_expr)
                     } else {
-                        self.eval_expr_value(else_expr, PipelineData::empty())
+                        self.eval_expr_value(else_expr)
                     }
                 }
                 Expr::Not(value) => {
-                    let value = self.eval_expr_value(value, PipelineData::empty())?;
+                    let value = self.eval_expr_value(value)?;
                     Ok(RuntimeValue::Nu(Value::bool(
                         !runtime_truthy(&value, "not")?,
                         span,
@@ -3367,13 +3365,13 @@ impl Evaluator<'_> {
                 }
                 Expr::Neg(value) => {
                     let value = self
-                        .eval_expr_value(value, PipelineData::empty())?
+                        .eval_expr_value(value)?
                         .into_nu_value("unary minus")?;
                     neg_value(&value).map(RuntimeValue::Nu)
                 }
                 Expr::Invert(value) => {
                     let value = self
-                        .eval_expr_value(value, PipelineData::empty())?
+                        .eval_expr_value(value)?
                         .into_nu_value("bitwise invert")?;
                     let value = value_to_operator_i64(&value, "bitwise invert")?;
                     Ok(RuntimeValue::Nu(Value::int(!value, span)))
@@ -3384,28 +3382,28 @@ impl Evaluator<'_> {
                 Expr::Mul { left, right } => self.eval_collection_aware_binop("multiplication", left, right),
                 Expr::Div { left, right } => {
                     let left = self
-                        .eval_expr_value(left, PipelineData::empty())?
+                        .eval_expr_value(left)?
                         .into_nu_value("division")?;
                     let right = self
-                        .eval_expr_value(right, PipelineData::empty())?
+                        .eval_expr_value(right)?
                         .into_nu_value("division")?;
                     div_values(&left, &right).map(RuntimeValue::Nu)
                 }
                 Expr::FloorDiv { left, right } => {
                     let left = self
-                        .eval_expr_value(left, PipelineData::empty())?
+                        .eval_expr_value(left)?
                         .into_nu_value("floor division")?;
                     let right = self
-                        .eval_expr_value(right, PipelineData::empty())?
+                        .eval_expr_value(right)?
                         .into_nu_value("floor division")?;
                     floor_div_values(&left, &right).map(RuntimeValue::Nu)
                 }
                 Expr::Mod { left, right } => {
                     let left = self
-                        .eval_expr_value(left, PipelineData::empty())?
+                        .eval_expr_value(left)?
                         .into_nu_value("modulo")?;
                     let right = self
-                        .eval_expr_value(right, PipelineData::empty())?
+                        .eval_expr_value(right)?
                         .into_nu_value("modulo")?;
                     mod_values(&left, &right).map(RuntimeValue::Nu)
                 }
@@ -3414,19 +3412,19 @@ impl Evaluator<'_> {
                 Expr::BitXor { left, right } => self.eval_collection_aware_binop("bitwise xor", left, right),
                 Expr::LShift { left, right } => {
                     let left = self
-                        .eval_expr_value(left, PipelineData::empty())?
+                        .eval_expr_value(left)?
                         .into_nu_value("left shift")?;
                     let right = self
-                        .eval_expr_value(right, PipelineData::empty())?
+                        .eval_expr_value(right)?
                         .into_nu_value("left shift")?;
                     shift_value(&left, &right, "left shift", i64::checked_shl).map(RuntimeValue::Nu)
                 }
                 Expr::RShift { left, right } => {
                     let left = self
-                        .eval_expr_value(left, PipelineData::empty())?
+                        .eval_expr_value(left)?
                         .into_nu_value("right shift")?;
                     let right = self
-                        .eval_expr_value(right, PipelineData::empty())?
+                        .eval_expr_value(right)?
                         .into_nu_value("right shift")?;
                     shift_value(&left, &right, "right shift", i64::checked_shr)
                         .map(RuntimeValue::Nu)
@@ -3453,7 +3451,7 @@ impl Evaluator<'_> {
                 // in for one.
                 Expr::Call(call) if self.state.pure_calls => {
                     if is_builtin_call(call) {
-                        self.eval_builtin_call(call, input)
+                        self.eval_builtin_call(call)
                     } else {
                         Err(unknown_stone_call_error(&call.name))
                     }
@@ -3476,7 +3474,7 @@ impl Evaluator<'_> {
                         } else if is_builtin_error_type(&call.name) {
                             self.eval_builtin_error_constructor(call)
                         } else if is_builtin_call(call) {
-                            self.eval_builtin_call(call, input)
+                            self.eval_builtin_call(call)
                         } else {
                             Err(unknown_stone_call_error(&call.name))
                         }
@@ -3507,15 +3505,15 @@ impl Evaluator<'_> {
                     positional,
                     named,
                 } => {
-                    let callee = self.eval_expr_value(callee, PipelineData::empty())?;
+                    let callee = self.eval_expr_value(callee)?;
                     let args = positional
                         .iter()
-                        .map(|arg| self.eval_expr_value(arg, PipelineData::empty()))
+                        .map(|arg| self.eval_expr_value(arg))
                         .collect::<Result<Vec<_>, _>>()?;
                     let named = named
                         .iter()
                         .map(|(name, arg)| {
-                            self.eval_expr_value(arg, PipelineData::empty())
+                            self.eval_expr_value(arg)
                                 .map(|value| (name.clone(), value))
                         })
                         .collect::<Result<Vec<_>, _>>()?;
@@ -3589,7 +3587,7 @@ impl Evaluator<'_> {
                     .map(|value| type_host_result("run", value));
             }
         }
-        let value = self.eval_expr_value(expression, PipelineData::empty())?;
+        let value = self.eval_expr_value(expression)?;
         match (expression, value) {
             (_, RuntimeValue::AttemptHandle(handle)) => {
                 self.eval_attempt_join_id(handle.attempt, None)
@@ -3628,7 +3626,6 @@ impl Evaluator<'_> {
     fn eval_builtin_call(
         &mut self,
         call: &Call,
-        input: PipelineData,
     ) -> Result<RuntimeValue, ShellError> {
         // Documented keyword arguments (`enumerate(xs, start=1)`,
         // `round(x, ndigits=2)`) are placed in their positional slots.
@@ -3652,7 +3649,7 @@ impl Evaluator<'_> {
                         "int() keyword arguments are not supported",
                     ));
                 }
-                let value = self.eval_expr_value(arg, PipelineData::empty())?;
+                let value = self.eval_expr_value(arg)?;
                 if let RuntimeValue::JsonScalarView(view) = value {
                     return json_scalar_view_to_i64(&view)
                         .map(|value| RuntimeValue::Nu(Value::int(value, Span::unknown())));
@@ -3673,7 +3670,7 @@ impl Evaluator<'_> {
                         "float() keyword arguments are not supported",
                     ));
                 }
-                let value = self.eval_expr_value(arg, PipelineData::empty())?;
+                let value = self.eval_expr_value(arg)?;
                 if let RuntimeValue::JsonScalarView(view) = value {
                     return json_scalar_view_to_f64(&view)
                         .map(|value| RuntimeValue::Nu(Value::float(value, Span::unknown())));
@@ -3691,7 +3688,7 @@ impl Evaluator<'_> {
                         "len() keyword arguments are not supported",
                     ));
                 }
-                let value = self.eval_expr_value(arg, PipelineData::empty())?;
+                let value = self.eval_expr_value(arg)?;
                 match &value {
                     RuntimeValue::List(list) => Ok(RuntimeValue::Nu(Value::int(
                         list.len() as i64,
@@ -3727,7 +3724,7 @@ impl Evaluator<'_> {
                         format!("{name}() keyword arguments are not supported"),
                     ));
                 }
-                let value = self.eval_expr_value(arg, PipelineData::empty())?;
+                let value = self.eval_expr_value(arg)?;
                 if let Some(text) = self.error_value_text(&value, name == "repr") {
                     return Ok(RuntimeValue::Nu(Value::string(text, Span::unknown())));
                 }
@@ -3814,7 +3811,7 @@ impl Evaluator<'_> {
             "to_json" => self.eval_to_json_call(call),
             "to_jsonl" => self.eval_to_jsonl_call(call),
             "write_text" | "write_file" => self.eval_write_text_call(call),
-            "get" | "keys" | "values" | "items" => self.eval_record_helper_call(call, input),
+            "get" | "keys" | "values" | "items" => self.eval_record_helper_call(call),
             "parse_float" => self.eval_parse_float_call(call),
             "parse_int" => self.eval_parse_int_call(call),
             "print" => self.eval_print_call(call),
@@ -3948,7 +3945,7 @@ impl Evaluator<'_> {
         let mut values = Vec::with_capacity(function.params.len());
         for param in &function.params {
             values.push(match &param.default {
-                Some(default) => Some(self.eval_expr_value(default, PipelineData::empty())?),
+                Some(default) => Some(self.eval_expr_value(default)?),
                 None => None,
             });
         }
@@ -3980,13 +3977,13 @@ impl Evaluator<'_> {
         let args = call
             .positional
             .iter()
-            .map(|expression| self.eval_expr_value(expression, PipelineData::empty()))
+            .map(|expression| self.eval_expr_value(expression))
             .collect::<Result<Vec<_>, _>>()?;
         let named = call
             .named
             .iter()
             .map(|(name, expression)| {
-                self.eval_expr_value(expression, PipelineData::empty())
+                self.eval_expr_value(expression)
                     .map(|value| (name.clone(), value))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -4087,7 +4084,6 @@ impl Evaluator<'_> {
                             ),
                         )
                     })?,
-                    PipelineData::empty(),
                 )?,
             };
             ensure_runtime_type(&value, param.ty, &format!("argument `{}`", param.name))?;
@@ -4111,7 +4107,7 @@ impl Evaluator<'_> {
             self.state.async_functions_entered =
                 self.state.async_functions_entered.saturating_add(1);
         }
-        let flow = self.eval_block(&function.body, PipelineData::empty(), false);
+        let flow = self.eval_block(&function.body, false);
         if function.is_async {
             self.state.active_async_depth = self.state.active_async_depth.saturating_sub(1);
         }
@@ -4175,13 +4171,13 @@ impl Evaluator<'_> {
         let args = call
             .positional
             .iter()
-            .map(|arg| self.eval_expr_value(arg, PipelineData::empty()))
+            .map(|arg| self.eval_expr_value(arg))
             .collect::<Result<Vec<_>, _>>()?;
         let named = call
             .named
             .iter()
             .map(|(name, expression)| {
-                self.eval_expr_value(expression, PipelineData::empty())
+                self.eval_expr_value(expression)
                     .map(|value| (name.clone(), value))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -4208,7 +4204,7 @@ impl Evaluator<'_> {
         value: &Expr,
         attr: &str,
     ) -> Result<RuntimeValue, ShellError> {
-        let receiver = self.eval_expr_value(value, PipelineData::empty())?;
+        let receiver = self.eval_expr_value(value)?;
         self.attribute_of(receiver, attr)
     }
 
@@ -4392,7 +4388,7 @@ impl Evaluator<'_> {
     }
 
     fn eval_callable_expr(&mut self, expression: &Expr) -> Result<CallableValue, ShellError> {
-        match self.eval_expr_value(expression, PipelineData::empty())? {
+        match self.eval_expr_value(expression)? {
             RuntimeValue::Callable(callable) => Ok(callable),
             other => Err(stone_error(
                 "callable",
@@ -4481,7 +4477,7 @@ impl Evaluator<'_> {
                     self.state.set_local(name.clone(), value);
                 }
                 let outer_pure = std::mem::replace(&mut self.state.pure_calls, *pure);
-                let result = self.eval_expr_value(body, PipelineData::empty());
+                let result = self.eval_expr_value(body);
                 self.state.pure_calls = outer_pure;
                 self.state.pop_scope()?;
                 result
@@ -4504,7 +4500,7 @@ impl Evaluator<'_> {
         }
 
         let path = self
-            .eval_expr_value(path, PipelineData::empty())?
+            .eval_expr_value(path)?
             .into_nu_value("open")?;
         let path = value_to_path_string(&path, "open")?;
         let target = self.resolve_script_path(&path)?;
@@ -4512,7 +4508,7 @@ impl Evaluator<'_> {
             [_] => "r".to_owned(),
             [_, mode] => {
                 let mode = self
-                    .eval_expr_value(mode, PipelineData::empty())?
+                    .eval_expr_value(mode)?
                     .into_nu_value("open")?;
                 value_to_string(&mode, "open")?
             }
@@ -4535,7 +4531,7 @@ impl Evaluator<'_> {
             ));
         }
         let path = self
-            .eval_expr_value(path, PipelineData::empty())?
+            .eval_expr_value(path)?
             .into_nu_value("cat")?;
         let path = value_to_path_string(&path, "cat")?;
         let target = self.resolve_script_path(&path)?;
@@ -4564,7 +4560,7 @@ impl Evaluator<'_> {
         let mut tail_bytes: Option<usize> = None;
         if let Some(max_bytes_expr) = max_bytes_expr {
             let value = self
-                .eval_expr_value(max_bytes_expr, PipelineData::empty())?
+                .eval_expr_value(max_bytes_expr)?
                 .into_nu_value("read_text")?;
             max_bytes = value_to_limit(&value, "read_text max_bytes")?;
         }
@@ -4576,7 +4572,7 @@ impl Evaluator<'_> {
                 ));
             }
             let value = self
-                .eval_expr_value(argument, PipelineData::empty())?
+                .eval_expr_value(argument)?
                 .into_nu_value("read_text")?;
             match name.as_str() {
                 "path" => {
@@ -4609,7 +4605,7 @@ impl Evaluator<'_> {
 
         if let Some(path_expr) = path_expr {
             let value = self
-                .eval_expr_value(path_expr, PipelineData::empty())?
+                .eval_expr_value(path_expr)?
                 .into_nu_value("read_text")?;
             path_value = Some(value_to_path_string(&value, "read_text")?);
         }
@@ -4665,7 +4661,7 @@ impl Evaluator<'_> {
         let mut append = false;
         for (name, argument) in &call.named {
             let value = self
-                .eval_expr_value(argument, PipelineData::empty())?
+                .eval_expr_value(argument)?
                 .into_nu_value("write_text")?;
             match name.as_str() {
                 "append" => append = value_to_bool(&value, "write_text append")?,
@@ -4679,12 +4675,12 @@ impl Evaluator<'_> {
         }
 
         let path = self
-            .eval_expr_value(path, PipelineData::empty())?
+            .eval_expr_value(path)?
             .into_nu_value("write_text")?;
         let path = value_to_path_string(&path, "write_text")?;
         let target = self.resolve_script_path(&path)?;
         let value = self
-            .eval_expr_value(value, PipelineData::empty())?
+            .eval_expr_value(value)?
             .into_nu_value("write_text")?;
         let text = value_to_string(&value, "write_text")?;
         Ok(RuntimeValue::Nu(stone_write_text(&target, &text, append)?))
@@ -4697,7 +4693,7 @@ impl Evaluator<'_> {
         let mut follow_symlinks = false;
         for (name, argument) in &call.named {
             let value = self
-                .eval_expr_value(argument, PipelineData::empty())?
+                .eval_expr_value(argument)?
                 .into_nu_value("stat")?;
             match name.as_str() {
                 "follow_symlinks" => {
@@ -4713,7 +4709,7 @@ impl Evaluator<'_> {
         }
 
         let path = self
-            .eval_expr_value(path, PipelineData::empty())?
+            .eval_expr_value(path)?
             .into_nu_value("stat")?;
         let path = value_to_path_string(&path, "stat")?;
         let target = self.resolve_script_path(&path)?;
@@ -4737,7 +4733,7 @@ impl Evaluator<'_> {
         let target = match path_expr {
             Some(path) => {
                 let path = self
-                    .eval_expr_value(path, PipelineData::empty())?
+                    .eval_expr_value(path)?
                     .into_nu_value("list_dir")?;
                 let path = value_to_path_string(&path, "list_dir")?;
                 self.resolve_script_path(&path)?
@@ -4762,7 +4758,7 @@ impl Evaluator<'_> {
         let mut values = Vec::with_capacity(call.positional.len());
         for argument in &call.positional {
             values.push(
-                self.eval_expr_value(argument, PipelineData::empty())?
+                self.eval_expr_value(argument)?
                     .into_nu_value("echo")?,
             );
         }
@@ -4789,7 +4785,7 @@ impl Evaluator<'_> {
                 "emit() was already called: a program has one result, and emit sets it once. Collect what you want to report into one value (a dict or a typed record) and emit that once, at the end",
             ));
         }
-        let value = self.eval_expr_value(value, PipelineData::empty())?;
+        let value = self.eval_expr_value(value)?;
         self.state.emitted = Some(value.clone().into_nu_value("emit")?);
         Ok(value)
     }
@@ -4799,14 +4795,14 @@ impl Evaluator<'_> {
             return Err(stone_error("fail", "fail() requires exactly one message"));
         };
         let message = self
-            .eval_expr_value(message, PipelineData::empty())?
+            .eval_expr_value(message)?
             .into_nu_value("fail")?;
         let message = value_to_string(&message, "fail")?;
         let mut code = None;
         let mut detail = None;
         for (name, argument) in &call.named {
             let value = self
-                .eval_expr_value(argument, PipelineData::empty())?
+                .eval_expr_value(argument)?
                 .into_nu_value("fail")?;
             match name.as_str() {
                 "code" => code = Some(value_to_string(&value, "fail code")?),
@@ -4834,7 +4830,7 @@ impl Evaluator<'_> {
             [] => stone_help_overview(Span::unknown()),
             [name] => {
                 let name = self
-                    .eval_expr_value(name, PipelineData::empty())?
+                    .eval_expr_value(name)?
                     .into_nu_value("help")?;
                 stone_help_topic(&value_to_string(&name, "help")?, Span::unknown())
             }
@@ -4865,7 +4861,7 @@ impl Evaluator<'_> {
             ));
         }
         let path = self
-            .eval_expr_value(path, PipelineData::empty())?
+            .eval_expr_value(path)?
             .into_nu_value("cd")?;
         let path = value_to_path_string(&path, "cd")?;
         let target = self.resolve_script_path(&path)?;
@@ -4912,7 +4908,7 @@ impl Evaluator<'_> {
         let name_glob = rest
             .first()
             .map(|expr| {
-                self.eval_expr_value(expr, PipelineData::empty())
+                self.eval_expr_value(expr)
                     .and_then(|value| value.into_nu_value("find"))
                     .and_then(|value| value_to_string(&value, "find"))
             })
@@ -4924,7 +4920,7 @@ impl Evaluator<'_> {
         let mut root_path = None;
         for (name, argument) in &call.named {
             let value = self
-                .eval_expr_value(argument, PipelineData::empty())?
+                .eval_expr_value(argument)?
                 .into_nu_value("find")?;
             match name.as_str() {
                 "root" | "path" => root_path = Some(value_to_path_string(&value, "find root")?),
@@ -4971,7 +4967,7 @@ impl Evaluator<'_> {
 
         if let Some(root_expr) = root_expr {
             let value = self
-                .eval_expr_value(root_expr, PipelineData::empty())?
+                .eval_expr_value(root_expr)?
                 .into_nu_value("find")?;
             root_path = Some(value_to_path_string(&value, "find")?);
         }
@@ -4994,10 +4990,10 @@ impl Evaluator<'_> {
             ));
         }
         let left = self
-            .eval_expr_value(left, PipelineData::empty())?
+            .eval_expr_value(left)?
             .into_nu_value("diff")?;
         let right = self
-            .eval_expr_value(right, PipelineData::empty())?
+            .eval_expr_value(right)?
             .into_nu_value("diff")?;
         let left_path = self.resolve_script_path(&value_to_path_string(&left, "diff")?)?;
         let right_path = self.resolve_script_path(&value_to_path_string(&right, "diff")?)?;
@@ -5021,7 +5017,7 @@ impl Evaluator<'_> {
             ));
         }
         let path = self
-            .eval_expr_value(path, PipelineData::empty())?
+            .eval_expr_value(path)?
             .into_nu_value("read_json")?;
         let path = value_to_path_string(&path, "read_json")?;
         let target = self.resolve_script_path(&path)?;
@@ -5036,7 +5032,7 @@ impl Evaluator<'_> {
             ));
         };
         let path = self
-            .eval_expr_value(path, PipelineData::empty())?
+            .eval_expr_value(path)?
             .into_nu_value("read_csv")?;
         let path = value_to_path_string(&path, "read_csv")?;
         let target = self.resolve_script_path(&path)?;
@@ -5052,7 +5048,7 @@ impl Evaluator<'_> {
             ));
         };
         let path = self
-            .eval_expr_value(path, PipelineData::empty())?
+            .eval_expr_value(path)?
             .into_nu_value("read_jsonl")?;
         let path = value_to_path_string(&path, "read_jsonl")?;
         let limit = self.eval_structured_read_limit("read_jsonl", call)?;
@@ -5117,7 +5113,7 @@ impl Evaluator<'_> {
             return Ok(None);
         };
         let limit = self
-            .eval_expr_value(limit, PipelineData::empty())?
+            .eval_expr_value(limit)?
             .into_nu_value(name)?;
         Ok(Some(value_to_limit(&limit, name)?))
     }
@@ -5136,12 +5132,12 @@ impl Evaluator<'_> {
             ));
         }
         let path = self
-            .eval_expr_value(path, PipelineData::empty())?
+            .eval_expr_value(path)?
             .into_nu_value("write_json")?;
         let path = value_to_string(&path, "write_json")?;
         let target = self.resolve_script_path(&path)?;
         let value = self
-            .eval_expr_value(value, PipelineData::empty())?
+            .eval_expr_value(value)?
             .into_nu_value("write_json")?;
         Ok(RuntimeValue::Nu(write_json_file(&target, &value)?))
     }
@@ -5171,20 +5167,20 @@ impl Evaluator<'_> {
             ));
         }
         let path = self
-            .eval_expr_value(path, PipelineData::empty())?
+            .eval_expr_value(path)?
             .into_nu_value("write_csv")?;
         let path = value_to_string(&path, "write_csv")?;
         let target = self.resolve_script_path(&path)?;
         let rows = self
-            .eval_expr_value(rows, PipelineData::empty())?
+            .eval_expr_value(rows)?
             .into_nu_value("write_csv")?;
         let columns = match call.positional.as_slice() {
             [_, _, columns] => Some(
-                self.eval_expr_value(columns, PipelineData::empty())?
+                self.eval_expr_value(columns)?
                     .into_nu_value("write_csv columns")?,
             ),
             _ => named_columns
-                .map(|expr| self.eval_expr_value(expr, PipelineData::empty()))
+                .map(|expr| self.eval_expr_value(expr))
                 .transpose()?
                 .map(|value| value.into_nu_value("write_csv columns"))
                 .transpose()?,
@@ -5207,12 +5203,12 @@ impl Evaluator<'_> {
             ));
         }
         let path = self
-            .eval_expr_value(path, PipelineData::empty())?
+            .eval_expr_value(path)?
             .into_nu_value("write_jsonl")?;
         let path = value_to_string(&path, "write_jsonl")?;
         let target = self.resolve_script_path(&path)?;
         let rows = self
-            .eval_expr_value(rows, PipelineData::empty())?
+            .eval_expr_value(rows)?
             .into_nu_value("write_jsonl")?;
         let Value::List { vals, .. } = rows else {
             return Err(stone_error(
@@ -5237,11 +5233,11 @@ impl Evaluator<'_> {
                 format!("{name}() keyword arguments are not supported"),
             ));
         }
-        let values = self.eval_expr_value(values, PipelineData::empty())?;
+        let values = self.eval_expr_value(values)?;
         let count = match call.positional.get(1) {
             Some(count) => {
                 let count = self
-                    .eval_expr_value(count, PipelineData::empty())?
+                    .eval_expr_value(count)?
                     .into_nu_value(name)?;
                 Some(value_to_limit(&count, name)?)
             }
@@ -5268,11 +5264,11 @@ impl Evaluator<'_> {
                 format!("{name}() keyword arguments are not supported"),
             ));
         }
-        let values = self.eval_expr_value(values, PipelineData::empty())?;
+        let values = self.eval_expr_value(values)?;
         let count = match call.positional.get(1) {
             Some(count) => {
                 let count = self
-                    .eval_expr_value(count, PipelineData::empty())?
+                    .eval_expr_value(count)?
                     .into_nu_value(name)?;
                 Some(value_to_limit(&count, name)?)
             }
@@ -5297,7 +5293,7 @@ impl Evaluator<'_> {
         }
         for argument in &call.positional {
             let path = self
-                .eval_expr_value(argument, PipelineData::empty())?
+                .eval_expr_value(argument)?
                 .into_nu_value("mkdir")?;
             let path = value_to_path_string(&path, "mkdir")?;
             let target = self.resolve_script_path(&path)?;
@@ -5311,7 +5307,7 @@ impl Evaluator<'_> {
         let mut path_values = Vec::new();
         for (name, argument) in &call.named {
             let value = self
-                .eval_expr_value(argument, PipelineData::empty())?
+                .eval_expr_value(argument)?
                 .into_nu_value("rm")?;
             match name.as_str() {
                 "path" | "paths" => path_values.push(value),
@@ -5331,7 +5327,7 @@ impl Evaluator<'_> {
         }
         for argument in &call.positional {
             let value = self
-                .eval_expr_value(argument, PipelineData::empty())?
+                .eval_expr_value(argument)?
                 .into_nu_value("rm")?;
             path_values.push(value);
         }
@@ -5366,7 +5362,7 @@ impl Evaluator<'_> {
         let mut expect = None;
         for (name, argument) in &call.named {
             let value = self
-                .eval_expr_value(argument, PipelineData::empty())?
+                .eval_expr_value(argument)?
                 .into_nu_value("edit")?;
             match name.as_str() {
                 "all" => replace_all = value_to_bool(&value, "edit all")?,
@@ -5392,13 +5388,13 @@ impl Evaluator<'_> {
                 _ => None,
             });
         let path = self
-            .eval_expr_value(path, PipelineData::empty())?
+            .eval_expr_value(path)?
             .into_nu_value("edit")?;
         let old = self
-            .eval_expr_value(old, PipelineData::empty())?
+            .eval_expr_value(old)?
             .into_nu_value("edit")?;
         let new = self
-            .eval_expr_value(new, PipelineData::empty())?
+            .eval_expr_value(new)?
             .into_nu_value("edit")?;
         let path = value_to_path_string(&path, "edit")?;
         let old = value_to_string(&old, "edit old")?;
@@ -5429,7 +5425,7 @@ impl Evaluator<'_> {
         let mut force = false;
         for (name, argument) in &call.named {
             let value = self
-                .eval_expr_value(argument, PipelineData::empty())?
+                .eval_expr_value(argument)?
                 .into_nu_value("save")?;
             match name.as_str() {
                 "append" => append = value_to_bool(&value, "save append")?,
@@ -5443,10 +5439,10 @@ impl Evaluator<'_> {
             }
         }
         let value = self
-            .eval_expr_value(value, PipelineData::empty())?
+            .eval_expr_value(value)?
             .into_nu_value("save")?;
         let path = self
-            .eval_expr_value(path, PipelineData::empty())?
+            .eval_expr_value(path)?
             .into_nu_value("save")?;
         let path = value_to_path_string(&path, "save")?;
         let target = self.resolve_script_path(&path)?;
@@ -5471,7 +5467,7 @@ impl Evaluator<'_> {
         let mut regex = false;
         for (name, argument) in &call.named {
             let value = self
-                .eval_expr_value(argument, PipelineData::empty())?
+                .eval_expr_value(argument)?
                 .into_nu_value("search")?;
             match name.as_str() {
                 "root" | "path" => root = Some(value_to_path_string(&value, "search root")?),
@@ -5491,13 +5487,13 @@ impl Evaluator<'_> {
         }
         if let Some(root_expr) = root_expr {
             let value = self
-                .eval_expr_value(root_expr, PipelineData::empty())?
+                .eval_expr_value(root_expr)?
                 .into_nu_value("search")?;
             root = Some(value_to_path_string(&value, "search")?);
         }
         if let Some(needle_expr) = needle_expr {
             let value = self
-                .eval_expr_value(needle_expr, PipelineData::empty())?
+                .eval_expr_value(needle_expr)?
                 .into_nu_value("search")?;
             needle = Some(value_to_string(&value, "search needle")?);
         }
@@ -5530,7 +5526,7 @@ impl Evaluator<'_> {
         }
         match call.positional.as_slice() {
             [values, predicate] => {
-                let values = self.eval_expr_value(values, PipelineData::empty())?;
+                let values = self.eval_expr_value(values)?;
                 let predicate = self.eval_callable_expr(predicate)?;
                 if let RuntimeValue::List(list) = &values {
                     let mut selected = Vec::new();
@@ -5548,36 +5544,36 @@ impl Evaluator<'_> {
                 self.eval_where_predicate(&values, &predicate)
             }
             [values, key, expected] => {
-                let values = self.eval_expr_value(values, PipelineData::empty())?;
+                let values = self.eval_expr_value(values)?;
                 if let RuntimeValue::List(list) = &values {
                     let key = self
-                        .eval_expr_value(key, PipelineData::empty())?
+                        .eval_expr_value(key)?
                         .into_nu_value("where")?;
                     let expected = self
-                        .eval_expr_value(expected, PipelineData::empty())?
+                        .eval_expr_value(expected)?
                         .into_nu_value("where")?;
                     return select_shared_matching(list, |row| where_builtin(row, &key, &expected));
                 }
                 let values = values.into_nu_value("where")?;
                 let key = self
-                    .eval_expr_value(key, PipelineData::empty())?
+                    .eval_expr_value(key)?
                     .into_nu_value("where")?;
                 let expected = self
-                    .eval_expr_value(expected, PipelineData::empty())?
+                    .eval_expr_value(expected)?
                     .into_nu_value("where")?;
                 where_builtin(&values, &key, &expected).map(RuntimeValue::Nu)
             }
             [values, key, op, expected] => {
-                let values = self.eval_expr_value(values, PipelineData::empty())?;
+                let values = self.eval_expr_value(values)?;
                 if let RuntimeValue::List(list) = &values {
                     let key = self
-                        .eval_expr_value(key, PipelineData::empty())?
+                        .eval_expr_value(key)?
                         .into_nu_value("where")?;
                     let op = self
-                        .eval_expr_value(op, PipelineData::empty())?
+                        .eval_expr_value(op)?
                         .into_nu_value("where")?;
                     let expected = self
-                        .eval_expr_value(expected, PipelineData::empty())?
+                        .eval_expr_value(expected)?
                         .into_nu_value("where")?;
                     return select_shared_matching(list, |row| {
                         where_compare_builtin(row, &key, &op, &expected)
@@ -5585,13 +5581,13 @@ impl Evaluator<'_> {
                 }
                 let values = values.into_nu_value("where")?;
                 let key = self
-                    .eval_expr_value(key, PipelineData::empty())?
+                    .eval_expr_value(key)?
                     .into_nu_value("where")?;
                 let op = self
-                    .eval_expr_value(op, PipelineData::empty())?
+                    .eval_expr_value(op)?
                     .into_nu_value("where")?;
                 let expected = self
-                    .eval_expr_value(expected, PipelineData::empty())?
+                    .eval_expr_value(expected)?
                     .into_nu_value("where")?;
                 where_compare_builtin(&values, &key, &op, &expected).map(RuntimeValue::Nu)
             }
@@ -5639,7 +5635,7 @@ impl Evaluator<'_> {
             ));
         }
         let text = self
-            .eval_expr_value(text, PipelineData::empty())?
+            .eval_expr_value(text)?
             .into_nu_value("from_json")?;
         let text = value_to_string(&text, "from_json")?;
         let json = serde_json::from_str::<serde_json::Value>(&text)
@@ -5661,7 +5657,7 @@ impl Evaluator<'_> {
             ));
         }
         let value = self
-            .eval_expr_value(value, PipelineData::empty())?
+            .eval_expr_value(value)?
             .into_nu_value("to_json")?;
         let text = serde_json::to_string(&nu_to_json_value(&value))
             .map_err(|err| stone_error("to_json", err.to_string()))?;
@@ -5682,7 +5678,7 @@ impl Evaluator<'_> {
             ));
         }
         let value = self
-            .eval_expr_value(value, PipelineData::empty())?
+            .eval_expr_value(value)?
             .into_nu_value("to_jsonl")?;
         let mut text = String::new();
         match value {
@@ -5723,7 +5719,7 @@ impl Evaluator<'_> {
             ));
         }
         let text = self
-            .eval_expr_value(text, PipelineData::empty())?
+            .eval_expr_value(text)?
             .into_nu_value("predicate")?;
         let text = value_to_string(&text, "predicate")?;
         let (params, body) = stone_predicate::compile_predicate(&text)?;
@@ -5748,7 +5744,7 @@ impl Evaluator<'_> {
             ));
         }
         let text = self
-            .eval_expr_value(text, PipelineData::empty())?
+            .eval_expr_value(text)?
             .into_nu_value("json_loads")?;
         let text = value_to_string(&text, "json_loads")?;
         let json = serde_json::from_str::<serde_json::Value>(&text)
@@ -5768,7 +5764,7 @@ impl Evaluator<'_> {
             match name.as_str() {
                 "indent" => {
                     let value = self
-                        .eval_expr_value(argument, PipelineData::empty())?
+                        .eval_expr_value(argument)?
                         .into_nu_value("json_dumps")?;
                     if matches!(value, Value::Nothing { .. }) {
                         indent = None;
@@ -5785,7 +5781,7 @@ impl Evaluator<'_> {
                 }
                 "separators" => {
                     let value = self
-                        .eval_expr_value(argument, PipelineData::empty())?
+                        .eval_expr_value(argument)?
                         .into_nu_value("json_dumps")?;
                     validate_json_dumps_separators(&value)?;
                 }
@@ -5798,7 +5794,7 @@ impl Evaluator<'_> {
             }
         }
         let value = self
-            .eval_expr_value(value, PipelineData::empty())?
+            .eval_expr_value(value)?
             .into_nu_value("json_dumps")?;
         let json = nu_to_json_value(&value);
         let text = if indent.is_some() {
@@ -5817,7 +5813,7 @@ impl Evaluator<'_> {
                 "sort() requires a list and optional key field",
             ));
         };
-        let values = self.eval_expr_value(values, PipelineData::empty())?;
+        let values = self.eval_expr_value(values)?;
         // A shared list sorts its elements themselves, so the result holds
         // the same dicts (Python's sorted() returns the same objects).
         let shared = match &values {
@@ -5863,7 +5859,7 @@ impl Evaluator<'_> {
                 }
                 "reverse" => {
                     let value = self
-                        .eval_expr_value(argument, PipelineData::empty())?
+                        .eval_expr_value(argument)?
                         .into_nu_value("sort")?;
                     reverse = value_to_bool(&value, "sort reverse")?;
                 }
@@ -5899,7 +5895,7 @@ impl Evaluator<'_> {
     }
 
     fn eval_sort_key(&mut self, expression: &Expr) -> Result<SortKey, ShellError> {
-        match self.eval_expr_value(expression, PipelineData::empty())? {
+        match self.eval_expr_value(expression)? {
             RuntimeValue::Callable(callable) => Ok(SortKey::Callable(callable)),
             other => {
                 let value = other.into_nu_value("sort")?;
@@ -5941,7 +5937,7 @@ impl Evaluator<'_> {
                 "unique() keyword arguments are not supported",
             ));
         }
-        let values = self.eval_expr_value(values, PipelineData::empty())?;
+        let values = self.eval_expr_value(values)?;
         // The first of each equal group is kept as is (shared, and still a
         // record if it was one).
         if let RuntimeValue::List(list) = &values {
@@ -5972,13 +5968,13 @@ impl Evaluator<'_> {
             ));
         }
         let value = self
-            .eval_expr_value(value, PipelineData::empty())?
+            .eval_expr_value(value)?
             .into_nu_value("round")?;
         let digits = match call.positional.as_slice() {
             [_] => None,
             [_, digits] => {
                 let digits = self
-                    .eval_expr_value(digits, PipelineData::empty())?
+                    .eval_expr_value(digits)?
                     .into_nu_value("round")?;
                 match digits {
                     Value::Nothing { .. } => None,
@@ -6004,10 +6000,10 @@ impl Evaluator<'_> {
             ));
         }
         let value = self
-            .eval_expr_value(value, PipelineData::empty())?
+            .eval_expr_value(value)?
             .into_nu_value("parse_float")?;
         let default = self
-            .eval_expr_value(default, PipelineData::empty())?
+            .eval_expr_value(default)?
             .into_nu_value("parse_float")?;
         parse_float_builtin(&value, default).map(RuntimeValue::Nu)
     }
@@ -6026,10 +6022,10 @@ impl Evaluator<'_> {
             ));
         }
         let value = self
-            .eval_expr_value(value, PipelineData::empty())?
+            .eval_expr_value(value)?
             .into_nu_value("parse_int")?;
         let default = self
-            .eval_expr_value(default, PipelineData::empty())?
+            .eval_expr_value(default)?
             .into_nu_value("parse_int")?;
         parse_int_builtin(&value, default).map(RuntimeValue::Nu)
     }
@@ -6037,7 +6033,6 @@ impl Evaluator<'_> {
     fn eval_record_helper_call(
         &mut self,
         call: &Call,
-        input: PipelineData,
     ) -> Result<RuntimeValue, ShellError> {
         if !call.named.is_empty() {
             return Err(stone_error(
@@ -6045,7 +6040,6 @@ impl Evaluator<'_> {
                 format!("{}() keyword arguments are not supported", call.name),
             ));
         }
-        let _ = input;
         if call.name == "get" && call.positional.len() < 2 {
             return Err(stone_typed_error(
                 "TypeError",
@@ -6060,7 +6054,7 @@ impl Evaluator<'_> {
                     format!("{}() requires a record argument", call.name),
                 ));
             };
-            let receiver = self.eval_expr_value(record, PipelineData::empty())?;
+            let receiver = self.eval_expr_value(record)?;
             // `get(x, key[, default])` hands out the stored value itself, as
             // `x.key` / `x[key]` do: a nested record stays a record and a
             // list or dict stays shared.
@@ -6068,7 +6062,7 @@ impl Evaluator<'_> {
                 && matches!(receiver, RuntimeValue::Record(_) | RuntimeValue::Dict(_))
             {
                 if let [_, key_expr, rest @ ..] = call.positional.as_slice() {
-                    let key = self.eval_expr_value(key_expr, PipelineData::empty())?;
+                    let key = self.eval_expr_value(key_expr)?;
                     if let RuntimeValue::Nu(Value::String { val: key, .. }) = &key {
                         let found = match &receiver {
                             RuntimeValue::Record(record) => {
@@ -6079,7 +6073,7 @@ impl Evaluator<'_> {
                         };
                         return match (found, rest) {
                             (Some(value), _) => Ok(value),
-                            (None, [default]) => self.eval_expr_value(default, PipelineData::empty()),
+                            (None, [default]) => self.eval_expr_value(default),
                             (None, _) => Ok(RuntimeValue::Nu(Value::nothing(Span::unknown()))),
                         };
                     }
@@ -6096,7 +6090,7 @@ impl Evaluator<'_> {
         let mut args = Vec::new();
         for arg in arg_exprs {
             args.push(
-                self.eval_expr_value(arg, PipelineData::empty())?
+                self.eval_expr_value(arg)?
                     .into_nu_value(&call.name)?,
             );
         }
@@ -6110,7 +6104,7 @@ impl Evaluator<'_> {
         let mut positional = Vec::with_capacity(call.positional.len());
         for argument in &call.positional {
             positional.push(
-                self.eval_expr_value(argument, PipelineData::empty())?
+                self.eval_expr_value(argument)?
                     .into_nu_value(&call.name)?,
             );
         }
@@ -6118,7 +6112,7 @@ impl Evaluator<'_> {
         for (name, argument) in &call.named {
             named.push((
                 name.clone(),
-                self.eval_expr_value(argument, PipelineData::empty())?
+                self.eval_expr_value(argument)?
                     .into_nu_value(&call.name)?,
             ));
         }
@@ -6132,7 +6126,7 @@ impl Evaluator<'_> {
         let mut positional = Vec::with_capacity(call.positional.len());
         for argument in &call.positional {
             positional.push(
-                self.eval_expr_value(argument, PipelineData::empty())?
+                self.eval_expr_value(argument)?
                     .into_nu_value(&call.name)?,
             );
         }
@@ -6150,7 +6144,7 @@ impl Evaluator<'_> {
             } else {
                 named.push((
                     name.clone(),
-                    self.eval_expr_value(argument, PipelineData::empty())?
+                    self.eval_expr_value(argument)?
                         .into_nu_value(&call.name)?,
                 ));
             }
@@ -6169,7 +6163,7 @@ impl Evaluator<'_> {
         if let Expr::Record(entries) = expression {
             return self.eval_transition_hook_entries(effect, entries);
         }
-        match self.eval_expr_value(expression, PipelineData::empty())? {
+        match self.eval_expr_value(expression)? {
             RuntimeValue::Nu(Value::Nothing { .. }) => Ok(TransitionHooks::default()),
             RuntimeValue::TransitionHooks(hooks) => Ok(hooks),
             other => Err(transition_hook_error(
@@ -6236,7 +6230,7 @@ impl Evaluator<'_> {
                 return Ok(TransitionHookHandler::NamedFunction(name.clone()));
             }
         }
-        match self.eval_expr_value(expression, PipelineData::empty())? {
+        match self.eval_expr_value(expression)? {
             RuntimeValue::Callable(callable) => Ok(TransitionHookHandler::Callable(callable)),
             other => Err(transition_hook_error(
                 effect,
@@ -6301,7 +6295,7 @@ impl Evaluator<'_> {
             .positional
             .iter()
             .map(|argument| {
-                self.eval_expr_value(argument, PipelineData::empty())?
+                self.eval_expr_value(argument)?
                     .into_nu_value("workflow_evidence")
             })
             .collect::<Result<Vec<_>, ShellError>>()?;
@@ -6333,7 +6327,7 @@ impl Evaluator<'_> {
             ));
         }
         let path = self
-            .eval_expr_value(path, PipelineData::empty())?
+            .eval_expr_value(path)?
             .into_nu_value("file_nonempty")
             .and_then(|value| value_to_path_string(&value, "file_nonempty path"))?;
         let length = path.chars().count();
@@ -6367,7 +6361,7 @@ impl Evaluator<'_> {
                 )));
             }
             let value = self
-                .eval_expr_value(expression, PipelineData::empty())?
+                .eval_expr_value(expression)?
                 .into_nu_value("artifact")?;
             match name.as_str() {
                 "format" => format = Some(value_to_string(&value, "artifact format")?),
@@ -6414,7 +6408,7 @@ impl Evaluator<'_> {
                 )));
             }
             let value = self
-                .eval_expr_value(expression, PipelineData::empty())?
+                .eval_expr_value(expression)?
                 .into_nu_value("file_valid")?;
             match name.as_str() {
                 "format" => format = Some(value_to_string(&value, "file_valid format")?),
@@ -6454,7 +6448,7 @@ impl Evaluator<'_> {
             ));
         }
         let value = self
-            .eval_expr_value(argv, PipelineData::empty())?
+            .eval_expr_value(argv)?
             .into_nu_value("command_succeeded")?;
         let argv = value_to_string_list(&value, "command_succeeded argv")?;
         if argv.is_empty() || argv.len() > 64 {
@@ -6494,7 +6488,7 @@ impl Evaluator<'_> {
             seen_keyword = true;
             resolved = name == "resolved";
             let value = self
-                .eval_expr_value(expression, PipelineData::empty())?
+                .eval_expr_value(expression)?
                 .into_nu_value("decision_recorded finding names")?;
             fields = match &value {
                 Value::List { vals, .. } => vals
@@ -6513,7 +6507,7 @@ impl Evaluator<'_> {
                     let mut parsed = Vec::with_capacity(specs.len());
                     for (name, descriptor) in specs.iter() {
                         let (kind, question, evidence) = match descriptor {
-                            Value::String { val, .. } | Value::Glob { val, .. } => {
+                            Value::String { val, .. } => {
                                 ("text".to_string(), val.clone(), None)
                             }
                             Value::Record { val, .. } => {
@@ -6625,7 +6619,7 @@ impl Evaluator<'_> {
         context: &str,
     ) -> Result<String, ShellError> {
         let path = self
-            .eval_expr_value(expression, PipelineData::empty())?
+            .eval_expr_value(expression)?
             .into_nu_value(context)
             .and_then(|value| value_to_path_string(&value, &format!("{context} path")))?;
         let length = path.chars().count();
@@ -6753,7 +6747,7 @@ impl Evaluator<'_> {
             ));
         };
         let name = self
-            .eval_expr_value(name, PipelineData::empty())?
+            .eval_expr_value(name)?
             .into_nu_value("workflow_stage")
             .and_then(|value| value_to_string(&value, "workflow_stage name"))?;
         validate_workflow_name(&name, "stage")?;
@@ -6856,7 +6850,7 @@ impl Evaluator<'_> {
                 }
             }
         }
-        match self.eval_expr_value(expression, PipelineData::empty())? {
+        match self.eval_expr_value(expression)? {
             RuntimeValue::WorkflowEvidenceSource(source) => Ok(source),
             RuntimeValue::Callable(callable) if callable.accepts_arity(1) => Ok(
                 WorkflowEvidenceSource::Handler(WorkflowHandler::Callable(callable)),
@@ -6878,7 +6872,7 @@ impl Evaluator<'_> {
         context: &str,
     ) -> Result<u32, ShellError> {
         let value = self
-            .eval_expr_value(expression, PipelineData::empty())?
+            .eval_expr_value(expression)?
             .into_nu_value(&format!("{context} max_attempts"))?;
         let attempts = value_to_limit(&value, &format!("{context} max_attempts"))?;
         let attempts =
@@ -6897,7 +6891,7 @@ impl Evaluator<'_> {
         context: &str,
     ) -> Result<String, ShellError> {
         let value = self
-            .eval_expr_value(expression, PipelineData::empty())?
+            .eval_expr_value(expression)?
             .into_nu_value(&format!("{context} goal"))?;
         let goal = value_to_string(&value, &format!("{context} goal"))?;
         let length = goal.chars().count();
@@ -6911,7 +6905,7 @@ impl Evaluator<'_> {
 
     fn eval_workflow_bool(&mut self, expression: &Expr, context: &str) -> Result<bool, ShellError> {
         let value = self
-            .eval_expr_value(expression, PipelineData::empty())?
+            .eval_expr_value(expression)?
             .into_nu_value(context)?;
         value_to_bool(&value, context).map_err(|error| workflow_error(format!("{error:?}")))
     }
@@ -6922,7 +6916,7 @@ impl Evaluator<'_> {
         context: &str,
     ) -> Result<Vec<WorkflowStageInput>, ShellError> {
         let value = self
-            .eval_expr_value(expression, PipelineData::empty())?
+            .eval_expr_value(expression)?
             .into_nu_value(&format!("{context} inputs"))?;
         let inputs = match &value {
             Value::List { .. } => value_to_string_list(&value, &format!("{context} inputs"))?
@@ -7008,7 +7002,7 @@ impl Evaluator<'_> {
         context: &str,
     ) -> Result<u32, ShellError> {
         let value = self
-            .eval_expr_value(expression, PipelineData::empty())?
+            .eval_expr_value(expression)?
             .into_nu_value(&format!("{context} max_actions"))?;
         let actions = value_to_limit(&value, &format!("{context} max_actions"))?;
         u32::try_from(actions).map_err(|_| workflow_error("max_actions is too large"))
@@ -7020,7 +7014,7 @@ impl Evaluator<'_> {
         context: &str,
     ) -> Result<WorkflowCheckpointPolicy, ShellError> {
         let value = self
-            .eval_expr_value(expression, PipelineData::empty())?
+            .eval_expr_value(expression)?
             .into_nu_value(&format!("{context} checkpoint"))?;
         let policy = value_to_string(&value, &format!("{context} checkpoint"))?;
         WorkflowCheckpointPolicy::parse(&policy).ok_or_else(|| {
@@ -7047,7 +7041,7 @@ impl Evaluator<'_> {
                 }
             }
         }
-        match self.eval_expr_value(expression, PipelineData::empty())? {
+        match self.eval_expr_value(expression)? {
             RuntimeValue::Callable(callable) if callable.accepts_arity(1) => {
                 Ok(WorkflowHandler::Callable(callable))
             }
@@ -7072,14 +7066,14 @@ impl Evaluator<'_> {
             return Err(workflow_error("workflow() accepts at most 64 stages"));
         }
         let name = self
-            .eval_expr_value(&call.positional[0], PipelineData::empty())?
+            .eval_expr_value(&call.positional[0])?
             .into_nu_value("workflow")
             .and_then(|value| value_to_string(&value, "workflow name"))?;
         validate_workflow_name(&name, "workflow")?;
         let mut stages = Vec::with_capacity(call.positional.len() - 1);
         let mut names = HashSet::new();
         for expression in &call.positional[1..] {
-            let value = self.eval_expr_value(expression, PipelineData::empty())?;
+            let value = self.eval_expr_value(expression)?;
             let RuntimeValue::WorkflowStage(stage) = value else {
                 return Err(workflow_error(format!(
                     "workflow() expected workflow_stage after its name, got {}",
@@ -7142,7 +7136,7 @@ impl Evaluator<'_> {
                 "workflow_patch() does not accept keyword arguments",
             ));
         }
-        let value = self.eval_expr_value(&call.positional[0], PipelineData::empty())?;
+        let value = self.eval_expr_value(&call.positional[0])?;
         let RuntimeValue::Workflow(mut workflow) = value else {
             return Err(workflow_error(format!(
                 "workflow_patch() expected workflow as its first argument, got {}",
@@ -7151,18 +7145,17 @@ impl Evaluator<'_> {
         };
 
         let selector = unshare(
-            self.eval_expr_value(&call.positional[1], PipelineData::empty())?,
+            self.eval_expr_value(&call.positional[1])?,
             "workflow_patch",
         )?;
         let (target, replacement) = match selector {
-            RuntimeValue::Nu(Value::String { val: target, .. })
-            | RuntimeValue::Nu(Value::Glob { val: target, .. }) => {
+            RuntimeValue::Nu(Value::String { val: target, .. }) => {
                 if call.positional.len() != 3 {
                     return Err(workflow_error(
                         "workflow_patch() static form requires exactly workflow, target stage name, and replacement stage",
                     ));
                 }
-                let value = self.eval_expr_value(&call.positional[2], PipelineData::empty())?;
+                let value = self.eval_expr_value(&call.positional[2])?;
                 let RuntimeValue::WorkflowStage(replacement) = value else {
                     return Err(workflow_error(format!(
                         "workflow_patch() expected workflow_stage as its replacement, got {}",
@@ -7207,7 +7200,7 @@ impl Evaluator<'_> {
 
                 let mut candidates = HashMap::new();
                 for expression in &call.positional[2..] {
-                    let value = self.eval_expr_value(expression, PipelineData::empty())?;
+                    let value = self.eval_expr_value(expression)?;
                     let RuntimeValue::WorkflowStage(candidate) = value else {
                         return Err(workflow_error(format!(
                             "workflow_patch() data-driven candidates must be workflow_stage values, got {}",
@@ -7287,7 +7280,7 @@ impl Evaluator<'_> {
                 "recursive workflow_run() calls are not supported",
             ));
         }
-        let value = self.eval_expr_value(workflow, PipelineData::empty())?;
+        let value = self.eval_expr_value(workflow)?;
         let RuntimeValue::Workflow(workflow) = value else {
             return Err(workflow_error(format!(
                 "workflow_run() expected workflow, got {}",
@@ -7863,14 +7856,14 @@ impl Evaluator<'_> {
         let mut positional = Vec::with_capacity(call.positional.len());
         for argument in &call.positional {
             positional.push(
-                self.eval_expr_value(argument, PipelineData::empty())?
+                self.eval_expr_value(argument)?
                     .into_nu_value(&call.name)?,
             );
         }
         let mut named = Vec::with_capacity(call.named.len());
         let mut scope = None;
         for (name, argument) in &call.named {
-            let value = self.eval_expr_value(argument, PipelineData::empty())?;
+            let value = self.eval_expr_value(argument)?;
             if name == "scope" {
                 let RuntimeValue::AttemptScope(value) = value else {
                     return Err(stone_error(
@@ -8233,7 +8226,7 @@ impl Evaluator<'_> {
             function.params[0].name.clone(),
             RuntimeValue::Nu(event_value),
         );
-        let flow = self.eval_block(&function.body, PipelineData::empty(), false);
+        let flow = self.eval_block(&function.body, false);
         let pop_result = self.state.pop_scope();
         self.state.functions = previous_functions;
         pop_result?;
@@ -8725,7 +8718,7 @@ impl Evaluator<'_> {
         let mut limits = stone_budget::ModelLimits::default();
         for (name, expr) in named {
             let value = self
-                .eval_expr_value(expr, PipelineData::empty())?
+                .eval_expr_value(expr)?
                 .into_nu_value("model.limit")?;
             let amount = match value {
                 Value::Int { val, .. } if val > 0 => val as u64,
@@ -9178,7 +9171,7 @@ impl Evaluator<'_> {
             ));
         };
         let actions = self
-            .eval_expr_value(actions, PipelineData::empty())?
+            .eval_expr_value(actions)?
             .into_nu_value("scripted_control actions")?;
         let actions = nu_to_json_value(&actions);
         let Some(actions) = actions.as_array() else {
@@ -9205,7 +9198,7 @@ impl Evaluator<'_> {
         let mut completion_path = None;
         for (name, expression) in &call.named {
             let value = self
-                .eval_expr_value(expression, PipelineData::empty())?
+                .eval_expr_value(expression)?
                 .into_nu_value("scripted_control option")?;
             match name.as_str() {
                 "max_turns" => max_turns = value_to_limit(&value, "scripted_control max_turns")?,
@@ -9693,15 +9686,15 @@ impl Evaluator<'_> {
         let mut checkpoint = call
             .positional
             .first()
-            .map(|expr| self.eval_expr_value(expr, PipelineData::empty()))
+            .map(|expr| self.eval_expr_value(expr))
             .transpose()?;
         let mut owner = call
             .positional
             .get(1)
-            .map(|expr| self.eval_expr_value(expr, PipelineData::empty()))
+            .map(|expr| self.eval_expr_value(expr))
             .transpose()?;
         for (name, expression) in &call.named {
-            let value = self.eval_expr_value(expression, PipelineData::empty())?;
+            let value = self.eval_expr_value(expression)?;
             match name.as_str() {
                 "checkpoint" if checkpoint.is_none() => checkpoint = Some(value),
                 "owner" if owner.is_none() => owner = Some(value),
@@ -9938,10 +9931,10 @@ impl Evaluator<'_> {
         let mut frontier = call
             .positional
             .first()
-            .map(|expr| self.eval_expr_value(expr, PipelineData::empty()))
+            .map(|expr| self.eval_expr_value(expr))
             .transpose()?;
         for (name, expression) in &call.named {
-            let value = self.eval_expr_value(expression, PipelineData::empty())?;
+            let value = self.eval_expr_value(expression)?;
             match name.as_str() {
                 "frontier" if frontier.is_none() => frontier = Some(value),
                 "frontier" => {
@@ -9995,12 +9988,12 @@ impl Evaluator<'_> {
         let mut frontier = call
             .positional
             .first()
-            .map(|expr| self.eval_expr_value(expr, PipelineData::empty()))
+            .map(|expr| self.eval_expr_value(expr))
             .transpose()?;
         let mut scope = None;
         let mut named = Vec::new();
         for (name, expression) in &call.named {
-            let value = self.eval_expr_value(expression, PipelineData::empty())?;
+            let value = self.eval_expr_value(expression)?;
             match name.as_str() {
                 "frontier" if frontier.is_none() => frontier = Some(value),
                 "frontier" => {
@@ -10470,7 +10463,7 @@ impl Evaluator<'_> {
             .positional
             .get(1)
             .map(|expr| {
-                self.eval_expr_value(expr, PipelineData::empty())?
+                self.eval_expr_value(expr)?
                     .into_nu_value(&call.name)
                     .and_then(|value| value_to_optional_timeout(&value, &call.name))
             })
@@ -10489,7 +10482,7 @@ impl Evaluator<'_> {
                 }
                 "timeout_ms" => {
                     let value = self
-                        .eval_expr_value(expr, PipelineData::empty())?
+                        .eval_expr_value(expr)?
                         .into_nu_value(&call.name)?;
                     timeout_ms = value_to_optional_timeout(&value, &call.name)?;
                 }
@@ -10563,7 +10556,7 @@ impl Evaluator<'_> {
         expr: &Expr,
         context: &str,
     ) -> Result<Vec<String>, ShellError> {
-        let value = unshare(self.eval_expr_value(expr, PipelineData::empty())?, context)?;
+        let value = unshare(self.eval_expr_value(expr)?, context)?;
         match value {
             RuntimeValue::AttemptScope(scope) => Ok(scope
                 .lock()?
@@ -10643,7 +10636,7 @@ impl Evaluator<'_> {
         let mut outcome = call
             .positional
             .get(1)
-            .map(|expression| self.eval_expr_value(expression, PipelineData::empty()))
+            .map(|expression| self.eval_expr_value(expression))
             .transpose()?;
         for (name, expression) in &call.named {
             match name.as_str() {
@@ -10653,7 +10646,7 @@ impl Evaluator<'_> {
                     )
                 }
                 "outcome" if outcome.is_none() => {
-                    outcome = Some(self.eval_expr_value(expression, PipelineData::empty())?)
+                    outcome = Some(self.eval_expr_value(expression)?)
                 }
                 "scope" | "outcome" => {
                     return Err(stone_error(
@@ -10740,7 +10733,7 @@ impl Evaluator<'_> {
             .positional
             .get(1)
             .map(|expression| {
-                self.eval_expr_value(expression, PipelineData::empty())?
+                self.eval_expr_value(expression)?
                     .into_nu_value("attempt_best objective")
                     .and_then(|value| value_to_string(&value, "attempt_best objective"))
             })
@@ -10759,7 +10752,7 @@ impl Evaluator<'_> {
                 }
                 "objective" => {
                     let value = self
-                        .eval_expr_value(expression, PipelineData::empty())?
+                        .eval_expr_value(expression)?
                         .into_nu_value("attempt_best objective")?;
                     objective = value_to_string(&value, "attempt_best objective")?;
                 }
@@ -10799,7 +10792,7 @@ impl Evaluator<'_> {
             ));
         }
         let best = self.eval_attempt_best_expr(&call.positional[0], "attempt_best_consider")?;
-        let outcome = match self.eval_expr_value(&call.positional[1], PipelineData::empty())? {
+        let outcome = match self.eval_expr_value(&call.positional[1])? {
             RuntimeValue::AttemptOutcome(outcome) => outcome,
             other => {
                 return Err(stone_error(
@@ -10815,7 +10808,7 @@ impl Evaluator<'_> {
             .positional
             .get(2)
             .map(|expression| {
-                self.eval_expr_value(expression, PipelineData::empty())?
+                self.eval_expr_value(expression)?
                     .into_nu_value("attempt_best_consider score")
                     .and_then(|value| value_to_f64(&value, "attempt_best_consider score"))
             })
@@ -10825,7 +10818,7 @@ impl Evaluator<'_> {
         let mut artifacts = Vec::new();
         for (name, expression) in &call.named {
             let value = self
-                .eval_expr_value(expression, PipelineData::empty())?
+                .eval_expr_value(expression)?
                 .into_nu_value("attempt_best_consider")?;
             match name.as_str() {
                 "score" => score = Some(value_to_f64(&value, "attempt_best_consider score")?),
@@ -10961,7 +10954,7 @@ impl Evaluator<'_> {
             .positional
             .get(1)
             .map(|expression| {
-                self.eval_expr_value(expression, PipelineData::empty())?
+                self.eval_expr_value(expression)?
                     .into_nu_value("attempt_best_accept parent")
                     .and_then(|value| attempt_id_from_value(&value, "attempt_best_accept parent"))
             })
@@ -10971,7 +10964,7 @@ impl Evaluator<'_> {
             match name.as_str() {
                 "parent" => {
                     let value = self
-                        .eval_expr_value(expression, PipelineData::empty())?
+                        .eval_expr_value(expression)?
                         .into_nu_value("attempt_best_accept parent")?;
                     parent = attempt_id_from_value(&value, "attempt_best_accept parent")?;
                 }
@@ -11019,7 +11012,7 @@ impl Evaluator<'_> {
             .positional
             .get(1)
             .map(|expression| {
-                self.eval_expr_value(expression, PipelineData::empty())?
+                self.eval_expr_value(expression)?
                     .into_nu_value("attempt_best_discard reason")
                     .and_then(|value| value_to_string(&value, "attempt_best_discard reason"))
             })
@@ -11029,7 +11022,7 @@ impl Evaluator<'_> {
             match name.as_str() {
                 "reason" => {
                     let value = self
-                        .eval_expr_value(expression, PipelineData::empty())?
+                        .eval_expr_value(expression)?
                         .into_nu_value("attempt_best_discard reason")?;
                     reason = value_to_string(&value, "attempt_best_discard reason")?;
                 }
@@ -11067,7 +11060,7 @@ impl Evaluator<'_> {
         expression: &Expr,
         context: &str,
     ) -> Result<AttemptBestValue, ShellError> {
-        match self.eval_expr_value(expression, PipelineData::empty())? {
+        match self.eval_expr_value(expression)? {
             RuntimeValue::AttemptBest(best) => Ok(best),
             other => Err(stone_error(
                 context,
@@ -11137,7 +11130,7 @@ impl Evaluator<'_> {
         }
         let scope = self.eval_attempt_scope_expr(&call.positional[0], "attempt_scope_add")?;
         let child = self
-            .eval_expr_value(&call.positional[1], PipelineData::empty())?
+            .eval_expr_value(&call.positional[1])?
             .into_nu_value("attempt_scope_add child")?;
         let attempt = attempt_id_from_value(&child, "attempt_scope_add child")?;
         scope.register(attempt)?;
@@ -11155,7 +11148,7 @@ impl Evaluator<'_> {
         let mut reason = "attempt scope closed".to_string();
         for (name, expression) in &call.named {
             let value = self
-                .eval_expr_value(expression, PipelineData::empty())?
+                .eval_expr_value(expression)?
                 .into_nu_value("attempt_scope_close reason")?;
             match name.as_str() {
                 "reason" => reason = value_to_string(&value, "attempt_scope_close reason")?,
@@ -11176,7 +11169,7 @@ impl Evaluator<'_> {
         expression: &Expr,
         context: &str,
     ) -> Result<AttemptScopeValue, ShellError> {
-        match self.eval_expr_value(expression, PipelineData::empty())? {
+        match self.eval_expr_value(expression)? {
             RuntimeValue::AttemptScope(scope) => Ok(scope),
             other => Err(stone_error(
                 context,
@@ -12211,14 +12204,14 @@ impl Evaluator<'_> {
 
         let mut timeout_ms: i64 = match call.positional.get(1) {
             Some(value) => self
-                .eval_expr_value(value, PipelineData::empty())?
+                .eval_expr_value(value)?
                 .into_nu_value("wait_for timeout_ms")
                 .and_then(|value| value_to_i64(&value, "wait_for timeout_ms"))?,
             None => 30_000,
         };
         let mut interval_ms: i64 = match call.positional.get(2) {
             Some(value) => self
-                .eval_expr_value(value, PipelineData::empty())?
+                .eval_expr_value(value)?
                 .into_nu_value("wait_for interval_ms")
                 .and_then(|value| value_to_i64(&value, "wait_for interval_ms"))?,
             None => 100,
@@ -12226,7 +12219,7 @@ impl Evaluator<'_> {
         let mut ignore_errors = false;
         for (name, argument) in &call.named {
             let value = self
-                .eval_expr_value(argument, PipelineData::empty())?
+                .eval_expr_value(argument)?
                 .into_nu_value("wait_for")?;
             match name.as_str() {
                 "timeout_ms" => timeout_ms = value_to_i64(&value, "wait_for timeout_ms")?,
@@ -12306,7 +12299,7 @@ impl Evaluator<'_> {
                 format!("{name}() requires exactly one argument"),
             ));
         };
-        let value = self.eval_expr_value(value, PipelineData::empty())?;
+        let value = self.eval_expr_value(value)?;
         let items = match &value {
             // A shallow copy, as in Python: a new sequence holding the same
             // elements.
@@ -12344,7 +12337,7 @@ impl Evaluator<'_> {
             ));
         };
         let value = self
-            .eval_expr_value(value, PipelineData::empty())?
+            .eval_expr_value(value)?
             .into_nu_value(name)?;
         let text = value_to_string(&value, name)?;
         hash_builtin(name, &text).map(RuntimeValue::Nu)
@@ -12371,7 +12364,7 @@ impl Evaluator<'_> {
         let mut record = Record::with_capacity(call.named.len());
         for (key, expression) in &call.named {
             let value = self
-                .eval_expr_value(expression, PipelineData::empty())?
+                .eval_expr_value(expression)?
                 .into_nu_value("Expect")?;
             stone_expect::validate_expect_field(key, &value)?;
             record.push(key.clone(), value);
@@ -12391,7 +12384,7 @@ impl Evaluator<'_> {
         let mut record = Record::with_capacity(call.named.len());
         for (key, expression) in &call.named {
             let value = self
-                .eval_expr_value(expression, PipelineData::empty())?
+                .eval_expr_value(expression)?
                 .into_nu_value("Effects")?;
             stone_expect::validate_effect_field(key, &value)?;
             record.push(key.clone(), value);
@@ -12416,7 +12409,7 @@ impl Evaluator<'_> {
                 "isinstance() keyword arguments are not supported",
             ));
         }
-        let value = self.eval_expr_value(value, PipelineData::empty())?;
+        let value = self.eval_expr_value(value)?;
         let specs = match spec {
             Expr::Tuple(items) | Expr::List(items) => items.iter().collect::<Vec<_>>(),
             other => vec![other],
@@ -12445,7 +12438,7 @@ impl Evaluator<'_> {
                     .resolve(&ty)
                     .map_err(|message| stone_error("isinstance", message))?,
             )),
-            None => self.eval_expr_value(spec, PipelineData::empty())?,
+            None => self.eval_expr_value(spec)?,
         };
         if let RuntimeValue::Type(ty) = &spec_value {
             if let TypeSpec::Error(name) = &**ty {
@@ -12513,7 +12506,7 @@ impl Evaluator<'_> {
                 "type() keyword arguments are not supported",
             ));
         }
-        let value = self.eval_expr_value(arg, PipelineData::empty())?;
+        let value = self.eval_expr_value(arg)?;
         if let Some(name) = self.error_value_type(&value) {
             return Ok(error_type_value(&name));
         }
@@ -12538,7 +12531,7 @@ impl Evaluator<'_> {
         let mut default = None;
         for (keyword, argument) in &call.named {
             match keyword.as_str() {
-                "key" => match self.eval_expr_value(argument, PipelineData::empty())? {
+                "key" => match self.eval_expr_value(argument)? {
                     RuntimeValue::Callable(callable) => key = Some(callable),
                     RuntimeValue::Nu(Value::Nothing { .. }) => {}
                     other => {
@@ -12549,7 +12542,7 @@ impl Evaluator<'_> {
                         ))
                     }
                 },
-                "default" => default = Some(self.eval_expr_value(argument, PipelineData::empty())?),
+                "default" => default = Some(self.eval_expr_value(argument)?),
                 other => {
                     return Err(stone_typed_error(
                         "TypeError",
@@ -12578,7 +12571,7 @@ impl Evaluator<'_> {
                 }
                 let mut values = Vec::with_capacity(arguments.len());
                 for argument in arguments {
-                    values.push(self.eval_expr_value(argument, PipelineData::empty())?);
+                    values.push(self.eval_expr_value(argument)?);
                 }
                 values
             }
@@ -12647,13 +12640,13 @@ impl Evaluator<'_> {
             ));
         };
         let text = self
-            .eval_expr_value(text, PipelineData::empty())?
+            .eval_expr_value(text)?
             .into_nu_value("split")?;
         let separator = match call.positional.as_slice() {
             [_] => None,
             [_, separator] | [_, separator, _] => {
                 let separator = self
-                    .eval_expr_value(separator, PipelineData::empty())?
+                    .eval_expr_value(separator)?
                     .into_nu_value("split")?;
                 Some(separator)
             }
@@ -12661,11 +12654,11 @@ impl Evaluator<'_> {
         };
         let maxsplit = match call.positional.as_slice() {
             [_, _, maxsplit] => Some(
-                self.eval_expr_value(maxsplit, PipelineData::empty())?
+                self.eval_expr_value(maxsplit)?
                     .into_nu_value("split")?,
             ),
             _ => named_maxsplit
-                .map(|expr| self.eval_expr_value(expr, PipelineData::empty()))
+                .map(|expr| self.eval_expr_value(expr))
                 .transpose()?
                 .map(|value| value.into_nu_value("split"))
                 .transpose()?,
@@ -12691,14 +12684,14 @@ impl Evaluator<'_> {
                 Value::list(self.eval_generator_values(items)?, Span::unknown())
             }
             _ => self
-                .eval_expr_value(items, PipelineData::empty())?
+                .eval_expr_value(items)?
                 .into_nu_value("join")?,
         };
         let second = match call.positional.as_slice() {
             [_] => None,
             [_, second] => {
                 let second = self
-                    .eval_expr_value(second, PipelineData::empty())?
+                    .eval_expr_value(second)?
                     .into_nu_value("join")?;
                 Some(second)
             }
@@ -12720,7 +12713,7 @@ impl Evaluator<'_> {
                 "slice() requires value, optional start, and optional end",
             ));
         };
-        let value = self.eval_expr_value(value, PipelineData::empty())?;
+        let value = self.eval_expr_value(value)?;
         let start = call
             .positional
             .get(1)
@@ -12749,7 +12742,7 @@ impl Evaluator<'_> {
         context: &str,
     ) -> Result<Option<i64>, ShellError> {
         let value = self
-            .eval_expr_value(expression, PipelineData::empty())?
+            .eval_expr_value(expression)?
             .into_nu_value(context)?;
         if matches!(value, Value::Nothing { .. }) {
             Ok(None)
@@ -12772,10 +12765,10 @@ impl Evaluator<'_> {
             ));
         };
         let text = self
-            .eval_expr_value(text, PipelineData::empty())?
+            .eval_expr_value(text)?
             .into_nu_value("starts_with")?;
         let prefix = self
-            .eval_expr_value(prefix, PipelineData::empty())?
+            .eval_expr_value(prefix)?
             .into_nu_value("starts_with")?;
         starts_with_builtin(&text, &prefix).map(RuntimeValue::Nu)
     }
@@ -12791,11 +12784,11 @@ impl Evaluator<'_> {
             return Err(stone_error("format", "format() requires a template string"));
         };
         let template = self
-            .eval_expr_value(template, PipelineData::empty())?
+            .eval_expr_value(template)?
             .into_nu_value("format")?;
         let mut args = Vec::with_capacity(call.positional.len().saturating_sub(1));
         for arg in call.positional.iter().skip(1) {
-            let value = self.eval_expr_value(arg, PipelineData::empty())?;
+            let value = self.eval_expr_value(arg)?;
             args.push(match self.error_value_text(&value, false) {
                 Some(text) => Value::string(text, Span::unknown()),
                 None => value.into_nu_value("format")?,
@@ -12811,7 +12804,7 @@ impl Evaluator<'_> {
         let mut end = "\n".to_string();
         for (name, argument) in &call.named {
             let value = self
-                .eval_expr_value(argument, PipelineData::empty())?
+                .eval_expr_value(argument)?
                 .into_nu_value("print")?;
             let text = match &value {
                 Value::Nothing { .. } => None,
@@ -12832,7 +12825,7 @@ impl Evaluator<'_> {
         let mut parts = Vec::with_capacity(call.positional.len());
         for arg in &call.positional {
             // print writes str(value) as Python does; emit() is the JSON path.
-            let value = self.eval_expr_value(arg, PipelineData::empty())?;
+            let value = self.eval_expr_value(arg)?;
             let text = match self.error_value_text(&value, false) {
                 Some(text) => text,
                 None => match &value {
@@ -12859,7 +12852,7 @@ impl Evaluator<'_> {
             .iter()
             .map(|arg| {
                 let value = self
-                    .eval_expr_value(arg, PipelineData::empty())?
+                    .eval_expr_value(arg)?
                     .into_nu_value("range")?;
                 value_to_i64(&value, "range")
             })
@@ -12885,7 +12878,7 @@ impl Evaluator<'_> {
             [_] => 0,
             [_, start] => {
                 let start = self
-                    .eval_expr_value(start, PipelineData::empty())?
+                    .eval_expr_value(start)?
                     .into_nu_value("enumerate")?;
                 value_to_i64(&start, "enumerate")?
             }
@@ -12926,7 +12919,7 @@ impl Evaluator<'_> {
         expression
             .map(|expression| {
                 let value = self
-                    .eval_expr_value(expression, PipelineData::empty())?
+                    .eval_expr_value(expression)?
                     .into_nu_value("slice")?;
                 value_to_i64(&value, "slice")
             })
@@ -13096,7 +13089,7 @@ impl Evaluator<'_> {
             // A set or tuple receiver answers its own methods (`s.add(x)`,
             // `s.discard(x)`) before the names that mean attempt control.
             if is_side_effect_free_receiver(receiver) && named.is_empty() {
-                let value = self.eval_expr_value(receiver, PipelineData::empty())?;
+                let value = self.eval_expr_value(receiver)?;
                 if matches!(value, RuntimeValue::Set(_) | RuntimeValue::Tuple(_)) {
                     return self.eval_collection_method(value, method, positional);
                 }
@@ -13165,7 +13158,7 @@ impl Evaluator<'_> {
                 _ => None,
             };
             if method == "limit" {
-                return match self.eval_expr_value(receiver, PipelineData::empty())? {
+                return match self.eval_expr_value(receiver)? {
                     RuntimeValue::Model(model) => self.eval_model_limit(model, positional, named),
                     other => Err(stone_error(
                         "method call",
@@ -13177,7 +13170,7 @@ impl Evaluator<'_> {
                 };
             }
             if method == "ask" {
-                let model = match self.eval_expr_value(receiver, PipelineData::empty())? {
+                let model = match self.eval_expr_value(receiver)? {
                     RuntimeValue::Model(model) => model,
                     other => {
                         return Err(stone_error(
@@ -13236,7 +13229,7 @@ impl Evaluator<'_> {
                 return self.eval_add_method_call(receiver, positional);
             }
 
-            let receiver = self.eval_expr_value(receiver, PipelineData::empty())?;
+            let receiver = self.eval_expr_value(receiver)?;
             let args = positional
                 .iter()
                 .map(|arg| {
@@ -13244,7 +13237,7 @@ impl Evaluator<'_> {
                         let values = self.eval_generator_values(arg)?;
                         Ok(Value::list(values, Span::unknown()))
                     } else {
-                        self.eval_expr_value(arg, PipelineData::empty())?
+                        self.eval_expr_value(arg)?
                             .into_nu_value("method call")
                     }
                 })
@@ -13294,8 +13287,8 @@ impl Evaluator<'_> {
         left: &Expr,
         right: &Expr,
     ) -> Result<RuntimeValue, ShellError> {
-        let left = self.eval_expr_value(left, PipelineData::empty())?;
-        let right = self.eval_expr_value(right, PipelineData::empty())?;
+        let left = self.eval_expr_value(left)?;
+        let right = self.eval_expr_value(right)?;
         if op == "bitwise or" {
             // `Read | Edit` on types (held in variables) is a union.
             if let Some(union) = type_union_value(&left, &right) {
@@ -13327,7 +13320,7 @@ impl Evaluator<'_> {
     fn eval_tuple_literal(&mut self, items: &[Expr]) -> Result<RuntimeValue, ShellError> {
         let mut values = Vec::with_capacity(items.len());
         for item in items {
-            values.push(self.eval_expr_value(item, PipelineData::empty())?);
+            values.push(self.eval_expr_value(item)?);
         }
         Ok(tuple_value(values))
     }
@@ -13341,7 +13334,7 @@ impl Evaluator<'_> {
     ) -> Result<RuntimeValue, ShellError> {
         let mut args = Vec::with_capacity(positional.len());
         for arg in positional {
-            args.push(self.eval_expr_value(arg, PipelineData::empty())?);
+            args.push(self.eval_expr_value(arg)?);
         }
         let none = || RuntimeValue::Nu(Value::nothing(Span::unknown()));
         let boolean = |value: bool| RuntimeValue::Nu(Value::bool(value, Span::unknown()));
@@ -13463,7 +13456,7 @@ impl Evaluator<'_> {
                 "append() requires exactly one argument",
             ));
         };
-        let value = self.eval_expr_value(arg, PipelineData::empty())?;
+        let value = self.eval_expr_value(arg)?;
         let target = self.mutable_list_method_target(receiver, "append")?;
         target.push(value);
         Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())))
@@ -13505,7 +13498,7 @@ impl Evaluator<'_> {
                 "key" => key = self.eval_sort_key(argument)?,
                 "reverse" => {
                     let value = self
-                        .eval_expr_value(argument, PipelineData::empty())?
+                        .eval_expr_value(argument)?
                         .into_nu_value("sort")?;
                     reverse = value_to_bool(&value, "sort reverse")?;
                 }
@@ -13540,7 +13533,7 @@ impl Evaluator<'_> {
         let [arg] = positional else {
             return Err(stone_error("add", "add() requires exactly one argument"));
         };
-        let value = self.eval_expr_value(arg, PipelineData::empty())?;
+        let value = self.eval_expr_value(arg)?;
         let key = value_identity_key(&materialize(&value, "add")?, "add")?;
         let target = self.mutable_list_method_target(receiver, "add")?;
         let existing = materialize(&RuntimeValue::List(target.clone()), "add")?;
@@ -13568,7 +13561,7 @@ impl Evaluator<'_> {
             ));
         };
         match receiver {
-            Value::String { .. } | Value::Glob { .. } => {
+            Value::String { .. } => {
                 string_method_builtin(&receiver, "count", args).map(RuntimeValue::Nu)
             }
             Value::List { vals, .. } => {
@@ -13601,7 +13594,7 @@ impl Evaluator<'_> {
             let (name, indices) = self.eval_mutable_expr_path(receiver, context)?;
             self.mutable_container(&name, &indices, context)
         } else {
-            Ok(share(self.eval_expr_value(receiver, PipelineData::empty())?))
+            Ok(share(self.eval_expr_value(receiver)?))
         }
     }
 
@@ -13622,7 +13615,7 @@ impl Evaluator<'_> {
         }
         let mut args = Vec::with_capacity(positional.len());
         for arg in positional {
-            args.push(self.eval_expr_value(arg, PipelineData::empty())?);
+            args.push(self.eval_expr_value(arg)?);
         }
         let none = || RuntimeValue::Nu(Value::nothing(Span::unknown()));
         let arity = |expected: &str| {
@@ -13745,7 +13738,7 @@ impl Evaluator<'_> {
                         _ => return Err(arity("at most 1 positional argument")),
                     };
                     for (name, value) in named {
-                        entries.push((name.clone(), self.eval_expr_value(value, PipelineData::empty())?));
+                        entries.push((name.clone(), self.eval_expr_value(value)?));
                     }
                     for (key, value) in entries {
                         dict.insert(key, value);
@@ -13925,7 +13918,7 @@ impl Evaluator<'_> {
                 .map(RuntimeValue::Nu)
                 .collect(),
             _ => {
-                let value = self.eval_expr_value(arg, PipelineData::empty())?;
+                let value = self.eval_expr_value(arg)?;
                 value_to_iter_values(&value)?
                     .into_iter()
                     .map(RuntimeValue::Nu)
@@ -13995,7 +13988,7 @@ impl Evaluator<'_> {
         self.eval_comprehension_clauses("generator expression", clauses, 0, &mut |evaluator| {
             output.push(
                 evaluator
-                    .eval_expr_value(elt, PipelineData::empty())?
+                    .eval_expr_value(elt)?
                     .into_nu_value("generator expression")?,
             );
             Ok(false)
@@ -14014,7 +14007,7 @@ impl Evaluator<'_> {
         let mut result = !is_any;
         self.eval_comprehension_clauses("generator expression", clauses, 0, &mut |evaluator| {
             let value = evaluator
-                .eval_expr_value(elt, PipelineData::empty())?
+                .eval_expr_value(elt)?
                 .into_nu_value("generator expression")?;
             let truthy = value_truthy(&value);
             if is_any && truthy {
@@ -14031,7 +14024,7 @@ impl Evaluator<'_> {
     }
 
     fn eval_iterable_expr(&mut self, expression: &Expr) -> Result<Vec<RuntimeValue>, ShellError> {
-        let value = self.eval_expr_value(expression, PipelineData::empty())?;
+        let value = self.eval_expr_value(expression)?;
         self.eval_iterable_value(value)
     }
 
@@ -14094,9 +14087,9 @@ impl Evaluator<'_> {
                 ));
             }
 
-            let mut left_value = self.eval_expr_value(left, PipelineData::empty())?;
+            let mut left_value = self.eval_expr_value(left)?;
             for (op, comparator) in ops.iter().zip(comparators) {
-                let right_value = self.eval_expr_value(comparator, PipelineData::empty())?;
+                let right_value = self.eval_expr_value(comparator)?;
                 let matches = if matches!(op, CompareOp::Is | CompareOp::IsNot)
                     && (runtime_value_is_none(&left_value) || runtime_value_is_none(&right_value))
                 {
@@ -14167,7 +14160,7 @@ impl Evaluator<'_> {
             for (index, value) in values.iter().enumerate() {
                 // The operand itself is the result (`d = cache or {}` aliases
                 // `cache`), as in Python.
-                let value = self.eval_expr_value(value, PipelineData::empty())?;
+                let value = self.eval_expr_value(value)?;
                 if index == last || runtime_truthy(&value, "boolean expression")? == stop_when {
                     return Ok(value);
                 }
@@ -14812,7 +14805,7 @@ fn csv_field_value(value: &Value) -> Result<String, ShellError> {
         Value::Bool { val, .. } => Ok(val.to_string()),
         Value::Int { val, .. } => Ok(val.to_string()),
         Value::Float { val, .. } => Ok(val.to_string()),
-        Value::String { val, .. } | Value::Glob { val, .. } => Ok(val.clone()),
+        Value::String { val, .. } => Ok(val.clone()),
         other => serde_json::to_string(&nu_to_json_value(other))
             .map_err(|err| stone_error("write_csv", err.to_string())),
     }
@@ -14918,7 +14911,7 @@ fn ensure_type(value: &Value, expected: StoneType, context: &str) -> Result<(), 
         StoneType::List => matches!(value, Value::List { .. }),
         StoneType::None => matches!(value, Value::Nothing { .. }),
         StoneType::Record => matches!(value, Value::Record { .. }),
-        StoneType::Str => matches!(value, Value::String { .. } | Value::Glob { .. }),
+        StoneType::Str => matches!(value, Value::String { .. }),
     };
     if ok {
         Ok(())
@@ -15031,7 +15024,7 @@ fn task_failure_error(message: String, code: Option<String>, detail: Option<Valu
 
 fn raised_error_parts(value: Value) -> Result<(String, String, Option<Value>), ShellError> {
     match &value {
-        Value::String { .. } | Value::Glob { .. } => Ok((
+        Value::String { .. } => Ok((
             value_to_string(&value, "raise")?,
             "stone_raised".to_string(),
             None,
@@ -15454,7 +15447,7 @@ fn workflow_evidence_satisfaction(value: &Value) -> Result<(bool, Option<String>
     if let Some(Value::Int { val, .. }) = record.get("exit_code") {
         context.push(format!("exit_code={val}"));
     }
-    if let Some(Value::String { val, .. } | Value::Glob { val, .. }) = record.get("code") {
+    if let Some(Value::String { val, .. }) = record.get("code") {
         if !val.is_empty() {
             context.push(format!("code={}", bounded_text(val, 128)));
         }
@@ -15466,7 +15459,7 @@ fn workflow_evidence_satisfaction(value: &Value) -> Result<(bool, Option<String>
     ]
     .into_iter()
     .find_map(|(field, label)| match record.get(field) {
-        Some(Value::String { val, .. } | Value::Glob { val, .. }) if !val.trim().is_empty() => {
+        Some(Value::String { val, .. }) if !val.trim().is_empty() => {
             Some(format!("{label}={}", bounded_tail_text(val.trim(), 640)))
         }
         _ => None,
@@ -15476,7 +15469,7 @@ fn workflow_evidence_satisfaction(value: &Value) -> Result<(bool, Option<String>
             return None;
         };
         match val.get("summary") {
-            Some(Value::String { val, .. } | Value::Glob { val, .. }) if !val.trim().is_empty() => {
+            Some(Value::String { val, .. }) if !val.trim().is_empty() => {
                 Some(format!(
                     "explanation={}",
                     bounded_tail_text(val.trim(), 640)
@@ -15869,7 +15862,7 @@ fn parse_workflow_finding_evidence_predicate(
     }
     let contains = match record.get("contains") {
         None => Vec::new(),
-        Some(Value::String { val, .. } | Value::Glob { val, .. }) => vec![val.clone()],
+        Some(Value::String { val, .. }) => vec![val.clone()],
         Some(Value::List { vals, .. }) => vals
             .iter()
             .map(|value| {
@@ -15970,7 +15963,7 @@ fn workflow_decision_evidence(
         };
         if !require_resolved {
             let present = match finding {
-                Value::String { val, .. } | Value::Glob { val, .. } => {
+                Value::String { val, .. } => {
                     !val.trim().is_empty() && val.chars().count() <= 2_048
                 }
                 _ => false,
@@ -15986,7 +15979,7 @@ fn workflow_decision_evidence(
         };
         let bounded_string = |name: &str, limit: usize| {
             record.get(name).and_then(|value| match value {
-                Value::String { val, .. } | Value::Glob { val, .. }
+                Value::String { val, .. }
                     if !val.trim().is_empty() && val.chars().count() <= limit =>
                 {
                     Some(val.as_str())
@@ -16100,7 +16093,7 @@ fn merge_workflow_finding_updates(
                 )));
             };
             let observed = probe.get("status").is_some_and(|value| match value {
-                Value::String { val, .. } | Value::Glob { val, .. } => val == "observed",
+                Value::String { val, .. } => val == "observed",
                 _ => false,
             });
             if !observed {
@@ -16110,7 +16103,7 @@ fn merge_workflow_finding_updates(
             }
             let basis = workflow_probe_resolution_basis(probe, field)?;
             let value = match value {
-                Value::String { val, .. } | Value::Glob { val, .. }
+                Value::String { val, .. }
                     if !val.trim().is_empty() && val.chars().count() <= 2_048 =>
                 {
                     val.clone()
@@ -16158,7 +16151,7 @@ fn merge_workflow_finding_updates(
                 )));
             }
             let value = match value {
-                Value::String { val, .. } | Value::Glob { val, .. }
+                Value::String { val, .. }
                     if !val.trim().is_empty() && val.chars().count() <= 2_048 =>
                 {
                     val.clone()
@@ -16182,7 +16175,7 @@ fn merge_workflow_finding_updates(
         None
     } else {
         outcome.get("kind").and_then(|value| match value {
-            Value::String { val, .. } | Value::Glob { val, .. }
+            Value::String { val, .. }
                 if matches!(val.as_str(), "decision_recorded" | "finish_requested") =>
             {
                 outcome.get("findings")
@@ -16215,7 +16208,7 @@ fn merge_workflow_finding_updates(
             };
             for (name, limit) in [("state", 16), ("value", 2_048), ("basis", 1_024)] {
                 let valid = finding.get(name).is_some_and(|value| match value {
-                    Value::String { val, .. } | Value::Glob { val, .. } => {
+                    Value::String { val, .. } => {
                         !val.trim().is_empty() && val.chars().count() <= limit
                     }
                     _ => false,
@@ -16230,7 +16223,7 @@ fn merge_workflow_finding_updates(
                 .get("state")
                 .expect("state field was validated above")
             {
-                Value::String { val, .. } | Value::Glob { val, .. } => val.as_str(),
+                Value::String { val, .. } => val.as_str(),
                 _ => unreachable!("state field was validated as a string"),
             };
             if !matches!(state_name, "resolved" | "unknown") {
@@ -16262,7 +16255,7 @@ fn merge_workflow_finding_updates(
         }
         let already_resolved = state.get(&field).is_some_and(|value| match value {
             Value::Record { val, .. } => val.get("state").is_some_and(|value| match value {
-                Value::String { val, .. } | Value::Glob { val, .. } => val == "resolved",
+                Value::String { val, .. } => val == "resolved",
                 _ => false,
             }),
             _ => false,
@@ -16315,14 +16308,14 @@ fn merge_workflow_finding_updates(
                 .unwrap_or(2);
             if let Some(Value::List { vals, .. }) = prior.get("bases") {
                 bases.extend(vals.iter().rev().take(3).cloned().rev());
-            } else if let Some(Value::String { val, .. } | Value::Glob { val, .. }) =
+            } else if let Some(Value::String { val, .. }) =
                 prior.get("basis")
             {
                 bases.push(Value::string(val.clone(), span));
             }
             if let Some(Value::List { vals, .. }) = prior.get("summaries") {
                 summaries.extend(vals.iter().rev().take(3).cloned().rev());
-            } else if let Some(Value::String { val, .. } | Value::Glob { val, .. }) =
+            } else if let Some(Value::String { val, .. }) =
                 prior.get("summary")
             {
                 summaries.push(Value::string(val.clone(), span));
@@ -16353,7 +16346,7 @@ fn merge_workflow_finding_updates(
             if !generated_required_text {
                 for needle in &predicate.contains {
                     let already_matched = matched_contains.iter().any(|value| match value {
-                        Value::String { val, .. } | Value::Glob { val, .. } => val == needle,
+                        Value::String { val, .. } => val == needle,
                         _ => false,
                     });
                     if !already_matched && workflow_probe_outcome_contains(outcome, needle) {
@@ -16365,7 +16358,7 @@ fn merge_workflow_finding_updates(
         let matched_text = matched_contains
             .iter()
             .filter_map(|value| match value {
-                Value::String { val, .. } | Value::Glob { val, .. } => Some(val.as_str()),
+                Value::String { val, .. } => Some(val.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -16462,7 +16455,7 @@ fn workflow_probe_summary(outcome: &Record) -> Option<String> {
         "stderr",
         "message",
     ] {
-        if let Some(Value::String { val, .. } | Value::Glob { val, .. }) = outcome.get(field) {
+        if let Some(Value::String { val, .. }) = outcome.get(field) {
             if !val.trim().is_empty() {
                 return Some(bounded_text(val, 2_048));
             }
@@ -16533,7 +16526,7 @@ fn workflow_probe_outcome_contains(outcome: &Record, needle: &str) -> bool {
     .iter()
     .any(|field| {
         outcome.get(field).is_some_and(|value| match value {
-            Value::String { val, .. } | Value::Glob { val, .. } => val.contains(needle),
+            Value::String { val, .. } => val.contains(needle),
             _ => false,
         })
     })
@@ -16553,7 +16546,7 @@ fn workflow_probe_generates_required_text(
     let command = vals
         .iter()
         .filter_map(|value| match value {
-            Value::String { val, .. } | Value::Glob { val, .. } => Some(val.as_str()),
+            Value::String { val, .. } => Some(val.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -16600,7 +16593,7 @@ fn workflow_probe_feedback(
             .get("regex")
             .is_some_and(|value| matches!(value, Value::Bool { val: false, .. }))
         && outcome.get("needle").is_some_and(|value| match value {
-            Value::String { val, .. } | Value::Glob { val, .. } => {
+            Value::String { val, .. } => {
                 val.chars().any(|character| "|()[]+?".contains(character))
             }
             _ => false,
@@ -16696,7 +16689,7 @@ fn workflow_probe_resolution_basis(probe: &Record, field: &str) -> Result<String
         Value::List { vals, .. } => Some(
             vals.iter()
                 .filter_map(|value| match value {
-                    Value::String { val, .. } | Value::Glob { val, .. }
+                    Value::String { val, .. }
                         if !val.trim().is_empty() =>
                     {
                         Some(val.clone())
@@ -16738,7 +16731,7 @@ fn workflow_prior_action_basis(outcome: &Value, attempt: u32) -> String {
 fn workflow_action_record_basis(outcome: &Record, attempt: u32) -> String {
     let text = |name: &str| {
         outcome.get(name).and_then(|value| match value {
-            Value::String { val, .. } | Value::Glob { val, .. } if !val.is_empty() => {
+            Value::String { val, .. } if !val.is_empty() => {
                 Some(val.as_str())
             }
             _ => None,
@@ -16894,7 +16887,7 @@ fn compact_workflow_action_record(record: &Record) -> Value {
             continue;
         };
         let bounded = match value {
-            Value::String { val, .. } | Value::Glob { val, .. } => {
+            Value::String { val, .. } => {
                 let limit = if *field == "message" { 2_048 } else { 512 };
                 Some(Value::string(bounded_text(val, limit), span))
             }
@@ -16919,13 +16912,13 @@ fn compact_workflow_action_record(record: &Record) -> Value {
             let mut bounded = Record::new();
             for (field, value) in findings.iter().take(12) {
                 match value {
-                    Value::String { val, .. } | Value::Glob { val, .. } => {
+                    Value::String { val, .. } => {
                         bounded.push(field, Value::string(bounded_text(val, 2_048), span));
                     }
                     Value::Record { val: finding, .. } => {
                         let mut compact_finding = Record::new();
                         for (name, limit) in [("state", 16), ("value", 2_048), ("basis", 1_024)] {
-                            if let Some(Value::String { val, .. } | Value::Glob { val, .. }) =
+                            if let Some(Value::String { val, .. }) =
                                 finding.get(name)
                             {
                                 compact_finding
@@ -16951,14 +16944,14 @@ fn compact_workflow_action_record(record: &Record) -> Value {
         let Some(value) = record.get(field).or_else(|| record.get(fallback)) else {
             continue;
         };
-        if let Value::String { val, .. } | Value::Glob { val, .. } = value {
+        if let Value::String { val, .. } = value {
             if !val.is_empty() {
                 compact.push(field, Value::string(bounded_text(val, limit), span));
             }
         }
     }
     if let Some(Value::Record { val, .. }) = record.get("explanation") {
-        if let Some(Value::String { val, .. } | Value::Glob { val, .. }) = val.get("summary") {
+        if let Some(Value::String { val, .. }) = val.get("summary") {
             compact.push(
                 "explanation_summary",
                 Value::string(bounded_text(val, 1_024), span),
@@ -18253,8 +18246,7 @@ fn runtime_value_record_string_field(
                 return Ok(None);
             };
             match value {
-                RuntimeValue::Nu(Value::String { val, .. })
-                | RuntimeValue::Nu(Value::Glob { val, .. }) => Ok(Some(val)),
+                RuntimeValue::Nu(Value::String { val, .. }) => Ok(Some(val)),
                 RuntimeValue::Nu(value) => Ok(Some(value_to_string(&value, "record field")?)),
                 _ => Ok(None),
             }
@@ -18278,7 +18270,7 @@ fn value_to_iter_values(value: &RuntimeValue) -> Result<Vec<Value>, ShellError> 
             .collect()),
         // A string iterates by character, as in Python (`for ch in word`);
         // `text.splitlines()` and `for line in open(path)` give lines.
-        RuntimeValue::Nu(Value::String { val, .. }) | RuntimeValue::Nu(Value::Glob { val, .. }) => {
+        RuntimeValue::Nu(Value::String { val, .. }) => {
             Ok(val
                 .chars()
                 .map(|ch| Value::string(ch.to_string(), Span::unknown()))
@@ -18999,7 +18991,7 @@ fn model_request_from_values(
                     ));
                 };
                 for (key, metadata_value) in val.iter() {
-                    if !matches!(metadata_value, Value::String { .. } | Value::Glob { .. }) {
+                    if !matches!(metadata_value, Value::String { .. }) {
                         return Err(model_input_error(
                             operation,
                             format!(

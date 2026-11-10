@@ -8,6 +8,7 @@ use serde_json::{json, Map, Number, Value as JsonValue};
 
 use crate::stone_correction;
 
+#[cfg(test)]
 pub(crate) fn success_response(value: JsonValue, cwd: String) -> JsonValue {
     json!({
         "ok": true,
@@ -64,6 +65,7 @@ pub(crate) fn unfinished_response(
     root
 }
 
+#[cfg(test)]
 pub(crate) fn error_response(err: &ShellError, cwd: Option<String>) -> JsonValue {
     error_response_inner(err, cwd, None)
 }

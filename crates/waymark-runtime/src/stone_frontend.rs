@@ -7,9 +7,7 @@ use nu_protocol::{
 
 use crate::stone_admission::validate_program;
 use crate::stone_ast::{lower_source, Program};
-use crate::stone_eval::{
-    eval_program, eval_program_with_output_and_session, EvalProgramOutput, StoneSession,
-};
+use crate::stone_eval::{eval_program_with_output_and_session, EvalProgramOutput, StoneSession};
 use crate::stone_modules::link_program;
 
 /// The command's working directory, where module lookup starts.
@@ -26,18 +24,6 @@ pub fn parse_stone_source(source: &str) -> Result<(), ShellError> {
 
 pub fn lower_stone_source(source: &str) -> Result<Program, ShellError> {
     lower_source(source)
-}
-
-pub fn eval_stone_source(
-    engine_state: &EngineState,
-    stack: &mut Stack,
-    source: &str,
-    input: PipelineData,
-) -> Result<PipelineData, ShellError> {
-    let mut program = lower_stone_source(source)?;
-    link_program(&mut program, &command_cwd(engine_state, stack))?;
-    validate_program(&program, &[])?;
-    eval_program(engine_state, stack, &program, input)
 }
 
 pub(crate) fn eval_stone_source_with_output_and_session(

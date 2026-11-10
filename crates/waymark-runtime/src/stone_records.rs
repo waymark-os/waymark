@@ -505,7 +505,7 @@ fn check_union(
 fn check_plain(value: &Value, ty: &TypeSpec) -> Result<(), TypeIssue> {
     let ok = match ty {
         TypeSpec::Any => true,
-        TypeSpec::Str => matches!(value, Value::String { .. } | Value::Glob { .. }),
+        TypeSpec::Str => matches!(value, Value::String { .. }),
         TypeSpec::Int => matches!(value, Value::Int { .. }),
         TypeSpec::Float => matches!(value, Value::Int { .. } | Value::Float { .. }),
         TypeSpec::Bool => matches!(value, Value::Bool { .. }),
@@ -915,7 +915,7 @@ pub(super) fn isinstance(value: &RuntimeValue, ty: &TypeSpec) -> Result<bool, St
             false
         }
         TypeSpec::None => matches!(value, RuntimeValue::Nu(Value::Nothing { .. })),
-        TypeSpec::Str => matches!(value, RuntimeValue::Nu(Value::String { .. } | Value::Glob { .. })),
+        TypeSpec::Str => matches!(value, RuntimeValue::Nu(Value::String { .. })),
         TypeSpec::Int => matches!(value, RuntimeValue::Nu(Value::Int { .. } | Value::Bool { .. })),
         TypeSpec::Float => matches!(value, RuntimeValue::Nu(Value::Float { .. })),
         TypeSpec::Bool => matches!(value, RuntimeValue::Nu(Value::Bool { .. })),
@@ -1567,7 +1567,7 @@ fn record_schema(
 /// records written as Python writes dataclasses: `Plan(steps=[], risky=False)`.
 pub(super) fn python_str(value: &RuntimeValue) -> Result<String, ShellError> {
     match value {
-        RuntimeValue::Nu(Value::String { val, .. } | Value::Glob { val, .. }) => Ok(val.clone()),
+        RuntimeValue::Nu(Value::String { val, .. }) => Ok(val.clone()),
         other => python_repr(other),
     }
 }

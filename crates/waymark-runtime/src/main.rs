@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use hermit as _;
 
 use serde_json::json;
-use waymark_runtime::{FrontendKind, StoneGuest};
+use waymark_runtime::StoneGuest;
 use waymark_runtime_support::{configure_process_environment, default_start_dir};
 
 fn main() -> ExitCode {
@@ -226,13 +226,6 @@ fn main() -> ExitCode {
         return ExitCode::from(if ok { 0 } else { 1 });
     }
 
-    let explicit_frontend = if stone {
-        Some(FrontendKind::Stone)
-    } else {
-        None
-    };
-    let default_inline_frontend = FrontendKind::Stone;
-
     let execution = if args.first().is_some_and(|arg| arg == "-c") {
         args.remove(0);
         if args.is_empty() {
@@ -240,30 +233,19 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
 
-        Ok((
-            explicit_frontend.unwrap_or(default_inline_frontend),
-            args.join(" "),
-        ))
+        Ok(args.join(" "))
     } else if read_stdin_script {
         read_stdin_source()
-            .map(|source| (explicit_frontend.unwrap_or(FrontendKind::Stone), source))
             .map_err(|err| format!("failed to read stdin script: {err}"))
     } else if args.len() == 1 {
         let path = &args[0];
-        read_script_file(path)
-            .map(|source| {
-                (
-                    explicit_frontend.unwrap_or_else(|| frontend_for_script_path(path)),
-                    source,
-                )
-            })
-            .map_err(|err| format!("failed to read script file: {err}"))
+        read_script_file(path).map_err(|err| format!("failed to read script file: {err}"))
     } else {
         emit_json_error("usage error", usage(&program_name));
         return ExitCode::from(2);
     };
 
-    let (frontend, source) = match execution {
+    let source = match execution {
         Ok(execution) => execution,
         Err(err) => {
             emit_json_error("usage error", err);
@@ -271,7 +253,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let code = guest.run_command_with_frontend(frontend, &source, nu_protocol::PipelineData::empty());
+    let code = guest.run_command(&source);
 
     ExitCode::from(normalize_exit_code(code))
 }
@@ -338,11 +320,6 @@ fn read_stdin_source() -> io::Result<String> {
 
 fn read_script_file(path: &str) -> io::Result<String> {
     fs::read_to_string(path)
-}
-
-fn frontend_for_script_path(path: &str) -> FrontendKind {
-    let _ = path;
-    FrontendKind::Stone
 }
 
 fn remove_flag(args: &mut Vec<String>, flag: &str) -> bool {
@@ -425,10 +402,9 @@ fn version_text(program_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        frontend_for_script_path, is_trailing_hermit_boot_arg, normalize_exit_code, remove_flag,
+        is_trailing_hermit_boot_arg, normalize_exit_code, remove_flag,
         remove_optional_value, strip_trailing_hermit_boot_args, usage, version_text,
     };
-    use waymark_runtime::FrontendKind;
 
     #[test]
     fn normalizes_exit_codes_to_process_status_range() {
@@ -438,20 +414,6 @@ mod tests {
         assert_eq!(normalize_exit_code(257), 1);
         assert_eq!(normalize_exit_code(-1), 255);
         assert_eq!(normalize_exit_code(-257), 255);
-    }
-
-    #[test]
-    fn detects_frontend_from_script_extension() {
-        assert_eq!(
-            frontend_for_script_path("script.stone"),
-            FrontendKind::Stone
-        );
-        assert_eq!(
-            frontend_for_script_path("/tmp/script.nu"),
-            FrontendKind::Stone
-        );
-        assert_eq!(frontend_for_script_path("/tmp/script"), FrontendKind::Stone);
-        assert_eq!(frontend_for_script_path("/tmp/STONE"), FrontendKind::Stone);
     }
 
     #[test]

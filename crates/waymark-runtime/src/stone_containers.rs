@@ -662,7 +662,7 @@ pub(super) fn child_for_mutation(
         }
         (
             RuntimeValue::Dict(dict),
-            Value::String { val: key, .. } | Value::Glob { val: key, .. },
+            Value::String { val: key, .. },
         ) => {
             let mut entries = dict.entries.borrow_mut();
             entries
@@ -672,7 +672,7 @@ pub(super) fn child_for_mutation(
         }
         (
             RuntimeValue::Record(record),
-            Value::String { val: key, .. } | Value::Glob { val: key, .. },
+            Value::String { val: key, .. },
         ) => match record.ty.field_index(key) {
             Some(index) => Ok(record.get(index)),
             None => Err(stone_error("attribute", record.ty.no_field_message(key))),
@@ -699,7 +699,7 @@ pub(super) fn assign_item(
     match (container, index) {
         (
             RuntimeValue::Dict(dict),
-            Value::String { val: key, .. } | Value::Glob { val: key, .. },
+            Value::String { val: key, .. },
         ) => {
             dict.insert(key.clone(), value);
             Ok(())

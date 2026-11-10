@@ -13,7 +13,7 @@ use nu_protocol::engine::{EngineState, Stack};
 use regex::bytes::Regex;
 use serde_json::{json, Value as JsonValue};
 
-use crate::{FrontendKind, StoneGuest};
+use crate::StoneGuest;
 
 pub struct ShellToolContext<'a> {
     pub engine_state: &'a mut EngineState,
@@ -1789,14 +1789,8 @@ pub fn run_tool(guest: &mut StoneGuest, limits: &ToolLimits, request: RunRequest
         );
     }
 
-    let frontend = match request.frontend {
-        RunFrontend::Stone => FrontendKind::Stone,
-    };
-    let response = guest.command_response_with_frontend(
-        frontend,
-        &request.source,
-        nu_protocol::PipelineData::empty(),
-    );
+    let RunFrontend::Stone = request.frontend;
+    let response = guest.command_response(&request.source);
     if response
         .get("ok")
         .and_then(JsonValue::as_bool)

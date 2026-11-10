@@ -458,7 +458,7 @@ pub(crate) fn save_value_file(
 fn value_to_save_bytes(value: &Value) -> Result<Vec<u8>, ShellError> {
     match value {
         Value::Binary { val, .. } => Ok(val.clone()),
-        Value::String { val, .. } | Value::Glob { val, .. } => Ok(val.as_bytes().to_vec()),
+        Value::String { val, .. } => Ok(val.as_bytes().to_vec()),
         other => serde_json::to_vec(&nu_to_json_value(other))
             .map_err(|err| stone_error("save", err.to_string())),
     }

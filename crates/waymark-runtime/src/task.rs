@@ -8,7 +8,7 @@ use serde_json::{json, Value as JsonValue};
 
 use crate::agent::{AgentModelGateway, AgentRunResult, AgentSession};
 use crate::tools::{TaskTools, ToolLimits};
-use crate::{pipeline_input_from_bytes, FrontendKind, StoneGuest};
+use crate::{pipeline_input_from_bytes, StoneGuest};
 
 const DEFAULT_TASK_PATH: &str = "/work/task/task.json";
 
@@ -94,8 +94,7 @@ impl StoneGuest {
         match spec.resolve() {
             Ok(resolved) => {
                 let response = match resolved.frontend {
-                    TaskFrontend::Stone => self.command_response_with_frontend_entrypoint(
-                        FrontendKind::Stone,
+                    TaskFrontend::Stone => self.command_response_with_entrypoint(
                         &resolved.script,
                         resolved.input,
                         resolved.entrypoint.as_deref(),

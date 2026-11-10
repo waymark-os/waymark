@@ -605,7 +605,7 @@ fn record_i64(record: &Record, field: &str) -> Option<i64> {
 
 fn record_string(record: &Record, field: &str) -> Option<String> {
     match record.get(field) {
-        Some(Value::String { val, .. }) | Some(Value::Glob { val, .. }) => Some(val.clone()),
+        Some(Value::String { val, .. }) => Some(val.clone()),
         _ => None,
     }
 }
@@ -615,7 +615,7 @@ fn record_explanation_kind(record: &Record) -> Option<String> {
         return None;
     };
     match val.get("kind") {
-        Some(Value::String { val, .. }) | Some(Value::Glob { val, .. }) => Some(val.clone()),
+        Some(Value::String { val, .. }) => Some(val.clone()),
         _ => None,
     }
 }

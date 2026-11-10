@@ -57,7 +57,7 @@ fn hash_key(value: &RuntimeValue) -> Result<(String, KeyKind), ShellError> {
             };
             (key, KeyKind::Number)
         }
-        RuntimeValue::Nu(Value::String { val, .. } | Value::Glob { val, .. }) => {
+        RuntimeValue::Nu(Value::String { val, .. }) => {
             (format!("S{val}"), KeyKind::Other)
         }
         RuntimeValue::Tuple(items) => {

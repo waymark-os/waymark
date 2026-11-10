@@ -56,7 +56,7 @@ fn value_to_i64(value: &Value, context: &str) -> Result<i64, ShellError> {
     match value {
         Value::Int { val, .. } => Ok(*val),
         Value::Float { val, .. } => Ok(*val as i64),
-        Value::String { val, .. } | Value::Glob { val, .. } => val
+        Value::String { val, .. } => val
             .trim()
             .parse::<i64>()
             .map_err(|err| stone_error(context, format!("failed to parse integer: {err}"))),
@@ -69,7 +69,7 @@ fn value_to_i64(value: &Value, context: &str) -> Result<i64, ShellError> {
 
 fn value_to_string(value: &Value, context: &str) -> Result<String, ShellError> {
     match value {
-        Value::String { val, .. } | Value::Glob { val, .. } => Ok(val.clone()),
+        Value::String { val, .. } => Ok(val.clone()),
         other => Err(stone_error(
             context,
             format!("expected string, got {}", crate::stone_builtins::value_type_name(&other)),
@@ -882,7 +882,7 @@ fn value_to_daemon_run_id(value: &Value, context: &str) -> Result<String, ShellE
             };
             value_to_string(run_id, context)
         }
-        Value::String { val, .. } | Value::Glob { val, .. } => Ok(val.clone()),
+        Value::String { val, .. } => Ok(val.clone()),
         other => Err(stone_error(
             context,
             format!(
