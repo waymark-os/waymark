@@ -188,6 +188,9 @@ const MAX_SEMANTIC_FRONTIER_DIAGNOSTICS: usize = 256;
 #[derive(Default)]
 pub struct EvalState {
     scopes: Vec<Scope>,
+    /// Emptied local maps from popped scopes, reused by the next call so a
+    /// function call does not allocate a fresh hash table.
+    spare_locals: Vec<NameMap<RuntimeValue>>,
     functions: NameMap<Rc<FunctionDef>>,
     next_file_id: u64,
     next_callable_id: u64,
@@ -619,7 +622,9 @@ impl EvalState {
         Some(stone_error("name", message))
     }
 
-    fn set_local(&mut self, name: String, value: RuntimeValue) {
+    /// Bind a variable. Takes the name by reference so rebinding an existing
+    /// variable (the common case in loops) allocates nothing.
+    fn set_local<N: AsRef<str> + Into<String>>(&mut self, name: N, value: RuntimeValue) {
         // A list or dict bound to a name becomes a shared object, so later
         // reads of the name alias it (Python reference semantics).
         let value = if is_plain_container(&value) {
@@ -632,12 +637,18 @@ impl EvalState {
         }
         let frame = self.frame_index();
         if !self.scopes[frame].cells.is_empty() {
-            if let Some(cell) = self.scopes[frame].cells.get(&name) {
+            if let Some(cell) = self.scopes[frame].cells.get(name.as_ref()) {
                 *cell.borrow_mut() = Some(value);
                 return;
             }
         }
-        self.root_scope_mut().locals.insert(name, value);
+        let locals = &mut self.root_scope_mut().locals;
+        match locals.get_mut(name.as_ref()) {
+            Some(slot) => *slot = value,
+            None => {
+                locals.insert(name.into(), value);
+            }
+        }
     }
 
     /// A variable's value with shared containers copied to plain values, for
@@ -657,8 +668,8 @@ impl EvalState {
     /// Store a loop-engine result. When the variable holds a shared list or
     /// dict and the result is the new contents of that container (the loop
     /// mutated it), update the shared object so every alias sees the change.
-    fn set_local_in_place(&mut self, name: String, value: RuntimeValue) {
-        match (self.get_local(&name), value) {
+    fn set_local_in_place<N: AsRef<str> + Into<String>>(&mut self, name: N, value: RuntimeValue) {
+        match (self.get_local(name.as_ref()), value) {
             (Some(RuntimeValue::Dict(dict)), RuntimeValue::Nu(Value::Record { val, .. })) => {
                 dict.replace_plain(val.into_owned());
             }
@@ -715,7 +726,9 @@ impl EvalState {
         if self.scopes.is_empty() {
             self.scopes.push(Scope::default());
         }
+        let locals = self.spare_locals.pop().unwrap_or_default();
         self.scopes.push(Scope {
+            locals,
             cells: CellMap(captures.to_vec()),
             frame: true,
             declared,
@@ -774,14 +787,24 @@ impl EvalState {
     }
 
     fn push_scope(&mut self) {
-        self.scopes.push(Scope::default());
+        let locals = self.spare_locals.pop().unwrap_or_default();
+        self.scopes.push(Scope {
+            locals,
+            ..Scope::default()
+        });
     }
 
     fn pop_scope(&mut self) -> Result<(), ShellError> {
         if self.scopes.len() <= 1 {
             return Err(stone_error("scope", "cannot pop root scope"));
         }
-        self.scopes.pop();
+        let mut scope = self.scopes.pop().expect("scope length checked before pop");
+        let mut locals = std::mem::take(&mut scope.locals);
+        drop(scope);
+        locals.clear();
+        if self.spare_locals.len() < 64 && locals.capacity() <= 64 {
+            self.spare_locals.push(locals);
+        }
         Ok(())
     }
 
@@ -991,6 +1014,7 @@ fn eval_program_with_source_options(
         stack,
         state: EvalState {
             scopes: vec![root_scope],
+            spare_locals: Vec::new(),
             functions: options
                 .session
                 .as_ref()
@@ -1416,7 +1440,7 @@ impl Evaluator<'_> {
                 .insert(module_function.name.clone(), instance);
             if let Some(stage) = stage {
                 self.state.set_local(
-                    module_function.name.clone(),
+                    &module_function.name,
                     RuntimeValue::WorkflowStage(Box::new(stage)),
                 );
             }
@@ -1438,7 +1462,7 @@ impl Evaluator<'_> {
         } else {
             let input = input.into_value(Span::unknown())?;
             self.state
-                .set_local(ENTRY_INPUT.to_string(), RuntimeValue::Nu(input));
+                .set_local(ENTRY_INPUT, RuntimeValue::Nu(input));
             vec![Expr::Name(ENTRY_INPUT.to_string())]
         };
         let call = Call {
@@ -1538,7 +1562,7 @@ impl Evaluator<'_> {
                 // importer can change what another importer sees.
                 for name in &module.constants {
                     if let Some(value) = self.state.get_local(name) {
-                        self.state.set_local(name.clone(), freeze(value));
+                        self.state.set_local(name, freeze(value));
                     }
                 }
                 self.state.modules.push(json!({
@@ -1596,7 +1620,7 @@ impl Evaluator<'_> {
                     if record_session_bindings {
                         self.state.record_session_binding(&import.local);
                     }
-                    self.state.set_local(import.local.clone(), value);
+                    self.state.set_local(&import.local, value);
                 }
                 Ok(EvalFlow::Output(none_value()))
             }
@@ -1658,14 +1682,14 @@ impl Evaluator<'_> {
                         captures,
                     );
                     self.state
-                        .set_local(function.name.clone(), RuntimeValue::Callable(Box::new(callable)));
+                        .set_local(&function.name, RuntimeValue::Callable(Box::new(callable)));
                     return Ok(EvalFlow::Output(none_value()));
                 }
                 let instance = self.instantiate_function(function)?;
                 self.state.functions.insert(function.name.clone(), instance);
                 if let Some(stage) = stage {
                     self.state
-                        .set_local(function.name.clone(), RuntimeValue::WorkflowStage(Box::new(stage)));
+                        .set_local(&function.name, RuntimeValue::WorkflowStage(Box::new(stage)));
                 }
                 Ok(EvalFlow::Output(none_value()))
             }
@@ -1880,7 +1904,7 @@ impl Evaluator<'_> {
                 Some(path) => path,
                 None => return Ok(None),
             };
-            self.state.set_local(file_target.clone(), value.clone());
+            self.state.set_local(file_target, value.clone());
             let rows = self.read_jsonl_rows_from_path(&path, "read_jsonl")?;
             self.eval_for_jsonl_rows_generic_native_body(
                 std::slice::from_ref(&plan.row_target),
@@ -2253,7 +2277,7 @@ impl Evaluator<'_> {
         }
         let owned_value = value.clone();
         if let Some(target) = target {
-            self.state.set_local(target.to_owned(), value);
+            self.state.set_local(target, value);
         }
         let result = self.eval_block(body, false);
         let cleanup = self.close_with_resource(&owned_value);
@@ -2320,7 +2344,7 @@ impl Evaluator<'_> {
                     } else {
                         value
                     };
-                    self.state.set_local(name.clone(), value);
+                    self.state.set_local(name, value);
                 }
                 self.state.caught_errors.push(error_record);
                 let result = self.eval_block(&handler.body, false);
@@ -2780,7 +2804,7 @@ impl Evaluator<'_> {
                 if record_session_bindings {
                     self.state.record_session_binding(name);
                 }
-                self.state.set_local(name.clone(), value);
+                self.state.set_local(name, value);
                 Ok(())
             }
             AssignTarget::Tuple(targets) => {
@@ -2801,7 +2825,7 @@ impl Evaluator<'_> {
                         ));
                     }
                     for (target, item) in targets.iter().zip(items) {
-                        self.state.set_local(target.clone(), item);
+                        self.state.set_local(target, item);
                     }
                     return Ok(());
                 }
@@ -3024,7 +3048,7 @@ impl Evaluator<'_> {
         value: RuntimeValue,
     ) -> Result<(), ShellError> {
         if let [target] = targets {
-            self.state.set_local(target.clone(), value);
+            self.state.set_local(target, value);
             return Ok(());
         }
         if let Some(items) = shared_sequence_items(&value) {
@@ -3039,7 +3063,7 @@ impl Evaluator<'_> {
                 ));
             }
             for (target, item) in targets.iter().zip(items) {
-                self.state.set_local(target.clone(), item);
+                self.state.set_local(target, item);
             }
             return Ok(());
         }
@@ -3063,7 +3087,7 @@ impl Evaluator<'_> {
         }
         for (target, value) in targets.iter().zip(vals.into_iter()) {
             self.state
-                .set_local(target.clone(), RuntimeValue::Nu(value));
+                .set_local(target, RuntimeValue::Nu(value));
         }
         Ok(())
     }
@@ -3092,7 +3116,7 @@ impl Evaluator<'_> {
         }
         for (target, value) in targets.iter().zip(vals.into_iter()) {
             self.state
-                .set_local(target.clone(), RuntimeValue::Nu(value));
+                .set_local(target, RuntimeValue::Nu(value));
         }
         Ok(())
     }
@@ -4493,7 +4517,7 @@ impl Evaluator<'_> {
                 }
                 self.state.push_frame(None, captures);
                 for (name, value) in bindings {
-                    self.state.set_local(name.clone(), value);
+                    self.state.set_local(name, value);
                 }
                 let outer_pure = std::mem::replace(&mut self.state.pure_calls, *pure);
                 let result = self.eval_expr_value(body);
@@ -6283,7 +6307,7 @@ impl Evaluator<'_> {
                 const EVENT_LOCAL: &str = "__waymark_transition_event";
                 self.state.push_scope();
                 self.state
-                    .set_local(EVENT_LOCAL.to_string(), host_record("TransitionEvent", event));
+                    .set_local(EVENT_LOCAL, host_record("TransitionEvent", event));
                 let call = Call {
                     name: name.clone(),
                     positional: vec![Expr::Name(EVENT_LOCAL.to_string())],
@@ -8242,7 +8266,7 @@ impl Evaluator<'_> {
         }
         self.state.push_frame(Some(function.scope.clone()), &[]);
         self.state.set_local(
-            function.params[0].name.clone(),
+            &function.params[0].name,
             RuntimeValue::Nu(event_value),
         );
         let flow = self.eval_block(&function.body, false);
