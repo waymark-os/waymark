@@ -14992,7 +14992,7 @@ fn apply_aug_op(op: AugOp, left: &Value, right: &Value) -> Result<Value, ShellEr
 
 /// Wrap a host-built error record (`ExpectationFailed`, ...) so that a handler
 /// sees exactly that record, with no wrapper fields.
-fn host_error(record: Value) -> ShellError {
+pub(crate) fn host_error(record: Value) -> ShellError {
     let message = match &record {
         Value::Record { val, .. } => match val.get("message") {
             Some(Value::String { val, .. }) => val.clone(),
@@ -15032,6 +15032,11 @@ pub(crate) fn stone_error_type_and_host_fields(
         }
     }
     (error_type, fields)
+}
+
+#[cfg(test)]
+pub(crate) fn host_error_record_for_tests(err: &ShellError) -> Option<Value> {
+    host_error_record(err)
 }
 
 fn host_error_record(err: &ShellError) -> Option<Value> {

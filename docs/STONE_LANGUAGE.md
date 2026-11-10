@@ -742,6 +742,7 @@ Builtin error types, with their parents:
 | `ExpectationFailed` | `ToolError` | an `expect=` check that was not met, `must_run`, or an `edit` whose old text did not match as required (host only) |
 | `UndeclaredEffect` | `ToolError` | a call that attempted an effect it did not declare (host only; nothing raises it yet) |
 | `ModelOutputError` | `ToolError` | `model.ask(..., output=T)` got no answer of type `T` within its retries (host only) |
+| `ModelProviderError` | `ToolError` | the model provider failed a call: a refusal such as HTTP 400, or a temporary failure (HTTP 429/5xx, a dropped connection) that lasted through 3 retries; fields `status`, `retryable`, `attempts` (host only) |
 | `ValueError` | `Exception` | bad values, such as `int("x")` |
 | `TypeError` | `Exception` | wrong operand or argument types, such as `1 + "a"` |
 | `LookupError` | `Exception` | |
@@ -759,7 +760,7 @@ failures. Each builtin type is also a constructor that takes one optional
 string message: `raise ValueError("bad row")` and `raise ValueError` both
 work.
 
-`ExpectationFailed`, `UndeclaredEffect`, and `ModelOutputError` are host-only. A program can catch
+`ExpectationFailed`, `UndeclaredEffect`, `ModelOutputError`, and `ModelProviderError` are host-only. A program can catch
 them, test them with `isinstance`, and re-raise one it caught (`raise` or
 `raise error`, unchanged), but it cannot construct, raise, or subclass them,
 and a modified copy cannot be raised. A caught host-only error is read-only:
@@ -1139,6 +1140,12 @@ says so with `result.effects.enforced == False`.
   `retries` times (at most 4); every attempt is an ordinary traced model call
   that hooks see. When no answer matches, `ModelOutputError` carries
   `expected` (the type), `issues`, `attempts`, and the last `answer`.
+  Every model call (`model.ask`, `model_call`) retries a temporary provider
+  failure (HTTP 429 or 5xx, a dropped connection) up to 3 times, after 1, 4,
+  and 16 seconds; a response that needed retries has `provider_retries`. A
+  failure that persists, or a refusal such as HTTP 400, raises
+  `ModelProviderError` with `status` (or `None`), `retryable`, and
+  `attempts`.
   Without `output=`, `model.ask` returns the reply text. `model` is a value
   bound in every program; functions take it as a `model: Model` parameter.
   Every attempt, including repairs, counts against the model's budget

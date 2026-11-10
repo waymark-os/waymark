@@ -332,10 +332,123 @@ fn gateway_model_request(
     request: &JsonValue,
 ) -> Result<JsonValue, ShellError> {
     let rpc_request = model_call_request_from_json(config, request)?;
-    let response = client
-        .model_call(rpc_request)
-        .map_err(|err| stone_error("gateway rpc", err.to_string()))?;
-    Ok(model_call_response_json(response))
+    let (response, retries) = model_call_retrying(&PROVIDER_RETRY_WAITS, rpc_request, |request| {
+        Ok(client.model_call(request))
+    })?;
+    Ok(model_call_response_json_with_retries(response, retries))
+}
+
+/// The waits before each retry of a model call that failed for a temporary
+/// provider reason (HTTP 429/5xx, a dropped connection). Three retries cover
+/// a short provider outage; a persistent failure still ends in about 20 s.
+const PROVIDER_RETRY_WAITS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(4),
+    Duration::from_secs(16),
+];
+
+/// A provider failure as Stone reports it: the HTTP status when the provider
+/// answered, and whether trying again can help.
+#[derive(Debug, PartialEq)]
+struct ProviderFailure {
+    status: Option<u16>,
+    retryable: bool,
+}
+
+/// Read a Gateway model-call error. The Gateway reports every provider error
+/// as an invalid request, so the status comes from its message
+/// ("model provider returned HTTP 503: ...").
+fn provider_failure(err: &GatewayClientError) -> Option<ProviderFailure> {
+    let GatewayClientError::Rpc {
+        message, retryable, ..
+    } = err
+    else {
+        return None;
+    };
+    const HTTP: &str = "model provider returned HTTP ";
+    if let Some(at) = message.find(HTTP) {
+        let status = message[at + HTTP.len()..]
+            .split(|ch: char| !ch.is_ascii_digit())
+            .next()
+            .and_then(|digits| digits.parse::<u16>().ok());
+        let retryable = *retryable
+            || status.is_some_and(|status| {
+                matches!(status, 408 | 409 | 429 | 500 | 502 | 503 | 504 | 529)
+            });
+        return Some(ProviderFailure { status, retryable });
+    }
+    let transport = message.contains("model provider transport failed")
+        || message.contains("failed to read model provider response");
+    (transport || *retryable).then_some(ProviderFailure {
+        status: None,
+        retryable: true,
+    })
+}
+
+/// Make a model call, retrying a temporary provider failure after each wait
+/// in `waits`. Returns the response and how many retries it took. A failure
+/// that retrying cannot fix, or the last temporary one, becomes a
+/// `ModelProviderError` the program can catch.
+fn model_call_retrying(
+    waits: &[Duration],
+    request: ModelCallRequest,
+    mut call: impl FnMut(
+        ModelCallRequest,
+    ) -> Result<Result<ModelCallResponse, GatewayClientError>, ShellError>,
+) -> Result<(ModelCallResponse, usize), ShellError> {
+    let mut retries = 0;
+    loop {
+        let err = match call(request.clone())? {
+            Ok(response) => return Ok((response, retries)),
+            Err(err) => err,
+        };
+        let Some(failure) = provider_failure(&err) else {
+            return Err(stone_error("gateway rpc", err.to_string()));
+        };
+        if failure.retryable && retries < waits.len() {
+            std::thread::sleep(waits[retries]);
+            retries += 1;
+            continue;
+        }
+        return Err(model_provider_error(&failure, retries + 1, &err));
+    }
+}
+
+fn model_provider_error(
+    failure: &ProviderFailure,
+    attempts: usize,
+    err: &GatewayClientError,
+) -> ShellError {
+    let detail = match err {
+        GatewayClientError::Rpc { message, .. } => message.clone(),
+        other => other.to_string(),
+    };
+    let message = if failure.retryable {
+        format!("the model provider failed {attempts} time(s) in a row: {detail}")
+    } else {
+        format!("the model provider refused the call: {detail}")
+    };
+    crate::stone_eval::host_error(json_to_nu_value(
+        json!({
+            "type": "ModelProviderError",
+            "message": message,
+            "call": "model_call",
+            "status": failure.status,
+            "retryable": failure.retryable,
+            "attempts": attempts,
+        }),
+        Span::unknown(),
+    ))
+}
+
+fn model_call_response_json_with_retries(response: ModelCallResponse, retries: usize) -> JsonValue {
+    let mut json = model_call_response_json(response);
+    if retries > 0 {
+        if let Some(object) = json.as_object_mut() {
+            object.insert("provider_retries".to_string(), json!(retries));
+        }
+    }
+    json
 }
 
 pub(crate) fn model_call_value(request: &JsonValue, span: Span) -> Result<Value, ShellError> {
@@ -347,9 +460,14 @@ pub(crate) fn model_call_value(request: &JsonValue, span: Span) -> Result<Value,
     })?;
     let rpc_request = model_call_request_from_json(&config, request)
         .map_err(|err| model_call_error("model_invalid_request", shell_error_detail(&err)))?;
-    let response = with_client(&config, |client| client.model_call(rpc_request))
-        .map_err(|err| model_call_error("model_transport_failed", shell_error_detail(&err)))?;
-    Ok(json_to_nu_value(model_call_response_json(response), span))
+    let (response, retries) = model_call_retrying(&PROVIDER_RETRY_WAITS, rpc_request, |request| {
+        with_client(&config, |client| Ok(client.model_call(request)))
+            .map_err(|err| model_call_error("model_transport_failed", shell_error_detail(&err)))
+    })?;
+    Ok(json_to_nu_value(
+        model_call_response_json_with_retries(response, retries),
+        span,
+    ))
 }
 
 pub(crate) fn task_spec_value(span: Span) -> Result<Value, ShellError> {
@@ -2492,12 +2610,9 @@ pub(crate) fn with_file_client<T>(
     with_runtime_client(config, |client| {
         call(client).map_err(|err| {
             let error_type = match &err {
-                GatewayClientError::Rpc { kind, .. } => match kind.as_str() {
-                    "not_found" => Some("FileNotFoundError"),
-                    "permission_denied" => Some("PermissionError"),
-                    "timeout" | "timed_out" => Some("TimeoutError"),
-                    _ => None,
-                },
+                GatewayClientError::Rpc { kind, os_code, .. } => {
+                    file_error_type(kind, *os_code)
+                }
                 _ => None,
             };
             match error_type {
@@ -2512,6 +2627,39 @@ pub(crate) fn with_file_client<T>(
             }
         })
     })
+}
+
+/// The Python error type for a Gateway file error. The OS error number
+/// decides when the Gateway sends one; otherwise the error kind does, which
+/// may carry a layer prefix (`workspace_path_not_found`).
+fn file_error_type(kind: &str, os_code: i32) -> Option<&'static str> {
+    let by_code = match os_code {
+        2 => Some("FileNotFoundError"),
+        1 | 13 => Some("PermissionError"),
+        17 => Some("FileExistsError"),
+        20 => Some("NotADirectoryError"),
+        21 => Some("IsADirectoryError"),
+        110 => Some("TimeoutError"),
+        _ => None,
+    };
+    if by_code.is_some() {
+        return by_code;
+    }
+    if kind.ends_with("not_found") {
+        Some("FileNotFoundError")
+    } else if kind.ends_with("permission_denied") {
+        Some("PermissionError")
+    } else if kind.ends_with("already_exists") {
+        Some("FileExistsError")
+    } else if kind.ends_with("not_a_directory") {
+        Some("NotADirectoryError")
+    } else if kind.ends_with("is_a_directory") {
+        Some("IsADirectoryError")
+    } else if kind.ends_with("timeout") || kind.ends_with("timed_out") {
+        Some("TimeoutError")
+    } else {
+        None
+    }
 }
 
 #[cfg(any(unix, target_os = "hermit"))]
@@ -2761,6 +2909,113 @@ mod tests {
         AttemptProgram, BuiltinWorkflow, StoneProgram, SuccessCriterion, TaskConstraint, TaskInput,
         TaskOutput,
     };
+
+    fn rpc_error(message: &str) -> GatewayClientError {
+        GatewayClientError::Rpc {
+            code: 3,
+            message: message.to_string(),
+            kind: "invalid_request".to_string(),
+            operation: "model.call".to_string(),
+            layer: "gateway_policy".to_string(),
+            subject: String::new(),
+            retryable: false,
+            os_code: 0,
+            suggestions: Vec::new(),
+            details_json: String::new(),
+            category: String::new(),
+            reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn provider_failures_are_read_from_the_gateway_message() {
+        let failure = |message: &str| provider_failure(&rpc_error(message));
+        assert_eq!(
+            failure("model provider returned HTTP 500: Internal server error"),
+            Some(ProviderFailure { status: Some(500), retryable: true })
+        );
+        assert_eq!(
+            failure("model provider returned HTTP 529: overloaded"),
+            Some(ProviderFailure { status: Some(529), retryable: true })
+        );
+        assert_eq!(
+            failure("model provider returned HTTP 400: bad schema"),
+            Some(ProviderFailure { status: Some(400), retryable: false })
+        );
+        assert_eq!(
+            failure("model provider transport failed: connection reset"),
+            Some(ProviderFailure { status: None, retryable: true })
+        );
+        assert_eq!(failure("unknown attempt"), None);
+    }
+
+    fn host_error_fields(error: &ShellError) -> JsonValue {
+        let record = crate::stone_eval::host_error_record_for_tests(error).expect("host error");
+        crate::json::nu_to_json_value(&record)
+    }
+
+    #[test]
+    fn model_calls_retry_temporary_provider_failures() {
+        let waits = [Duration::ZERO; 3];
+        let request = ModelCallRequest::default();
+
+        // Two 503s, then an answer: the call succeeds after two retries.
+        let mut calls = 0;
+        let (_, retries) = model_call_retrying(&waits, request.clone(), |_| {
+            calls += 1;
+            Ok(if calls < 3 {
+                Err(rpc_error("model provider returned HTTP 503: unavailable"))
+            } else {
+                Ok(ModelCallResponse::default())
+            })
+        })
+        .expect("succeeds after retries");
+        assert_eq!((calls, retries), (3, 2));
+
+        // A 500 that never clears: four attempts, then ModelProviderError.
+        let mut calls = 0;
+        let error = model_call_retrying(&waits, request.clone(), |_| {
+            calls += 1;
+            Ok(Err(rpc_error("model provider returned HTTP 500: Internal server error")))
+        })
+        .expect_err("persistent failure");
+        assert_eq!(calls, 4);
+        let fields = host_error_fields(&error);
+        assert_eq!(fields["type"], "ModelProviderError");
+        assert_eq!(fields["status"], 500);
+        assert_eq!(fields["retryable"], true);
+        assert_eq!(fields["attempts"], 4);
+
+        // A 400 is not retried.
+        let mut calls = 0;
+        let error = model_call_retrying(&waits, request, |_| {
+            calls += 1;
+            Ok(Err(rpc_error("model provider returned HTTP 400: bad request")))
+        })
+        .expect_err("refused");
+        assert_eq!(calls, 1);
+        let fields = host_error_fields(&error);
+        assert_eq!(fields["retryable"], false);
+        assert_eq!(fields["attempts"], 1);
+    }
+
+    #[test]
+    fn gateway_file_errors_get_python_error_types() {
+        // What the Gateway sends for a missing workspace path.
+        assert_eq!(
+            file_error_type("workspace_path_not_found", 2),
+            Some("FileNotFoundError")
+        );
+        assert_eq!(
+            file_error_type("workspace_path_not_found", 0),
+            Some("FileNotFoundError")
+        );
+        assert_eq!(file_error_type("io_error", 13), Some("PermissionError"));
+        assert_eq!(file_error_type("permission_denied", 0), Some("PermissionError"));
+        assert_eq!(file_error_type("io_error", 21), Some("IsADirectoryError"));
+        assert_eq!(file_error_type("timeout", 0), Some("TimeoutError"));
+        assert_eq!(file_error_type("invalid_request", 0), None);
+    }
 
     #[test]
     fn gateway_bindings_are_isolated_between_stone_process_threads() {
