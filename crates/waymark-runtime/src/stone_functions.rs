@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
+
+use super::NameMap;
 
 use crate::stone_ast::{Expr, FunctionDef};
 
@@ -333,8 +334,8 @@ impl CallableValue {
 
 #[derive(Default)]
 pub(crate) struct StoneSession {
-    pub(super) locals: HashMap<String, RuntimeValue>,
-    pub(super) functions: HashMap<String, Rc<FunctionDef>>,
+    pub(super) locals: NameMap<RuntimeValue>,
+    pub(super) functions: NameMap<Rc<FunctionDef>>,
     pub(super) context: ContextState,
     pub(super) next_transition_id: u64,
     /// Host-only errors (such as `ExpectationFailed`) this session has caught.
@@ -400,7 +401,7 @@ impl StoneSession {
             .collect();
     }
 
-    pub(super) fn update_functions(&mut self, functions: &HashMap<String, Rc<FunctionDef>>) {
+    pub(super) fn update_functions(&mut self, functions: &NameMap<Rc<FunctionDef>>) {
         self.functions = functions.clone();
     }
 

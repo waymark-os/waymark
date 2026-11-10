@@ -2459,6 +2459,7 @@ dependencies = [
  "regex",
  "ruff_python_ast",
  "ruff_python_parser",
+ "rustc-hash",
  "serde_json",
  "sha1",
  "sha2",

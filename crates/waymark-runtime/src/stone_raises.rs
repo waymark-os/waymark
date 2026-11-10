@@ -12,7 +12,7 @@
 //! a re-raise of a caught value) makes the block "may raise anything", and
 //! then no warning is given.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 use std::rc::Rc;
 
@@ -76,7 +76,7 @@ const MAX_CALL_DEPTH: usize = 8;
 type Raises = Option<BTreeSet<String>>;
 
 struct Analyzer<'a> {
-    functions: &'a HashMap<String, Rc<FunctionDef>>,
+    functions: &'a crate::stone_eval::NameMap<Rc<FunctionDef>>,
     visiting: HashSet<String>,
 }
 
@@ -85,7 +85,7 @@ struct Analyzer<'a> {
 /// functions and error classes visible to the program.
 pub(crate) fn unreachable_handler_warnings(
     statements: &[Stmt],
-    functions: &HashMap<String, Rc<FunctionDef>>,
+    functions: &crate::stone_eval::NameMap<Rc<FunctionDef>>,
 ) -> Vec<String> {
     let mut all_functions = functions.clone();
     collect_functions(statements, &mut all_functions);
@@ -100,7 +100,7 @@ pub(crate) fn unreachable_handler_warnings(
     warnings
 }
 
-fn collect_functions(statements: &[Stmt], functions: &mut HashMap<String, Rc<FunctionDef>>) {
+fn collect_functions(statements: &[Stmt], functions: &mut crate::stone_eval::NameMap<Rc<FunctionDef>>) {
     for statement in statements {
         match statement {
             Stmt::FunctionDef(function) => {
@@ -494,7 +494,7 @@ mod tests {
 
     fn warnings(source: &str) -> Vec<String> {
         let program = lower_source(source).expect("lower");
-        unreachable_handler_warnings(&program.statements, &HashMap::new())
+        unreachable_handler_warnings(&program.statements, &Default::default())
     }
 
     #[test]

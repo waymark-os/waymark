@@ -2,6 +2,10 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+
+/// Maps keyed by variable and function names. Looked up on every name
+/// access, so they use a fast non-cryptographic hash.
+pub(crate) type NameMap<V> = rustc_hash::FxHashMap<String, V>;
 use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -165,7 +169,7 @@ const MAX_SEMANTIC_FRONTIER_DIAGNOSTICS: usize = 256;
 #[derive(Default)]
 pub struct EvalState {
     scopes: Vec<Scope>,
-    functions: HashMap<String, Rc<FunctionDef>>,
+    functions: NameMap<Rc<FunctionDef>>,
     next_file_id: u64,
     next_callable_id: u64,
     next_transition_id: u64,
@@ -421,7 +425,7 @@ const EVAL_PROFILE_BUCKET_NAMES: [&str; EVAL_PROFILE_BUCKETS] = [
 
 #[derive(Default)]
 struct Scope {
-    locals: HashMap<String, RuntimeValue>,
+    locals: NameMap<RuntimeValue>,
     files: HashMap<u64, RuntimeFile>,
     /// Locals shared with closures. A name lives in `locals` or `cells`,
     /// never both. Only frame scopes (and the root) hold cells.
@@ -3963,15 +3967,11 @@ impl Evaluator<'_> {
             .ok_or_else(|| {
                 stone_error("function call", format!("unknown function `{}`", call.name))
             })?;
-        let parameter_names = function
-            .params
-            .iter()
-            .map(|param| param.name.clone())
-            .collect::<Vec<_>>();
         validate_stone_call_shape(
             "function call",
-            &format!("{}()", function.name),
-            &parameter_names,
+            || format!("{}()", function.name),
+            function.params.len(),
+            || function.params.iter().map(|param| param.name.clone()).collect(),
             call,
         )?;
         let args = call
@@ -4140,15 +4140,11 @@ impl Evaluator<'_> {
         };
         match boxed_callable {
             Some(CallableValue::Named { function, .. }) => {
-                let parameter_names = function
-                    .params
-                    .iter()
-                    .map(|param| param.name.clone())
-                    .collect::<Vec<_>>();
                 validate_stone_call_shape(
                     "function call",
-                    &format!("{}()", function.name),
-                    &parameter_names,
+                    || format!("{}()", function.name),
+                    function.params.len(),
+                    || function.params.iter().map(|param| param.name.clone()).collect(),
                     call,
                 )?;
             }
@@ -4159,8 +4155,9 @@ impl Evaluator<'_> {
             }) => {
                 validate_stone_call_shape(
                     "callable",
-                    &format!("lambda#{function_id}"),
-                    params,
+                    || format!("lambda#{function_id}"),
+                    params.len(),
+                    || params.clone(),
                     call,
                 )?;
             }
@@ -18122,12 +18119,22 @@ fn runtime_value_is_none(value: &RuntimeValue) -> bool {
     matches!(value, RuntimeValue::Nu(Value::Nothing { .. }))
 }
 
+/// Check a call's argument shape against the callee's parameters. A call
+/// with only positional arguments, no more than the parameters, always
+/// fits; the names and the display label are built only to explain a
+/// mismatch.
 fn validate_stone_call_shape(
     error_kind: &str,
-    display_name: &str,
-    parameter_names: &[String],
+    display_name: impl FnOnce() -> String,
+    parameter_count: usize,
+    parameter_names: impl FnOnce() -> Vec<String>,
     call: &Call,
 ) -> Result<(), ShellError> {
+    if call.named.is_empty() && call.positional.len() <= parameter_count {
+        return Ok(());
+    }
+    let display_name = display_name();
+    let parameter_names = parameter_names();
     if call.positional.len() > parameter_names.len() {
         return Err(stone_error(
             error_kind,

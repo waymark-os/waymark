@@ -11,6 +11,9 @@ name = "waymark_runtime"
 waymark-global-audit = { path = "../waymark-global-audit" }
 
 [dependencies]
+# Fast hashing for variable and function names (already in the build via
+# other crates).
+rustc-hash = "2"
 asset-image = { path = "../asset-image" }
 waymark-gateway-client = { path = "../../../waymark-gateway/crates/waymark-gateway-client" }
 waymark-runtime-support = { path = "../waymark-runtime-support" }
