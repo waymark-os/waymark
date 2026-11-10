@@ -20234,6 +20234,17 @@ emit(inc(5))
         );
         // Imported names stay bound in a warm session.
         assert_eq!(run("emit(join([\"p\", \"q\"]))\n")?, json_value!("p, q"));
+        // A module may name the types `isinstance` checks, bool and dict
+        // included, as a program can.
+        write(
+            "kinds.stone",
+            "def kinds(x):\n    return [isinstance(x, bool), isinstance(x, dict), isinstance(x, int)]\n",
+        );
+        assert_eq!(
+            run("from kinds import kinds\nemit(kinds(True))\n")?,
+            json_value!([true, false, true])
+        );
+
         // Module values are read-only all the way down.
         let error = run("DEFAULTS[\"tags\"].append(\"b\")\n").expect_err("frozen");
         assert!(format!("{error:?}").contains("read-only"), "{error:?}");

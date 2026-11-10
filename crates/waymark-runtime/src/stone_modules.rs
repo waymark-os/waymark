@@ -45,6 +45,9 @@ const MODULE_EXTRA_NAMES: &[&str] = &[
     "keys",
     "values",
     "isinstance",
+    // Type names `isinstance` accepts that are not callable builtins.
+    "bool",
+    "dict",
     "true",
     "false",
     "null",
