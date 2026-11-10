@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use nu_protocol::{PipelineData, ShellError, Span, Value};
+use nu_protocol::{ShellError, Span, Value};
 
 use super::stone_json_view::{jsonl_row_views, runtime_value_to_string_key, JsonlRows};
 use super::stone_runtime_value::{RuntimeValue, TextLines};
@@ -59,7 +59,7 @@ impl Evaluator<'_> {
                 .hot_loop_diagnostics
                 .fused_kernel_time(execution_duration);
         }
-        Ok(Some(EvalFlow::Output(PipelineData::empty())))
+        Ok(Some(EvalFlow::Output(super::none_value())))
     }
 
     pub(super) fn try_eval_for_text_lines_generic_vm(
@@ -76,7 +76,7 @@ impl Evaluator<'_> {
         }
         if let [GenericLoopOp::JsonlAggregation { .. }] = plan.ops.as_slice() {
             self.eval_for_text_lines_jsonl_generic_native_body(targets, lines, plan)?;
-            return Ok(Some(EvalFlow::Output(PipelineData::empty())));
+            return Ok(Some(EvalFlow::Output(super::none_value())));
         }
         let Some(function) = compile_generic_vm_function(plan) else {
             self.state
@@ -108,7 +108,7 @@ impl Evaluator<'_> {
                 .hot_loop_diagnostics
                 .fused_kernel_time(execution_duration);
         }
-        Ok(Some(EvalFlow::Output(PipelineData::empty())))
+        Ok(Some(EvalFlow::Output(super::none_value())))
     }
 
     pub(super) fn try_eval_for_jsonl_rows_generic_vm(
@@ -163,10 +163,10 @@ impl Evaluator<'_> {
                     .hot_loop_diagnostics
                     .fused_kernel_time(execution_duration);
             }
-            return Ok(Some(EvalFlow::Output(PipelineData::empty())));
+            return Ok(Some(EvalFlow::Output(super::none_value())));
         };
         self.eval_for_jsonl_rows_generic_native_body(targets, rows, plan)?;
-        Ok(Some(EvalFlow::Output(PipelineData::empty())))
+        Ok(Some(EvalFlow::Output(super::none_value())))
     }
 
     fn record_loop_ir_function_selection(

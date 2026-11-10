@@ -6,6 +6,25 @@ use std::collections::{HashMap, HashSet};
 /// Maps keyed by variable and function names. Looked up on every name
 /// access, so they use a fast non-cryptographic hash.
 pub(crate) type NameMap<V> = rustc_hash::FxHashMap<String, V>;
+
+/// An error from the evaluator's core (blocks, statements, expressions).
+/// ShellError is 192 bytes, and a Result is as large as its error, so the
+/// recursion would move 192 bytes per step; boxed, a Result is about the
+/// size of its value. `?` converts to and from ShellError at the edges.
+#[derive(Debug)]
+pub(crate) struct EvalError(Box<ShellError>);
+
+impl From<ShellError> for EvalError {
+    fn from(error: ShellError) -> Self {
+        EvalError(Box::new(error))
+    }
+}
+
+impl From<EvalError> for ShellError {
+    fn from(error: EvalError) -> Self {
+        *error.0
+    }
+}
 use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1208,7 +1227,10 @@ struct Evaluator<'a> {
 }
 
 enum EvalFlow {
-    Output(PipelineData),
+    /// A statement finished normally. Only an expression statement's value
+    /// is kept (as the program's result when it is the last statement); it
+    /// stays a runtime value until the program ends.
+    Output(RuntimeValue),
     Break,
     Continue,
     Return(RuntimeValue),
@@ -1322,7 +1344,7 @@ impl WorkflowCheckpointResult {
 impl Evaluator<'_> {
     fn eval_program(&mut self, program: &Program) -> Result<PipelineData, ShellError> {
         match self.eval_block(&program.statements, true)? {
-            EvalFlow::Output(output) => Ok(output),
+            EvalFlow::Output(output) => statement_value(output),
             EvalFlow::Break => Err(stone_error("break", "break outside loop")),
             EvalFlow::Continue => Err(stone_error("continue", "continue outside loop")),
             EvalFlow::Return(_) => Err(stone_error("return", "return outside function")),
@@ -1435,9 +1457,9 @@ impl Evaluator<'_> {
         &mut self,
         statements: &[Stmt],
         record_session_bindings: bool,
-    ) -> Result<EvalFlow, ShellError> {
+    ) -> Result<EvalFlow, EvalError> {
         let started = self.state.profiler.start();
-        let mut output = PipelineData::empty();
+        let mut output = none_value();
         let result = (|| {
             for statement in statements {
                 let flow = self.eval_stmt(statement, record_session_bindings)?;
@@ -1450,7 +1472,7 @@ impl Evaluator<'_> {
                         output = if matches!(statement, Stmt::Expr(_)) {
                             value
                         } else {
-                            PipelineData::empty()
+                            none_value()
                         };
                     }
                     EvalFlow::Break | EvalFlow::Continue | EvalFlow::Return(_) => return Ok(flow),
@@ -1469,9 +1491,9 @@ impl Evaluator<'_> {
         &mut self,
         statement: &Stmt,
         record_session_bindings: bool,
-    ) -> Result<EvalFlow, ShellError> {
+    ) -> Result<EvalFlow, EvalError> {
         let started = self.state.profiler.start();
-        let result = match statement {
+        let result: Result<EvalFlow, ShellError> = match statement {
             Stmt::Assign { target, value } => {
                 let value = match self.static_type_value(value) {
                     Some(spec) => RuntimeValue::Type(Rc::new(spec?)),
@@ -1481,7 +1503,7 @@ impl Evaluator<'_> {
                     self.define_type_alias(name, spec)?;
                 }
                 self.assign_value(target, value, record_session_bindings)?;
-                Ok(EvalFlow::Output(PipelineData::empty()))
+                Ok(EvalFlow::Output(none_value()))
             }
             Stmt::AugAssign { target, op, value } => {
                 let place = self.resolve_place(target, "augmented assignment")?;
@@ -1492,7 +1514,7 @@ impl Evaluator<'_> {
                     ensure_mutable(&left, "augmented assignment")?;
                     let items = self.eval_iterable_expr(value)?;
                     list.extend(items);
-                    return Ok(EvalFlow::Output(PipelineData::empty()));
+                    return Ok(EvalFlow::Output(none_value()));
                 }
                 let left = left.into_nu_value("augmented assignment")?;
                 let right = self
@@ -1505,9 +1527,9 @@ impl Evaluator<'_> {
                     }
                 }
                 self.write_place(place, RuntimeValue::Nu(value))?;
-                Ok(EvalFlow::Output(PipelineData::empty()))
+                Ok(EvalFlow::Output(none_value()))
             }
-            Stmt::Pass => Ok(EvalFlow::Output(PipelineData::empty())),
+            Stmt::Pass => Ok(EvalFlow::Output(none_value())),
             Stmt::Module(module) => {
                 for statement in &module.body {
                     self.eval_stmt(statement, false)?;
@@ -1524,7 +1546,7 @@ impl Evaluator<'_> {
                     "path": module.path,
                     "sha256": module.sha256,
                 }));
-                Ok(EvalFlow::Output(PipelineData::empty()))
+                Ok(EvalFlow::Output(none_value()))
             }
             Stmt::Import { module, names } => {
                 for import in names {
@@ -1568,7 +1590,7 @@ impl Evaluator<'_> {
                                     "`from {module} import {}` must be at the top level of a file",
                                     import.name
                                 ),
-                            ))
+                            ).into())
                         }
                     };
                     if record_session_bindings {
@@ -1576,11 +1598,11 @@ impl Evaluator<'_> {
                     }
                     self.state.set_local(import.local.clone(), value);
                 }
-                Ok(EvalFlow::Output(PipelineData::empty()))
+                Ok(EvalFlow::Output(none_value()))
             }
             Stmt::RecordDef(record) => {
                 self.define_record(record)?;
-                Ok(EvalFlow::Output(PipelineData::empty()))
+                Ok(EvalFlow::Output(none_value()))
             }
             Stmt::FunctionDef(function) => {
                 if let Some(base) = &function.error_base {
@@ -1591,7 +1613,7 @@ impl Evaluator<'_> {
                                 "`{}` derives from the record `{base}`, but records do not inherit; repeat the fields in `class {}(Record):`",
                                 function.name, function.name
                             ),
-                        ));
+                        ).into());
                     }
                     if is_builtin_error_type(&function.name) {
                         return Err(stone_error(
@@ -1600,10 +1622,10 @@ impl Evaluator<'_> {
                                 "`{}` is a builtin error type and cannot be redefined; choose a new name such as `class Config{}({}):`",
                                 function.name, function.name, function.name
                             ),
-                        ));
+                        ).into());
                     }
                     if is_host_only_error_type(base) {
-                        return Err(stone_error("class", host_only_error_message(base)));
+                        return Err(stone_error("class", host_only_error_message(base)).into());
                     }
                     if !self.is_error_type_name(base) {
                         return Err(stone_error(
@@ -1612,7 +1634,7 @@ impl Evaluator<'_> {
                                 "error class `{}` must derive from an error type, but `{base}` is not one; use `class {}(Exception):` or another builtin error such as ValueError or ToolError",
                                 function.name, function.name
                             ),
-                        ));
+                        ).into());
                     }
                 }
                 let stage = function
@@ -1637,7 +1659,7 @@ impl Evaluator<'_> {
                     );
                     self.state
                         .set_local(function.name.clone(), RuntimeValue::Callable(Box::new(callable)));
-                    return Ok(EvalFlow::Output(PipelineData::empty()));
+                    return Ok(EvalFlow::Output(none_value()));
                 }
                 let instance = self.instantiate_function(function)?;
                 self.state.functions.insert(function.name.clone(), instance);
@@ -1645,7 +1667,7 @@ impl Evaluator<'_> {
                     self.state
                         .set_local(function.name.clone(), RuntimeValue::WorkflowStage(Box::new(stage)));
                 }
-                Ok(EvalFlow::Output(PipelineData::empty()))
+                Ok(EvalFlow::Output(none_value()))
             }
             Stmt::Return(value) => {
                 let value = match value {
@@ -1661,7 +1683,7 @@ impl Evaluator<'_> {
                 body,
             } => self.eval_for_stmt(targets, iter, body),
             Stmt::While { condition, body } => {
-                let mut output = PipelineData::empty();
+                let mut output = none_value();
                 for _ in 0..1_000_000 {
                     let condition = self.eval_expr_value(condition)?;
                     if !runtime_truthy(&condition, "while")? {
@@ -1687,7 +1709,7 @@ impl Evaluator<'_> {
                 if self.state.hot_loop_enabled
                     && self.try_eval_fused_map_update_if(condition, then_branch, else_branch)?
                 {
-                    return Ok(EvalFlow::Output(PipelineData::empty()));
+                    return Ok(EvalFlow::Output(none_value()));
                 }
                 let condition = self.eval_expr_value(condition)?;
                 let branch = if runtime_truthy(&condition, "if")? {
@@ -1695,7 +1717,7 @@ impl Evaluator<'_> {
                 } else {
                     else_branch
                 };
-                self.eval_block(branch, false)
+                Ok(self.eval_block(branch, false)?)
             }
             Stmt::With {
                 is_async,
@@ -1706,12 +1728,10 @@ impl Evaluator<'_> {
             Stmt::Try { body, handlers } => self.eval_try_stmt(body, handlers),
             Stmt::Break => Ok(EvalFlow::Break),
             Stmt::Continue => Ok(EvalFlow::Continue),
-            Stmt::Expr(expression) => self
-                .eval_expr_pipeline(expression)
-                .map(EvalFlow::Output),
+            Stmt::Expr(expression) => Ok(EvalFlow::Output(self.eval_expr_statement(expression)?)),
         };
         self.state.profiler.finish(EvalProfileBucket::Stmt, started);
-        result
+        result.map_err(EvalError::from)
     }
 
     fn eval_for_stmt(
@@ -1874,7 +1894,7 @@ impl Evaluator<'_> {
                 },
             )?;
         }
-        Ok(Some(EvalFlow::Output(PipelineData::empty())))
+        Ok(Some(EvalFlow::Output(none_value())))
     }
 
     fn record_hot_jsonl_ir_fused_selection(
@@ -1906,7 +1926,7 @@ impl Evaluator<'_> {
         rows: JsonlRows,
         body: &[Stmt],
     ) -> Result<EvalFlow, ShellError> {
-        let mut output = PipelineData::empty();
+        let mut output = none_value();
         for line in rows.lines.iter().cloned() {
             let value = jsonl_row_view(&rows, line);
             self.assign_loop_targets(targets, value)?;
@@ -1932,7 +1952,7 @@ impl Evaluator<'_> {
         body: &[Stmt],
         plan: &HotLoopPlan,
     ) -> Result<EvalFlow, ShellError> {
-        let mut output = PipelineData::empty();
+        let mut output = none_value();
         let remaining_body = body.get(plan.body_start..).unwrap_or(&[]);
         let hot_body_plan = match_hot_jsonl_aggregation_body(&plan.target, remaining_body)
             .or_else(|| match_hot_jsonl_aggregation_body(&plan.target, body));
@@ -1971,7 +1991,7 @@ impl Evaluator<'_> {
     where
         I: IntoIterator<Item = RuntimeValue>,
     {
-        let mut output = PipelineData::empty();
+        let mut output = none_value();
         for value in values {
             self.assign_loop_targets(targets, value)?;
             let started = self.state.profiler.start();
@@ -2048,7 +2068,7 @@ impl Evaluator<'_> {
         same_size: impl Fn() -> bool,
         what: &str,
     ) -> Result<EvalFlow, ShellError> {
-        let mut output = PipelineData::empty();
+        let mut output = none_value();
         for value in values {
             if !same_size() {
                 return Err(changed_size_error(what));
@@ -2240,9 +2260,9 @@ impl Evaluator<'_> {
         match (result, cleanup) {
             (Ok(flow), Ok(())) => Ok(flow),
             (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
-            (Err(program_error), Ok(())) => Err(program_error),
+            (Err(program_error), Ok(())) => Err(program_error.into()),
             (Err(program_error), Err(cleanup_error)) => {
-                Err(attach_cleanup_error(program_error, cleanup_error))
+                Err(attach_cleanup_error(program_error.into(), cleanup_error))
             }
         }
     }
@@ -2270,10 +2290,10 @@ impl Evaluator<'_> {
         body: &[Stmt],
         handlers: &[ExceptHandler],
     ) -> Result<EvalFlow, ShellError> {
-        match self.eval_block(body, false) {
+        match self.eval_block(body, false).map_err(ShellError::from) {
             Ok(flow) => Ok(flow),
             // A control stop (the host ended the attempt) is never caught.
-            Err(err) if self.is_control_stop(&err) => Err(err),
+            Err(err) if self.is_control_stop(&err) => Err(err.into()),
             Err(err) => {
                 let error_record = shell_error_record(&err);
                 let error_type = error_record_type(&error_record);
@@ -2285,7 +2305,7 @@ impl Evaluator<'_> {
                         .iter()
                         .any(|handler_type| self.error_type_matches(&error_type, handler_type))
                 }) else {
-                    return Err(err);
+                    return Err(err.into());
                 };
                 if is_host_only_error_type(&error_type) {
                     self.remember_host_error(&error_record);
@@ -2315,7 +2335,7 @@ impl Evaluator<'_> {
                         self.state.swallowed_tool_errors.saturating_add(1);
                     self.state.last_swallowed_tool_error = caught;
                 }
-                result
+                Ok(result?)
             }
         }
     }
@@ -3191,10 +3211,8 @@ impl Evaluator<'_> {
         Ok(RuntimeValue::Nu(Value::string(output, Span::unknown())))
     }
 
-    fn eval_expr_pipeline(
-        &mut self,
-        expression: &Expr,
-    ) -> Result<PipelineData, ShellError> {
+    /// The value of an expression statement, kept as a runtime value.
+    fn eval_expr_statement(&mut self, expression: &Expr) -> Result<RuntimeValue, EvalError> {
         match expression {
             Expr::Call(call)
                 if is_builtin_call(call)
@@ -3203,19 +3221,19 @@ impl Evaluator<'_> {
                     || self.state.types.record(&call.name).is_some()
                     || self.state.get_local(&call.name).is_some() =>
             {
-                statement_value(self.eval_expr_value(expression)?)
+                self.eval_expr_value(expression)
             }
-            Expr::Call(call) => Err(unknown_stone_call_error(&call.name)),
-            other => statement_value(self.eval_expr_value(other)?),
+            Expr::Call(call) => Err(unknown_stone_call_error(&call.name).into()),
+            other => self.eval_expr_value(other),
         }
     }
 
     fn eval_expr_value(
         &mut self,
         expression: &Expr,
-    ) -> Result<RuntimeValue, ShellError> {
+    ) -> Result<RuntimeValue, EvalError> {
         let started = self.state.profiler.start();
-        let result = (|| {
+        let result = (|| -> Result<RuntimeValue, ShellError> {
             let span = Span::unknown();
             match expression {
                 Expr::None => Ok(RuntimeValue::Nu(Value::nothing(span))),
@@ -3355,9 +3373,9 @@ impl Evaluator<'_> {
                 } => {
                     let condition = self.eval_expr_value(condition)?;
                     if runtime_truthy(&condition, "conditional expression")? {
-                        self.eval_expr_value(then_expr)
+                        Ok(self.eval_expr_value(then_expr)?)
                     } else {
-                        self.eval_expr_value(else_expr)
+                        Ok(self.eval_expr_value(else_expr)?)
                     }
                 }
                 Expr::Not(value) => {
@@ -3552,7 +3570,7 @@ impl Evaluator<'_> {
             }
         })();
         self.state.profiler.finish(EvalProfileBucket::Expr, started);
-        result
+        result.map_err(EvalError::from)
     }
 
     fn eval_await_expr(&mut self, expression: &Expr) -> Result<RuntimeValue, ShellError> {
@@ -4481,7 +4499,7 @@ impl Evaluator<'_> {
                 let result = self.eval_expr_value(body);
                 self.state.pure_calls = outer_pure;
                 self.state.pop_scope()?;
-                result
+                Ok(result?)
             }
         }
     }
@@ -4910,8 +4928,8 @@ impl Evaluator<'_> {
             .first()
             .map(|expr| {
                 self.eval_expr_value(expr)
-                    .and_then(|value| value.into_nu_value("find"))
-                    .and_then(|value| value_to_string(&value, "find"))
+                    .and_then(|value| Ok(value.into_nu_value("find")?))
+                    .and_then(|value| Ok(value_to_string(&value, "find")?))
             })
             .transpose()?;
         let mut options = StoneFindOptions {
@@ -6074,7 +6092,7 @@ impl Evaluator<'_> {
                         };
                         return match (found, rest) {
                             (Some(value), _) => Ok(value),
-                            (None, [default]) => self.eval_expr_value(default),
+                            (None, [default]) => Ok(self.eval_expr_value(default)?),
                             (None, _) => Ok(RuntimeValue::Nu(Value::nothing(Span::unknown()))),
                         };
                     }
@@ -14225,6 +14243,10 @@ enum Place {
     Name(String),
     Item { container: RuntimeValue, index: Value },
     Field { container: RuntimeValue, attr: String },
+}
+
+fn none_value() -> RuntimeValue {
+    RuntimeValue::Nu(Value::nothing(Span::unknown()))
 }
 
 /// The value of an expression statement. A value that only lives inside

@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::Instant;
 
-use nu_protocol::{PipelineData, Record, ShellError, Span, Value};
+use nu_protocol::{Record, ShellError, Span, Value};
 
 use super::stone_json_view::{
     find_top_level_json_field, json_array_bytes_for_each_range, json_key_matches,
@@ -1048,7 +1048,7 @@ impl Evaluator<'_> {
             self.validate_stone_materialized_snapshot(&snapshot)?;
         }
         self.apply_stone_materialized_snapshot(snapshot);
-        Ok(EvalFlow::Output(PipelineData::empty()))
+        Ok(EvalFlow::Output(super::none_value()))
     }
 
     fn execute_hot_jsonl_aggregation_native_body(
