@@ -337,7 +337,22 @@ impl TaskSpec {
         let frontend = frontend_kind(&self.root)?;
         let script = self.script_source()?;
         let entrypoint = self.script_entrypoint()?;
-        let input = self.input()?;
+        // Task input is passed explicitly, as the entrypoint's argument. A
+        // program without an entrypoint has nowhere to receive it, so it may
+        // only have an empty input (`null` or `{}`).
+        let input = if frontend != TaskFrontend::Agent && entrypoint.is_none() {
+            match self.root.get("input") {
+                None | Some(JsonValue::Null) if self.root.get("input_path").is_none() => TaskInput {
+                    pipeline: PipelineData::empty(),
+                },
+                Some(JsonValue::Object(fields)) if fields.is_empty() && self.root.get("input_path").is_none() => TaskInput {
+                    pipeline: PipelineData::empty(),
+                },
+                _ => return Err("task input needs script.entrypoint: name a function in the script that takes the input as its parameter, e.g. `def main(input): ...`".to_string()),
+            }
+        } else {
+            self.input()?
+        };
         let agent = if frontend == TaskFrontend::Agent {
             self.agent_spec()?
         } else {
@@ -394,6 +409,8 @@ impl TaskSpec {
         let input = self.root.get("input");
         let input_path = self.root.get("input_path").and_then(JsonValue::as_str);
 
+        // `"input": null` means no input.
+        let input = input.filter(|value| !value.is_null());
         match (input, input_path) {
             (Some(value), None) => {
                 let bytes = serde_json::to_vec(value)
@@ -762,7 +779,7 @@ mod tests {
               "version": 0,
               "id": "inline-task",
               "runtime": { "frontend": "stone" },
-              "script": { "source": "items = get(\"items\")\nnames = []\nfor item in items:\n    if item[\"kind\"] == \"file\":\n        names.append(item[\"name\"])\nemit(sorted(names))" },
+              "script": { "source": "def main(input):\n    names = []\n    for item in input[\"items\"]:\n        if item[\"kind\"] == \"file\":\n            names.append(item[\"name\"])\n    return sorted(names)", "entrypoint": "main" },
               "input": {
                 "items": [
                   { "name": "b.txt", "kind": "file" },
@@ -785,12 +802,37 @@ mod tests {
     }
 
     #[test]
+    fn rejects_task_input_without_an_entrypoint() {
+        let root = temp_dir("input-without-entrypoint");
+        let task_path = root.join("task.json");
+        fs::write(
+            &task_path,
+            r#"{
+              "version": 0,
+              "id": "input-without-entrypoint",
+              "runtime": { "frontend": "stone" },
+              "script": { "source": "emit(1)" },
+              "input": { "message": "hello" }
+            }"#,
+        )
+        .expect("write task");
+        let mut guest = StoneGuest::new(root.clone()).expect("guest");
+        let response = guest.task_response_from_path(&task_path);
+        assert_eq!(response["ok"], json!(false));
+        assert!(
+            response.to_string().contains("task input needs script.entrypoint"),
+            "{response}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn runs_guest_path_task_spec() {
         let root = temp_dir("guest-path-task");
         let task_path = root.join("task.json");
         let script_path = root.join("task.stone");
         let input_path = root.join("input.json");
-        fs::write(&script_path, "get(\"message\")").expect("write script");
+        fs::write(&script_path, "def main(input):\n    return input[\"message\"]\n").expect("write script");
         fs::write(&input_path, r#"{"message":"hello"}"#).expect("write input");
         fs::write(
             &task_path,
@@ -799,7 +841,7 @@ mod tests {
                   "version": 0,
                   "id": "guest-path-task",
                   "runtime": {{ "frontend": "stone" }},
-                  "script": {{ "guest_path": "{}" }},
+                  "script": {{ "guest_path": "{}", "entrypoint": "main" }},
                   "input_path": "{}"
                 }}"#,
                 script_path.display(),

@@ -568,11 +568,18 @@ emit(control(session).value)"#],
     },
     StoneHelpEntry {
         name: "emit",
-        signature: "emit(value: Any? = pipeline_value) -> Any",
-        use_when: "Use to publish a structured result from a Stone script or MCP call. emit returns the value to the running program and does not terminate execution.",
-        examples: &[r#"emit({"ok": True, "path": "/app/out.json"})"#],
+        signature: "emit(value: Any) -> Any",
+        use_when: "Use to set the structured result of a Stone script or MCP call. The emitted value is the program's result even if statements run after it; a program that never emits returns its last statement's value. emit returns the value and does not stop the program.",
+        examples: &[
+            r#"emit({"ok": True, "path": "/app/out.json"})"#,
+            r#"def finish(path):
+    emit({"ok": True, "path": path})
+    print("done")
+finish("/app/out.json")"#,
+        ],
         avoid: &[
             "Do not print final structured results; emit them.",
+            "Do not emit more than once: a program has one result, and a second emit raises an error. Collect what you want to report into one dict or typed record and emit it at the end.",
             "Do not treat emit as exit; use mutually exclusive control flow or return from a function when later effects must not run.",
             "Do not emit large lists just to inspect them; bind the list and emit len/head/tail summaries.",
         ],

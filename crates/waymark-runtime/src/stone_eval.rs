@@ -195,6 +195,10 @@ pub struct EvalState {
     current_program_entrypoint: Option<String>,
     context: ContextState,
     stdout: String,
+    /// The program's result, once `emit(value)` has run. It is the result
+    /// whatever statements follow; a program that never emits returns its
+    /// last statement's value.
+    emitted: Option<Value>,
     session_bound_names: Vec<String>,
     /// Modules linked into this program, for diagnostics.
     modules: Vec<JsonValue>,
@@ -1003,6 +1007,7 @@ fn eval_program_with_source_options(
                 .map(|session| session.context.clone())
                 .unwrap_or_default(),
             stdout: String::new(),
+            emitted: None,
             session_bound_names: Vec::new(),
             modules: Vec::new(),
             types: options
@@ -1035,6 +1040,11 @@ fn eval_program_with_source_options(
         }
         _ => evaluator.eval_program(program, input),
     };
+    // An emitted value is the result, whatever the last statement was.
+    let pipeline = pipeline.map(|output| match evaluator.state.emitted.take() {
+        Some(value) => value.into_pipeline_data(),
+        None => output,
+    });
     let scope_cleanup = evaluator.close_open_attempt_scopes("Stone evaluation ended");
     let frontier_cleanup = evaluator.release_open_semantic_frontiers();
     let cleanup = combine_cleanup_results(scope_cleanup, frontier_cleanup);
@@ -3539,7 +3549,7 @@ impl Evaluator<'_> {
             "all" => self.eval_any_all_call(call, false),
             "enumerate" => self.eval_enumerate_call(call),
             "echo" => self.eval_echo_call(call),
-            "emit" => self.eval_emit_call(call, input),
+            "emit" => self.eval_emit_call(call),
             "fail" => self.eval_fail_call(call),
             "find" => self.eval_find_call(call),
             "diff" => self.eval_diff_call(call),
@@ -4486,25 +4496,25 @@ impl Evaluator<'_> {
         }))
     }
 
-    fn eval_emit_call(
-        &mut self,
-        call: &Call,
-        input: PipelineData,
-    ) -> Result<RuntimeValue, ShellError> {
-        if !call.named.is_empty() {
+    /// `emit(value)` sets the program's result. Later statements still run
+    /// but do not replace it, and a program has one result, so a second
+    /// `emit` is an error rather than a silent overwrite.
+    fn eval_emit_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let ([value], []) = (call.positional.as_slice(), call.named.as_slice()) else {
             return Err(stone_error(
                 "emit",
-                "emit() keyword arguments are not supported",
+                "emit() takes exactly one value, the program's result, as in `emit({\"ok\": True})`",
+            ));
+        };
+        if self.state.emitted.is_some() {
+            return Err(stone_error(
+                "emit",
+                "emit() was already called: a program has one result, and emit sets it once. Collect what you want to report into one value (a dict or a typed record) and emit that once, at the end",
             ));
         }
-        match call.positional.as_slice() {
-            [] => input
-                .into_value(Span::unknown())
-                .map(RuntimeValue::Nu)
-                .map_err(|err| stone_error("emit", err.to_string())),
-            [value] => self.eval_expr_value(value, PipelineData::empty()),
-            _ => Err(stone_error("emit", "emit() takes at most one value")),
-        }
+        let value = self.eval_expr_value(value, PipelineData::empty())?;
+        self.state.emitted = Some(value.clone().into_nu_value("emit")?);
+        Ok(value)
     }
 
     fn eval_fail_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -25815,7 +25825,7 @@ kept = []
 for line in open("numbers.txt"):
     text = line.strip()
     if text.startswith("#"):
-        emit(None)
+        pass
     else:
         total += int(text)
         kept.append(text)
@@ -25834,6 +25844,39 @@ emit({"total": total, "kept": kept, "count": len(kept), "has_20": "20" in kept})
             })
         );
 
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn emit_sets_the_result_once() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("emit-result")?;
+        let run = |stack: &mut Stack, source: &str| -> Result<serde_json::Value, ShellError> {
+            let program = lower_source(source)?;
+            let output = eval_program(&engine_state, stack, &program, PipelineData::empty())?;
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())
+        };
+        // Statements after emit run but do not replace the result.
+        assert_eq!(
+            run(&mut stack, "emit({\"a\": 1})\nprint(\"later\")\nx = 2\n")?,
+            json_value!({"a": 1})
+        );
+        // emit inside a function sets the program's result too.
+        assert_eq!(
+            run(&mut stack, "def finish(n):\n    emit({\"n\": n})\n    return n + 1\nfinish(3)\n")?,
+            json_value!({"n": 3})
+        );
+        // Without emit, the last statement's value is the result, as before.
+        assert_eq!(run(&mut stack, "1 + 1\n")?, json_value!(2));
+        // A second emit is an error, not a silent overwrite.
+        let err = run(&mut stack, "emit(1)\nemit(2)\n").expect_err("second emit must fail");
+        assert!(format!("{err:?}").contains("emit() was already called"));
+        let err = run(&mut stack, "for i in range(2):\n    emit(i)\n").expect_err("emit in a loop must fail");
+        assert!(format!("{err:?}").contains("emit() was already called"));
+        let err = run(&mut stack, "emit(1, 2)\n").expect_err("two values must fail");
+        assert!(format!("{err:?}").contains("exactly one value"));
+        let err = run(&mut stack, "emit()\n").expect_err("emit without a value must fail");
+        assert!(format!("{err:?}").contains("exactly one value"));
         cleanup_dir(&root);
         Ok(())
     }

@@ -1607,7 +1607,7 @@ mod tests {
                         "version": 0,
                         "id": "inline",
                         "runtime": { "frontend": "stone" },
-                        "script": { "source": "get(\"message\")" },
+                        "script": { "source": "def main(input):\n    return input[\"message\"]", "entrypoint": "main" },
                         "input": { "message": "hello" }
                     }
                 }

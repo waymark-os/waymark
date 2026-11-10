@@ -196,6 +196,19 @@ impl StoneGuest {
         input: PipelineData,
         entrypoint: Option<&str>,
     ) -> JsonValue {
+        // Program input is passed explicitly, as the entrypoint's argument.
+        // Without an entrypoint there is nowhere to receive it (the old
+        // first-statement "pipeline input" route was removed with --stdin).
+        if entrypoint.is_none_or(str::is_empty) && !input.is_nothing() {
+            let err = ShellError::Generic(
+                GenericError::new_internal(
+                    "Stone input error",
+                    "program input needs an entrypoint: name a function that takes the input as its parameter, e.g. `def main(input): ...`",
+                )
+                .with_code("stone_script_error"),
+            );
+            return json::error_response_with_source(&err, Some(self.current_cwd()), source);
+        }
         let response = if frontend == FrontendKind::Stone {
             let response =
                 match stone_frontend::eval_stone_source_with_output_session_and_entrypoint(
@@ -1305,94 +1318,44 @@ emit(first(map(lambda row: row["name"], dirs)))"#,
     }
 
     #[test]
-    fn stdin_json_becomes_structured_pipeline_input() -> Result<(), ShellError> {
-        let start_dir = test_root("stdin-json");
+    fn program_input_reaches_the_entrypoint_as_its_argument() -> Result<(), ShellError> {
+        let start_dir = test_root("entry-input");
         fs::create_dir_all(&start_dir).expect("create start dir");
-
         let mut guest = StoneGuest::new(start_dir.clone())?;
-        let response = guest.command_response_with_input(
-            r#"get("name")"#,
+        let mut call = |source: &str, input: PipelineData| {
+            guest.command_response_with_frontend_entrypoint(
+                FrontendKind::Stone,
+                source,
+                input,
+                Some("main"),
+            )
+        };
+
+        // JSON input arrives structured.
+        let response = call(
+            "def main(input):\n    return input[\"name\"]\n",
             pipeline_input_from_bytes(br#"{"name":"stone","kind":"shell"}"#.to_vec()),
         );
-        assert_eq!(response["ok"], json!(true));
-        assert_eq!(response["value"], json!("stone"));
+        assert_eq!(response["value"], json!("stone"), "{response}");
 
-        cleanup_dir(&start_dir);
-        Ok(())
-    }
-
-    #[test]
-    fn stdin_text_falls_back_to_string_input() -> Result<(), ShellError> {
-        let start_dir = test_root("stdin-text");
-        fs::create_dir_all(&start_dir).expect("create start dir");
-
-        let mut guest = StoneGuest::new(start_dir.clone())?;
-        let response = guest.command_response_with_input(
-            r#"text = emit()
-save(text, "note.txt")
-cat("note.txt")"#,
-            pipeline_input_from_bytes(b"hello from stdin".to_vec()),
+        // Input that is not JSON arrives as text.
+        let response = call(
+            "def main(text):\n    save(text, \"note.txt\")\n    return cat(\"note.txt\")\n",
+            pipeline_input_from_bytes(b"hello from input".to_vec()),
         );
-        assert_eq!(response["ok"], json!(true));
-        assert_eq!(response["value"], json!("hello from stdin"));
+        assert_eq!(response["value"], json!("hello from input"), "{response}");
 
-        cleanup_dir(&start_dir);
-        Ok(())
-    }
-
-    #[test]
-    fn get_streams_record_fields_from_list_stream_input() -> Result<(), ShellError> {
-        let start_dir = test_root("stream-get");
-        fs::create_dir_all(&start_dir).expect("create start dir");
-
-        let mut guest = StoneGuest::new(start_dir.clone())?;
+        // A streamed list arrives as an ordinary list.
         let span = Span::unknown();
-        let input = PipelineData::list_stream(
-            ListStream::new(
-                vec![
-                    record_value([("name", Value::string("a", span))], span),
-                    record_value([("name", Value::string("b", span))], span),
-                ]
-                .into_iter(),
-                span,
-                Signals::empty(),
-            ),
-            None,
-        );
-        let response = guest.command_response_with_input(
-            r#"rows = emit()
-emit(map(lambda row: row["name"], rows))"#,
-            input,
-        );
-        assert_eq!(response["ok"], json!(true));
-        assert_eq!(response["value"], json!(["a", "b"]));
-
-        cleanup_dir(&start_dir);
-        Ok(())
-    }
-
-    #[test]
-    fn where_filters_list_stream_input() -> Result<(), ShellError> {
-        let start_dir = test_root("stream-where");
-        fs::create_dir_all(&start_dir).expect("create start dir");
-
-        let mut guest = StoneGuest::new(start_dir.clone())?;
-        let span = Span::unknown();
-        let input = PipelineData::list_stream(
+        let rows = PipelineData::list_stream(
             ListStream::new(
                 vec![
                     record_value(
-                        [
-                            ("name", Value::string("a", span)),
-                            ("kind", Value::string("file", span)),
-                        ],
+                        [("name", Value::string("a", span)), ("kind", Value::string("file", span))],
                         span,
                     ),
                     record_value(
-                        [
-                            ("name", Value::string("b", span)),
-                            ("kind", Value::string("dir", span)),
-                        ],
+                        [("name", Value::string("b", span)), ("kind", Value::string("dir", span))],
                         span,
                     ),
                 ]
@@ -1402,69 +1365,36 @@ emit(map(lambda row: row["name"], rows))"#,
             ),
             None,
         );
-        let response = guest.command_response_with_input(
-            r#"rows = emit()
-dirs = where(rows, "kind", "dir")
-emit(map(lambda row: row["name"], dirs))"#,
-            input,
+        let response = call(
+            "def main(rows):\n    return {\"names\": [r[\"name\"] for r in rows], \"dirs\": len(where(rows, \"kind\", \"dir\")), \"first\": first(rows)[\"name\"]}\n",
+            rows,
         );
-        assert_eq!(response["ok"], json!(true));
-        assert_eq!(response["value"], json!(["b"]));
+        assert_eq!(
+            response["value"],
+            json!({"names": ["a", "b"], "dirs": 1, "first": "a"}),
+            "{response}"
+        );
 
         cleanup_dir(&start_dir);
         Ok(())
     }
 
     #[test]
-    fn first_and_last_work_with_list_stream_input() -> Result<(), ShellError> {
-        let start_dir = test_root("stream-first-last");
+    fn program_input_without_an_entrypoint_is_rejected() -> Result<(), ShellError> {
+        let start_dir = test_root("input-no-entry");
         fs::create_dir_all(&start_dir).expect("create start dir");
-
         let mut guest = StoneGuest::new(start_dir.clone())?;
-        let span = Span::unknown();
-
-        let first_input = PipelineData::list_stream(
-            ListStream::new(
-                vec![
-                    Value::int(1, span),
-                    Value::int(2, span),
-                    Value::int(3, span),
-                ]
-                .into_iter(),
-                span,
-                Signals::empty(),
-            ),
-            None,
+        let response = guest.command_response_with_input(
+            "1 + 1",
+            pipeline_input_from_bytes(br#"{"name":"stone"}"#.to_vec()),
         );
-        let first = guest.command_response_with_input(
-            r#"values = emit()
-first(values)"#,
-            first_input,
+        assert_eq!(response["ok"], json!(false));
+        assert!(
+            response.to_string().contains("program input needs an entrypoint"),
+            "{response}"
         );
-        assert_eq!(first["ok"], json!(true));
-        assert_eq!(first["value"], json!(1));
-
-        let last_input = PipelineData::list_stream(
-            ListStream::new(
-                vec![
-                    Value::int(1, span),
-                    Value::int(2, span),
-                    Value::int(3, span),
-                ]
-                .into_iter(),
-                span,
-                Signals::empty(),
-            ),
-            None,
-        );
-        let last = guest.command_response_with_input(
-            r#"values = emit()
-last(values, 2)"#,
-            last_input,
-        );
-        assert_eq!(last["ok"], json!(true));
-        assert_eq!(last["value"], json!([2, 3]));
-
+        // No input: programs run as before.
+        assert_eq!(guest.command_response("1 + 1")["value"], json!(2));
         cleanup_dir(&start_dir);
         Ok(())
     }

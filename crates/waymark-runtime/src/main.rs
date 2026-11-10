@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use hermit as _;
 
 use serde_json::json;
-use waymark_runtime::{pipeline_input_from_bytes, FrontendKind, StoneGuest};
+use waymark_runtime::{FrontendKind, StoneGuest};
 use waymark_runtime_support::{configure_process_environment, default_start_dir};
 
 fn main() -> ExitCode {
@@ -66,7 +66,15 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
-    let read_stdin = remove_flag(&mut args, "--stdin");
+    // `--stdin` used to hand stdin to the program as hidden "pipeline input"
+    // (a leftover of the removed Nu frontend). Stone takes data explicitly.
+    if remove_flag(&mut args, "--stdin") {
+        emit_json_error(
+            "usage error",
+            "--stdin was removed: Stone programs take data explicitly. Write the data to a file and read it in the program (open, read_json, read_jsonl), or run a task whose script.entrypoint is a function that takes the task's input as its parameter. To pass the program's source on stdin, use --stdin-script.",
+        );
+        return ExitCode::from(2);
+    }
     let read_stdin_script = remove_flag(&mut args, "--stdin-script");
     let task_server = remove_flag(&mut args, "--task-server");
     let task_server_stream = remove_flag(&mut args, "--task-server-stream");
@@ -115,7 +123,6 @@ fn main() -> ExitCode {
 
     if task_server
         && (task_path.is_some()
-            || read_stdin
             || read_stdin_script
             || stone
             || nu
@@ -130,7 +137,6 @@ fn main() -> ExitCode {
 
     if task_server_stream
         && (task_path.is_some()
-            || read_stdin
             || read_stdin_script
             || stone
             || nu
@@ -145,7 +151,6 @@ fn main() -> ExitCode {
 
     if task_server_vsock.is_some()
         && (task_path.is_some()
-            || read_stdin
             || read_stdin_script
             || stone
             || nu
@@ -158,7 +163,7 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    if task_path.is_some() && (read_stdin || read_stdin_script || stone || nu || !args.is_empty()) {
+    if task_path.is_some() && (read_stdin_script || stone || nu || !args.is_empty()) {
         emit_json_error(
             "usage error",
             "--task cannot be combined with other execution modes",
@@ -221,22 +226,6 @@ fn main() -> ExitCode {
         return ExitCode::from(if ok { 0 } else { 1 });
     }
 
-    if read_stdin && read_stdin_script {
-        emit_json_error(
-            "usage error",
-            "--stdin and --stdin-script both consume stdin",
-        );
-        return ExitCode::from(2);
-    }
-
-    let stdin_input = match read_stdin_input(read_stdin) {
-        Ok(input) => input,
-        Err(err) => {
-            emit_json_error("failed to read stdin", err.to_string());
-            return ExitCode::from(1);
-        }
-    };
-
     let explicit_frontend = if stone {
         Some(FrontendKind::Stone)
     } else {
@@ -282,7 +271,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let code = guest.run_command_with_frontend(frontend, &source, stdin_input);
+    let code = guest.run_command_with_frontend(frontend, &source, nu_protocol::PipelineData::empty());
 
     ExitCode::from(normalize_exit_code(code))
 }
@@ -338,17 +327,6 @@ fn emit_json_response(response: serde_json::Value, ok: bool) {
     } else {
         eprintln!("{encoded}");
     }
-}
-
-fn read_stdin_input(read_stdin: bool) -> io::Result<nu_protocol::PipelineData> {
-    if !read_stdin {
-        return Ok(nu_protocol::PipelineData::empty());
-    }
-
-    let stdin = io::stdin();
-    let mut bytes = Vec::new();
-    stdin.lock().read_to_end(&mut bytes)?;
-    Ok(pipeline_input_from_bytes(bytes))
 }
 
 fn read_stdin_source() -> io::Result<String> {
@@ -429,8 +407,8 @@ fn is_trailing_hermit_boot_arg(arg: &str) -> bool {
 
 fn usage(program_name: &str) -> String {
     format!(
-        "usage: {program_name} eval [--budget <limits>] [--stdin] [--stone] -c <command> | \
-         {program_name} eval [--budget <limits>] [--stdin] [--stone] <script.stone> | \
+        "usage: {program_name} eval [--budget <limits>] [--stone] -c <command> | \
+         {program_name} eval [--budget <limits>] [--stone] <script.stone> | \
          {program_name} eval [--stone] --stdin-script | \
          {program_name} help | \
          {program_name} --version | \

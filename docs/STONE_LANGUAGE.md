@@ -66,6 +66,11 @@ waymark eval --stdin-script < script.stone
 
 Stone is the frontend for `waymark eval -c`, script files, and `--stdin-script`.
 
+A program has no implicit input. It reads data explicitly, from files
+(`open`, `read_json`, `read_jsonl`) or, in a task spec, as the argument of the
+function named by `script.entrypoint` (`def main(input): ...`). A task that
+sets `input` or `input_path` without an entrypoint is rejected.
+
 `--budget model_calls=40,output_tokens=60000,tool_calls=200,wall_time_ms=600000`
 gives the run a budget (any subset of those limits). See
 [Budgets](#budgets).
@@ -867,7 +872,10 @@ says so with `result.effects.enforced == False`.
 
 ## Core Builtins
 
-- `emit(value)`: return a structured success value.
+- `emit(value)`: set the program's structured result. The emitted value is the
+  result even if statements run after it, and a second `emit` raises an error,
+  because a program has one result. `emit` does not stop the program. A program
+  that never emits returns the value of its last statement.
 - `fail(message)`: return a structured failure.
 - `workflow_evidence(satisfied_or_result, summary, references=[])`: construct
   bounded stage evidence from a boolean or a typed action result. Passing a
