@@ -2855,17 +2855,17 @@ impl Evaluator<'_> {
         indices: &[Value],
         context: &str,
     ) -> Result<RuntimeValue, ShellError> {
-        self.mutable_container_at(&TargetRoot::Name(name.to_string()), indices, context)
+        self.mutable_container_at(&TargetRoot::Name(name), indices, context)
     }
 
     fn mutable_container_at(
         &mut self,
-        root: &TargetRoot,
+        root: &TargetRoot<'_>,
         indices: &[Value],
         context: &str,
     ) -> Result<RuntimeValue, ShellError> {
         let name = match root {
-            TargetRoot::Name(name) => name.as_str(),
+            TargetRoot::Name(name) => *name,
             TargetRoot::Value(value) => {
                 let mut current = share(value.clone());
                 for index in indices {
@@ -2900,13 +2900,13 @@ impl Evaluator<'_> {
     /// Work out where an assignment writes, evaluating every expression in
     /// the target once (Python order: the base, then each index), so that
     /// `xs[i()] += 1` calls `i()` once and `f()[0] = v` calls `f()` once.
-    fn resolve_place(
+    fn resolve_place<'t>(
         &mut self,
-        target: &AssignTarget,
+        target: &'t AssignTarget,
         context: &str,
-    ) -> Result<Place, ShellError> {
+    ) -> Result<Place<'t>, ShellError> {
         match target {
-            AssignTarget::Name(name) => Ok(Place::Name(name.clone())),
+            AssignTarget::Name(name) => Ok(Place::Name(name)),
             AssignTarget::Subscript { .. } => {
                 let (root, indices) = self.eval_assign_target_path(target, context)?;
                 let Some((index, parents)) = indices.split_last() else {
@@ -2954,7 +2954,7 @@ impl Evaluator<'_> {
     }
 
     /// The current value at a place, for `+=` and friends.
-    fn read_place(&mut self, place: &Place) -> Result<RuntimeValue, ShellError> {
+    fn read_place(&mut self, place: &Place<'_>) -> Result<RuntimeValue, ShellError> {
         let started = self.state.profiler.start();
         let result = match place {
             Place::Name(name) => self.state.get_local(name).ok_or_else(|| {
@@ -2971,7 +2971,7 @@ impl Evaluator<'_> {
 
     /// Store into an item or field place. Names go through assign_value,
     /// which also records session bindings.
-    fn write_place(&mut self, place: Place, value: RuntimeValue) -> Result<(), ShellError> {
+    fn write_place(&mut self, place: Place<'_>, value: RuntimeValue) -> Result<(), ShellError> {
         match place {
             Place::Name(name) => {
                 self.state.set_local(name, value);
@@ -2984,13 +2984,13 @@ impl Evaluator<'_> {
         }
     }
 
-    fn eval_assign_target_path(
+    fn eval_assign_target_path<'t>(
         &mut self,
-        target: &AssignTarget,
+        target: &'t AssignTarget,
         context: &str,
-    ) -> Result<(TargetRoot, Vec<Value>), ShellError> {
+    ) -> Result<(TargetRoot<'t>, Vec<Value>), ShellError> {
         match target {
-            AssignTarget::Name(name) => Ok((TargetRoot::Name(name.clone()), Vec::new())),
+            AssignTarget::Name(name) => Ok((TargetRoot::Name(name), Vec::new())),
             AssignTarget::Expr(expr) => Ok((
                 TargetRoot::Value(self.eval_expr_value(expr)?),
                 Vec::new(),
@@ -14248,23 +14248,23 @@ fn method_int_arg(value: &RuntimeValue, context: &str) -> Result<i64, ShellError
 
 /// Where an assignment target starts: a variable, or the object an
 /// expression such as `f()` gave.
-enum TargetRoot {
-    Name(String),
+enum TargetRoot<'a> {
+    Name(&'a str),
     Value(RuntimeValue),
 }
 
-impl TargetRoot {
+impl TargetRoot<'_> {
     fn label(&self) -> String {
         match self {
-            TargetRoot::Name(name) => name.clone(),
+            TargetRoot::Name(name) => name.to_string(),
             TargetRoot::Value(value) => runtime_type_name(value).to_string(),
         }
     }
 }
 
 /// An assignment target with every expression in it already evaluated.
-enum Place {
-    Name(String),
+enum Place<'a> {
+    Name(&'a str),
     Item { container: RuntimeValue, index: Value },
     Field { container: RuntimeValue, attr: String },
 }
