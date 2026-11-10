@@ -1391,7 +1391,7 @@ impl Evaluator<'_> {
             if let Some(stage) = stage {
                 self.state.set_local(
                     module_function.name.clone(),
-                    RuntimeValue::WorkflowStage(stage),
+                    RuntimeValue::WorkflowStage(Box::new(stage)),
                 );
             }
         }
@@ -1632,14 +1632,14 @@ impl Evaluator<'_> {
                         captures,
                     );
                     self.state
-                        .set_local(function.name.clone(), RuntimeValue::Callable(callable));
+                        .set_local(function.name.clone(), RuntimeValue::Callable(Box::new(callable)));
                     return Ok(EvalFlow::Output(PipelineData::empty()));
                 }
                 let instance = self.instantiate_function(function)?;
                 self.state.functions.insert(function.name.clone(), instance);
                 if let Some(stage) = stage {
                     self.state
-                        .set_local(function.name.clone(), RuntimeValue::WorkflowStage(stage));
+                        .set_local(function.name.clone(), RuntimeValue::WorkflowStage(Box::new(stage)));
                 }
                 Ok(EvalFlow::Output(PipelineData::empty()))
             }
@@ -3273,10 +3273,10 @@ impl Evaluator<'_> {
                         // child attempt) as its name.
                         Ok(error_type_value(name))
                     } else if let Some(function) = self.state.functions.get(name).cloned() {
-                        Ok(RuntimeValue::Callable(CallableValue::named(
+                        Ok(RuntimeValue::Callable(Box::new(CallableValue::named(
                             self.state.next_callable_id(),
                             function,
-                        )))
+                        ))))
                     } else if let Some(spec) = self.state.types.get(name) {
                         // A record class or type alias used as a value.
                         Ok(RuntimeValue::Type(Rc::new(spec.clone())))
@@ -3439,12 +3439,12 @@ impl Evaluator<'_> {
                     captures,
                 } => {
                     let captures = self.state.capture_cells(captures);
-                    Ok(RuntimeValue::Callable(CallableValue::lambda(
+                    Ok(RuntimeValue::Callable(Box::new(CallableValue::lambda(
                         self.state.next_callable_id(),
                         params.clone(),
                         body.clone(),
                         captures,
-                    )))
+                    ))))
                 }
                 // In a predicate, a call is a builtin: compile_predicate
                 // admitted only pure builtins, and no program name may stand
@@ -4134,8 +4134,12 @@ impl Evaluator<'_> {
             .state
             .get_local(&call.name)
             .ok_or_else(|| unknown_stone_call_error(&call.name))?;
-        match &callable {
-            RuntimeValue::Callable(CallableValue::Named { function, .. }) => {
+        let boxed_callable = match &callable {
+            RuntimeValue::Callable(callable) => Some(&**callable),
+            _ => None,
+        };
+        match boxed_callable {
+            Some(CallableValue::Named { function, .. }) => {
                 let parameter_names = function
                     .params
                     .iter()
@@ -4148,7 +4152,7 @@ impl Evaluator<'_> {
                     call,
                 )?;
             }
-            RuntimeValue::Callable(CallableValue::Lambda {
+            Some(CallableValue::Lambda {
                 function_id,
                 params,
                 ..
@@ -4160,7 +4164,7 @@ impl Evaluator<'_> {
                     call,
                 )?;
             }
-            RuntimeValue::AgentControl(_) if !call.named.is_empty() => {
+            _ if matches!(callable, RuntimeValue::AgentControl(_)) && !call.named.is_empty() => {
                 return Err(stone_error(
                     "callable",
                     "agent-control values currently accept positional arguments only",
@@ -4319,13 +4323,13 @@ impl Evaluator<'_> {
         let host_field = |owner: &str, value: Value| host_record(&host_field_type(owner, attr), value);
         if let RuntimeValue::AttemptBest(best) = receiver {
             if attr == "outcome" {
-                return best.typed_outcome().map(RuntimeValue::AttemptOutcome);
+                return best.typed_outcome().map(|outcome| RuntimeValue::AttemptOutcome(Box::new(outcome)));
             }
             return best.attribute(attr).map(|value| host_field("AttemptBest", value));
         }
         if let RuntimeValue::AttemptFailure(failure) = receiver {
             if attr == "outcome" {
-                return failure.typed_outcome().map(RuntimeValue::AttemptOutcome);
+                return failure.typed_outcome().map(|outcome| RuntimeValue::AttemptOutcome(Box::new(outcome)));
             }
             return failure.attribute(attr).map(|value| host_field("AttemptFailure", value));
         }
@@ -4337,7 +4341,7 @@ impl Evaluator<'_> {
         }
         if let RuntimeValue::AttemptAcceptance(acceptance) = receiver {
             if attr == "selected" {
-                return Ok(RuntimeValue::AttemptHandle(acceptance.selected_handle()));
+                return Ok(RuntimeValue::AttemptHandle(Box::new(acceptance.selected_handle())));
             }
             return acceptance
                 .attribute(attr)
@@ -4389,7 +4393,7 @@ impl Evaluator<'_> {
 
     fn eval_callable_expr(&mut self, expression: &Expr) -> Result<CallableValue, ShellError> {
         match self.eval_expr_value(expression)? {
-            RuntimeValue::Callable(callable) => Ok(callable),
+            RuntimeValue::Callable(callable) => Ok(*callable),
             other => Err(stone_error(
                 "callable",
                 format!(
@@ -5723,11 +5727,11 @@ impl Evaluator<'_> {
             .into_nu_value("predicate")?;
         let text = value_to_string(&text, "predicate")?;
         let (params, body) = stone_predicate::compile_predicate(&text)?;
-        Ok(RuntimeValue::Callable(CallableValue::pure_lambda(
+        Ok(RuntimeValue::Callable(Box::new(CallableValue::pure_lambda(
             self.state.next_callable_id(),
             params,
             Box::new(body),
-        )))
+        ))))
     }
 
     fn eval_json_loads_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5896,7 +5900,7 @@ impl Evaluator<'_> {
 
     fn eval_sort_key(&mut self, expression: &Expr) -> Result<SortKey, ShellError> {
         match self.eval_expr_value(expression)? {
-            RuntimeValue::Callable(callable) => Ok(SortKey::Callable(callable)),
+            RuntimeValue::Callable(callable) => Ok(SortKey::Callable(*callable)),
             other => {
                 let value = other.into_nu_value("sort")?;
                 value_to_string(&value, "sort key").map(SortKey::Field)
@@ -6165,7 +6169,7 @@ impl Evaluator<'_> {
         }
         match self.eval_expr_value(expression)? {
             RuntimeValue::Nu(Value::Nothing { .. }) => Ok(TransitionHooks::default()),
-            RuntimeValue::TransitionHooks(hooks) => Ok(hooks),
+            RuntimeValue::TransitionHooks(hooks) => Ok(*hooks),
             other => Err(transition_hook_error(
                 effect,
                 format!(
@@ -6184,7 +6188,7 @@ impl Evaluator<'_> {
             ));
         }
         self.eval_transition_hook_entries("transition_hooks", &call.named)
-            .map(RuntimeValue::TransitionHooks)
+            .map(|hooks| RuntimeValue::TransitionHooks(Box::new(hooks)))
     }
 
     fn eval_transition_hook_entries(
@@ -6231,7 +6235,7 @@ impl Evaluator<'_> {
             }
         }
         match self.eval_expr_value(expression)? {
-            RuntimeValue::Callable(callable) => Ok(TransitionHookHandler::Callable(callable)),
+            RuntimeValue::Callable(callable) => Ok(TransitionHookHandler::Callable(*callable)),
             other => Err(transition_hook_error(
                 effect,
                 format!(
@@ -6340,7 +6344,7 @@ impl Evaluator<'_> {
             ));
         }
         Ok(RuntimeValue::WorkflowEvidenceSource(
-            WorkflowEvidenceSource::FileNonempty { path },
+            Box::new(WorkflowEvidenceSource::FileNonempty { path }),
         ))
     }
 
@@ -6387,7 +6391,7 @@ impl Evaluator<'_> {
             workflow_elf_machine(arch)?;
         }
         Ok(RuntimeValue::WorkflowEvidenceSource(
-            WorkflowEvidenceSource::Artifact { path, format, arch },
+            Box::new(WorkflowEvidenceSource::Artifact { path, format, arch }),
         ))
     }
 
@@ -6428,11 +6432,11 @@ impl Evaluator<'_> {
             }
         }
         Ok(RuntimeValue::WorkflowEvidenceSource(
-            WorkflowEvidenceSource::FileValid {
+            Box::new(WorkflowEvidenceSource::FileValid {
                 path,
                 format,
                 nonempty,
-            },
+            }),
         ))
     }
 
@@ -6457,7 +6461,7 @@ impl Evaluator<'_> {
             ));
         }
         Ok(RuntimeValue::WorkflowEvidenceSource(
-            WorkflowEvidenceSource::CommandSucceeded { argv },
+            Box::new(WorkflowEvidenceSource::CommandSucceeded { argv }),
         ))
     }
 
@@ -6466,7 +6470,7 @@ impl Evaluator<'_> {
             return Err(workflow_error("stdout_nonempty() accepts no arguments"));
         }
         Ok(RuntimeValue::WorkflowEvidenceSource(
-            WorkflowEvidenceSource::StdoutNonempty,
+            Box::new(WorkflowEvidenceSource::StdoutNonempty),
         ))
     }
 
@@ -6609,7 +6613,7 @@ impl Evaluator<'_> {
             }
         }
         Ok(RuntimeValue::WorkflowEvidenceSource(
-            WorkflowEvidenceSource::DecisionRecorded { fields, resolved },
+            Box::new(WorkflowEvidenceSource::DecisionRecorded { fields, resolved }),
         ))
     }
 
@@ -6647,7 +6651,7 @@ impl Evaluator<'_> {
             sources.push(self.eval_workflow_evidence_source(expression)?);
         }
         Ok(RuntimeValue::WorkflowEvidenceSource(
-            WorkflowEvidenceSource::All(sources),
+            Box::new(WorkflowEvidenceSource::All(sources)),
         ))
     }
 
@@ -6819,7 +6823,7 @@ impl Evaluator<'_> {
             }
             max_attempts = max_actions;
         }
-        Ok(RuntimeValue::WorkflowStage(WorkflowStage {
+        Ok(RuntimeValue::WorkflowStage(Box::new(WorkflowStage {
             name,
             metadata: WorkflowStage::new_metadata(goal, inputs),
             agent_loop,
@@ -6829,7 +6833,7 @@ impl Evaluator<'_> {
             max_attempts,
             max_actions,
             checkpoint,
-        }))
+        })))
     }
 
     fn eval_workflow_evidence_source(
@@ -6851,9 +6855,9 @@ impl Evaluator<'_> {
             }
         }
         match self.eval_expr_value(expression)? {
-            RuntimeValue::WorkflowEvidenceSource(source) => Ok(source),
+            RuntimeValue::WorkflowEvidenceSource(source) => Ok(*source),
             RuntimeValue::Callable(callable) if callable.accepts_arity(1) => Ok(
-                WorkflowEvidenceSource::Handler(WorkflowHandler::Callable(callable)),
+                WorkflowEvidenceSource::Handler(WorkflowHandler::Callable(*callable)),
             ),
             RuntimeValue::Callable(callable) => Err(workflow_error(format!(
                 "evidence handler {} must accept one workflow context argument",
@@ -7043,7 +7047,7 @@ impl Evaluator<'_> {
         }
         match self.eval_expr_value(expression)? {
             RuntimeValue::Callable(callable) if callable.accepts_arity(1) => {
-                Ok(WorkflowHandler::Callable(callable))
+                Ok(WorkflowHandler::Callable(*callable))
             }
             RuntimeValue::Callable(callable) => Err(workflow_error(format!(
                 "{role} handler {} must accept exactly one workflow context argument",
@@ -7116,13 +7120,13 @@ impl Evaluator<'_> {
                     stage.name
                 )));
             }
-            stages.push(stage);
+            stages.push(*stage);
         }
-        Ok(RuntimeValue::Workflow(Workflow {
+        Ok(RuntimeValue::Workflow(Box::new(Workflow {
             name,
             stages,
             patches: Vec::new(),
-        }))
+        })))
     }
 
     fn eval_workflow_patch_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -7256,7 +7260,7 @@ impl Evaluator<'_> {
             )));
         }
         let replacement_name = replacement.name.clone();
-        workflow.stages[target_index] = replacement;
+        workflow.stages[target_index] = *replacement;
         workflow.patches.push(WorkflowPatch {
             target,
             replacement: replacement_name,
@@ -9112,14 +9116,14 @@ impl Evaluator<'_> {
                 }
             }
         }
-        Ok(RuntimeValue::AgentControl(AgentControlValue {
+        Ok(RuntimeValue::AgentControl(Box::new(AgentControlValue {
             control_id: self.state.next_callable_id(),
             kind: AgentControlKind::React { model },
             max_rounds,
             max_turns,
             max_tool_ms,
             completion_path,
-        }))
+        })))
     }
 
     fn eval_current_program_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -9221,14 +9225,14 @@ impl Evaluator<'_> {
                 }
             }
         }
-        Ok(RuntimeValue::AgentControl(AgentControlValue {
+        Ok(RuntimeValue::AgentControl(Box::new(AgentControlValue {
             control_id: self.state.next_callable_id(),
             kind: AgentControlKind::Scripted { actions },
             max_rounds: 0,
             max_turns,
             max_tool_ms,
             completion_path,
-        }))
+        })))
     }
 
     fn invoke_agent_control(
@@ -9670,9 +9674,9 @@ impl Evaluator<'_> {
         if let Some(scope) = scope {
             scope.register(attempt.clone())?;
         }
-        Ok(RuntimeValue::AttemptHandle(AttemptHandleValue::new(
+        Ok(RuntimeValue::AttemptHandle(Box::new(AttemptHandleValue::new(
             attempt, child,
-        )))
+        ))))
     }
 
     fn eval_semantic_frontier_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -9915,7 +9919,7 @@ impl Evaluator<'_> {
                 .saturating_add(1);
         }
         self.state.semantic_frontiers.push(frontier.clone());
-        Ok(RuntimeValue::SemanticFrontier(frontier))
+        Ok(RuntimeValue::SemanticFrontier(Box::new(frontier)))
     }
 
     fn eval_semantic_frontier_release_call(
@@ -10164,9 +10168,9 @@ impl Evaluator<'_> {
         if let Some(scope) = scope {
             scope.register(attempt.clone())?;
         }
-        Ok(RuntimeValue::AttemptHandle(AttemptHandleValue::new(
+        Ok(RuntimeValue::AttemptHandle(Box::new(AttemptHandleValue::new(
             attempt, child,
-        )))
+        ))))
     }
 
     fn eval_attempt_fork_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -10267,9 +10271,9 @@ impl Evaluator<'_> {
         if let Some(scope) = scope {
             scope.register(attempt.clone())?;
         }
-        Ok(RuntimeValue::AttemptHandle(AttemptHandleValue::new(
+        Ok(RuntimeValue::AttemptHandle(Box::new(AttemptHandleValue::new(
             attempt, child,
-        )))
+        ))))
     }
 
     fn eval_attempt_finish_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -10430,14 +10434,14 @@ impl Evaluator<'_> {
                 scope.mark_joined(&attempt)?;
             }
         }
-        Ok(RuntimeValue::AttemptOutcome(AttemptOutcomeValue {
+        Ok(RuntimeValue::AttemptOutcome(Box::new(AttemptOutcomeValue {
             attempt,
             joined,
             timed_out: !joined,
             state,
             controller_state,
             record: waited,
-        }))
+        })))
     }
 
     fn eval_attempt_wait_set_call(
@@ -10513,14 +10517,14 @@ impl Evaluator<'_> {
         }
         if !wait_all {
             return Ok(RuntimeValue::AttemptOutcome(
-                outcomes.into_iter().next().unwrap_or(AttemptOutcomeValue {
+                Box::new(outcomes.into_iter().next().unwrap_or(AttemptOutcomeValue {
                     attempt: String::new(),
                     joined: false,
                     timed_out: waited.timed_out,
                     state: "waiting".to_string(),
                     controller_state: "running".to_string(),
                     record: Value::nothing(Span::unknown()),
-                }),
+                })),
             ));
         }
 
@@ -10712,7 +10716,7 @@ impl Evaluator<'_> {
                 ));
             }
         }
-        let failure = AttemptFailureValue::new(self.state.next_callable_id(), scope, outcome);
+        let failure = AttemptFailureValue::new(self.state.next_callable_id(), scope, *outcome);
         self.state.retained_failures.push(failure.clone());
         Ok(RuntimeValue::AttemptFailure(failure))
     }
@@ -10885,7 +10889,7 @@ impl Evaluator<'_> {
             ));
         }
         let candidate = AttemptBestCandidate {
-            outcome,
+            outcome: *outcome,
             score,
             summary,
             evidence,
@@ -10996,7 +11000,7 @@ impl Evaluator<'_> {
         }
         best.mark_accepted(&candidate)?;
         Ok(RuntimeValue::AttemptAcceptance(
-            AttemptAcceptanceValue::new(child, accepted)?,
+            Box::new(AttemptAcceptanceValue::new(child, accepted)?),
         ))
     }
 
@@ -11483,7 +11487,7 @@ impl Evaluator<'_> {
         }
         self.resolve_retained_failures(&child, "accepted")?;
         Ok(RuntimeValue::AttemptAcceptance(
-            AttemptAcceptanceValue::new(child, accepted)?,
+            Box::new(AttemptAcceptanceValue::new(child, accepted)?),
         ))
     }
 
@@ -20353,8 +20357,8 @@ mod tests {
         let mut report = nu_protocol::Record::new();
         report.push("child", Value::record(child, span));
         let value = RuntimeValue::AttemptAcceptance(
-            AttemptAcceptanceValue::new("attempt-child".to_string(), Value::record(report, span))
-                .expect("acceptance"),
+            Box::new(AttemptAcceptanceValue::new("attempt-child".to_string(), Value::record(report, span))
+                .expect("acceptance")),
         );
         ensure_runtime_type(&value, StoneType::AttemptAcceptance, "argument `accepted`")
             .expect("matching nominal type");
@@ -20426,7 +20430,7 @@ emit({
             .insert("scope".to_string(), RuntimeValue::AttemptScope(scope));
         session
             .locals
-            .insert("outcome".to_string(), RuntimeValue::AttemptOutcome(outcome));
+            .insert("outcome".to_string(), RuntimeValue::AttemptOutcome(Box::new(outcome)));
         let source = r#"def identity(value: attempt_failure) -> attempt_failure:
     return value
 
@@ -30781,5 +30785,19 @@ emit({
         if path.exists() {
             fs::remove_dir_all(path).expect("cleanup test dir");
         }
+    }
+}
+
+#[cfg(test)]
+mod value_size {
+    /// Every expression result moves a RuntimeValue, so its size is a cost
+    /// paid everywhere. A large new variant belongs in a Box.
+    #[test]
+    fn runtime_values_stay_small() {
+        assert!(
+            std::mem::size_of::<super::RuntimeValue>() <= 64,
+            "RuntimeValue grew to {} bytes; box the large variant",
+            std::mem::size_of::<super::RuntimeValue>()
+        );
     }
 }

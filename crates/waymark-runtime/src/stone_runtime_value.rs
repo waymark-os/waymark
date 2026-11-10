@@ -25,6 +25,8 @@ use crate::stone_attempt_value::{
 };
 
 #[derive(Clone)]
+/// Kept small (one nu Value plus a tag): every expression result moves one,
+/// so rare, large values (workflows, attempt results, closures) are boxed.
 pub(super) enum RuntimeValue {
     Nu(Value),
     /// A shared list (Python reference semantics; see stone_containers).
@@ -48,19 +50,19 @@ pub(super) enum RuntimeValue {
     JsonObjectView(JsonObjectView),
     JsonArrayView(JsonArrayView),
     JsonScalarView(JsonScalarView),
-    Callable(CallableValue),
-    TransitionHooks(TransitionHooksValue),
-    WorkflowEvidenceSource(WorkflowEvidenceSourceValue),
-    WorkflowStage(WorkflowStageValue),
-    Workflow(WorkflowValue),
-    AgentControl(AgentControlValue),
+    Callable(Box<CallableValue>),
+    TransitionHooks(Box<TransitionHooksValue>),
+    WorkflowEvidenceSource(Box<WorkflowEvidenceSourceValue>),
+    WorkflowStage(Box<WorkflowStageValue>),
+    Workflow(Box<WorkflowValue>),
+    AgentControl(Box<AgentControlValue>),
     AttemptBest(AttemptBestValue),
     AttemptFailure(AttemptFailureValue),
     AttemptScope(AttemptScopeValue),
-    AttemptHandle(AttemptHandleValue),
-    AttemptOutcome(AttemptOutcomeValue),
-    AttemptAcceptance(AttemptAcceptanceValue),
-    SemanticFrontier(SemanticFrontierValue),
+    AttemptHandle(Box<AttemptHandleValue>),
+    AttemptOutcome(Box<AttemptOutcomeValue>),
+    AttemptAcceptance(Box<AttemptAcceptanceValue>),
+    SemanticFrontier(Box<SemanticFrontierValue>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -215,7 +217,7 @@ impl RuntimeValue {
         Some(match self {
             RuntimeValue::Model(_) => "<model>".to_string(),
             RuntimeValue::File(_) => "<file>".to_string(),
-            RuntimeValue::Callable(callable) => match callable {
+            RuntimeValue::Callable(callable) => match &**callable {
                 super::stone_functions::CallableValue::Lambda { .. } => "<function <lambda>>".to_string(),
                 super::stone_functions::CallableValue::Named { function, .. } => {
                     format!("<function {}>", function.name)
@@ -384,7 +386,7 @@ mod tests {
 
     #[test]
     fn callables_are_persistable_only_when_captures_are_persistable() {
-        let persistable = RuntimeValue::Callable(CallableValue::lambda(
+        let persistable = RuntimeValue::Callable(Box::new(CallableValue::lambda(
             1,
             Vec::new(),
             Box::new(Expr::None),
@@ -395,11 +397,11 @@ mod tests {
                     Span::unknown(),
                 ))))),
             )],
-        ));
+        )));
         assert!(persistable.is_session_persistable());
         assert_eq!(persistable.type_tag(), RuntimeValueTag::Callable);
 
-        let non_persistable = RuntimeValue::Callable(CallableValue::lambda(
+        let non_persistable = RuntimeValue::Callable(Box::new(CallableValue::lambda(
             2,
             Vec::new(),
             Box::new(Expr::None),
@@ -412,7 +414,7 @@ mod tests {
                     },
                 )))),
             )],
-        ));
+        )));
         assert!(!non_persistable.is_session_persistable());
     }
 
@@ -441,12 +443,12 @@ mod tests {
         .expect_err("file handles cannot materialize");
         assert!(file_error.to_string().contains("file boundary"));
 
-        let callable_error = RuntimeValue::Callable(CallableValue::lambda(
+        let callable_error = RuntimeValue::Callable(Box::new(CallableValue::lambda(
             99,
             Vec::new(),
             Box::new(Expr::None),
             Vec::new(),
-        ))
+        )))
         .into_nu_value("callable boundary")
         .expect_err("callables cannot materialize");
         assert!(callable_error.to_string().contains("callable boundary"));
@@ -463,14 +465,14 @@ mod tests {
         reported_result.push("candidate", Value::string("cobalt", span));
         attempt.push("reported_result", Value::record(reported_result, span));
         attempt.push("reported_error", Value::nothing(span));
-        let value = RuntimeValue::AttemptOutcome(AttemptOutcomeValue {
+        let value = RuntimeValue::AttemptOutcome(Box::new(AttemptOutcomeValue {
             attempt: "attempt-1".to_string(),
             joined: true,
             timed_out: false,
             state: "active".to_string(),
             controller_state: "exited".to_string(),
             record: Value::record(attempt, span),
-        })
+        }))
         .into_nu_value("test")
         .expect("attempt outcome should materialize");
         let record = value.as_record().expect("outcome record");
@@ -517,10 +519,10 @@ mod tests {
         let acceptance =
             AttemptAcceptanceValue::new("attempt-child".to_string(), Value::record(report, span))
                 .expect("acceptance");
-        let selected = RuntimeValue::AttemptHandle(acceptance.selected_handle());
+        let selected = RuntimeValue::AttemptHandle(Box::new(acceptance.selected_handle()));
         assert_eq!(selected.type_tag(), RuntimeValueTag::AttemptHandle);
 
-        let value = RuntimeValue::AttemptAcceptance(acceptance)
+        let value = RuntimeValue::AttemptAcceptance(Box::new(acceptance))
             .into_nu_value("test")
             .expect("acceptance should materialize");
         let record = value.as_record().expect("acceptance record");
