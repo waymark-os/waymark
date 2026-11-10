@@ -62,7 +62,7 @@ fn value_to_i64(value: &Value, context: &str) -> Result<i64, ShellError> {
             .map_err(|err| stone_error(context, format!("failed to parse integer: {err}"))),
         other => Err(stone_error(
             context,
-            format!("expected integer, got {}", other.get_type()),
+            format!("expected integer, got {}", crate::stone_builtins::value_type_name(&other)),
         )),
     }
 }
@@ -72,7 +72,7 @@ fn value_to_string(value: &Value, context: &str) -> Result<String, ShellError> {
         Value::String { val, .. } | Value::Glob { val, .. } => Ok(val.clone()),
         other => Err(stone_error(
             context,
-            format!("expected string, got {}", other.get_type()),
+            format!("expected string, got {}", crate::stone_builtins::value_type_name(&other)),
         )),
     }
 }
@@ -91,7 +91,7 @@ fn value_to_string_list(value: &Value, context: &str) -> Result<Vec<String>, She
             context,
             format!(
                 "expected list of strings, got {}; use {context}([\"cmd\", \"arg\"]) instead of {context}(\"cmd\")",
-                value.get_type()
+                crate::stone_builtins::value_type_name(&value)
             ),
         ));
     };
@@ -107,7 +107,7 @@ fn value_to_string_pairs(
     let Value::Record { val, .. } = value else {
         return Err(stone_error(
             context,
-            format!("expected record of string values, got {}", value.get_type()),
+            format!("expected record of string values, got {}", crate::stone_builtins::value_type_name(&value)),
         ));
     };
     val.iter()
@@ -238,7 +238,12 @@ pub(crate) fn run_call_values(
                 return Err(stone_error(
                     context,
                     format!(
-                        "unsupported keyword `{other}`; expected cwd, env, stdin, timeout_ms, background, max_stdout_bytes, max_stderr_bytes, stdout, or stderr"
+                        "{context}() got an unexpected keyword argument `{other}`; it accepts {}",
+                        match context {
+                            "run" | "run_complete" => "cwd, env, stdin, timeout_ms, background, max_stdout_bytes, max_stderr_bytes, stdout, stderr, expect, effects, and hooks",
+                            "must_run" => "cwd, env, stdin, timeout_ms, max_stdout_bytes, max_stderr_bytes, stdout, stderr, expect, and effects",
+                            _ => "cwd, env, stdin, timeout_ms, background, max_stdout_bytes, max_stderr_bytes, stdout, and stderr",
+                        }
                     ),
                 ));
             }
@@ -464,7 +469,7 @@ fn value_to_bool(value: &Value, context: &str) -> Result<bool, ShellError> {
     let Value::Bool { val, .. } = value else {
         return Err(stone_error(
             context,
-            format!("expected bool, got {}", value.get_type()),
+            format!("expected bool, got {}", crate::stone_builtins::value_type_name(&value)),
         ));
     };
     Ok(*val)
@@ -882,7 +887,7 @@ fn value_to_daemon_run_id(value: &Value, context: &str) -> Result<String, ShellE
             context,
             format!(
                 "expected daemon record or run_id string, got {}",
-                other.get_type()
+                crate::stone_builtins::value_type_name(&other)
             ),
         )),
     }
@@ -1774,15 +1779,31 @@ fn run_posix_command(
             command.env(key, value);
         }
 
-        let mut child = command.spawn().map_err(|err| {
-            if let Some(file) = &stdout_file {
-                file.cleanup();
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                if let Some(file) = &stdout_file {
+                    file.cleanup();
+                }
+                if let Some(file) = &stderr_file {
+                    file.cleanup();
+                }
+                // A command that cannot be executed is a process outcome,
+                // like a shell's exit 127/126: ok=False, not an exception.
+                if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) {
+                    return Ok(command_not_runnable_record(
+                        argv,
+                        cwd,
+                        &err,
+                        started,
+                        stdout_target,
+                        stderr_target,
+                        span,
+                    ));
+                }
+                return Err(command_spawn_error("run", &argv[0], &err));
             }
-            if let Some(file) = &stderr_file {
-                file.cleanup();
-            }
-            command_spawn_error("run", &argv[0], &err)
-        })?;
+        };
         if let Some(stdin) = stdin {
             if let Some(mut child_stdin) = child.stdin.take() {
                 child_stdin
@@ -1907,6 +1928,82 @@ fn run_posix_command(
         }
         Ok(record)
     }
+}
+
+/// The result of run() for a command that could not be executed: missing
+/// from PATH (exit 127) or not executable (exit 126), with the reason in
+/// stderr and an explanation naming the next step.
+#[cfg(not(target_os = "hermit"))]
+fn command_not_runnable_record(
+    argv: &[String],
+    cwd: &Path,
+    err: &std::io::Error,
+    started: Instant,
+    stdout_target: RunOutputTarget,
+    stderr_target: RunOutputTarget,
+    span: Span,
+) -> Record {
+    let name = &argv[0];
+    let not_found = err.kind() == ErrorKind::NotFound;
+    let message = match command_spawn_error("run", name, err) {
+        ShellError::Generic(error) => error.msg.into_owned(),
+        other => other.to_string(),
+    };
+    let (kind, exit_code, summary, next_steps): (&str, i64, String, Vec<String>) = if not_found {
+        (
+            "command_not_found",
+            127,
+            format!("Stone did not start a process: the executable `{name}` was not found."),
+            vec![
+                format!("Check the command name, or call resolve_command(\"{name}\") to see where it was searched."),
+                "If the tool is missing, install it or use a different tool that is available.".to_owned(),
+            ],
+        )
+    } else {
+        (
+            "command_not_executable",
+            126,
+            format!("Stone did not start a process: `{name}` is not executable."),
+            vec![format!(
+                "Inspect the file with stat() and resolve_command(\"{name}\"); run scripts through their interpreter, e.g. [\"sh\", \"{name}\"]."
+            )],
+        )
+    };
+    let mut flags = Record::new();
+    flags.push("stdout", Value::bool(false, span));
+    flags.push("stderr", Value::bool(false, span));
+    let mut suppressed = Record::new();
+    suppressed.push("stdout", Value::bool(stdout_target == RunOutputTarget::Suppress, span));
+    suppressed.push("stderr", Value::bool(stderr_target == RunOutputTarget::Suppress, span));
+    let mut explanation = Record::new();
+    explanation.push("kind", Value::string(kind, span));
+    explanation.push("summary", Value::string(summary, span));
+    explanation.push("scope", Value::string("command resolution; no process ran", span));
+    explanation.push(
+        "next_steps",
+        Value::list(next_steps.into_iter().map(|step| Value::string(step, span)).collect(), span),
+    );
+    let mut record = Record::new();
+    record.push("ok", Value::bool(false, span));
+    record.push("kind", Value::string(kind, span));
+    record.push("exit_code", Value::int(exit_code, span));
+    record.push(
+        "duration_ms",
+        Value::int(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX), span),
+    );
+    record.push("cwd", Value::string(cwd.display().to_string(), span));
+    record.push(
+        "argv",
+        Value::list(argv.iter().map(|arg| Value::string(arg.clone(), span)).collect(), span),
+    );
+    record.push("stdout", Value::string("", span));
+    record.push("stderr", Value::string(message, span));
+    record.push("timed_out", Value::bool(false, span));
+    record.push("truncated", Value::record(flags, span));
+    record.push("suppressed", Value::record(suppressed, span));
+    record.push("stderr_to_stdout", Value::bool(stderr_target == RunOutputTarget::Stdout, span));
+    record.push("explanation", Value::record(explanation, span));
+    record
 }
 
 #[cfg(not(target_os = "hermit"))]

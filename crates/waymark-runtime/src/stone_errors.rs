@@ -336,7 +336,40 @@ pub(crate) fn expectation_failed_record(
 /// `message` are inspected. Runtime errors from the evaluator are all
 /// `Stone {kind} error` with code `stone_script_error`; the message refines
 /// the type for the handful of cases Python distinguishes.
+/// The code of an error raised as builtin type `error_type`:
+/// `stone_value_error` for ValueError, `stone_os_error` for OSError. The
+/// type then comes from the code, not from the message text.
+pub(crate) fn typed_error_code(error_type: &str) -> String {
+    let chars = error_type.chars().collect::<Vec<_>>();
+    let mut snake = String::from("stone_");
+    for (index, ch) in chars.iter().enumerate() {
+        if ch.is_ascii_uppercase() && index > 0 {
+            let previous_lower = chars[index - 1].is_ascii_lowercase();
+            let next_lower = chars.get(index + 1).is_some_and(char::is_ascii_lowercase);
+            if previous_lower || (chars[index - 1].is_ascii_uppercase() && next_lower) {
+                snake.push('_');
+            }
+        }
+        snake.push(ch.to_ascii_lowercase());
+    }
+    snake
+}
+
+/// The builtin error type a typed code names (see `typed_error_code`).
+fn error_type_for_code(code: &str) -> Option<&'static str> {
+    if !code.starts_with("stone_") || !code.ends_with("_error") {
+        return None;
+    }
+    BUILTIN_ERROR_TYPES
+        .iter()
+        .map(|(name, _)| *name)
+        .find(|name| typed_error_code(name) == code)
+}
+
 pub(crate) fn classify_error(kind: &str, code: &str, message: &str) -> &'static str {
+    if let Some(error_type) = error_type_for_code(code) {
+        return error_type;
+    }
     let lower_kind = kind.to_ascii_lowercase();
     match code {
         "stone_io_error" | "io_error" => {
@@ -606,6 +639,10 @@ mod tests {
                 "ToolError",
             ),
             ("Task failure", "task_failure", "boom", "Exception"),
+            ("Stone iteration error", "stone_runtime_error", "changed size", "RuntimeError"),
+            ("Stone model.limit input error", "stone_value_error", "calls must be", "ValueError"),
+            ("Stone stat error", "stone_file_not_found_error", "no such path", "FileNotFoundError"),
+            ("Stone x error", "stone_os_error", "x", "OSError"),
         ];
         for (kind, code, message, expected) in cases {
             assert_eq!(

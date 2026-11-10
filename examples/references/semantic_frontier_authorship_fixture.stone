@@ -46,17 +46,17 @@ def fixture_prepare_checkpoint():
 
 
 def worker(input):
-    inherited = read_text(input.path).strip()
-    if inherited != input.expected:
+    inherited = read_text(input["path"]).strip()
+    if inherited != input["expected"]:
         fail(
             "branch did not restore the expected semantic frontier",
             code="frontier_authorship_restore_failed",
-            detail={"expected": input.expected, "actual": inherited},
+            detail={"expected": input["expected"], "actual": inherited},
         )
-    write_file("branch.txt", input.label + "\n")
+    write_file("branch.txt", input["label"] + "\n")
     return {
-        "label": input.label,
-        "expected": input.expected,
+        "label": input["label"],
+        "expected": input["expected"],
         "inherited": inherited,
     }
 
@@ -80,12 +80,12 @@ def setup_owner(input):
 
 def fixture_checkpoint_cost(checkpoint):
     return {
-        "create_duration_ms": checkpoint.create_duration_ms,
-        "storage_bytes": checkpoint.storage_bytes,
-        "copy_files": checkpoint.copy_files,
-        "copy_bytes": checkpoint.copy_bytes,
-        "reflink_attempts": checkpoint.reflink_attempts,
-        "reflink_successes": checkpoint.reflink_successes,
+        "create_duration_ms": checkpoint["create_duration_ms"] if isinstance(checkpoint, dict) else checkpoint.create_duration_ms,
+        "storage_bytes": checkpoint["storage_bytes"] if isinstance(checkpoint, dict) else checkpoint.storage_bytes,
+        "copy_files": checkpoint["copy_files"] if isinstance(checkpoint, dict) else checkpoint.copy_files,
+        "copy_bytes": checkpoint["copy_bytes"] if isinstance(checkpoint, dict) else checkpoint.copy_bytes,
+        "reflink_attempts": checkpoint["reflink_attempts"] if isinstance(checkpoint, dict) else checkpoint.reflink_attempts,
+        "reflink_successes": checkpoint["reflink_successes"] if isinstance(checkpoint, dict) else checkpoint.reflink_successes,
         "remaining_budget_ms": None,
     }
 
@@ -104,7 +104,7 @@ def fixture_finalize(
     if (
         not parent_outcome.joined
         or parent_outcome.result.status != "succeeded"
-        or parent_outcome.result.value.inherited != "root"
+        or parent_outcome.result.value["inherited"] != "root"
     ):
         fail(
             "parent branch evidence failed",
@@ -114,14 +114,14 @@ def fixture_finalize(
     if (
         not repaired_outcome.joined
         or repaired_outcome.result.status != "succeeded"
-        or repaired_outcome.result.value.inherited != "owner"
+        or repaired_outcome.result.value["inherited"] != "owner"
     ):
         fail(
             "retained branch evidence failed",
             code="frontier_authorship_retained_evidence_failed",
             detail=repaired_outcome,
         )
-    if not cleanup.clean:
+    if not (cleanup["clean"] if isinstance(cleanup, dict) else cleanup.clean):
         fail(
             "authored attempt scope did not close cleanly",
             code="frontier_authorship_cleanup_failed",
@@ -153,7 +153,7 @@ def fixture_finalize(
         parent_cost = fixture_checkpoint_cost(parent_source)
         retained_cost = fixture_checkpoint_cost(retained_source)
         parent_guidance = parent_source.guidance
-        retained_guidance = retained_source.guidance
+        retained_guidance = retained_source["guidance"]
 
     return {
         "parent": {
@@ -177,5 +177,5 @@ def fixture_finalize(
         },
         "accepted": read_text("branch.txt").strip(),
         "owner_resource_state": owner_inspection.resource_state,
-        "clean": cleanup.clean,
+        "clean": cleanup["clean"] if isinstance(cleanup, dict) else cleanup.clean,
     }

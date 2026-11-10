@@ -14,9 +14,9 @@ def worker(input):
             "candidate did not inherit the parent requirement",
             code="fork_needed_memory_missing",
         )
-    target = requirement[0].content.expected
+    target = requirement[0].content["expected"]
     problem = read_text("problem.txt").strip()
-    write_file("answer.txt", input.candidate + "\n")
+    write_file("answer.txt", input["candidate"] + "\n")
     check = run(
         [
             "python3",
@@ -30,12 +30,12 @@ def worker(input):
         max_stdout_bytes=1024,
         max_stderr_bytes=1024,
     )
-    passed = check.ok and input.candidate == target
+    passed = check.ok and input["candidate"] == target
     context_write(
         "candidate.result",
         "candidate",
         {
-            "candidate": input.candidate,
+            "candidate": input["candidate"],
             "passed": passed,
             "problem": problem,
         },
@@ -43,7 +43,7 @@ def worker(input):
         evidence=["candidate:test"],
     )
     return {
-        "candidate": input.candidate,
+        "candidate": input["candidate"],
         "passed": passed,
         "problem": problem,
         "inherited_target": target,
@@ -53,14 +53,14 @@ def worker(input):
 
 
 def main(input):
-    if len(input.candidates) != 2:
+    if len(input["candidates"]) != 2:
         fail("fork canary requires two candidates", code="fork_needed_bad_input")
     root = attempt_info()
-    write_file("problem.txt", input.problem + "\n")
+    write_file("problem.txt", input["problem"] + "\n")
     context_write(
         "requirement.fork_target",
         "requirement",
-        {"expected": input.expected},
+        {"expected": input["expected"]},
         status="verified",
         evidence=["parent:uncommitted-frontier"],
     )
@@ -69,14 +69,14 @@ def main(input):
     first = attempt_fork(
         program=current_program(),
         entrypoint="worker",
-        input={"candidate": input.candidates[0]},
+        input={"candidate": input["candidates"][0]},
         start=True,
         scope=scope,
     )
     second = attempt_fork(
         program=current_program(),
         entrypoint="worker",
-        input={"candidate": input.candidates[1]},
+        input={"candidate": input["candidates"][1]},
         start=True,
         scope=scope,
     )
@@ -104,7 +104,7 @@ def main(input):
             "fork_memory_ref": outcome.record.fork_origin.memory_ref,
             "fork_memory_revision": outcome.record.fork_origin.memory_revision,
         })
-        if outcome.result.value.passed:
+        if outcome.result.value["passed"]:
             if winner != None:
                 fail(
                     "multiple candidates passed",
@@ -131,11 +131,11 @@ def main(input):
         )
 
     answer = read_text("answer.txt").strip()
-    if answer != input.expected:
+    if answer != input["expected"]:
         fail(
             "accepted branch did not import the winning answer",
             code="fork_needed_accept_failed",
-            detail={"expected": input.expected, "actual": answer},
+            detail={"expected": input["expected"], "actual": answer},
         )
     parent_keys = map(lambda item: item.key, context_read(limit=8))
     if parent_keys != ["requirement.fork_target"]:

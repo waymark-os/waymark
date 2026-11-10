@@ -57,11 +57,11 @@ def first_context_worker(input):
 
 def first_context_parent(input):
     root = attempt_info()
-    write_file("problem.txt", input.problem + "\n")
+    write_file("problem.txt", input["problem"] + "\n")
     context_write(
         "requirement.fork_target",
         "requirement",
-        {"target": input.target},
+        {"target": input["target"]},
         status="verified",
         evidence=["parent:fork-frontier"],
     )

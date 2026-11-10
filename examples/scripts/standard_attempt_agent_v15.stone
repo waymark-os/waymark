@@ -247,7 +247,7 @@ def standard_agent_options(input):
     options["max_actions"] = standard_optional_limit(
         get(input, "max_turns", 0), 10000, "max_turns"
     )
-    options["max_model_calls"] = options.max_actions
+    options["max_model_calls"] = options["max_actions"]
     for name, bounds in standard_option_ranges().items():
         options[name] = standard_clamp(
             get(input, name, options[name]), bounds[0], bounds[1]
@@ -268,13 +268,13 @@ def standard_agent_options(input):
     ]:
         options[name] = get(input, name, options[name])
     projection_reserve = (
-        options.action_memory_projection_tokens * 4 + 2048
+        options["action_memory_projection_tokens"] * 4 + 2048
     )
     options["max_task_context_characters"] = min(
-        options.max_task_context_characters,
+        options["max_task_context_characters"],
         max(
             2048,
-            options.max_action_context_characters - projection_reserve,
+            options["max_action_context_characters"] - projection_reserve,
         ),
     )
     return options
@@ -284,11 +284,11 @@ def standard_initial_action_memory_policy(session, options):
     view = get(session, "context_prompt_view", None)
     if view is None:
         source = "controller_default"
-        if len(options.initial_action_memory_required_keys) > 0:
+        if len(options["initial_action_memory_required_keys"]) > 0:
             source = "task_input_compatibility"
         return {
             "source": source,
-            "required_keys": options.initial_action_memory_required_keys,
+            "required_keys": options["initial_action_memory_required_keys"],
         }
     required_keys = get(view, "required_keys", [])
     if len(required_keys) == 0 or len(required_keys) > 4:
@@ -371,12 +371,12 @@ def standard_control_instruction(state, time_budget):
             "Do not start broad new work. Resolve the active blocker if one "
             "is shown; otherwise verify the strongest result and finish."
         )
-    if state.control_mode == "explore":
+    if state["control_mode"] == "explore":
         return (
             "Choose one materially different, reversible probe or repair "
             "action; do not repeat an unchanged action-state pair."
         )
-    if state.control_mode == "verify":
+    if state["control_mode"] == "verify":
         return (
             "Acquire any final missing evidence, then submit finish only when "
             "the public requirement is supported."
@@ -390,12 +390,12 @@ def standard_control_instruction(state, time_budget):
 def standard_control_frame(state, time_budget):
     return {
         "kind": "runtime_control",
-        "mode": state.control_mode,
-        "objective": state.control_objective,
-        "blocker": state.control_blocker,
-        "progress": state.progress_class,
-        "unchanged_streak": state.unchanged_streak,
-        "reason": state.control_reason,
+        "mode": state["control_mode"],
+        "objective": state["control_objective"],
+        "blocker": state["control_blocker"],
+        "progress": state["progress_class"],
+        "unchanged_streak": state["unchanged_streak"],
+        "reason": state["control_reason"],
         "instruction": standard_control_instruction(state, time_budget),
         "time_budget": time_budget,
     }
@@ -414,7 +414,7 @@ def standard_prepare_action_context(
             "verified or contradicted tool evidence, active owned run handles, "
             "blockers, and repair objective"
         ),
-        max_tokens=options.action_memory_projection_tokens,
+        max_tokens=options["action_memory_projection_tokens"],
         required_keys=required_keys,
     )
     projection_message = {
@@ -427,14 +427,14 @@ def standard_prepare_action_context(
         "content": "Current runtime control frame:\n" + json_dumps(control),
     }
     recent_budget = max(
-        options.max_task_context_characters + 1024,
-        options.max_action_context_characters
-        - len(projection_message.content)
-        - len(control_message.content),
+        options["max_task_context_characters"] + 1024,
+        options["max_action_context_characters"]
+        - len(projection_message["content"])
+        - len(control_message["content"]),
     )
     bounded = standard_bounded_messages(
         messages,
-        options.max_messages,
+        options["max_messages"],
         recent_budget,
     )
     prepared = bounded + [projection_message, control_message]
@@ -454,8 +454,8 @@ def standard_prepare_action_context(
 def standard_available_retries(agent, options, reserved_after):
     left = agent.remaining.calls
     if left is None:
-        return options.repair_retries
-    return max(0, min(options.repair_retries, left - 1 - reserved_after))
+        return options["repair_retries"]
+    return max(0, min(options["repair_retries"], left - 1 - reserved_after))
 
 
 def standard_ask(agent, prompt, output, state, retries, max_output_tokens, hooks=None):
@@ -488,7 +488,7 @@ def standard_initial_messages(session, options):
             "content": standard_bounded_payload(
                 "Public task projection",
                 standard_task_requirement(session, options),
-                options.max_task_context_characters,
+                options["max_task_context_characters"],
             ),
         },
     ]
@@ -501,7 +501,7 @@ def standard_terminate_and_reap(run_id, options):
     last_error = ""
     while (
         get(cleanup, "still_running", False)
-        and termination_attempts < options.run_cleanup_wait_attempts
+        and termination_attempts < options["run_cleanup_wait_attempts"]
     ):
         try:
             cleanup = run_terminate(run_id)
@@ -513,7 +513,7 @@ def standard_terminate_and_reap(run_id, options):
             try:
                 cleanup = run_wait(
                     run_id,
-                    timeout_ms=options.run_cleanup_wait_ms,
+                    timeout_ms=options["run_cleanup_wait_ms"],
                 )
             except Exception as error:
                 last_error = json_dumps(error)
@@ -566,7 +566,7 @@ def standard_shell_dispatch(action, options):
             "ok": True,
             "kind": "read",
             "path": args.path,
-            "content": read_file(args.path, max_bytes=options.max_read_bytes),
+            "content": read_file(args.path, max_bytes=options["max_read_bytes"]),
         }
     if tool == "edit":
         result = edit(
@@ -592,16 +592,16 @@ def standard_shell_dispatch(action, options):
             cwd=get(args, "cwd", None),
             stdin=get(args, "stdin", None),
             timeout_ms=min(
-                args.timeout_ms or options.tool_timeout_ms,
-                options.tool_timeout_ms,
+                args.timeout_ms or options["tool_timeout_ms"],
+                options["tool_timeout_ms"],
             ),
             max_stdout_bytes=min(
-                args.max_stdout_bytes or options.max_stdout_bytes,
-                options.max_stdout_bytes,
+                args.max_stdout_bytes or options["max_stdout_bytes"],
+                options["max_stdout_bytes"],
             ),
             max_stderr_bytes=min(
-                args.max_stderr_bytes or options.max_stderr_bytes,
-                options.max_stderr_bytes,
+                args.max_stderr_bytes or options["max_stderr_bytes"],
+                options["max_stderr_bytes"],
             ),
         )
         if get(result, "still_running", False):
@@ -610,7 +610,7 @@ def standard_shell_dispatch(action, options):
                 "ok": False,
                 "kind": (
                     "timed_out_and_reaped"
-                    if cleanup.ok
+                    if cleanup["ok"]
                     else "timed_out_cleanup_pending"
                 ),
                 "run_id": result.run_id,
@@ -633,16 +633,16 @@ def standard_shell_dispatch(action, options):
             cwd=get(args, "cwd", None),
             stdin=get(args, "stdin", None),
             timeout_ms=min(
-                args.timeout_ms or options.run_complete_timeout_ms,
-                options.run_complete_timeout_ms,
+                args.timeout_ms or options["run_complete_timeout_ms"],
+                options["run_complete_timeout_ms"],
             ),
             max_stdout_bytes=min(
-                args.max_stdout_bytes or options.max_stdout_bytes,
-                options.max_stdout_bytes,
+                args.max_stdout_bytes or options["max_stdout_bytes"],
+                options["max_stdout_bytes"],
             ),
             max_stderr_bytes=min(
-                args.max_stderr_bytes or options.max_stderr_bytes,
-                options.max_stderr_bytes,
+                args.max_stderr_bytes or options["max_stderr_bytes"],
+                options["max_stderr_bytes"],
             ),
         )
         outcome = standard_owned_run_outcome(
@@ -658,7 +658,7 @@ def standard_shell_dispatch(action, options):
         outcome["requested_timeout_ms"] = get(
             result,
             "requested_timeout_ms",
-            options.run_complete_timeout_ms,
+            options["run_complete_timeout_ms"],
         )
         outcome["message"] = str(get(result, "explanation", ""))
         return outcome
@@ -669,12 +669,12 @@ def standard_shell_dispatch(action, options):
             stdin=get(args, "stdin", None),
             background=True,
             max_stdout_bytes=min(
-                args.max_stdout_bytes or options.max_stdout_bytes,
-                options.max_stdout_bytes,
+                args.max_stdout_bytes or options["max_stdout_bytes"],
+                options["max_stdout_bytes"],
             ),
             max_stderr_bytes=min(
-                args.max_stderr_bytes or options.max_stderr_bytes,
-                options.max_stderr_bytes,
+                args.max_stderr_bytes or options["max_stderr_bytes"],
+                options["max_stderr_bytes"],
             ),
         )
         run_id = get(result, "run_id", "")
@@ -702,8 +702,8 @@ def standard_shell_dispatch(action, options):
         result = run_wait(
             args.run_id,
             timeout_ms=min(
-                args.timeout_ms or options.run_wait_ms,
-                options.run_wait_ms,
+                args.timeout_ms or options["run_wait_ms"],
+                options["run_wait_ms"],
             ),
         )
         return standard_owned_run_outcome(
@@ -717,13 +717,13 @@ def standard_shell_dispatch(action, options):
         )
     if tool == "run_terminate":
         cleanup = standard_terminate_and_reap(args.run_id, options)
-        result = cleanup.result
+        result = cleanup["result"]
         outcome = standard_owned_run_outcome(
-            cleanup.kind,
+            cleanup["kind"],
             args.run_id,
             result,
         )
-        outcome["ok"] = cleanup.ok
+        outcome["ok"] = cleanup["ok"]
         outcome["cleanup"] = cleanup
         return outcome
     fail(
@@ -805,8 +805,8 @@ def standard_action_outcome_signature(action, outcome):
 def standard_update_progress(action, outcome, state):
     signature = standard_action_outcome_signature(action, outcome)
     repeated = (
-        len(state.last_action_outcome_signature) > 0
-        and signature == state.last_action_outcome_signature
+        len(state["last_action_outcome_signature"]) > 0
+        and signature == state["last_action_outcome_signature"]
     )
     state["last_action_outcome_signature"] = signature
     if repeated:
@@ -814,11 +814,11 @@ def standard_update_progress(action, outcome, state):
         return standard_set_control(
             state,
             "explore",
-            state.control_objective,
+            state["control_objective"],
             {
                 "kind": "unchanged_action_state",
                 "action": standard_action_summary(action),
-                "repetitions": state.unchanged_streak,
+                "repetitions": state["unchanged_streak"],
             },
             "unchanged",
             "repeated_action_state",
@@ -828,7 +828,7 @@ def standard_update_progress(action, outcome, state):
         return standard_set_control(
             state,
             "explore",
-            state.control_objective,
+            state["control_objective"],
             {
                 "kind": "tool_failure",
                 "action": standard_action_summary(action),
@@ -841,7 +841,7 @@ def standard_update_progress(action, outcome, state):
             "worse",
             "failed_action",
         )
-    blocker = state.control_blocker
+    blocker = state["control_blocker"]
     if (
         blocker is not None
         and get(blocker, "kind", "") in [
@@ -853,7 +853,7 @@ def standard_update_progress(action, outcome, state):
     return standard_set_control(
         state,
         "exploit",
-        state.control_objective,
+        state["control_objective"],
         blocker,
         "better",
         "novel_successful_evidence",
@@ -861,14 +861,14 @@ def standard_update_progress(action, outcome, state):
 
 
 def standard_record_active_runs(state, options):
-    status = "active" if len(state.active_runs) > 0 else "verified"
+    status = "active" if len(state["active_runs"]) > 0 else "verified"
     return context_write(
         "progress.active_runs",
         "progress",
         {
-            "count": len(state.active_runs),
-            "max_active_runs": options.max_active_runs,
-            "runs": state.active_runs,
+            "count": len(state["active_runs"]),
+            "max_active_runs": options["max_active_runs"],
+            "runs": state["active_runs"],
         },
         status=status,
         evidence=["control:stone.standard_action_v15"],
@@ -896,11 +896,11 @@ def standard_reconcile_active_runs(state, options):
     state["active_runs"] = recovered
     state["run_reconciliations"] += 1
     state["recovered_active_runs"] += len(recovered)
-    if len(recovered) > options.max_active_runs:
+    if len(recovered) > options["max_active_runs"]:
         state["run_reconciliation_over_capacity"] += 1
     state["peak_active_runs"] = max(
-        state.peak_active_runs,
-        len(state.active_runs),
+        state["peak_active_runs"],
+        len(state["active_runs"]),
     )
     standard_record_active_runs(state, options)
     return state
@@ -932,11 +932,11 @@ def standard_track_owned_run(action, outcome, state, options):
         return state
     retained = []
     was_active = False
-    started_at_step = state.actions
-    for active in state.active_runs:
-        if active.run_id == run_id:
+    started_at_step = state["actions"]
+    for active in state["active_runs"]:
+        if active["run_id"] == run_id:
             was_active = True
-            started_at_step = active.started_at_step
+            started_at_step = active["started_at_step"]
         else:
             retained.append(active)
     still_running = get(outcome, "still_running", False)
@@ -945,15 +945,15 @@ def standard_track_owned_run(action, outcome, state, options):
             "run_id": run_id,
             "status": "running",
             "started_at_step": started_at_step,
-            "last_observed_step": state.actions,
+            "last_observed_step": state["actions"],
             "last_tool": tool,
         })
     elif was_active:
         state["run_completions"] += 1
     state["active_runs"] = retained
     state["peak_active_runs"] = max(
-        state.peak_active_runs,
-        len(state.active_runs),
+        state["peak_active_runs"],
+        len(state["active_runs"]),
     )
     standard_record_active_runs(state, options)
     return state
@@ -961,10 +961,10 @@ def standard_track_owned_run(action, outcome, state, options):
 
 def standard_reap_active_runs(state, options):
     retained = []
-    for active in state.active_runs:
-        cleanup = standard_terminate_and_reap(active.run_id, options)
+    for active in state["active_runs"]:
+        cleanup = standard_terminate_and_reap(active["run_id"], options)
         state["run_termination_calls"] += 1
-        if cleanup.still_running:
+        if cleanup["still_running"]:
             retained.append(active)
         else:
             state["run_completions"] += 1
@@ -1018,22 +1018,22 @@ def standard_outcome_evidence(action, outcome, state, options):
         if value is not None and len(standard_text(value)) > 0:
             result[field + "_characters"] = len(standard_text(value))
             result[field + "_truncated"] = (
-                len(standard_text(value)) > options.max_evidence_characters
+                len(standard_text(value)) > options["max_evidence_characters"]
             )
             result[field] = standard_bounded_evidence_text(
                 value,
-                options.max_evidence_characters,
+                options["max_evidence_characters"],
             )
     return {
-        "step": state.actions,
+        "step": state["actions"],
         "action": standard_action_summary(action),
         "result": result,
-        "transition_id": state.last_transition_id,
+        "transition_id": state["last_transition_id"],
     }
 
 
 def standard_record_evidence(action, outcome, state, options):
-    slot = (state.tool_calls - 1) % options.max_evidence_items
+    slot = (state["tool_calls"] - 1) % options["max_evidence_items"]
     key = "evidence.action." + str(slot)
     status = "verified" if get(outcome, "ok", False) else "contradicted"
     return context_write(
@@ -1041,7 +1041,7 @@ def standard_record_evidence(action, outcome, state, options):
         "evidence",
         standard_outcome_evidence(action, outcome, state, options),
         status=status,
-        evidence=["transition:" + state.last_transition_id],
+        evidence=["transition:" + state["last_transition_id"]],
     )
 
 
@@ -1052,12 +1052,12 @@ def standard_task_requirement(session, options):
         "objective": slice(
             standard_text(objective),
             0,
-            options.max_requirement_characters,
+            options["max_requirement_characters"],
         ),
         "task_input": slice(
             json_dumps(session.input),
             0,
-            options.max_evidence_characters,
+            options["max_evidence_characters"],
         ),
         "resource_limits": session.limits,
         "time_budget": get(session, "time_budget", None),
@@ -1075,17 +1075,17 @@ def standard_record_task_requirement(session, options, status):
 
 
 def standard_record_completion_audit(critique, status):
-    evidence = ["critic:" + critique.transition_id]
+    evidence = ["critic:" + critique["transition_id"]]
     return context_write(
         "requirement.audit",
         "requirement",
         {
             "audit_mode": get(critique, "audit_mode", "completion"),
-            "approved": critique.approved,
-            "claimed_approved": critique.claimed_approved,
-            "summary": critique.summary,
-            "repair_objective": critique.repair_objective,
-            "requirements": critique.requirements,
+            "approved": critique["approved"],
+            "claimed_approved": critique["claimed_approved"],
+            "summary": critique["summary"],
+            "repair_objective": critique["repair_objective"],
+            "requirements": critique["requirements"],
         },
         status=status,
         evidence=evidence,
@@ -1105,7 +1105,7 @@ def standard_requirement_critique(
     prior = context_read(keys=["requirement.audit"], limit=1)
     evidence = context_read(
         kinds=["evidence"],
-        limit=options.max_evidence_items,
+        limit=options["max_evidence_items"],
     )
     instruction = (
         "Independently audit the completion candidate using only the public "
@@ -1140,24 +1140,24 @@ def standard_requirement_critique(
         CompletionAudit,
         state,
         standard_available_retries(agent, options, reserved_after),
-        options.critic_max_output_tokens,
+        options["critic_max_output_tokens"],
     )
     critique = {
         "approved": audit.approved,
         "summary": audit.summary,
         "repair_objective": audit.repair_objective,
         "requirements": audit.requirements,
-        "transition_id": state.last_transition_id,
+        "transition_id": state["last_transition_id"],
         "audit_mode": audit_mode,
         "claimed_approved": audit.approved,
     }
     all_satisfied = True
-    for requirement in critique.requirements:
+    for requirement in critique["requirements"]:
         if requirement.status != "satisfied":
             all_satisfied = False
     if not all_satisfied:
         critique["approved"] = False
-    if not critique.approved and len(critique.repair_objective) == 0:
+    if not critique["approved"] and len(critique["repair_objective"]) == 0:
         critique["repair_objective"] = (
             "Collect visible evidence for every unsupported requirement."
         )
@@ -1177,7 +1177,7 @@ def standard_completion_critique(agent, candidate, session, state, options):
 
 
 def standard_critique_blocker(critique):
-    for requirement in critique.requirements:
+    for requirement in critique["requirements"]:
         if requirement.status != "satisfied":
             return {
                 "kind": "unsupported_requirement",
@@ -1236,13 +1236,13 @@ def standard_model_outcome(outcome, options):
             result[field + "_characters"] = len(standard_text(value))
             result[field + "_truncated"] = (
                 len(standard_text(value))
-                > options.max_observation_field_characters
+                > options["max_observation_field_characters"]
             )
             if result[field + "_truncated"]:
                 compacted_field_count += 1
             result[field] = standard_bounded_evidence_text(
                 value,
-                options.max_observation_field_characters,
+                options["max_observation_field_characters"],
             )
     result["compacted_field_count"] = compacted_field_count
     return result
@@ -1252,7 +1252,7 @@ def standard_observation(action, outcome, state, options):
     return {
         "action": standard_action_summary(action),
         "result": standard_model_outcome(outcome, options),
-        "step": state.actions,
+        "step": state["actions"],
     }
 
 
@@ -1260,12 +1260,12 @@ def standard_observation_message(action, outcome, state, options):
     observation = standard_observation(action, outcome, state, options)
     text = json_dumps(observation)
     source_characters = len(text)
-    truncated = source_characters > options.max_observation_characters
+    truncated = source_characters > options["max_observation_characters"]
     if truncated:
         marker = "\n...<observation-middle-omitted>...\n"
         remaining = max(
             0,
-            options.max_observation_characters - len(marker),
+            options["max_observation_characters"] - len(marker),
         )
         head = remaining // 2
         tail = remaining - head
@@ -1276,7 +1276,7 @@ def standard_observation_message(action, outcome, state, options):
         )
     return {
         "content": text,
-        "field_truncations": observation.result.compacted_field_count,
+        "field_truncations": observation["result"]["compacted_field_count"],
         "source_characters": source_characters,
         "visible_characters": len(text),
         "truncated": truncated,
@@ -1284,7 +1284,7 @@ def standard_observation_message(action, outcome, state, options):
 
 
 def standard_verify_finish(candidate, session, state):
-    answer = candidate.answer
+    answer = candidate["answer"]
     if len(answer) == 0:
         fail("finish requires a non-empty answer", code="agent_invalid_finish")
     if len(answer) > 4096:
@@ -1311,67 +1311,67 @@ def standard_result(candidate, state):
     result = candidate
     result["_control"] = {
         "name": "stone.standard_action_v15",
-        "rounds": state.rounds,
-        "actions": state.actions,
-        "model_calls": state.model_calls,
-        "tool_calls": state.tool_calls,
-        "failed_tools": state.failed_tools,
-        "run_start_calls": state.run_start_calls,
-        "run_observations": state.run_observations,
-        "run_termination_calls": state.run_termination_calls,
-        "run_completions": state.run_completions,
-        "run_complete_calls": state.run_complete_calls,
-        "run_complete_completions": state.run_complete_completions,
-        "runtime_wait_observations": state.runtime_wait_observations,
-        "run_reconciliations": state.run_reconciliations,
-        "recovered_active_runs": state.recovered_active_runs,
+        "rounds": state["rounds"],
+        "actions": state["actions"],
+        "model_calls": state["model_calls"],
+        "tool_calls": state["tool_calls"],
+        "failed_tools": state["failed_tools"],
+        "run_start_calls": state["run_start_calls"],
+        "run_observations": state["run_observations"],
+        "run_termination_calls": state["run_termination_calls"],
+        "run_completions": state["run_completions"],
+        "run_complete_calls": state["run_complete_calls"],
+        "run_complete_completions": state["run_complete_completions"],
+        "runtime_wait_observations": state["runtime_wait_observations"],
+        "run_reconciliations": state["run_reconciliations"],
+        "recovered_active_runs": state["recovered_active_runs"],
         "run_reconciliation_over_capacity": (
-            state.run_reconciliation_over_capacity
+            state["run_reconciliation_over_capacity"]
         ),
         "initial_action_memory_required_keys": (
-            state.initial_action_memory_required_keys
+            state["initial_action_memory_required_keys"]
         ),
         "initial_action_memory_policy_source": (
-            state.initial_action_memory_policy_source
+            state["initial_action_memory_policy_source"]
         ),
         "initial_action_memory_projection_keys": (
-            state.initial_action_memory_projection_keys
+            state["initial_action_memory_projection_keys"]
         ),
         "action_memory_required_keys": (
-            state.action_memory_required_keys
+            state["action_memory_required_keys"]
         ),
         "decision_hooks": "first_class_transition_hooks",
-        "peak_active_runs": state.peak_active_runs,
-        "active_runs": len(state.active_runs),
-        "finish_blocked_active_runs": state.finish_blocked_active_runs,
-        "completion_critiques": state.completion_critiques,
-        "critic_rejections": state.critic_rejections,
-        "budget_checkpoints": state.budget_checkpoints,
-        "checkpoint_rejections": state.checkpoint_rejections,
-        "memory_projections": state.memory_projections,
-        "projection_truncations": state.projection_truncations,
-        "context_messages_dropped": state.context_messages_dropped,
-        "observation_truncations": state.observation_truncations,
+        "peak_active_runs": state["peak_active_runs"],
+        "active_runs": len(state["active_runs"]),
+        "finish_blocked_active_runs": state["finish_blocked_active_runs"],
+        "completion_critiques": state["completion_critiques"],
+        "critic_rejections": state["critic_rejections"],
+        "budget_checkpoints": state["budget_checkpoints"],
+        "checkpoint_rejections": state["checkpoint_rejections"],
+        "memory_projections": state["memory_projections"],
+        "projection_truncations": state["projection_truncations"],
+        "context_messages_dropped": state["context_messages_dropped"],
+        "observation_truncations": state["observation_truncations"],
         "observation_field_truncations": (
-            state.observation_field_truncations
+            state["observation_field_truncations"]
         ),
         "peak_action_context_characters": (
-            state.peak_action_context_characters
+            state["peak_action_context_characters"]
         ),
         "max_action_context_characters": (
-            state.max_action_context_characters
+            state["max_action_context_characters"]
         ),
-        "validation_retries": state.validation_retries,
-        "last_transition_id": state.last_transition_id,
-        "time_budget_phase": state.time_budget_phase,
-        "time_budget_warnings": state.time_budget_warnings,
-        "last_time_remaining_ms": state.last_time_remaining_ms,
-        "control_mode": state.control_mode,
-        "control_reason": state.control_reason,
-        "control_updates": state.control_updates,
-        "progress_class": state.progress_class,
-        "unchanged_streak": state.unchanged_streak,
-        "needs_review_count": state.needs_review_count,
+        "validation_retries": state["validation_retries"],
+        "last_transition_id": state["last_transition_id"],
+        "time_budget_phase": state["time_budget_phase"],
+        "time_budget_warnings": state["time_budget_warnings"],
+        "last_time_remaining_ms": state["last_time_remaining_ms"],
+        "control_mode": state["control_mode"],
+        "control_reason": state["control_reason"],
+        "control_updates": state["control_updates"],
+        "progress_class": state["progress_class"],
+        "unchanged_streak": state["unchanged_streak"],
+        "needs_review_count": state["needs_review_count"],
     }
     return result
 
@@ -1383,17 +1383,17 @@ def standard_needs_review(reason, state, options, record_progress):
         "stage": "needs_review",
         "status": "pending",
         "reason": reason,
-        "mode": state.control_mode,
-        "objective": state.control_objective,
-        "blocker": state.control_blocker,
-        "progress": state.progress_class,
-        "unchanged_streak": state.unchanged_streak,
-        "rounds": state.rounds,
-        "actions": state.actions,
-        "model_calls": state.model_calls,
-        "tool_calls": state.tool_calls,
-        "failed_tools": state.failed_tools,
-        "transition_id": state.last_transition_id,
+        "mode": state["control_mode"],
+        "objective": state["control_objective"],
+        "blocker": state["control_blocker"],
+        "progress": state["progress_class"],
+        "unchanged_streak": state["unchanged_streak"],
+        "rounds": state["rounds"],
+        "actions": state["actions"],
+        "model_calls": state["model_calls"],
+        "tool_calls": state["tool_calls"],
+        "failed_tools": state["failed_tools"],
+        "transition_id": state["last_transition_id"],
     })
     return standard_result(
         {
@@ -1402,12 +1402,12 @@ def standard_needs_review(reason, state, options, record_progress):
             "completion": "needs_review",
             "review": {
                 "reason": reason,
-                "mode": state.control_mode,
-                "objective": state.control_objective,
-                "blocker": state.control_blocker,
-                "progress": state.progress_class,
-                "unchanged_streak": state.unchanged_streak,
-                "latest_completion_audit": state.last_completion_audit,
+                "mode": state["control_mode"],
+                "objective": state["control_objective"],
+                "blocker": state["control_blocker"],
+                "progress": state["progress_class"],
+                "unchanged_streak": state["unchanged_streak"],
+                "latest_completion_audit": state["last_completion_audit"],
             },
         },
         state,
@@ -1424,15 +1424,15 @@ def standard_agent_control(
 ):
     messages = standard_initial_messages(session, options)
     agent = (
-        model.limit(calls=options.max_model_calls)
-        if options.max_model_calls > 0
+        model.limit(calls=options["max_model_calls"])
+        if options["max_model_calls"] > 0
         else model
     )
     initial_memory_policy = standard_initial_action_memory_policy(
         session,
         options,
     )
-    if len(options.action_memory_required_keys) > 4:
+    if len(options["action_memory_required_keys"]) > 4:
         fail(
             "action_memory_required_keys accepts at most four keys",
             code="action_memory_frontier_too_large",
@@ -1454,11 +1454,11 @@ def standard_agent_control(
         "recovered_active_runs": 0,
         "run_reconciliation_over_capacity": 0,
         "initial_action_memory_required_keys": (
-            initial_memory_policy.required_keys
+            initial_memory_policy["required_keys"]
         ),
-        "initial_action_memory_policy_source": initial_memory_policy.source,
+        "initial_action_memory_policy_source": initial_memory_policy["source"],
         "initial_action_memory_projection_keys": [],
-        "action_memory_required_keys": options.action_memory_required_keys,
+        "action_memory_required_keys": options["action_memory_required_keys"],
         "peak_active_runs": 0,
         "active_runs": [],
         "finish_blocked_active_runs": 0,
@@ -1474,7 +1474,7 @@ def standard_agent_control(
         "observation_field_truncations": 0,
         "peak_action_context_characters": 0,
         "max_action_context_characters": (
-            options.max_action_context_characters
+            options["max_action_context_characters"]
         ),
         "validation_retries": 0,
         "last_transition_id": "",
@@ -1506,15 +1506,15 @@ def standard_agent_control(
 
     round = 0
     limit_reason = "round_limit"
-    while options.max_rounds == 0 or round < options.max_rounds:
+    while options["max_rounds"] == 0 or round < options["max_rounds"]:
         time_budget = standard_current_time_budget()
         if time_budget is not None:
             state["last_time_remaining_ms"] = time_budget.remaining_ms
-            if time_budget.phase != state.time_budget_phase:
+            if time_budget.phase != state["time_budget_phase"]:
                 state["time_budget_phase"] = time_budget.phase
                 if time_budget.should_finalize:
                     state["time_budget_warnings"] += 1
-                    if state.control_blocker is None:
+                    if state["control_blocker"] is None:
                         state = standard_set_control(
                             state,
                             "verify",
@@ -1523,7 +1523,7 @@ def standard_agent_control(
                                 "finish if its evidence is sufficient."
                             ),
                             None,
-                            state.progress_class,
+                            state["progress_class"],
                             "time_budget_finalize",
                         )
             if time_budget.expired:
@@ -1533,10 +1533,10 @@ def standard_agent_control(
         calls_left = agent.remaining.calls
         should_checkpoint = (
             calls_left is not None
-            and options.completion_critique
-            and options.proactive_completion_checkpoint
-            and not state.budget_checkpoint_done
-            and calls_left <= options.finalization_window
+            and options["completion_critique"]
+            and options["proactive_completion_checkpoint"]
+            and not state["budget_checkpoint_done"]
+            and calls_left <= options["finalization_window"]
             and calls_left >= 4
         )
         if should_checkpoint:
@@ -1549,23 +1549,23 @@ def standard_agent_control(
             state["budget_checkpoints"] += 1
             state["budget_checkpoint_done"] = True
             state["last_completion_audit"] = critique
-            if not critique.approved:
+            if not critique["approved"]:
                 state["checkpoint_rejections"] += 1
             standard_record_completion_audit(critique, "pending")
             record_progress({
                 "stage": "budget_checkpoint",
                 "status": "active",
-                "ready_to_finish": critique.approved,
-                "rounds": state.rounds,
-                "actions": state.actions,
-                "model_calls": state.model_calls,
-                "tool_calls": state.tool_calls,
-                "failed_tools": state.failed_tools,
-                "budget_checkpoints": state.budget_checkpoints,
-                "checkpoint_rejections": state.checkpoint_rejections,
-                "transition_id": state.last_transition_id,
+                "ready_to_finish": critique["approved"],
+                "rounds": state["rounds"],
+                "actions": state["actions"],
+                "model_calls": state["model_calls"],
+                "tool_calls": state["tool_calls"],
+                "failed_tools": state["failed_tools"],
+                "budget_checkpoints": state["budget_checkpoints"],
+                "checkpoint_rejections": state["checkpoint_rejections"],
+                "transition_id": state["last_transition_id"],
             })
-            if critique.approved:
+            if critique["approved"]:
                 state = standard_set_control(
                     state,
                     "verify",
@@ -1578,23 +1578,23 @@ def standard_agent_control(
                 state = standard_set_control(
                     state,
                     "exploit",
-                    critique.repair_objective,
+                    critique["repair_objective"],
                     standard_critique_blocker(critique),
                     "unknown",
                     "budget_checkpoint_repair",
                 )
 
-        reserved_calls = 1 if options.completion_critique else 0
+        reserved_calls = 1 if options["completion_critique"] else 0
         calls_left = agent.remaining.calls
         if calls_left is not None and calls_left < 1 + reserved_calls:
             limit_reason = "model_call_limit"
             break
         state["rounds"] = round
-        initial_projection = state.memory_projections == 0
+        initial_projection = state["memory_projections"] == 0
         required_keys = (
-            state.initial_action_memory_required_keys
+            state["initial_action_memory_required_keys"]
             if initial_projection
-            else state.action_memory_required_keys
+            else state["action_memory_required_keys"]
         )
         prepared = standard_prepare_action_context(
             messages,
@@ -1605,31 +1605,31 @@ def standard_agent_control(
         )
         if initial_projection:
             state["initial_action_memory_projection_keys"] = (
-                prepared.projection_keys
+                prepared["projection_keys"]
             )
-        messages = prepared.history
+        messages = prepared["history"]
         state["memory_projections"] += 1
-        if prepared.projection_truncated:
+        if prepared["projection_truncated"]:
             state["projection_truncations"] += 1
-        state["context_messages_dropped"] += prepared.messages_dropped
+        state["context_messages_dropped"] += prepared["messages_dropped"]
         state["peak_action_context_characters"] = max(
-            state.peak_action_context_characters,
-            prepared.characters,
+            state["peak_action_context_characters"],
+            prepared["characters"],
         )
         turn = standard_ask(
             agent,
-            prepared.messages,
+            prepared["messages"],
             ActionTurn,
             state,
             standard_available_retries(agent, options, reserved_calls),
-            options.max_output_tokens,
+            options["max_output_tokens"],
             decision_hooks,
         )
         action = turn.actions[0]
         state["actions"] += 1
-        if options.max_actions > 0 and state.actions > options.max_actions:
+        if options["max_actions"] > 0 and state["actions"] > options["max_actions"]:
             fail(
-                "agent exceeded max_actions " + str(options.max_actions),
+                "agent exceeded max_actions " + str(options["max_actions"]),
                 code="agent_action_limit",
                 detail=state,
             )
@@ -1641,11 +1641,11 @@ def standard_agent_control(
         record_progress({
             "stage": "decision",
             "status": "active",
-            "rounds": state.rounds,
-            "actions": state.actions,
-            "tool_calls": state.tool_calls,
-            "failed_tools": state.failed_tools,
-            "transition_id": state.last_transition_id,
+            "rounds": state["rounds"],
+            "actions": state["actions"],
+            "tool_calls": state["tool_calls"],
+            "failed_tools": state["failed_tools"],
+            "transition_id": state["last_transition_id"],
         })
 
         final = None
@@ -1654,18 +1654,18 @@ def standard_agent_control(
         elif isinstance(action, Finish):
             final = {"answer": action.input.answer}
         if final is not None:
-            if len(state.active_runs) > 0:
+            if len(state["active_runs"]) > 0:
                 state["finish_blocked_active_runs"] += 1
                 record_progress({
                     "stage": "completion_rejected",
                     "status": "active",
                     "reason": "active_owned_runs",
-                    "active_runs": state.active_runs,
-                    "rounds": state.rounds,
-                    "actions": state.actions,
-                    "model_calls": state.model_calls,
-                    "tool_calls": state.tool_calls,
-                    "transition_id": state.last_transition_id,
+                    "active_runs": state["active_runs"],
+                    "rounds": state["rounds"],
+                    "actions": state["actions"],
+                    "model_calls": state["model_calls"],
+                    "tool_calls": state["tool_calls"],
+                    "transition_id": state["last_transition_id"],
                 })
                 state = standard_set_control(
                     state,
@@ -1676,17 +1676,17 @@ def standard_agent_control(
                     ),
                     {
                         "kind": "active_owned_runs",
-                        "runs": state.active_runs,
+                        "runs": state["active_runs"],
                     },
                     "unknown",
                     "finish_blocked",
                 )
                 continue
             candidate = verify_finish(final, session, state)
-            if options.completion_critique:
+            if options["completion_critique"]:
                 if (
-                    state.completion_critiques
-                    >= options.max_completion_critiques
+                    state["completion_critiques"]
+                    >= options["max_completion_critiques"]
                 ):
                     return standard_needs_review(
                         "completion_critic_exhausted",
@@ -1703,7 +1703,7 @@ def standard_agent_control(
                 )
                 state["completion_critiques"] += 1
                 state["last_completion_audit"] = critique
-                if not critique.approved:
+                if not critique["approved"]:
                     state["critic_rejections"] += 1
                     standard_record_completion_audit(critique, "pending")
                     standard_record_task_requirement(
@@ -1714,19 +1714,19 @@ def standard_agent_control(
                     record_progress({
                         "stage": "completion_rejected",
                         "status": "active",
-                        "rounds": state.rounds,
-                        "actions": state.actions,
-                        "model_calls": state.model_calls,
-                        "tool_calls": state.tool_calls,
-                        "failed_tools": state.failed_tools,
-                        "completion_critiques": state.completion_critiques,
-                        "critic_rejections": state.critic_rejections,
-                        "transition_id": state.last_transition_id,
+                        "rounds": state["rounds"],
+                        "actions": state["actions"],
+                        "model_calls": state["model_calls"],
+                        "tool_calls": state["tool_calls"],
+                        "failed_tools": state["failed_tools"],
+                        "completion_critiques": state["completion_critiques"],
+                        "critic_rejections": state["critic_rejections"],
+                        "transition_id": state["last_transition_id"],
                     })
                     state = standard_set_control(
                         state,
                         "exploit",
-                        critique.repair_objective,
+                        critique["repair_objective"],
                         standard_critique_blocker(critique),
                         "unknown",
                         "completion_critique_repair",
@@ -1740,21 +1740,21 @@ def standard_agent_control(
                 )
                 candidate["_completion_critique"] = {
                     "approved": True,
-                    "summary": critique.summary,
-                    "requirements": critique.requirements,
-                    "transition_id": critique.transition_id,
+                    "summary": critique["summary"],
+                    "requirements": critique["requirements"],
+                    "transition_id": critique["transition_id"],
                 }
             record_progress({
                 "stage": "finished",
                 "status": "verified",
-                "rounds": state.rounds,
-                "actions": state.actions,
-                "model_calls": state.model_calls,
-                "tool_calls": state.tool_calls,
-                "failed_tools": state.failed_tools,
-                "completion_critiques": state.completion_critiques,
-                "critic_rejections": state.critic_rejections,
-                "transition_id": state.last_transition_id,
+                "rounds": state["rounds"],
+                "actions": state["actions"],
+                "model_calls": state["model_calls"],
+                "tool_calls": state["tool_calls"],
+                "failed_tools": state["failed_tools"],
+                "completion_critiques": state["completion_critiques"],
+                "critic_rejections": state["critic_rejections"],
+                "transition_id": state["last_transition_id"],
             })
             return standard_result(candidate, state)
 
@@ -1762,7 +1762,7 @@ def standard_agent_control(
         state["last_tool"] = action.tool
         if (
             action.tool == "run_start"
-            and len(state.active_runs) >= options.max_active_runs
+            and len(state["active_runs"]) >= options["max_active_runs"]
         ):
             outcome = {
                 "ok": False,
@@ -1772,7 +1772,7 @@ def standard_agent_control(
                 "message": (
                     "Observe, wait for, or terminate an active run before "
                     "starting another. max_active_runs="
-                    + str(options.max_active_runs)
+                    + str(options["max_active_runs"])
                 ),
             }
         else:
@@ -1793,19 +1793,19 @@ def standard_agent_control(
         record_progress({
             "stage": "tool_outcome",
             "status": "active",
-            "rounds": state.rounds,
-            "actions": state.actions,
-            "model_calls": state.model_calls,
-            "tool_calls": state.tool_calls,
-            "failed_tools": state.failed_tools,
-            "last_tool": state.last_tool,
+            "rounds": state["rounds"],
+            "actions": state["actions"],
+            "model_calls": state["model_calls"],
+            "tool_calls": state["tool_calls"],
+            "failed_tools": state["failed_tools"],
+            "last_tool": state["last_tool"],
             "last_tool_ok": get(outcome, "ok", False),
-            "mode": state.control_mode,
-            "progress": state.progress_class,
-            "unchanged_streak": state.unchanged_streak,
-            "transition_id": state.last_transition_id,
+            "mode": state["control_mode"],
+            "progress": state["progress_class"],
+            "unchanged_streak": state["unchanged_streak"],
+            "transition_id": state["last_transition_id"],
         })
-        if state.unchanged_streak >= options.max_stagnant_actions:
+        if state["unchanged_streak"] >= options["max_stagnant_actions"]:
             return standard_needs_review(
                 "repeated_unchanged_action_state",
                 state,
@@ -1818,14 +1818,14 @@ def standard_agent_control(
             state,
             options,
         )
-        if observation.truncated:
+        if observation["truncated"]:
             state["observation_truncations"] += 1
         state["observation_field_truncations"] += (
-            observation.field_truncations
+            observation["field_truncations"]
         )
         messages.append({
             "role": "user",
-            "content": observation.content,
+            "content": observation["content"],
         })
 
     state = standard_reap_active_runs(state, options)
@@ -1833,14 +1833,14 @@ def standard_agent_control(
         "stage": "blocked",
         "status": "pending",
         "reason": limit_reason,
-        "rounds": state.rounds,
-        "actions": state.actions,
-        "model_calls": state.model_calls,
-        "tool_calls": state.tool_calls,
-        "failed_tools": state.failed_tools,
-        "transition_id": state.last_transition_id,
+        "rounds": state["rounds"],
+        "actions": state["actions"],
+        "model_calls": state["model_calls"],
+        "tool_calls": state["tool_calls"],
+        "failed_tools": state["failed_tools"],
+        "transition_id": state["last_transition_id"],
     })
-    if options.report_partial_on_limit:
+    if options["report_partial_on_limit"]:
         return standard_result(
             {
                 "answer": "budget-exhausted-with-best-effort",
@@ -1857,12 +1857,12 @@ def standard_agent_control(
         )
     if limit_reason == "model_call_limit":
         fail(
-            "agent exhausted max_model_calls " + str(options.max_model_calls),
+            "agent exhausted max_model_calls " + str(options["max_model_calls"]),
             code="agent_model_call_limit",
             detail=state,
         )
     fail(
-        "agent exhausted max_rounds " + str(options.max_rounds),
+        "agent exhausted max_rounds " + str(options["max_rounds"]),
         code="agent_round_limit",
         detail=state,
     )

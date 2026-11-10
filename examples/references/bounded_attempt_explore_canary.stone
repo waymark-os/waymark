@@ -39,14 +39,14 @@ def propose_lexical_first(candidates):
 def evaluate_candidate(item, outcome):
     result = outcome.result.value
     return {
-        "accepted": result.passed,
-        "summary": result.summary,
-        "evidence": result.evidence,
+        "accepted": result["passed"],
+        "summary": result["summary"],
+        "evidence": result["evidence"],
     }
 
 
 def worker(input):
-    item = input.candidate
+    item = input["candidate"]
     view = agent_session().context_prompt_view
     if (
         view is None
@@ -67,7 +67,7 @@ def worker(input):
             code="explore_canary_memory_missing",
         )
     problem = read_text("problem.txt").strip()
-    answer = item.input.answer
+    answer = item["input"]["answer"]
     write_file("answer.txt", answer + "\n")
     check = run(
         [
@@ -83,14 +83,14 @@ def worker(input):
         max_stderr_bytes=1024,
     )
     passed = (
-        answer == requirement[0].content.expected
+        answer == requirement[0].content["expected"]
         and check.ok
     )
     context_write(
         "candidate.explore_result",
         "candidate",
         {
-            "name": item.name,
+            "name": item["name"],
             "answer": answer,
             "passed": passed,
         },
@@ -98,7 +98,7 @@ def worker(input):
         evidence=["canary:candidate-check"],
     )
     return {
-        "candidate": item.name,
+        "candidate": item["name"],
         "answer": answer,
         "passed": passed,
         "summary": (
@@ -172,23 +172,23 @@ def main(input):
             detail=release_error,
         )
     accepted_shape = (
-        result.ok
-        and result.status == "accepted"
-        and result.outcomes[0].status == "rejected"
-        and result.outcomes[0].candidate == "deserts"
-        and result.outcomes[1].status == "accepted"
-        and result.outcomes[1].candidate == "desserts"
+        result["ok"]
+        and result["status"] == "accepted"
+        and result["outcomes"][0]["status"] == "rejected"
+        and result["outcomes"][0]["candidate"] == "deserts"
+        and result["outcomes"][1]["status"] == "accepted"
+        and result["outcomes"][1]["candidate"] == "desserts"
     )
     exhausted_shape = (
-        not result.ok
-        and result.status == "exhausted"
-        and result.outcomes[0].status == "rejected"
-        and result.outcomes[1].status == "rejected"
-        and result.accepted_attempt is None
+        not result["ok"]
+        and result["status"] == "exhausted"
+        and result["outcomes"][0]["status"] == "rejected"
+        and result["outcomes"][1]["status"] == "rejected"
+        and result["accepted_attempt"] is None
     )
     if (
-        result.tried != 2
-        or result.release.status != "released"
+        result["tried"] != 2
+        or result["release"].status != "released"
         or frontier.status != "released"
         or (exhaust and not exhausted_shape)
         or (not exhaust and not accepted_shape)
@@ -215,17 +215,17 @@ def main(input):
     return {
         "answer": answer,
         "checkpoint": checkpoint.reference,
-        "origin": result.source.availability,
-        "source_type": result.source.type,
-        "status": result.status,
-        "release": result.release,
+        "origin": result["source"]["availability"],
+        "source_type": result["source"]["type"],
+        "status": result["status"],
+        "release": result["release"],
         "frontier_status": frontier.status,
         "release_guard": True,
-        "proposal": result.proposal,
-        "outcomes": result.outcomes,
-        "accepted_attempt": result.accepted_attempt,
-        "tried": result.tried,
-        "clean": result.clean,
+        "proposal": result["proposal"],
+        "outcomes": result["outcomes"],
+        "accepted_attempt": result["accepted_attempt"],
+        "tried": result["tried"],
+        "clean": result["clean"],
         "parent_keys": parent_keys,
     }
 

@@ -182,7 +182,7 @@ fn json_object_view_subscript(
 ) -> Result<RuntimeValue, ShellError> {
     let key = value_to_string(index, "subscript")?;
     json_object_view_get(view, &key)?
-        .ok_or_else(|| stone_error("subscript", format!("record has no key `{key}`")))
+        .ok_or_else(|| stone_error("subscript", format!("dict has no key `{key}`")))
 }
 
 fn json_array_view_subscript(

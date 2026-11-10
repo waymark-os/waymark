@@ -28,20 +28,20 @@ def prepare_owner(step):
 
 
 def worker(input):
-    if input.expected == "root":
+    if input["expected"] == "root":
         inherited = read_text("root.txt").strip()
     else:
         inherited = read_text("owner.txt").strip()
-    if inherited != input.expected:
+    if inherited != input["expected"]:
         fail(
             "branch did not restore the expected semantic frontier",
             code="semantic_frontier_restore_failed",
-            detail={"expected": input.expected, "actual": inherited},
+            detail={"expected": input["expected"], "actual": inherited},
         )
-    write_file("branch.txt", input.label + "\n")
+    write_file("branch.txt", input["label"] + "\n")
     return {
-        "label": input.label,
-        "expected": input.expected,
+        "label": input["label"],
+        "expected": input["expected"],
         "inherited": inherited,
     }
 
@@ -92,7 +92,7 @@ def main(input):
     if (
         not parent_outcome.joined
         or parent_outcome.result.status != "succeeded"
-        or parent_outcome.result.value.inherited != "root"
+        or parent_outcome.result.value["inherited"] != "root"
     ):
         fail(
             "parent-owned semantic frontier branch failed",
@@ -125,7 +125,7 @@ def main(input):
     failed = attempt_retain_failure(scope, failed_outcome)
 
     retained_frontier = semantic_frontier(
-        setup_outcome.result.value.checkpoint,
+        setup_outcome.result.value["checkpoint"],
         owner=failed,
     )
     repaired = attempt_branch(
@@ -140,7 +140,7 @@ def main(input):
     if (
         not repaired_outcome.joined
         or repaired_outcome.result.status != "succeeded"
-        or repaired_outcome.result.value.inherited != "owner"
+        or repaired_outcome.result.value["inherited"] != "owner"
     ):
         fail(
             "retained semantic frontier branch failed",

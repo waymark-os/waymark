@@ -94,8 +94,8 @@ def portfolio_worker(input):
         standard_record_progress,
     )
     result["_portfolio"] = {
-        "role": input.portfolio_role,
-        "instruction": input.portfolio_instruction,
+        "role": input["portfolio_role"],
+        "instruction": input["portfolio_instruction"],
         "context_prompt_view": get(session, "context_prompt_view", None),
         "memory_revision": attempt_info().memory_revision,
     }
@@ -189,9 +189,9 @@ def portfolio_select(first, second):
         max_output_tokens=384,
     )
     return {
-        "winner_index": inference.value.winner_index,
-        "publish_ready": inference.value.publish_ready,
-        "reason": inference.value.reason,
+        "winner_index": inference.value["winner_index"],
+        "publish_ready": inference.value["publish_ready"],
+        "reason": inference.value["reason"],
         "transition_id": inference.response.transition_id,
         "validation_attempts": inference.validation_attempts,
     }
@@ -214,7 +214,7 @@ def portfolio_parent(input):
     phase = portfolio_phase_session(session)
     phase_result = standard_agent_control(
         phase,
-        standard_agent_options(phase.input),
+        standard_agent_options(phase["input"]),
         standard_shell_dispatch,
         standard_verify_finish,
         standard_record_progress,
@@ -283,8 +283,8 @@ def portfolio_parent(input):
             entrypoint="portfolio_worker",
             input=portfolio_child_input(
                 input,
-                role.name,
-                role.instruction,
+                role["name"],
+                role["instruction"],
             ),
             context_prompt_view={
                 "required_keys": [
@@ -298,7 +298,7 @@ def portfolio_parent(input):
         outcome = attempt_join(child, timeout_ms=420000)
         handles.append(child)
         outcomes.append(outcome)
-        summaries.append(portfolio_candidate_summary(outcome, role.name))
+        summaries.append(portfolio_candidate_summary(outcome, role["name"]))
         inspections.append(portfolio_inspection_summary(
             attempt_inspect(
                 child,
@@ -309,9 +309,9 @@ def portfolio_parent(input):
         ))
 
     selection = portfolio_select(summaries[0], summaries[1])
-    selected_index = selection.winner_index
-    first_succeeded = summaries[0].status == "succeeded"
-    second_succeeded = summaries[1].status == "succeeded"
+    selected_index = selection["winner_index"]
+    first_succeeded = summaries[0]["status"] == "succeeded"
+    second_succeeded = summaries[1]["status"] == "succeeded"
     if first_succeeded and not second_succeeded:
         selected_index = 0
     if second_succeeded and not first_succeeded:
@@ -323,7 +323,7 @@ def portfolio_parent(input):
         loser_index = 1 if selected_index == 0 else 0
         attempt_accept(root.attempt, handles[selected_index])
         accepted_attempt = handles[selected_index].attempt
-        selected_ready = summaries[selected_index].ready
+        selected_ready = summaries[selected_index]["ready"]
         attempt_discard(
             handles[loser_index],
             reason="fork portfolio non-selected candidate",
@@ -340,7 +340,7 @@ def portfolio_parent(input):
 
     publish_ready = (
         selected_ready
-        and selection.publish_ready
+        and selection["publish_ready"]
         and len(accepted_attempt) > 0
     )
     selection["selected_index"] = selected_index
@@ -352,7 +352,7 @@ def portfolio_parent(input):
         "decision",
         selection,
         status="verified" if publish_ready else "pending",
-        evidence=["transition:" + selection.transition_id],
+        evidence=["transition:" + selection["transition_id"]],
     )
 
     cleanup = attempt_scope_close(scope)
@@ -365,7 +365,7 @@ def portfolio_parent(input):
 
     answer = "No fork candidate had sufficient visible completion evidence."
     if len(accepted_attempt) > 0:
-        answer = summaries[selected_index].answer
+        answer = summaries[selected_index]["answer"]
     return {
         "answer": answer,
         "complete": publish_ready,
@@ -379,6 +379,6 @@ def portfolio_parent(input):
             "name": "stone.standard_fork_portfolio_v1",
             "attempt_forks": 2,
             "accepted": 1 if len(accepted_attempt) > 0 else 0,
-            "selection_model_calls": selection.validation_attempts,
+            "selection_model_calls": selection["validation_attempts"],
         },
     }

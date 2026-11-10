@@ -32,7 +32,7 @@ def react_agent():
                 "model did not return valid JSON: " + json_dumps(error),
                 code="invalid_model_response",
             )
-        actions = decoded.actions
+        actions = decoded["actions"]
         if len(actions) == 0:
             fail("model actions array must not be empty", code="invalid_model_response")
         messages.append({"role": "assistant", "content": response.content})
@@ -56,13 +56,13 @@ def react_agent():
             saw_tool = True
             args = get(action, "input", {})
             if tool == "read":
-                result = {"ok": True, "content": read_text(args.path)}
+                result = {"ok": True, "content": read_text(args["path"])}
             elif tool == "write":
-                write_text(args.path, args.content)
-                result = {"ok": True, "path": args.path}
+                write_text(args["path"], args["content"])
+                result = {"ok": True, "path": args["path"]}
             elif tool == "run_linux":
                 result = run(
-                    args.argv,
+                    args["argv"],
                     cwd=get(args, "cwd", None),
                     stdin=get(args, "stdin", None),
                     timeout_ms=get(args, "timeout_ms", 60000),

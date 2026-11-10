@@ -131,7 +131,7 @@ def prepare_stone_recovery(source, failure):
 
     # This validates the source digest and exact byte edit but does not execute.
     preview = correction_apply(source, correction)
-    corrected_sha256 = preview["source_sha256"]
+    corrected_sha256 = preview.source_sha256
     if any(
         get(entry, "source_sha256", "") == corrected_sha256
         or get(entry, "corrected_source_sha256", "") == corrected_sha256

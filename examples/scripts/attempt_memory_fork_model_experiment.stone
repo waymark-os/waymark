@@ -8,7 +8,7 @@
 
 def prepare_candidate_decision(step, projection):
     return {
-        "messages": step.input.messages + [
+        "messages": step.input["messages"] + [
             {
                 "role": "user",
                 "content": "Active attempt memory:\n" + projection.text,
@@ -47,32 +47,32 @@ def worker(input):
             },
             {
                 "role": "user",
-                "content": "Candidate: " + input.candidate,
+                "content": "Candidate: " + input["candidate"],
             },
         ],
         response_format={"type": "json_object"},
         max_output_tokens=128,
         hooks={
             "pre": lambda step: prepare_candidate_decision(step, projection),
-            "post": lambda step: record_candidate_decision(step, input.candidate),
+            "post": lambda step: record_candidate_decision(step, input["candidate"]),
         },
     )
     decoded = json_loads(response.content)
-    if decoded.candidate != input.candidate:
+    if decoded["candidate"] != input["candidate"]:
         fail(
             "model did not echo its assigned candidate",
             code="fork_model_candidate_mismatch",
-            detail={"expected": input.candidate, "actual": decoded},
+            detail={"expected": input["candidate"], "actual": decoded},
         )
-    if decoded.decision != "select" and decoded.decision != "reject" and decoded.decision != "insufficient":
+    if decoded["decision"] != "select" and decoded["decision"] != "reject" and decoded["decision"] != "insufficient":
         fail(
             "model returned an invalid decision",
             code="fork_model_invalid_decision",
             detail=decoded,
         )
     return {
-        "candidate": input.candidate,
-        "decision": decoded.decision,
+        "candidate": input["candidate"],
+        "decision": decoded["decision"],
         "projected_keys": map(lambda item: item.key, projection.items),
         "memory_revision": attempt_info().memory_revision,
         "transition_id": response.transition_id,
@@ -104,24 +104,24 @@ def start_worker(arm, root, scope, candidate):
 
 
 def main(input):
-    if input.arm != "F" and input.arm != "S":
+    if input["arm"] != "F" and input["arm"] != "S":
         fail("arm must be F or S", code="fork_model_bad_arm")
-    if len(input.candidates) != 2:
+    if len(input["candidates"]) != 2:
         fail("experiment requires exactly two candidates", code="fork_model_bad_candidates")
 
     root = attempt_info()
     context_write(
         "requirement.target",
         "requirement",
-        {"target": input.target},
+        {"target": input["target"]},
         status="verified",
         evidence=["experiment:parent-input"],
     )
     scope = attempt_scope(join_timeout_ms=60000)
 
-    first = start_worker(input.arm, root, scope, input.candidates[0])
+    first = start_worker(input["arm"], root, scope, input["candidates"][0])
     first_outcome = attempt_join(first, timeout_ms=60000)
-    second = start_worker(input.arm, root, scope, input.candidates[1])
+    second = start_worker(input["arm"], root, scope, input["candidates"][1])
     second_outcome = attempt_join(second, timeout_ms=60000)
 
     if not first_outcome.joined or not second_outcome.joined:
@@ -142,18 +142,18 @@ def main(input):
     selected = None
     selected_result = None
     rejected = None
-    if first_result.decision == "select" and second_result.decision != "select":
+    if first_result["decision"] == "select" and second_result["decision"] != "select":
         selected = first
         selected_result = first_result
         rejected = second
-    if second_result.decision == "select" and first_result.decision != "select":
+    if second_result["decision"] == "select" and first_result["decision"] != "select":
         selected = second
         selected_result = second_result
         rejected = first
 
     accepted = ""
     promoted = False
-    if input.arm == "F" and selected != None and selected_result.candidate == input.target:
+    if input["arm"] == "F" and selected != None and selected_result["candidate"] == input["target"]:
         attempt_accept(root.attempt, selected)
         accepted = selected.attempt
         attempt_discard(rejected, reason="non-selected fork candidate")
@@ -161,9 +161,9 @@ def main(input):
             "candidate.accepted",
             "candidate",
             {
-                "candidate": selected_result.candidate,
+                "candidate": selected_result["candidate"],
                 "child_attempt": selected.attempt,
-                "decision": selected_result.decision,
+                "decision": selected_result["decision"],
             },
             status="verified",
             evidence=["accepted-child:" + selected.attempt],
@@ -184,8 +184,8 @@ def main(input):
     parent = attempt_info()
     parent_memory = context_read(limit=20)
     return {
-        "arm": input.arm,
-        "target": input.target,
+        "arm": input["arm"],
+        "target": input["target"],
         "children": [
             {
                 "attempt": first.attempt,

@@ -5,7 +5,7 @@ def worker(input):
     inherited = context_read(keys=["shared.parent"], limit=1)
     if len(inherited) != 1:
         fail("child did not inherit parent memory", code="fork_memory_missing")
-    inherited_value = inherited[0].content.value
+    inherited_value = inherited[0].content["value"]
     context_write(
         "candidate.child",
         "candidate",
@@ -68,7 +68,7 @@ def main(input):
     context_write(
         "candidate.accepted",
         "candidate",
-        {"value": child_observation.inherited_value + 1},
+        {"value": child_observation["inherited_value"] + 1},
         status="verified",
         evidence=["accepted-child:" + child.attempt],
     )

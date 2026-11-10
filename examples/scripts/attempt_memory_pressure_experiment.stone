@@ -23,7 +23,7 @@ def retain_model_decision(step):
 
 def inject_projection(step, projection):
     return {
-        "messages": step.input.messages + [
+        "messages": step.input["messages"] + [
             {
                 "role": "user",
                 "content": "Active attempt memory:\n" + projection.text,
@@ -37,14 +37,14 @@ def seed_pressure(mode):
     context_write(
         "requirement.target",
         "requirement",
-        {"target": targets.old, "state": "obsolete"},
+        {"target": targets["old"], "state": "obsolete"},
         status="contradicted",
         evidence=["fixture:old-target"],
     )
     current = context_write(
         "requirement.target",
         "requirement",
-        {"target": targets.current, "state": "current"},
+        {"target": targets["current"], "state": "current"},
         status="verified",
         evidence=["fixture:current-target"],
     )
@@ -121,9 +121,9 @@ def seed_pressure(mode):
         "memory_revision": attempt_info().memory_revision,
         "item_count": len(items),
         "pressure_item_count": len(context_read(kinds=["pressure"], limit=256)),
-        "latest_decision_sequence": latest_decision.content.sequence,
-        "latest_pressure_sequence": latest_pressure.content.sequence,
-        "requirement_target": requirement.content.target,
+        "latest_decision_sequence": latest_decision.content["sequence"],
+        "latest_pressure_sequence": latest_pressure.content["sequence"],
+        "requirement_target": requirement.content["target"],
         "requirement_supersedes": requirement.supersedes,
         "resolved_risk_count": len(context_read(keys=["risk.resolved"], limit=1)),
         "current_item_id": current.id,
@@ -157,13 +157,13 @@ def worker(input):
     )
     decoded = json_loads(response.content)
     return {
-        "selected_target": decoded.selected_target,
+        "selected_target": decoded["selected_target"],
         "projection_keys": map(lambda item: item.key, projection.items),
         "projection_revision": projection.revision,
         "projection_estimated_tokens": projection.estimated_tokens,
         "projection_truncated": projection.truncated,
-        "projection_contains_current": targets.current in projection.text,
-        "projection_contains_old": targets.old in projection.text,
+        "projection_contains_current": targets["current"] in projection.text,
+        "projection_contains_old": targets["old"] in projection.text,
         "item_count_before": item_count_before,
         "item_count_after": len(context_read(limit=256)),
         "memory_revision": attempt_info().memory_revision,
@@ -200,7 +200,7 @@ def restore_and_fork(mode):
         "decision",
         {
             "phase": "parent-promotion",
-            "selected_target": child_result.selected_target,
+            "selected_target": child_result["selected_target"],
             "child_attempt": child.attempt,
         },
         status="verified",
@@ -226,7 +226,7 @@ def restore_and_fork(mode):
         "parent_revision_after": attempt_info().memory_revision,
         "parent_item_count_before": parent_count_before,
         "parent_item_count_after": len(context_read(limit=256)),
-        "requirement_target": requirement.content.target,
+        "requirement_target": requirement.content["target"],
         "requirement_supersedes": requirement.supersedes,
         "resolved_risk_count": len(context_read(keys=["risk.resolved"], limit=1)),
         "fork_origin_revision": child.fork_origin.memory_revision,
@@ -262,7 +262,7 @@ if entrypoint == "worker":
     )
 else:
     result = main(task_input())
-    if result.phase == "restore":
+    if result["phase"] == "restore":
         attempt_report(
             status="succeeded",
             result=result,

@@ -18,7 +18,7 @@ def prepare_decision(step):
         "role": "user",
         "content": "Active attempt memory:\n" + projection.text,
     }
-    messages = step.input.messages
+    messages = step.input["messages"]
     # Keep the caller's newest observation/instruction last. Appending memory
     # after it can make retrieved evidence override the action requested for
     # this particular transition.
@@ -58,7 +58,7 @@ def record_decision(step):
 # narrow patch or denial affects this action pair only; Gateway policy remains
 # authoritative afterward.
 def check_action(step):
-    if len(step.input.argv) == 0:
+    if len(step.input["argv"]) == 0:
         return {"allow": False, "reason": "empty action argv"}
     return None
 
@@ -71,7 +71,7 @@ def record_outcome(step):
     content = {
         "ok": step.outcome.ok,
         "transition_id": step.transition_id,
-        "argv": step.input.argv,
+        "argv": step.input["argv"],
     }
     if result == None:
         content["error"] = step.outcome.error

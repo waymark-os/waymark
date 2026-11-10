@@ -74,7 +74,7 @@ def typed_react_agent():
             max_output_tokens=512,
         )
         decoded = inference.value
-        actions = decoded.actions
+        actions = decoded["actions"]
         messages.append({
             "role": "assistant",
             "content": inference.response.content,
@@ -94,18 +94,18 @@ def typed_react_agent():
             if final is not None:
                 return final
             if tool == "finish":
-                return action.input
+                return action["input"]
 
             saw_tool = True
-            args = action.input
+            args = action["input"]
             if tool == "read":
-                result = {"ok": True, "content": read_text(args.path)}
+                result = {"ok": True, "content": read_text(args["path"])}
             elif tool == "write":
-                write_text(args.path, args.content)
-                result = {"ok": True, "path": args.path}
+                write_text(args["path"], args["content"])
+                result = {"ok": True, "path": args["path"]}
             elif tool == "run_linux":
                 result = run(
-                    args.argv,
+                    args["argv"],
                     cwd=get(args, "cwd", None),
                     stdin=get(args, "stdin", None),
                     timeout_ms=get(args, "timeout_ms", 60000),

@@ -46,7 +46,7 @@ def main(input):
         fail("wait-set scope cleanup failed", code="attempt_wait_set_cleanup_failed")
 
     return {
-        "answer": input.answer,
+        "answer": input["answer"],
         "model_probe": probe.content,
         "winner_type": type(winner),
         "winner": winner.attempt,

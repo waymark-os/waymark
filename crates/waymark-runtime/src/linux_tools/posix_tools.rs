@@ -177,7 +177,14 @@ fn sysinfo_cpu_records(long: bool, span: Span) -> Value {
     }
 
     let load = System::load_average();
-    let load_average = format!("{:.2}, {:.2}, {:.2}", load.one, load.five, load.fifteen);
+    // [1, 5, 15]-minute load averages as numbers.
+    let load_average = Value::list(
+        [load.one, load.five, load.fifteen]
+            .into_iter()
+            .map(|value| Value::float((value * 100.0).round() / 100.0, span))
+            .collect(),
+        span,
+    );
     Value::list(
         sys.cpus()
             .iter()
@@ -190,7 +197,7 @@ fn sysinfo_cpu_records(long: bool, span: Span) -> Value {
                     Value::string(trim_cstyle_null(cpu.vendor_id()), span),
                 );
                 record.push("freq", Value::int(cpu.frequency() as i64, span));
-                record.push("load_average", Value::string(load_average.clone(), span));
+                record.push("load_average", load_average.clone());
                 if long {
                     let rounded = (f64::from(cpu.cpu_usage()) * 10.0).round() / 10.0;
                     record.push("cpu_usage", Value::float(rounded, span));
@@ -208,31 +215,31 @@ fn sysinfo_memory_record(span: Span) -> Value {
     let mut record = Record::with_capacity(7);
     record.push(
         "total",
-        Value::filesize(u64_to_i64_saturating(sys.total_memory()), span),
+        Value::int(u64_to_i64_saturating(sys.total_memory()), span),
     );
     record.push(
         "free",
-        Value::filesize(u64_to_i64_saturating(sys.free_memory()), span),
+        Value::int(u64_to_i64_saturating(sys.free_memory()), span),
     );
     record.push(
         "used",
-        Value::filesize(u64_to_i64_saturating(sys.used_memory()), span),
+        Value::int(u64_to_i64_saturating(sys.used_memory()), span),
     );
     record.push(
         "available",
-        Value::filesize(u64_to_i64_saturating(sys.available_memory()), span),
+        Value::int(u64_to_i64_saturating(sys.available_memory()), span),
     );
     record.push(
         "swap_total",
-        Value::filesize(u64_to_i64_saturating(sys.total_swap()), span),
+        Value::int(u64_to_i64_saturating(sys.total_swap()), span),
     );
     record.push(
         "swap_free",
-        Value::filesize(u64_to_i64_saturating(sys.free_swap()), span),
+        Value::int(u64_to_i64_saturating(sys.free_swap()), span),
     );
     record.push(
         "swap_used",
-        Value::filesize(u64_to_i64_saturating(sys.used_swap()), span),
+        Value::int(u64_to_i64_saturating(sys.used_swap()), span),
     );
     Value::record(record, span)
 }
@@ -257,11 +264,11 @@ fn sysinfo_disk_records(span: Span) -> Value {
                 );
                 record.push(
                     "total",
-                    Value::filesize(u64_to_i64_saturating(disk.total_space()), span),
+                    Value::int(u64_to_i64_saturating(disk.total_space()), span),
                 );
                 record.push(
                     "free",
-                    Value::filesize(u64_to_i64_saturating(disk.available_space()), span),
+                    Value::int(u64_to_i64_saturating(disk.available_space()), span),
                 );
                 record.push("removable", Value::bool(disk.is_removable(), span));
                 record.push("kind", Value::string(disk.kind().to_string(), span));
@@ -299,11 +306,11 @@ fn sysinfo_network_records(span: Span) -> Value {
                 record.push("ip", Value::list(ips, span));
                 record.push(
                     "sent",
-                    Value::filesize(u64_to_i64_saturating(data.total_transmitted()), span),
+                    Value::int(u64_to_i64_saturating(data.total_transmitted()), span),
                 );
                 record.push(
                     "recv",
-                    Value::filesize(u64_to_i64_saturating(data.total_received()), span),
+                    Value::int(u64_to_i64_saturating(data.total_received()), span),
                 );
                 Value::record(record, span)
             })

@@ -72,14 +72,14 @@ def propose_lexical_first(candidates):
 def evaluate_candidate(item, outcome):
     result = outcome.result.value
     return {
-        "accepted": result.passed,
-        "summary": result.summary,
-        "evidence": result.evidence,
+        "accepted": result["passed"],
+        "summary": result["summary"],
+        "evidence": result["evidence"],
     }
 
 
 def worker(input):
-    item = input.candidate
+    item = input["candidate"]
     requirement = context_read(
         keys=["requirement.explore_target"],
         limit=1,
@@ -90,7 +90,7 @@ def worker(input):
             code="explore_authorship_memory_missing",
         )
     problem = read_text("problem.txt").strip()
-    answer = item.input.answer
+    answer = item["input"]["answer"]
     write_file("answer.txt", answer + "\n")
     check = run(
         [
@@ -106,14 +106,14 @@ def worker(input):
         max_stderr_bytes=1024,
     )
     passed = (
-        answer == requirement[0].content.expected
+        answer == requirement[0].content["expected"]
         and check.ok
     )
     context_write(
         "candidate.explore_result",
         "candidate",
         {
-            "name": item.name,
+            "name": item["name"],
             "answer": answer,
             "passed": passed,
         },
@@ -121,7 +121,7 @@ def worker(input):
         evidence=["authorship:candidate-check"],
     )
     return {
-        "candidate": item.name,
+        "candidate": item["name"],
         "answer": answer,
         "passed": passed,
         "summary": (
@@ -137,13 +137,13 @@ def worker(input):
 
 def fixture_finalize(result):
     if (
-        not result.ok
-        or result.status != "accepted"
-        or result.tried != 2
-        or result.outcomes[0].candidate != "deserts"
-        or result.outcomes[0].status != "rejected"
-        or result.outcomes[1].candidate != "desserts"
-        or result.outcomes[1].status != "accepted"
+        not result["ok"]
+        or result["status"] != "accepted"
+        or result["tried"] != 2
+        or result["outcomes"][0]["candidate"] != "deserts"
+        or result["outcomes"][0]["status"] != "rejected"
+        or result["outcomes"][1]["candidate"] != "desserts"
+        or result["outcomes"][1]["status"] != "accepted"
     ):
         fail(
             "authored control did not reject then recover",
@@ -165,11 +165,11 @@ def fixture_finalize(result):
         )
     return {
         "answer": answer,
-        "checkpoint": result.checkpoint,
-        "proposal": result.proposal,
-        "outcomes": result.outcomes,
-        "accepted_attempt": result.accepted_attempt,
-        "tried": result.tried,
-        "clean": result.clean,
+        "checkpoint": result["checkpoint"],
+        "proposal": result["proposal"],
+        "outcomes": result["outcomes"],
+        "accepted_attempt": result["accepted_attempt"],
+        "tried": result["tried"],
+        "clean": result["clean"],
         "parent_keys": parent_keys,
     }

@@ -59,8 +59,8 @@ conversions such as `int(...)` or `float(...)` at data boundaries.
 Waymark Shell favors typed values over string pipelines. Commands and scripts pass
 records, lists, booleans, numbers, and nulls directly instead of repeatedly
 serializing and reparsing text. Text still matters at process boundaries, but it
-is not the only internal transport. This keeps agent work inspectable: a file
-write returns a record, a command returns stdout/stderr/status plus diagnostics,
+is not the only internal transport. This keeps agent work inspectable: `save(path,
+text)` returns a record with the path and byte count, a command returns stdout/stderr/status plus diagnostics,
 and `emit(...)` returns a JSON value rather than a scraped terminal transcript.
 
 Structured I/O is the integration contract. The CLI, MCP adapter, and helpers
@@ -120,7 +120,7 @@ text = read_text("target/example.txt")
 result = run(["wc", "-c", "target/example.txt"])
 emit({
     "text": text,
-    "wc_stdout": result["stdout"],
+    "wc_stdout": result.stdout,
 })
 ```
 

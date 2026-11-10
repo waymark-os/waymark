@@ -16,7 +16,7 @@ class ForkNeededCanaryTests(unittest.TestCase):
     def test_example_requires_the_parent_frontier_and_isolated_branches(self) -> None:
         source = SOURCE.read_text(encoding="utf-8")
 
-        self.assertIn('write_file("problem.txt", input.problem + "\\n")', source)
+        self.assertIn('write_file("problem.txt", input["problem"] + "\\n")', source)
         self.assertIn('"requirement.fork_target"', source)
         self.assertEqual(source.count("attempt_fork("), 2)
         self.assertIn("attempt_wait_all(scope", source)

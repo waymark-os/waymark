@@ -710,7 +710,7 @@ def stage_agent_check_command(command):
 
 
 def stage_agent_ensure_command(args):
-    before = stage_agent_check_command(args.command)
+    before = stage_agent_check_command(args["command"])
     after = before
     provision = get(args, "provision", None)
     provision_result = None
@@ -723,14 +723,14 @@ def stage_agent_ensure_command(args):
     }
     if not before.ok and provision is not None:
         provision_result = run_complete(
-            provision.argv,
+            provision["argv"],
             cwd=get(provision, "cwd", None),
             stdin=get(provision, "stdin", None),
             timeout_ms=min(get(provision, "timeout_ms", 900000), 1800000),
             max_stdout_bytes=8192,
             max_stderr_bytes=8192,
         )
-        after = stage_agent_check_command(args.command)
+        after = stage_agent_check_command(args["command"])
         transition = {
             "kind": "environment",
             "attempted": True,
@@ -741,7 +741,7 @@ def stage_agent_ensure_command(args):
                 if provision_result.ok
                 else "failed"
             ),
-            "argv": provision.argv,
+            "argv": provision["argv"],
             "exit_code": get(provision_result, "exit_code", None),
         }
     path = slice(get(after, "stdout", ""), 0, 2048)
@@ -753,13 +753,13 @@ def stage_agent_ensure_command(args):
             get(provision_result, "stderr", diagnostic),
         )
     diagnostic = slice(diagnostic, 0, 2048)
-    message = "command `" + args.command + "` remains unavailable"
+    message = "command `" + args["command"] + "` remains unavailable"
     if after.ok:
-        message = "command `" + args.command + "` is available at " + path
+        message = "command `" + args["command"] + "` is available at " + path
     return {
         "ok": after.ok,
         "kind": "capability_ready" if after.ok else "capability_absent",
-        "command": args.command,
+        "command": args["command"],
         "stdout": path,
         "stderr": diagnostic,
         "message": message,
@@ -775,17 +775,17 @@ def stage_agent_ensure_command(args):
 
 
 def stage_agent_dispatch(action):
-    tool = action.tool
-    args = action.input
+    tool = action["tool"]
+    args = action["input"]
     try:
         if tool == "read":
-            info = stat(args.path)
+            info = stat(args["path"])
             if info.is_dir:
-                listing = json_dumps(ls(args.path))
+                listing = json_dumps(ls(args["path"]))
                 return {
                     "ok": True,
                     "kind": "list",
-                    "path": args.path,
+                    "path": args["path"],
                     "content": slice(listing, 0, 8192),
                     "content_truncated": len(listing) > 8192,
                 }
@@ -796,36 +796,36 @@ def stage_agent_dispatch(action):
             end_line = get(args, "end_line", None)
             if tail_bytes is not None:
                 content = read_file(
-                    args.path, max_bytes=max_bytes, tail_bytes=tail_bytes
+                    args["path"], max_bytes=max_bytes, tail_bytes=tail_bytes
                 )
             elif offset is not None:
-                content = read_file(args.path, max_bytes=max_bytes, offset=offset)
+                content = read_file(args["path"], max_bytes=max_bytes, offset=offset)
             elif start_line is not None and end_line is not None:
                 content = read_file(
-                    args.path,
+                    args["path"],
                     max_bytes=max_bytes,
                     start_line=start_line,
                     end_line=end_line,
                 )
             elif start_line is not None:
                 content = read_file(
-                    args.path, max_bytes=max_bytes, start_line=start_line
+                    args["path"], max_bytes=max_bytes, start_line=start_line
                 )
             elif end_line is not None:
-                content = read_file(args.path, max_bytes=max_bytes, end_line=end_line)
+                content = read_file(args["path"], max_bytes=max_bytes, end_line=end_line)
             else:
-                content = read_file(args.path, max_bytes=max_bytes)
+                content = read_file(args["path"], max_bytes=max_bytes)
             return {
                 "ok": True,
                 "kind": "read",
-                "path": args.path,
+                "path": args["path"],
                 "content": content,
                 "content_truncated": len(content) >= max_bytes,
             }
         if tool == "find":
             entries = find(
-                args.path,
-                args.name_glob,
+                args["path"],
+                args["name_glob"],
                 max_depth=get(args, "max_depth", 32),
                 type=get(args, "type", "any"),
             )
@@ -833,41 +833,41 @@ def stage_agent_dispatch(action):
             return {
                 "ok": True,
                 "kind": "find",
-                "path": args.path,
-                "name_glob": args.name_glob,
+                "path": args["path"],
+                "name_glob": args["name_glob"],
                 "content": slice(serialized, 0, 8192),
                 "content_truncated": len(serialized) > 8192,
             }
         if tool == "search":
             matches = search(
-                args.path,
-                args.needle,
+                args["path"],
+                args["needle"],
                 regex=get(args, "regex", False),
             )
             serialized = json_dumps(matches)
             return {
                 "ok": True,
                 "kind": "search",
-                "path": args.path,
-                "needle": args.needle,
+                "path": args["path"],
+                "needle": args["needle"],
                 "regex": get(args, "regex", False),
                 "content": slice(serialized, 0, 8192),
                 "content_truncated": len(serialized) > 8192,
             }
         if tool == "write":
-            write_text(args.path, args.content)
-            return {"ok": True, "kind": "write", "path": args.path}
+            write_text(args["path"], args["content"])
+            return {"ok": True, "kind": "write", "path": args["path"]}
         if tool == "edit":
             result = edit(
-                args.path,
-                args.old,
-                args.new,
+                args["path"],
+                args["old"],
+                args["new"],
                 all=get(args, "all", False),
             )
             return {
                 "ok": True,
                 "kind": "edit",
-                "path": args.path,
+                "path": args["path"],
                 "replacements": result.replacements,
                 "matched": result.matched,
             }
@@ -875,7 +875,7 @@ def stage_agent_dispatch(action):
             return stage_agent_ensure_command(args)
         if tool == "run_linux":
             return run(
-                args.argv,
+                args["argv"],
                 cwd=get(args, "cwd", None),
                 stdin=get(args, "stdin", None),
                 timeout_ms=min(get(args, "timeout_ms", 60000), 120000),
@@ -884,7 +884,7 @@ def stage_agent_dispatch(action):
             )
         if tool == "run_complete":
             return run_complete(
-                args.argv,
+                args["argv"],
                 cwd=get(args, "cwd", None),
                 stdin=get(args, "stdin", None),
                 timeout_ms=min(get(args, "timeout_ms", 900000), 1800000),
@@ -950,18 +950,18 @@ def agent_loop(step):
         return stage_agent_remember(
             step, action, outcome, ["runtime:model_infer_validation"]
         )
-    action = inference.value.actions[0]
+    action = inference.value["actions"][0]
     decision = None
     if get(action, "tool", "") == "decide":
-        decision = action.input
+        decision = action["input"]
     final = get(action, "final", None)
     if final is None and get(action, "tool", "") == "finish":
-        final = action.input
+        final = action["input"]
     if decision is not None:
         outcome = {
             "ok": True,
             "kind": "decision_recorded",
-            "message": decision.answer,
+            "message": decision["answer"],
             "findings": get(decision, "findings", {}),
             "probe_resolutions": get(action, "resolves", {}),
             "unknown_findings": get(action, "unknown", get(decision, "unknown", {})),
@@ -971,7 +971,7 @@ def agent_loop(step):
         outcome = {
             "ok": True,
             "kind": "finish_requested",
-            "message": final.answer,
+            "message": final["answer"],
             "findings": get(final, "findings", {}),
             "probe_resolutions": get(action, "resolves", {}),
             "unknown_findings": get(action, "unknown", get(final, "unknown", {})),

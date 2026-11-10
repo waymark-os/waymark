@@ -577,6 +577,11 @@ impl Budget {
             "calls": calls,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "tool_calls": self
+                .limits
+                .get()
+                .tool_calls
+                .map(|limit| limit.saturating_sub(self.tool_calls.get())),
             "seconds": self.remaining_ms().map(|ms| ms / 1000),
         })
     }

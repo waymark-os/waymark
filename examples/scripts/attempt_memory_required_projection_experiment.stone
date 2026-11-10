@@ -3,7 +3,7 @@
 
 def inject_projection(step, projection):
     return {
-        "messages": step.input.messages + [
+        "messages": step.input["messages"] + [
             {
                 "role": "user",
                 "content": "Active attempt memory:\n" + projection.text,
@@ -61,13 +61,13 @@ def worker(input):
     decoded = json_loads(response.content)
     return {
         "mode": mode,
-        "selected_target": decoded.selected_target,
+        "selected_target": decoded["selected_target"],
         "projection_keys": map(lambda item: item.key, projection.items),
         "required_keys": projection.required_keys,
         "projection_tokens": projection.estimated_tokens,
         "projection_truncated": projection.truncated,
-        "contains_current": targets.current in projection.text,
-        "contains_decoy": targets.decoy in projection.text,
+        "contains_current": targets["current"] in projection.text,
+        "contains_decoy": targets["decoy"] in projection.text,
         "memory_revision": attempt_info().memory_revision,
         "provider": response.provider,
         "model": response.model,
@@ -84,7 +84,7 @@ def main(input):
     context_write(
         "requirement.target",
         "requirement",
-        {"state": "current", "target": targets.current},
+        {"state": "current", "target": targets["current"]},
         status="verified",
         evidence=["fixture:current-target"],
     )
@@ -93,7 +93,7 @@ def main(input):
         "decision",
         {
             "state": "pending",
-            "candidate": targets.decoy,
+            "candidate": targets["decoy"],
             "note": "latest decision considers an active goal and current verified target",
         },
         status="pending",

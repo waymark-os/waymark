@@ -1332,9 +1332,11 @@ pub(crate) fn io_read_stone_error(kind: &str, err: std::io::Error, path: &Path) 
     if suggestions.is_empty() {
         return io_stone_error(kind, err, path);
     }
+    // The title names the failure: the error type comes from it, and the
+    // "did you mean" hint must not turn FileNotFoundError into OSError.
     ShellError::Generic(
         GenericError::new_internal(
-            format!("Stone {kind} I/O error"),
+            format!("Stone {kind} I/O error: file not found"),
             format!(
                 "{}: {}. Did you mean {}?",
                 path.display(),

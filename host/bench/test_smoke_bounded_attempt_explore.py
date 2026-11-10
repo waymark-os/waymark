@@ -44,7 +44,7 @@ class BoundedAttemptExploreTests(unittest.TestCase):
         self.assertIn('propose=propose_lexical_first', source)
         self.assertIn('evaluate=evaluate_candidate', source)
         self.assertIn('"candidate": "deserts"', source)
-        self.assertIn('result.outcomes[0].status == "rejected"', source)
+        self.assertIn('result["outcomes"][0]["status"] == "rejected"', source)
         self.assertNotIn("attempt_fork(", source)
         self.assertNotIn("attempt_accept(", source)
         self.assertNotIn("attempt_discard(", source)
@@ -57,7 +57,7 @@ class BoundedAttemptExploreTests(unittest.TestCase):
         self.assertIn("frontier=frontier", source)
         self.assertIn("context_prompt_view={", source)
         self.assertIn("agent_session().context_prompt_view", source)
-        self.assertIn('result.source.availability != "retained"', source)
+        self.assertIn('result["source"]["availability"] != "retained"', source)
         self.assertNotIn("attempt_spawn(", source)
         self.assertNotIn("workspace_source", source)
 

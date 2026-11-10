@@ -386,9 +386,9 @@ snapshots can come later.
 
 Today, Waymark already has an early optimized loop path:
 
-- `crates/waymark-runtime/src/stone_ir.rs` contains current Stone IR, JSONL
-  lowering, generic loop lowering, optimization helpers, and VM execution
-  support.
+- `crates/waymark-runtime/src/stone_vm/` contains current Stone IR, JSONL
+  lowering (`lower.rs`, `jsonl_*.rs`), generic loop lowering, optimization
+  helpers (`optimize.rs`), and VM execution support (`interp.rs`).
 - `crates/waymark-runtime/src/stone_eval.rs` contains the AST evaluator and
   currently drives the hot-loop path when `WAYMARK_STONE_HOT_LOOP` is enabled.
 - `WAYMARK_STONE_HOT_LOOP_VM` selects the VM interpreter path where supported.

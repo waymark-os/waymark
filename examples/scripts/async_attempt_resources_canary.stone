@@ -22,7 +22,7 @@ def worker(input):
             code="async_frontier_restore_failed",
             detail={"actual": inherited},
         )
-    return {"inherited": inherited, "label": input.label}
+    return {"inherited": inherited, "label": input["label"]}
 
 
 async def main(input):
@@ -53,7 +53,7 @@ async def main(input):
             if (
                 not outcome.joined
                 or outcome.result.status != "succeeded"
-                or outcome.result.value.inherited != "root"
+                or outcome.result.value["inherited"] != "root"
             ):
                 fail("async child failed", code="async_child_failed", detail=outcome)
             child.discard(reason="async resource canary complete")

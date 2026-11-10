@@ -78,7 +78,7 @@ def authorship_prompt(
     if case == "process-compression":
         contract = """Program contract:
 1. Define `worker(input)` for a real compression candidate. Every child sees `/app/input.txt`. For codec `lzma`, use `run_complete` with `python3 -c` to read that file and write `/app/archive.bin` with `lzma.compress(data, preset=9)`. For codec `gzip`, do the same with `gzip.compress(data, compresslevel=9, mtime=0)`. Codec `missing` must deliberately execute a Python import of `definitely_missing_waymark_codec` so its evaluator returns nonzero. Use a 30000 ms timeout and inspect the process result.
-2. A failed compression process is an evaluated but invalid candidate, not a controller crash: write `input.answer + "\\n"` to `answer.txt` and return name, answer, valid=false, cost=1000000000, evidence `["compression:failed:" + input.codec]`, and artifacts `["answer.txt"]`. On success, measure the actual `/app/archive.bin` bytes with `stat`, write `answer.txt`, and return valid=true, the measured integer cost, evidence `["compression:ok:" + input.codec]`, and artifacts `["answer.txt", "archive.bin"]`.
+2. A failed compression process is an evaluated but invalid candidate, not a controller crash: write `input["answer"] + "\\n"` to `answer.txt` and return name, answer, valid=false, cost=1000000000, evidence `["compression:failed:" + input["codec"]]`, and artifacts `["answer.txt"]`. On success, measure the actual `/app/archive.bin` bytes with `stat`, write `answer.txt`, and return valid=true, the measured integer cost, evidence `["compression:ok:" + input["codec"]]`, and artifacts `["answer.txt", "archive.bin"]`.
 3. Define `main(input)`. Capture the current root attempt, create one attempt scope, and create a minimizing attempt_best bound to that scope with `objective="min"`.
 4. In declared order, explore exactly these candidate records, with no parent-supplied score: missing/alpha, lzma/lzma, gzip/gzip. For each candidate fork an isolated child that runs this same program at entrypoint `worker`, starts immediately under the scope, and join it with a 60000 ms timeout. A child controller that does not report succeeded is a `candidate_failed` task failure.
 5. Consider every successful child outcome through the selector using the worker's returned cost, a nonempty summary, evidence, and artifacts. Append each decision and child id. Do not manually accept or discard candidates; selector policy owns that. The failed evaluator should be retained initially with its penalty, replaced by lzma, and the later larger gzip archive should be rejected.
@@ -88,7 +88,7 @@ def authorship_prompt(
 """
     elif case == "min-derived-cost":
         contract = """Program contract:
-1. Define `worker(input)`. Compute `cost = input.setup_cost + input.run_cost` inside the worker, write `input.answer + "\\n"` to `answer.txt`, and return name, answer, cost, evidence `["canary:cost:" + input.name]`, and artifacts `["answer.txt"]`.
+1. Define `worker(input)`. Compute `cost = input["setup_cost"] + input["run_cost"]` inside the worker, write `input["answer"] + "\\n"` to `answer.txt`, and return name, answer, cost, evidence `["canary:cost:" + input["name"]]`, and artifacts `["answer.txt"]`.
 2. Define `main(input)`. Capture the current root attempt, create one attempt scope, and create a minimizing attempt_best bound to that scope with `objective="min"`.
 3. In declared order, explore exactly these candidates without putting a precomputed total cost in their records: baseline/alpha/setup 0.70/run 0.80, efficient/beta/setup 0.40/run 0.50, late-balanced/gamma/setup 0.55/run 0.65. For each candidate fork an isolated child that runs this same program at entrypoint `worker`, starts immediately under the scope, and join it with a 60000 ms timeout.
 4. Unless each outcome succeeded, call Stone's documented `fail(...)` builtin with the stable `candidate_failed` code. Consider each outcome through the best-candidate API using the worker's returned cost as score, a nonempty summary, evidence, and artifacts. Append each decision record and child attempt id to lists. Do not manually accept or discard individual candidates; selector policy owns that.
@@ -99,7 +99,7 @@ def authorship_prompt(
 """
     else:
         contract = """Program contract:
-1. Define `worker(input)`. It writes `input.answer + "\\n"` to `answer.txt` and returns name, answer, score, evidence `["canary:score:" + input.name]`, and artifacts `["answer.txt"]`.
+1. Define `worker(input)`. It writes `input["answer"] + "\\n"` to `answer.txt` and returns name, answer, score, evidence `["canary:score:" + input["name"]]`, and artifacts `["answer.txt"]`.
 2. Define `main(input)`. Capture the current root attempt, create one attempt scope, and create a maximizing attempt_best bound to that scope.
 3. In declared order, explore exactly these candidates: baseline/alpha/0.50, winner/beta/0.90, late-worse/gamma/0.70. For each candidate fork an isolated child that runs this same program at entrypoint `worker`, starts immediately under the scope, and join it with a 60000 ms timeout.
 4. Unless each outcome succeeded, call Stone's documented `fail(...)` builtin with the stable `candidate_failed` code. Consider each outcome through the best-candidate API using its returned score, a nonempty summary, evidence, and artifacts. Append each decision record and child attempt id to lists. Do not manually accept or discard individual candidates; selector policy owns that.
@@ -151,13 +151,13 @@ def source_features(source: str, case: str = "max-score") -> dict[str, bool]:
         'objective="min"' in compact if minimizing else True
     )
     features["case_worker_cost"] = (
-        "input.setup_cost+input.run_cost" in compact
+        'input["setup_cost"]+input["run_cost"]' in compact
         if case == "min-derived-cost"
         else True
     )
     features["case_outcome_score"] = (
         (
-            "score=outcome.result.value.cost" in compact
+            'score=outcome.result.value["cost"]' in compact
             or (
                 "=outcome.result.value" in compact
                 and "score=" in compact

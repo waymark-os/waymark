@@ -147,7 +147,7 @@ def example_prelude(app: Path, example: str) -> str:
         "b = 2",
         "c = 3",
         'names = ["grace", "ada"]',
-        'result = {"ok": True, "exit_code": 0, "stderr": "", "explanation": {}}',
+        'result = run(["sh", "-c", "printf failed >&2; exit 3"])',
     ]
     if "daemon_status(daemon" in example or "stop_daemon(daemon" in example:
         lines.append('daemon = start_daemon(["sh", "-c", "sleep 2"], stderr="server.err")')

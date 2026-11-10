@@ -246,9 +246,18 @@ impl StoneGuest {
                         }
                     }
                     Err(err) => {
-                        json::error_response_with_source(&err, Some(self.current_cwd()), source)
+                        let mut response =
+                            json::error_response_with_source(&err, Some(self.current_cwd()), source);
+                        // What the program printed before it failed is often
+                        // the evidence for why.
+                        let printed = self.stone_session.take_last_stdout();
+                        if !printed.is_empty() {
+                            response["output"] = serde_json::json!({"stdout": printed, "stderr": ""});
+                        }
+                        response
                     }
                 };
+            self.stone_session.take_last_stdout();
             match self.stone_session.budget_stopped() {
                 Some(unfinished) => json::unfinished_response(
                     unfinished,
@@ -609,12 +618,26 @@ mod tests {
     }
 
     #[test]
+    fn failed_programs_keep_what_they_printed() -> Result<(), ShellError> {
+        let start_dir = test_root("failed-stdout");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let failed = guest.stone_command_response("print(\"step 1\")\nfail(\"boom\")");
+        assert_eq!(failed["ok"], json!(false));
+        assert_eq!(failed["output"]["stdout"], json!("step 1\n"));
+        let next = guest.stone_command_response("x = 1\nfail(\"again\")");
+        assert!(next.get("output").is_none(), "{next}");
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
     fn echo_and_save_roundtrip() -> Result<(), ShellError> {
         let start_dir = test_root("roundtrip");
         fs::create_dir_all(&start_dir).expect("create start dir");
 
         let mut guest = StoneGuest::new(start_dir.clone())?;
-        assert_eq!(guest.run_command(r#"save("hello", "note.txt")"#), 0);
+        assert_eq!(guest.run_command(r#"save("note.txt", "hello")"#), 0);
 
         let output = pipeline_to_string(guest.evaluate(r#"cat("note.txt")"#)?)?;
         assert_eq!(output, "hello");
@@ -632,7 +655,7 @@ mod tests {
         let mut guest = StoneGuest::new(start_dir.clone())?;
         let response = guest.stone_command_response(
             r#"result = edit("answer.txt", "hello", "goodbye")
-emit({"content": cat("answer.txt"), "replacements": result["replacements"]})"#,
+emit({"content": cat("answer.txt"), "replacements": result.replacements})"#,
         );
         assert_eq!(response["ok"], json!(true));
         assert_eq!(
@@ -700,8 +723,8 @@ emit({"content": cat("answer.txt"), "replacements": result["replacements"]})"#,
         let response = guest.stone_command_response(
             r#"names = []
 for item in ls("."):
-    if item["type"] == "file":
-        names.append(item["name"])
+    if item.type == "file":
+        names.append(item.name)
 emit(names)"#,
         );
         assert_eq!(response["ok"], json!(true));
@@ -786,7 +809,7 @@ emit(names)"#,
         let json_text =
             guest.command_response(r#"to_json(json_loads('{"name":"Ada","count":2}'))"#);
         assert_eq!(json_text["ok"], json!(true));
-        assert_eq!(json_text["value"], json!(r#"{"count":2,"name":"Ada"}"#));
+        assert_eq!(json_text["value"], json!(r#"{"name":"Ada","count":2}"#));
 
         let jsonl_text =
             guest.command_response(r#"to_jsonl(json_loads('[{"name":"Ada"},{"name":"Grace"}]'))"#);
@@ -987,8 +1010,8 @@ wrapped = lambda session: base(session)"#,
 outcome = wrapped(session)
 emit({
     "control_type": type(base),
-    "answer": outcome.value.answer,
-    "control": outcome.trace[0].value.control,
+    "answer": outcome.value["answer"],
+    "control": outcome.trace[0].value["control"],
 })"#,
         );
         assert_eq!(result["ok"], json!(true));
@@ -1018,7 +1041,7 @@ outcome = control({"task": {"objective": "fixture"}, "input": None})
 emit({
     "ok": outcome.ok,
     "error": outcome.error.code,
-    "control": outcome.trace[0].value.control,
+    "control": outcome.trace[0].value["control"],
 })"#,
         );
         assert_eq!(result["ok"], json!(true));
@@ -1164,7 +1187,7 @@ emit({"kind": program.kind, "entrypoint": program.stone.entrypoint, "source": pr
         fs::create_dir_all(&start_dir).expect("create start dir");
 
         let source = r#"def worker(input):
-    return {"answer": input.value * 2, "entrypoint": current_program().stone.entrypoint}
+    return {"answer": input["value"] * 2, "entrypoint": current_program().stone.entrypoint}
 
 def unused(input):
     return {"answer": 0}"#;
@@ -1340,7 +1363,7 @@ emit(first(map(lambda row: row["name"], dirs)))"#,
 
         // Input that is not JSON arrives as text.
         let response = call(
-            "def main(text):\n    save(text, \"note.txt\")\n    return cat(\"note.txt\")\n",
+            "def main(text):\n    save(\"note.txt\", text)\n    return cat(\"note.txt\")\n",
             pipeline_input_from_bytes(b"hello from input".to_vec()),
         );
         assert_eq!(response["value"], json!("hello from input"), "{response}");
@@ -1565,9 +1588,12 @@ emit(preview)"#,
         );
 
         let field = guest.command_response(
-            r#"def transition_id(step):
+            r#"class Step(BaseModel):
+    transition_id: str
+    phase: str
+def transition_id(step):
     return step.id
-emit(transition_id({"transition_id": "transition-1", "phase": "post"}))"#,
+emit(transition_id(Step(transition_id="transition-1", phase="post")))"#,
         );
         assert_eq!(field["ok"], json!(false));
         assert_eq!(field["error"]["correction"]["class"], json!("field"));

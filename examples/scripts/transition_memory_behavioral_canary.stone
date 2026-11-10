@@ -6,7 +6,7 @@ def retain_requirement(step):
         "requirement.pivot_action",
         "requirement",
         {
-            "action_token": payload.action_token,
+            "action_token": payload["action_token"],
             "source_transition_id": step.transition_id,
         },
         status="verified",
@@ -20,7 +20,7 @@ def prepare_decision(step):
         max_tokens=128,
     )
     return {
-        "messages": step.input.messages + [
+        "messages": step.input["messages"] + [
             {
                 "role": "user",
                 "content": "Active attempt memory:\n" + projection.text,
@@ -67,7 +67,7 @@ for mode in modes:
             max_output_tokens=128,
         )
     decoded = json_loads(response.content)
-    selected_action = decoded.selected_action
+    selected_action = decoded["selected_action"]
     action = run(["printf", selected_action])
     results.append({
         "mode": mode,

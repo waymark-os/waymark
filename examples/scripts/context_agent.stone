@@ -25,7 +25,7 @@ def context_agent():
         )
         turns += 1
         decoded = json_loads(response.content)
-        actions = decoded.actions
+        actions = decoded["actions"]
         if len(actions) == 0:
             fail("model returned no actions", code="invalid_model_response")
         messages.append({"role": "assistant", "content": response.content})
@@ -37,7 +37,7 @@ def context_agent():
                 if len(ledger) == 0:
                     fail("finish requires requirement.output", code="finish_without_ledger")
                 return {
-                    "answer": final.answer,
+                    "answer": final["answer"],
                     "turns": turns,
                     "ledger": ledger,
                     "projection": projection,
@@ -47,9 +47,9 @@ def context_agent():
             input = get(action, "input", {})
             if tool == "context_write":
                 result = context_write(
-                    input.key,
-                    input.kind,
-                    input.content,
+                    input["key"],
+                    input["kind"],
+                    input["content"],
                     status=get(input, "status", "active"),
                     evidence=get(input, "evidence", []),
                 )

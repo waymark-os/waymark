@@ -15,8 +15,80 @@ pub(crate) enum SortKeyKind {
     Composite,
 }
 
+/// `int(x)`: the one place text and floats become ints. A float is
+/// truncated toward zero, as in Python; NaN, infinities, and floats outside
+/// the 64-bit range raise instead of saturating.
 pub(crate) fn value_to_int(value: &Value) -> Result<Value, ShellError> {
-    value_to_i64(value, "int").map(|value| Value::int(value, Span::unknown()))
+    let int = match value {
+        Value::Int { val, .. } => *val,
+        Value::Bool { val, .. } => i64::from(*val),
+        Value::Float { val, .. } => float_to_i64(*val, "int")?,
+        Value::String { val, .. } | Value::Glob { val, .. } => {
+            val.trim().parse::<i64>().map_err(|_| {
+                typed_error(
+                    "ValueError",
+                    "int",
+                    format!("invalid literal for int(): {}", python_quote(val)),
+                )
+            })?
+        }
+        other => {
+            return Err(typed_error(
+                "TypeError",
+                "int",
+                format!("int() argument must be a string or a number, not {}", value_type_name(other)),
+            ))
+        }
+    };
+    Ok(Value::int(int, Span::unknown()))
+}
+
+fn float_to_i64(value: f64, context: &str) -> Result<i64, ShellError> {
+    if value.is_nan() {
+        return Err(typed_error("ValueError", context, "cannot convert float NaN to integer"));
+    }
+    let truncated = value.trunc();
+    // i64::MAX is not exactly representable; 2^63 is the first float past it.
+    if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&truncated) {
+        return Err(typed_error(
+            "ValueError",
+            context,
+            format!("cannot convert float {value} to integer: Stone ints are 64-bit"),
+        ));
+    }
+    Ok(truncated as i64)
+}
+
+/// The character offset of byte offset `byte` in `text`.
+fn char_offset(text: &str, byte: usize) -> i64 {
+    text[..byte].chars().count() as i64
+}
+
+fn python_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+fn typed_error(error_type: &str, kind: &str, message: impl Into<String>) -> ShellError {
+    ShellError::Generic(
+        GenericError::new_internal(format!("Stone {kind} error"), message.into())
+            .with_code(crate::stone_errors::typed_error_code(error_type)),
+    )
+}
+
+/// The error for a non-int where an int is required (`range(2.7)`,
+/// `xs[:n/2]`, `timeout_ms="500"`). Nothing is converted implicitly.
+fn expected_int_error(value: &Value, context: &str) -> ShellError {
+    let hint = match value {
+        Value::Float { .. } => "; convert explicitly with int(x), round(x), or use // for integer division",
+        Value::String { .. } | Value::Glob { .. } => "; convert text explicitly with int(text)",
+        Value::Bool { .. } => "; convert explicitly with int(flag)",
+        _ => "",
+    };
+    typed_error(
+        "TypeError",
+        context,
+        format!("{context}: expected int, got {}{hint}", value_type_name(value)),
+    )
 }
 
 pub(crate) fn int_builtin(value: &Value) -> Result<Value, ShellError> {
@@ -37,7 +109,7 @@ pub(crate) fn index_method_builtin(receiver: &Value, args: &[Value]) -> Result<V
                     return Ok(Value::int(index as i64, Span::unknown()));
                 }
             }
-            Err(stone_error("index", "value is not in list"))
+            Err(typed_error("ValueError", "index", "value is not in list"))
         }
         Value::String { val, .. } | Value::Glob { val, .. } => {
             let ([needle] | [needle, _]) = args else {
@@ -60,14 +132,15 @@ pub(crate) fn index_method_builtin(receiver: &Value, args: &[Value]) -> Result<V
                 .nth(start)
                 .map(|(index, _)| index)
                 .unwrap_or_else(|| val.len());
+            // Offsets count characters, as slicing does: "é-x".index("x") is 2.
             val[prefix_len..]
                 .find(&needle)
-                .map(|index| Value::int((prefix_len + index) as i64, Span::unknown()))
-                .ok_or_else(|| stone_error("index", "substring not found"))
+                .map(|index| Value::int(char_offset(val, prefix_len + index), Span::unknown()))
+                .ok_or_else(|| typed_error("ValueError", "index", "substring not found"))
         }
         other => Err(stone_error(
             "index",
-            format!("{} has no index()", other.get_type()),
+            format!("{} has no index()", crate::stone_builtins::value_type_name(&other)),
         )),
     }
 }
@@ -76,7 +149,7 @@ pub(crate) fn find_method_builtin(receiver: &Value, args: &[Value]) -> Result<Va
     let (Value::String { val, .. } | Value::Glob { val, .. }) = receiver else {
         return Err(stone_error(
             "find",
-            format!("{} has no find()", receiver.get_type()),
+            format!("{} has no find()", crate::stone_builtins::value_type_name(&receiver)),
         ));
     };
     let ([needle] | [needle, _]) = args else {
@@ -101,13 +174,13 @@ pub(crate) fn find_method_builtin(receiver: &Value, args: &[Value]) -> Result<Va
         .unwrap_or_else(|| val.len());
     let index = val[prefix_len..]
         .find(&needle)
-        .map(|index| (prefix_len + index) as i64)
+        .map(|index| char_offset(val, prefix_len + index))
         .unwrap_or(-1);
     Ok(Value::int(index, Span::unknown()))
 }
 
 pub(crate) fn float_builtin(value: &Value) -> Result<Value, ShellError> {
-    value_to_f64(value, "float").map(|value| Value::float(value, Span::unknown()))
+    convert_to_f64(value, "float").map(|value| Value::float(value, Span::unknown()))
 }
 
 pub(crate) fn format_builtin(template: &Value, args: &[Value]) -> Result<Value, ShellError> {
@@ -175,7 +248,7 @@ pub(crate) fn add_values(left: &Value, right: &Value) -> Result<Value, ShellErro
         }
         _ => Err(stone_error(
             "addition",
-            format!("cannot add {} and {}", left.get_type(), right.get_type()),
+            format!("cannot add {} and {}", crate::stone_builtins::value_type_name(&left), crate::stone_builtins::value_type_name(&right)),
         )),
     }
 }
@@ -202,7 +275,7 @@ pub(crate) fn div_values(left: &Value, right: &Value) -> Result<Value, ShellErro
         _ => {
             return Err(stone_error(
                 "division",
-                format!("cannot divide {} and {}", left.get_type(), right.get_type()),
+                format!("cannot divide {} and {}", crate::stone_builtins::value_type_name(&left), crate::stone_builtins::value_type_name(&right)),
             ));
         }
     };
@@ -268,7 +341,7 @@ pub(crate) fn mod_values(left: &Value, right: &Value) -> Result<Value, ShellErro
                 _ => {
                     return Err(stone_error(
                         "modulo",
-                        format!("cannot modulo {} and {}", left.get_type(), right.get_type()),
+                        format!("cannot modulo {} and {}", crate::stone_builtins::value_type_name(&left), crate::stone_builtins::value_type_name(&right)),
                     ));
                 }
             };
@@ -302,8 +375,8 @@ pub(crate) fn mul_values(left: &Value, right: &Value) -> Result<Value, ShellErro
             "multiplication",
             format!(
                 "cannot multiply {} and {}",
-                left.get_type(),
-                right.get_type()
+                crate::stone_builtins::value_type_name(&left),
+                crate::stone_builtins::value_type_name(&right)
             ),
         )),
     }
@@ -318,7 +391,7 @@ pub(crate) fn neg_value(value: &Value) -> Result<Value, ShellError> {
         Value::Float { val, .. } => Ok(Value::float(-val, Span::unknown())),
         other => Err(stone_error(
             "unary minus",
-            format!("cannot negate {}", other.get_type()),
+            format!("cannot negate {}", crate::stone_builtins::value_type_name(&other)),
         )),
     }
 }
@@ -333,9 +406,13 @@ pub(crate) fn shift_value(
     let right = value_to_operator_i64(right, context)?;
     let shift = u32::try_from(right)
         .map_err(|_| stone_error(context, "shift count must be non-negative"))?;
-    op(left, shift)
-        .map(|value| Value::int(value, Span::unknown()))
-        .ok_or_else(|| stone_error(context, "shift count is too large"))
+    let value = op(left, shift).ok_or_else(|| stone_error(context, "shift count is too large"))?;
+    // checked_shl only rejects counts >= 64; bits shifted out of an int are
+    // an overflow, as for the other integer operators.
+    if context == "left shift" && value >> shift != left {
+        return Err(stone_error(context, "integer left shift overflow"));
+    }
+    Ok(Value::int(value, Span::unknown()))
 }
 
 pub(crate) fn sub_values(left: &Value, right: &Value) -> Result<Value, ShellError> {
@@ -357,8 +434,8 @@ pub(crate) fn sub_values(left: &Value, right: &Value) -> Result<Value, ShellErro
             "subtraction",
             format!(
                 "cannot subtract {} and {}",
-                left.get_type(),
-                right.get_type()
+                crate::stone_builtins::value_type_name(&left),
+                crate::stone_builtins::value_type_name(&right)
             ),
         )),
     }
@@ -372,7 +449,7 @@ pub(crate) fn first_builtin(
     let Value::List { vals, .. } = value else {
         return Err(stone_error(
             name,
-            format!("expected list, got {}", value.get_type()),
+            format!("expected list, got {}", crate::stone_builtins::value_type_name(&value)),
         ));
     };
     Ok(match count {
@@ -392,7 +469,7 @@ pub(crate) fn last_builtin(
     let Value::List { vals, .. } = value else {
         return Err(stone_error(
             name,
-            format!("expected list, got {}", value.get_type()),
+            format!("expected list, got {}", crate::stone_builtins::value_type_name(&value)),
         ));
     };
     Ok(match count {
@@ -424,12 +501,22 @@ pub(crate) fn join_builtin(first: &Value, second: Option<&Value>) -> Result<Valu
     let Value::List { vals, .. } = items else {
         return Err(stone_error(
             "join",
-            format!("expected list, got {}", items.get_type()),
+            format!("expected list, got {}", crate::stone_builtins::value_type_name(&items)),
         ));
     };
     let mut parts = Vec::with_capacity(vals.len());
-    for value in vals {
-        parts.push(value_to_string(value, "join")?);
+    for (index, value) in vals.iter().enumerate() {
+        let (Value::String { val, .. } | Value::Glob { val, .. }) = value else {
+            return Err(typed_error(
+                "TypeError",
+                "join",
+                format!(
+                    "join: item {index} is {}, not str; convert items first: \",\".join([str(x) for x in items])",
+                    value_type_name(value)
+                ),
+            ));
+        };
+        parts.push(val.clone());
     }
     Ok(Value::string(parts.join(&separator), Span::unknown()))
 }
@@ -442,9 +529,15 @@ pub(crate) fn list_builtin(value: &Value) -> Result<Value, ShellError> {
     match value {
         Value::List { vals, .. } => Ok(Value::list(vals.clone(), Span::unknown())),
         Value::Record { .. } => record_method_builtin(value, "keys", &[]),
-        other => Err(stone_error(
+        // list("ab") is ["a", "b"], as in Python.
+        Value::String { val, .. } | Value::Glob { val, .. } => Ok(Value::list(
+            val.chars().map(|ch| Value::string(ch.to_string(), Span::unknown())).collect(),
+            Span::unknown(),
+        )),
+        other => Err(typed_error(
+            "TypeError",
             "list",
-            format!("expected list or record, got {}", other.get_type()),
+            format!("{} is not iterable", value_type_name(other)),
         )),
     }
 }
@@ -625,14 +718,27 @@ pub(crate) fn python_float_repr(value: f64) -> String {
     }
 }
 
+/// `sum`: ints add exactly (overflow is an error); once a float appears the
+/// total is a float added with Neumaier compensation, as Python 3.12 does,
+/// so `sum([0.1] * 10) == 1.0`.
 pub(crate) fn sum_builtin(values: Vec<Value>) -> Result<Value, ShellError> {
     let mut int_total = 0i64;
     let mut float_total = 0.0f64;
+    let mut compensation = 0.0f64;
     let mut has_float = false;
+    let add_float = |total: &mut f64, compensation: &mut f64, value: f64| {
+        let next = *total + value;
+        if total.abs() >= value.abs() {
+            *compensation += (*total - next) + value;
+        } else {
+            *compensation += (value - next) + *total;
+        }
+        *total = next;
+    };
     for value in values {
         match value_to_sum_number(&value)? {
             SumNumber::Int(value) if has_float => {
-                float_total += value as f64;
+                add_float(&mut float_total, &mut compensation, value as f64);
             }
             SumNumber::Int(value) => {
                 int_total = int_total
@@ -640,16 +746,17 @@ pub(crate) fn sum_builtin(values: Vec<Value>) -> Result<Value, ShellError> {
                     .ok_or_else(|| stone_error("sum", "integer sum overflow"))?;
             }
             SumNumber::Float(value) if has_float => {
-                float_total += value;
+                add_float(&mut float_total, &mut compensation, value);
             }
             SumNumber::Float(value) => {
                 has_float = true;
-                float_total = int_total as f64 + value;
+                float_total = int_total as f64;
+                add_float(&mut float_total, &mut compensation, value);
             }
         }
     }
     if has_float {
-        Ok(Value::float(float_total, Span::unknown()))
+        Ok(Value::float(float_total + compensation, Span::unknown()))
     } else {
         Ok(Value::int(int_total, Span::unknown()))
     }
@@ -659,7 +766,7 @@ pub(crate) fn unique_builtin(value: &Value) -> Result<Value, ShellError> {
     let Value::List { vals, .. } = value else {
         return Err(stone_error(
             "unique",
-            format!("expected list, got {}", value.get_type()),
+            format!("expected list, got {}", crate::stone_builtins::value_type_name(&value)),
         ));
     };
     unique_values(vals.clone(), "unique").map(|values| Value::list(values, Span::unknown()))
@@ -674,7 +781,7 @@ pub(crate) fn where_builtin(
     let Value::List { vals, .. } = values else {
         return Err(stone_error(
             "where",
-            format!("expected list, got {}", values.get_type()),
+            format!("expected list, got {}", crate::stone_builtins::value_type_name(&values)),
         ));
     };
     let mut selected = Vec::new();
@@ -703,7 +810,7 @@ pub(crate) fn where_compare_builtin(
     let Value::List { vals, .. } = values else {
         return Err(stone_error(
             "where",
-            format!("expected list, got {}", values.get_type()),
+            format!("expected list, got {}", crate::stone_builtins::value_type_name(&values)),
         ));
     };
     let mut selected = Vec::new();
@@ -736,8 +843,35 @@ fn where_compare_op(op: &str) -> Result<CompareOp, ShellError> {
     }
 }
 
+/// A key that is equal exactly when two values are `==` in Stone: dict key
+/// order does not matter, and an integral float equals the int (`1 == 1.0`).
 pub(crate) fn value_identity_key(value: &Value, context: &str) -> Result<String, ShellError> {
-    serde_json::to_string(&nu_to_json_value(value))
+    fn canonical(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut entries = map.into_iter().collect::<Vec<_>>();
+                entries.sort_by(|left, right| left.0.cmp(&right.0));
+                serde_json::Value::Object(
+                    entries.into_iter().map(|(key, value)| (key, canonical(value))).collect(),
+                )
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.into_iter().map(canonical).collect())
+            }
+            serde_json::Value::Number(number) => match number.as_f64() {
+                Some(float)
+                    if number.is_f64()
+                        && float.fract() == 0.0
+                        && (-9_007_199_254_740_992.0..=9_007_199_254_740_992.0).contains(&float) =>
+                {
+                    serde_json::Value::from(float as i64)
+                }
+                _ => serde_json::Value::Number(number),
+            },
+            other => other,
+        }
+    }
+    serde_json::to_string(&canonical(nu_to_json_value(value)))
         .map_err(|err| stone_error(context, err.to_string()))
 }
 
@@ -752,27 +886,15 @@ pub(crate) fn value_truthy(value: &Value) -> bool {
 }
 
 pub(crate) fn value_to_operator_i64(value: &Value, context: &str) -> Result<i64, ShellError> {
-    match value {
-        Value::Int { val, .. } => Ok(*val),
-        other => Err(stone_error(
-            context,
-            format!("expected integer, got {}", other.get_type()),
-        )),
-    }
+    value_to_i64(value, context)
 }
 
+/// An int argument. Floats, text, and bools are rejected rather than
+/// truncated or parsed; `int(x)` is the explicit conversion.
 pub(crate) fn value_to_i64(value: &Value, context: &str) -> Result<i64, ShellError> {
     match value {
         Value::Int { val, .. } => Ok(*val),
-        Value::Float { val, .. } => Ok(*val as i64),
-        Value::String { val, .. } | Value::Glob { val, .. } => val
-            .trim()
-            .parse::<i64>()
-            .map_err(|err| stone_error(context, format!("failed to parse integer: {err}"))),
-        other => Err(stone_error(
-            context,
-            format!("expected integer, got {}", other.get_type()),
-        )),
+        other => Err(expected_int_error(other, context)),
     }
 }
 
@@ -818,17 +940,45 @@ pub(crate) fn value_to_u64(value: &Value, context: &str) -> Result<u64, ShellErr
     u64::try_from(value).map_err(|_| stone_error(context, "value is too large"))
 }
 
+/// A numeric argument: an int or a float. Text is rejected rather than
+/// parsed; `float(text)` is the explicit conversion.
 pub(crate) fn value_to_f64(value: &Value, context: &str) -> Result<f64, ShellError> {
     match value {
         Value::Int { val, .. } => Ok(*val as f64),
         Value::Float { val, .. } => Ok(*val),
-        Value::String { val, .. } | Value::Glob { val, .. } => val
-            .trim()
-            .parse::<f64>()
-            .map_err(|err| stone_error(context, format!("failed to parse float: {err}"))),
-        other => Err(stone_error(
+        other => {
+            let hint = match other {
+                Value::String { .. } | Value::Glob { .. } => "; convert text explicitly with float(text)",
+                Value::Bool { .. } => "; convert explicitly with float(flag)",
+                _ => "",
+            };
+            Err(typed_error(
+                "TypeError",
+                context,
+                format!("{context}: expected a number, got {}{hint}", value_type_name(other)),
+            ))
+        }
+    }
+}
+
+/// `float(x)` and `parse_float(text)`: text becomes a float only here.
+fn convert_to_f64(value: &Value, context: &str) -> Result<f64, ShellError> {
+    match value {
+        Value::Bool { val, .. } => Ok(f64::from(u8::from(*val))),
+        Value::String { val, .. } | Value::Glob { val, .. } => {
+            val.trim().parse::<f64>().map_err(|_| {
+                typed_error(
+                    "ValueError",
+                    context,
+                    format!("could not convert string to float: {}", python_quote(val)),
+                )
+            })
+        }
+        Value::Int { .. } | Value::Float { .. } => value_to_f64(value, context),
+        other => Err(typed_error(
+            "TypeError",
             context,
-            format!("expected number, got {}", other.get_type()),
+            format!("float() argument must be a string or a number, not {}", value_type_name(other)),
         )),
     }
 }
@@ -838,7 +988,7 @@ pub(crate) fn value_to_bool(value: &Value, context: &str) -> Result<bool, ShellE
         Value::Bool { val, .. } => Ok(*val),
         other => Err(stone_error(
             context,
-            format!("expected bool, got {}", other.get_type()),
+            format!("expected bool, got {}", crate::stone_builtins::value_type_name(&other)),
         )),
     }
 }
@@ -848,7 +998,7 @@ pub(crate) fn value_to_string(value: &Value, context: &str) -> Result<String, Sh
         Value::String { val, .. } | Value::Glob { val, .. } => Ok(val.clone()),
         other => Err(stone_error(
             context,
-            format!("expected string, got {}", other.get_type()),
+            format!("expected string, got {}", crate::stone_builtins::value_type_name(&other)),
         )),
     }
 }
@@ -861,7 +1011,7 @@ pub(crate) fn value_to_path_string(value: &Value, context: &str) -> Result<Strin
                     context,
                     format!(
                         "record path argument is missing `path`; got {}",
-                        value.get_type()
+                        crate::stone_builtins::value_type_name(&value)
                     ),
                 ));
             };
@@ -883,6 +1033,10 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
         Value::List { .. } => "list",
         Value::Record { .. } => "dict",
         Value::Binary { .. } => "bytes",
+        Value::Filesize { .. } | Value::Duration { .. } => "int",
+        Value::Date { .. } => "datetime",
+        Value::Closure { .. } => "function",
+        Value::Range { .. } => "range",
         _ => "value",
     }
 }
@@ -935,14 +1089,36 @@ fn bool_number_comparison_error(left: &Value, right: &Value) -> ShellError {
     )
 }
 
+/// Exact int-to-float comparison, as Python does: the int is not rounded
+/// to a float first, so `2**53 + 1 == float(2**53)` is false. None for NaN.
+pub(crate) fn cmp_int_float(int: i64, float: f64) -> Option<Ordering> {
+    if float.is_nan() {
+        return None;
+    }
+    // Every i64 lies in [-2^63, 2^63).
+    if float >= 9_223_372_036_854_775_808.0 {
+        return Some(Ordering::Less);
+    }
+    if float < -9_223_372_036_854_775_808.0 {
+        return Some(Ordering::Greater);
+    }
+    let floor = float.floor();
+    match int.cmp(&(floor as i64)) {
+        Ordering::Equal if float > floor => Some(Ordering::Less),
+        ordering => Some(ordering),
+    }
+}
+
 pub(crate) fn values_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Nothing { .. }, Value::Nothing { .. }) => true,
         (Value::Bool { val: left, .. }, Value::Bool { val: right, .. }) => left == right,
         (Value::Int { val: left, .. }, Value::Int { val: right, .. }) => left == right,
         (Value::Float { val: left, .. }, Value::Float { val: right, .. }) => left == right,
-        (Value::Int { val: left, .. }, Value::Float { val: right, .. }) => (*left as f64) == *right,
-        (Value::Float { val: left, .. }, Value::Int { val: right, .. }) => *left == (*right as f64),
+        (Value::Int { val: left, .. }, Value::Float { val: right, .. })
+        | (Value::Float { val: right, .. }, Value::Int { val: left, .. }) => {
+            cmp_int_float(*left, *right) == Some(Ordering::Equal)
+        }
         (Value::String { val: left, .. }, Value::String { val: right, .. })
         | (Value::Glob { val: left, .. }, Value::Glob { val: right, .. })
         | (Value::String { val: left, .. }, Value::Glob { val: right, .. })
@@ -972,11 +1148,10 @@ pub(crate) fn value_ordering(left: &Value, right: &Value) -> Result<Ordering, Sh
         (Value::Float { val: left, .. }, Value::Float { val: right, .. }) => left
             .partial_cmp(right)
             .ok_or_else(|| stone_error("comparison", "cannot compare NaN values")),
-        (Value::Int { val: left, .. }, Value::Float { val: right, .. }) => (*left as f64)
-            .partial_cmp(right)
+        (Value::Int { val: left, .. }, Value::Float { val: right, .. }) => cmp_int_float(*left, *right)
             .ok_or_else(|| stone_error("comparison", "cannot compare NaN values")),
-        (Value::Float { val: left, .. }, Value::Int { val: right, .. }) => left
-            .partial_cmp(&(*right as f64))
+        (Value::Float { val: left, .. }, Value::Int { val: right, .. }) => cmp_int_float(*right, *left)
+            .map(Ordering::reverse)
             .ok_or_else(|| stone_error("comparison", "cannot compare NaN values")),
         (Value::String { val: left, .. }, Value::String { val: right, .. })
         | (Value::Glob { val: left, .. }, Value::Glob { val: right, .. })
@@ -993,7 +1168,7 @@ pub(crate) fn value_ordering(left: &Value, right: &Value) -> Result<Ordering, Sh
         }
         _ => Err(stone_error(
             "comparison",
-            format!("cannot order {} and {}", left.get_type(), right.get_type()),
+            format!("cannot order {} and {}", crate::stone_builtins::value_type_name(&left), crate::stone_builtins::value_type_name(&right)),
         )),
     }
 }
@@ -1018,7 +1193,7 @@ fn value_contains(container: &Value, needle: &Value) -> Result<bool, ShellError>
         }
         other => Err(stone_error(
             "membership",
-            format!("cannot test membership in {}", other.get_type()),
+            format!("cannot test membership in {}", crate::stone_builtins::value_type_name(&other)),
         )),
     }
 }
@@ -1029,9 +1204,10 @@ pub(crate) fn record_method_builtin(
     args: &[Value],
 ) -> Result<Value, ShellError> {
     let Value::Record { val, .. } = receiver else {
-        return Err(stone_error(
+        return Err(typed_error(
+            "AttributeError",
             method,
-            format!("{} has no {method}()", receiver.get_type()),
+            format!("{} has no {method}()", value_type_name(receiver)),
         ));
     };
     match method {
@@ -1125,45 +1301,14 @@ pub(crate) fn range_builtin(args: &[i64]) -> Result<Value, ShellError> {
     Ok(Value::list(values, Span::unknown()))
 }
 
-pub(crate) fn min_max_builtin(values: Vec<Value>, name: &str) -> Result<Value, ShellError> {
-    let mut best: Option<Value> = None;
-    for value in values {
-        if !matches!(value, Value::Int { .. } | Value::Float { .. }) {
-            return Err(stone_error(
-                name,
-                format!("{name}() expected numbers, got {}", value.get_type()),
-            ));
-        }
-        let Some(current) = &best else {
-            best = Some(value);
-            continue;
-        };
-        let ordering = value_ordering(&value, current)?;
-        let should_replace = match name {
-            "min" => ordering.is_lt(),
-            "max" => ordering.is_gt(),
-            _ => unreachable!("min/max dispatch is validated by caller"),
-        };
-        if should_replace {
-            best = Some(value);
-        }
-    }
-    best.ok_or_else(|| {
-        stone_error(
-            name,
-            format!("{name}() requires at least one numeric argument"),
-        )
-    })
-}
-
 pub(crate) fn parse_float_builtin(value: &Value, default: Value) -> Result<Value, ShellError> {
-    match value_to_f64(value, "parse_float") {
+    match convert_to_f64(value, "parse_float") {
         Ok(value) => Ok(Value::float(value, Span::unknown())),
         Err(_) => match default {
             Value::Float { .. } | Value::Int { .. } => Ok(default),
             other => Err(stone_error(
                 "parse_float",
-                format!("default must be int or float, got {}", other.get_type()),
+                format!("default must be int or float, got {}", crate::stone_builtins::value_type_name(&other)),
             )),
         },
     }
@@ -1176,7 +1321,7 @@ pub(crate) fn parse_int_builtin(value: &Value, default: Value) -> Result<Value, 
             Value::Int { .. } => Ok(default),
             other => Err(stone_error(
                 "parse_int",
-                format!("default must be int, got {}", other.get_type()),
+                format!("default must be int, got {}", crate::stone_builtins::value_type_name(&other)),
             )),
         },
     }
@@ -1248,7 +1393,7 @@ pub(crate) fn slice_builtin(
         }
         other => Err(stone_error(
             "slice",
-            format!("cannot slice {}", other.get_type()),
+            format!("cannot slice {}", crate::stone_builtins::value_type_name(&other)),
         )),
     }
 }
@@ -1409,10 +1554,10 @@ pub(crate) fn sort_key_for_value(value: &Value, field: Option<&str>) -> Result<V
             Value::Record { val, .. } => val
                 .get(field)
                 .cloned()
-                .ok_or_else(|| stone_error("sort", format!("record has no key `{field}`"))),
+                .ok_or_else(|| stone_error("sort", format!("dict has no key `{field}`"))),
             other => Err(stone_error(
                 "sort",
-                format!("key= requires record rows, got {}", other.get_type()),
+                format!("key= requires record rows, got {}", crate::stone_builtins::value_type_name(&other)),
             )),
         },
     }
@@ -1427,7 +1572,7 @@ pub(crate) fn sort_key_kind(value: &Value) -> Result<SortKeyKind, ShellError> {
         Value::List { .. } => Ok(SortKeyKind::Composite),
         other => Err(stone_error(
             "sort",
-            format!("cannot sort by {}", other.get_type()),
+            format!("cannot sort by {}", crate::stone_builtins::value_type_name(&other)),
         )),
     }
 }
@@ -1457,9 +1602,10 @@ pub(crate) fn sort_keyed<T>(
         let next_key_kind = sort_key_kind(&sort_key)?;
         if let Some(key_kind) = key_kind {
             if key_kind != next_key_kind {
-                return Err(stone_error(
+                return Err(typed_error(
+                    "TypeError",
                     "sort",
-                    "all sort keys must have compatible types",
+                    "all sort keys must have compatible types: ints and floats sort together, but strings, numbers, and lists cannot be ordered against each other",
                 ));
             }
         } else {
@@ -1491,9 +1637,10 @@ pub(crate) fn string_method_builtin(
     args: &[Value],
 ) -> Result<Value, ShellError> {
     let (Value::String { val: text, .. } | Value::Glob { val: text, .. }) = receiver else {
-        return Err(stone_error(
+        return Err(typed_error(
+            "AttributeError",
             method,
-            format!("{} has no {method}()", receiver.get_type()),
+            format!("{} has no {method}()", value_type_name(receiver)),
         ));
     };
     match method {
@@ -1636,7 +1783,7 @@ pub(crate) fn string_method_builtin(
             let Value::List { vals, .. } = items else {
                 return Err(stone_error(
                     "join",
-                    format!("expected list, got {}", items.get_type()),
+                    format!("expected list, got {}", crate::stone_builtins::value_type_name(&items)),
                 ));
             };
             let mut parts = Vec::with_capacity(vals.len());
@@ -1699,7 +1846,7 @@ pub(crate) fn subscript_builtin(value: &Value, index: &Value) -> Result<Value, S
         | (Value::Record { val, .. }, Value::Glob { val: key, .. }) => val
             .get(key)
             .cloned()
-            .ok_or_else(|| stone_error("subscript", format!("record has no key `{key}`"))),
+            .ok_or_else(|| stone_error("subscript", format!("dict has no key `{key}`"))),
         (Value::List { vals, .. }, Value::Int { val: index, .. }) => {
             let index = normalize_index(*index, vals.len())?;
             vals.get(index).cloned().ok_or_else(|| {
@@ -1720,8 +1867,8 @@ pub(crate) fn subscript_builtin(value: &Value, index: &Value) -> Result<Value, S
             "subscript",
             format!(
                 "cannot index {} with {}",
-                value.get_type(),
-                index.get_type()
+                crate::stone_builtins::value_type_name(&value),
+                crate::stone_builtins::value_type_name(&index)
             ),
         )),
     }
@@ -1735,14 +1882,14 @@ fn value_len(value: &Value) -> Result<i64, ShellError> {
         other => {
             return Err(stone_error(
                 "len",
-                format!("len() does not support {}", other.get_type()),
+                format!("len() does not support {}", crate::stone_builtins::value_type_name(&other)),
             ));
         }
     };
     i64::try_from(len).map_err(|_| stone_error("len", "value is too large"))
 }
 
-fn normalize_slice_bounds(
+pub(crate) fn normalize_slice_bounds(
     lower: Option<i64>,
     upper: Option<i64>,
     len: usize,
@@ -1934,18 +2081,13 @@ fn value_to_sum_number(value: &Value) -> Result<SumNumber, ShellError> {
     match value {
         Value::Int { val, .. } => Ok(SumNumber::Int(*val)),
         Value::Float { val, .. } => Ok(SumNumber::Float(*val)),
-        Value::String { val, .. } | Value::Glob { val, .. } => {
-            let text = val.trim();
-            if let Ok(value) = text.parse::<i64>() {
-                return Ok(SumNumber::Int(value));
-            }
-            text.parse::<f64>()
-                .map(SumNumber::Float)
-                .map_err(|err| stone_error("sum", format!("failed to parse number: {err}")))
-        }
-        other => Err(stone_error(
+        other => Err(typed_error(
+            "TypeError",
             "sum",
-            format!("expected number, got {}", other.get_type()),
+            format!(
+                "sum(): unsupported operand type {}; sum adds ints and floats (convert text with int(x) or float(x))",
+                value_type_name(other)
+            ),
         )),
     }
 }

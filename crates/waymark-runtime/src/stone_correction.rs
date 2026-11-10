@@ -614,8 +614,15 @@ pub(crate) fn expected_keywords(call_name: &str) -> Option<&'static [&'static st
 }
 
 fn attribute_error(detail: &str) -> Option<(String, Vec<String>)> {
-    let received = backticked_after(detail, "record has no attribute `")?;
-    let (_, fields) = detail.split_once("; available fields: ")?;
+    // Typed records: "record `Step` has no field `id`; its fields are: a, b".
+    let (received, fields) = match backticked_after(detail, "record has no attribute `") {
+        Some(received) => (received, detail.split_once("; available fields: ")?.1),
+        None => {
+            let (_, rest) = detail.split_once("` has no field `")?;
+            let (received, _) = rest.split_once('`')?;
+            (received.to_string(), detail.split_once("; its fields are: ")?.1)
+        }
+    };
     let expected = fields
         .split(',')
         .map(|field| field.trim().trim_matches('`').to_string())
@@ -968,6 +975,23 @@ mod tests {
         assert_eq!(
             correction["candidates"][0]["replacement"],
             json!("context_prompt_view")
+        );
+    }
+
+    #[test]
+    fn typed_record_field_errors_suggest_the_nearest_field() {
+        let correction = correction_for_error(
+            &error(
+                "stone_script_error",
+                "record `Step` has no field `id`; its fields are: transition_id, phase",
+            ),
+            "emit(step.id)",
+        )
+        .expect("correction");
+        assert_eq!(correction["class"], json!("field"));
+        assert_eq!(
+            correction["candidates"][0]["replacement"],
+            json!("transition_id")
         );
     }
 

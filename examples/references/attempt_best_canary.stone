@@ -8,12 +8,12 @@
 
 
 def worker(input):
-    write_file("answer.txt", input.answer + "\n")
+    write_file("answer.txt", input["answer"] + "\n")
     return {
-        "name": input.name,
-        "answer": input.answer,
-        "score": input.score,
-        "evidence": ["canary:score:" + input.name],
+        "name": input["name"],
+        "answer": input["answer"],
+        "score": input["score"],
+        "evidence": ["canary:score:" + input["name"]],
         "artifacts": ["answer.txt"],
     }
 
@@ -47,10 +47,10 @@ def main(input):
         decision = attempt_best_consider(
             best,
             outcome,
-            score=result.score,
-            summary="independent canary score for " + result.name,
-            evidence=result.evidence,
-            artifacts=result.artifacts,
+            score=result["score"],
+            summary="independent canary score for " + result["name"],
+            evidence=result["evidence"],
+            artifacts=result["artifacts"],
         )
         decisions.append(decision)
         children.append(outcome.attempt)
@@ -59,7 +59,7 @@ def main(input):
         best.status != "retaining"
         or best.attempt != children[1]
         or best.score != 0.90
-        or best.outcome.result.value.answer != "beta"
+        or best.outcome.result.value["answer"] != "beta"
         or best.considered != 3
         or best.replacements != 1
     ):

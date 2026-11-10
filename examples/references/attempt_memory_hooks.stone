@@ -39,7 +39,7 @@ def prepare_decision(step):
         "role": "user",
         "content": "Active attempt memory:\n" + projection.text,
     }
-    messages = step.input.messages
+    messages = step.input["messages"]
     if len(messages) == 0:
         return {"messages": [memory_message]}
     return {
@@ -72,7 +72,7 @@ def record_decision(step):
 
 
 def check_action(step):
-    if len(step.input.argv) == 0:
+    if len(step.input["argv"]) == 0:
         return {"allow": False, "reason": "empty action argv"}
     return None
 
@@ -86,7 +86,7 @@ def record_outcome(step):
     content = {
         "ok": step.outcome.ok,
         "transition_id": step.transition_id,
-        "argv": step.input.argv,
+        "argv": step.input["argv"],
     }
     if result == None:
         content["error"] = step.outcome.error

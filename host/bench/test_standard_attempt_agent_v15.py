@@ -60,7 +60,7 @@ class StandardAttemptAgentV15Tests(unittest.TestCase):
             self.source,
         )
         self.assertIn("class CompletionAudit(BaseModel):", self.source)
-        self.assertIn("model.limit(calls=options.max_model_calls)", self.source)
+        self.assertIn('model.limit(calls=options["max_model_calls"])', self.source)
         self.assertIn("agent.remaining.calls", self.source)
         # The extension contract is unchanged.
         self.assertIn("outcome = dispatch_action(action, options)", self.source)

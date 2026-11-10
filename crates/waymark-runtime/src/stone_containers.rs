@@ -594,7 +594,7 @@ fn kind(value: &RuntimeValue) -> String {
         RuntimeValue::List(_) => "list".to_string(),
         RuntimeValue::Dict(_) => "record".to_string(),
         RuntimeValue::Record(record) => record.ty.name.clone(),
-        RuntimeValue::Nu(value) => value.get_type().to_string(),
+        RuntimeValue::Nu(value) => crate::stone_builtins::value_type_name(&value).to_string(),
         _ => "value".to_string(),
     }
 }
@@ -621,7 +621,7 @@ pub(super) fn child_for_mutation(
             entries
                 .get_mut(key)
                 .map(Item::share)
-                .ok_or_else(|| stone_error(context, format!("record has no key `{key}`")))
+                .ok_or_else(|| stone_error(context, format!("dict has no key `{key}`")))
         }
         (
             RuntimeValue::Record(record),
@@ -635,7 +635,7 @@ pub(super) fn child_for_mutation(
             format!(
                 "cannot mutate nested {} item with {} index",
                 kind(parent),
-                index.get_type()
+                crate::stone_builtins::value_type_name(&index)
             ),
         )),
     }
@@ -668,7 +668,7 @@ pub(super) fn assign_item(
             format!(
                 "cannot assign {} item with {} index",
                 kind(container),
-                index.get_type()
+                crate::stone_builtins::value_type_name(&index)
             ),
         )),
     }

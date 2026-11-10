@@ -33,14 +33,14 @@ pub(super) fn validate_expect_field(key: &str, value: &Value) -> Result<(), Shel
             }
             other => fail(format!(
                 "Expect exit must be an int or a non-empty list of ints, got {}; for example Expect(exit=0) or Expect(exit=[0, 1])",
-                other.get_type()
+                crate::stone_builtins::value_type_name(&other)
             )),
         },
         "stdout_contains" => match value {
             Value::String { .. } => Ok(()),
             other => fail(format!(
                 "Expect stdout_contains must be a string, got {}",
-                other.get_type()
+                crate::stone_builtins::value_type_name(&other)
             )),
         },
         "stdout_matches" => match value {
@@ -52,14 +52,14 @@ pub(super) fn validate_expect_field(key: &str, value: &Value) -> Result<(), Shel
             }),
             other => fail(format!(
                 "Expect stdout_matches must be a regular-expression string, got {}",
-                other.get_type()
+                crate::stone_builtins::value_type_name(&other)
             )),
         },
         "stderr_empty" => match value {
             Value::Bool { .. } => Ok(()),
             other => fail(format!(
                 "Expect stderr_empty must be True or False, got {}",
-                other.get_type()
+                crate::stone_builtins::value_type_name(&other)
             )),
         },
         "max_seconds" => match value {
@@ -113,7 +113,7 @@ pub(super) fn validate_effect_field(key: &str, value: &Value) -> Result<(), Shel
             }
             other => fail(format!(
                 "Effects network must be False or a list of host names, got {}",
-                other.get_type()
+                crate::stone_builtins::value_type_name(&other)
             )),
         },
         "irreversible" => match value {
@@ -134,14 +134,14 @@ pub(super) fn validate_effect_field(key: &str, value: &Value) -> Result<(), Shel
             }
             other => fail(format!(
                 "Effects irreversible must be a list such as [\"push\"], got {}",
-                other.get_type()
+                crate::stone_builtins::value_type_name(&other)
             )),
         },
         "background" => match value {
             Value::Bool { .. } => Ok(()),
             other => fail(format!(
                 "Effects background must be True or False, got {}",
-                other.get_type()
+                crate::stone_builtins::value_type_name(&other)
             )),
         },
         other => fail(format!(
@@ -165,7 +165,7 @@ pub(super) fn effects_from_value(
                 context,
                 format!(
                     "{context}() effects= must be Effects(...) or a dict, got {}; for example effects=Effects(network=[\"pypi.org\"])",
-                    other.get_type()
+                    crate::stone_builtins::value_type_name(&other)
                 ),
             ));
         }
@@ -192,7 +192,7 @@ pub(super) fn expect_from_value(
                 context,
                 format!(
                     "{context}() expect= must be Expect(...) or a dict of checks, got {}; for example expect=Expect({})",
-                    other.get_type(),
+                    crate::stone_builtins::value_type_name(&other),
                     if allowed.contains(&"exit") {
                         "exit=0"
                     } else {

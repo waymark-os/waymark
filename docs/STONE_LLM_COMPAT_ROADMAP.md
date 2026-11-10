@@ -152,7 +152,7 @@ Tests:
 Support:
 
 ```python
-def head(path, limit=10):
+def first_lines(path, limit=10):
     return read_text(path).splitlines()[0:limit]
 ```
 

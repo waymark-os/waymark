@@ -25,8 +25,24 @@ pub(crate) fn validate_program(
     program: &Program,
     session_bound_names: &[String],
 ) -> Result<(), ShellError> {
+    let mut program_bindings = HashSet::new();
+    collect_statement_bindings(&program.statements, &mut program_bindings);
+    if let Some(name) = ["true", "false", "null"]
+        .into_iter()
+        .find(|name| program_bindings.contains(*name))
+    {
+        let python = match name {
+            "true" => "True",
+            "false" => "False",
+            _ => "None",
+        };
+        return Err(admission_error(format!(
+            "`{name}` is reserved: it reads as {python}, the way JSON spells it, so it cannot name a variable, parameter, function, or import. Choose another name"
+        )));
+    }
+    validate_top_level(&program.statements, None)?;
     let mut bound_names = session_bound_names.iter().cloned().collect::<HashSet<_>>();
-    collect_statement_bindings(&program.statements, &mut bound_names);
+    bound_names.extend(program_bindings);
 
     let mut callable = stone_builtin_names()
         .iter()
@@ -138,6 +154,142 @@ fn validate_statements(statements: &[Stmt], names: &AdmissionNames) -> Result<()
             Stmt::RecordDef(record) => validate_record_name(&record.name)?,
             Stmt::Module(module) => validate_statements(&module.body, names)?,
             Stmt::Raise(None) | Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Pass => {}
+        }
+    }
+    Ok(())
+}
+
+/// Names a program or module may not define at its top level: they would
+/// change what a builtin call means, for the rest of the run and inside code
+/// that never mentions the new definition (a `predicate()`, the loop engine).
+fn is_reserved_builtin_name(name: &str) -> bool {
+    stone_builtin_names().contains(&name)
+        || matches!(
+            name,
+            "get" | "items" | "keys" | "values" | "isinstance" | "bool" | "dict" | "model"
+        )
+        || is_builtin_error_type(name)
+}
+
+/// Top-level definitions (`def`, `class`, imports) bind each name once, for
+/// the whole run: not a builtin's name, not twice, and not inside a
+/// top-level `if`, loop, `with`, or `try`. So every call means one thing,
+/// and it can be resolved before the program runs. A function's own nested
+/// `def` is a local, like any other variable, and is not checked here.
+fn validate_top_level(statements: &[Stmt], module: Option<&str>) -> Result<(), ShellError> {
+    let mut defined = HashSet::new();
+    for statement in statements {
+        let (keyword, name) = match statement {
+            Stmt::FunctionDef(function) if function.error_base.is_some() => ("class", &function.name),
+            Stmt::FunctionDef(function) => ("def", &function.name),
+            Stmt::RecordDef(record) => ("class", &record.name),
+            Stmt::Import { names, .. } => {
+                for import in names {
+                    if is_reserved_builtin_name(&import.local) {
+                        return Err(admission_error(format!(
+                            "`import ... {local}` binds `{local}`, which is a builtin; importing it would change what `{local}(...)` means for the whole program. Import it under another name (`from lib import {name} as {name}_fn`)",
+                            local = import.local,
+                            name = import.name,
+                        )));
+                    }
+                }
+                continue;
+            }
+            Stmt::Module(init) => {
+                validate_top_level(&init.body, Some(&init.name))?;
+                continue;
+            }
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                reject_nested_definitions(then_branch, "an `if` statement")?;
+                reject_nested_definitions(else_branch, "an `if` statement")?;
+                continue;
+            }
+            Stmt::For { body, .. } => {
+                reject_nested_definitions(body, "a `for` loop")?;
+                continue;
+            }
+            Stmt::While { body, .. } => {
+                reject_nested_definitions(body, "a `while` loop")?;
+                continue;
+            }
+            Stmt::With { body, .. } => {
+                reject_nested_definitions(body, "a `with` statement")?;
+                continue;
+            }
+            Stmt::Try { body, handlers } => {
+                reject_nested_definitions(body, "a `try` statement")?;
+                for handler in handlers {
+                    reject_nested_definitions(&handler.body, "a `try` statement")?;
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        // A linked module's names are qualified (`lib.helper`).
+        let plain = match module {
+            Some(module) => name
+                .strip_prefix(module)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .unwrap_or(name),
+            None => name.as_str(),
+        };
+        let place = match module {
+            Some(module) => format!(" in module `{module}`"),
+            None => String::new(),
+        };
+        // Records have their own message (validate_record_name).
+        if keyword == "def" && is_reserved_builtin_name(plain) {
+            return Err(admission_error(format!(
+                "`def {plain}(...)`{place}: `{plain}` is a builtin, and a program cannot redefine builtins: the new definition would change what every `{plain}(...)` means, including calls in code that never mentions it. Give the function its own name"
+            )));
+        }
+        if !defined.insert(plain.to_string()) {
+            return Err(admission_error(format!(
+                "`{keyword} {plain}` is defined twice{place}. A top-level name has one definition for the whole run, so a call means the same thing before and after it. Keep one definition, or give the other a different name"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `def` and `class` belong at the top level, unconditionally.
+fn reject_nested_definitions(statements: &[Stmt], container: &str) -> Result<(), ShellError> {
+    for statement in statements {
+        let nested: &[&[Stmt]] = match statement {
+            Stmt::FunctionDef(function) => {
+                let keyword = if function.error_base.is_some() { "class" } else { "def" };
+                return Err(admission_error(format!(
+                    "`{keyword} {}` is inside {container} at the top level. Define functions and classes at the top level, unconditionally, so a name means one thing for the whole run. Put the condition inside the function, or define two functions with different names and choose between them",
+                    function.name
+                )));
+            }
+            Stmt::RecordDef(record) => {
+                return Err(admission_error(format!(
+                    "`class {}` is inside {container} at the top level. Define classes at the top level, unconditionally",
+                    record.name
+                )));
+            }
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => &[then_branch, else_branch],
+            Stmt::For { body, .. } | Stmt::While { body, .. } | Stmt::With { body, .. } => &[body],
+            Stmt::Try { body, handlers } => {
+                reject_nested_definitions(body, container)?;
+                for handler in handlers {
+                    reject_nested_definitions(&handler.body, container)?;
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        for block in nested {
+            reject_nested_definitions(block, container)?;
         }
     }
     Ok(())
@@ -800,13 +952,27 @@ emit(invoke(double))"#,
     }
 
     #[test]
-    fn does_not_apply_builtin_keyword_schemas_to_shadowed_names() {
+    fn rejects_redefining_builtins_and_conditional_definitions() {
+        for (source, expected) in [
+            ("def context_project(max_token):\n    return max_token\n", "`context_project` is a builtin"),
+            ("def len(x):\n    return 7\n", "`len` is a builtin"),
+            ("def f():\n    return 1\ndef f():\n    return 2\n", "`def f` is defined twice"),
+            ("if True:\n    def f():\n        return 1\n", "inside an `if` statement"),
+            ("for i in [1]:\n    class Bad(Exception):\n        pass\n", "inside a `for` loop"),
+            ("true = 5\n", "`true` is reserved"),
+            ("def f(null):\n    return null\n", "`null` is reserved"),
+            ("xs = [false for false in [1]]\n", "`false` is reserved"),
+        ] {
+            let program = lower_source(source).expect("lower");
+            let error = validate_program(&program, &[]).expect_err(source);
+            let debug = format!("{error:?}");
+            assert!(debug.contains(expected), "{source}: {debug}");
+        }
+        // A function's own nested def is a local, as in Python.
         let program = lower_source(
-            r#"def context_project(max_token):
-    return max_token
-emit(context_project(max_token=32))"#,
+            "def outer():\n    def len(x):\n        return 9\n    return len([1])\nemit(outer())\n",
         )
         .expect("lower");
-        validate_program(&program, &[]).expect("shadowed builtin");
+        validate_program(&program, &[]).expect("nested def");
     }
 }

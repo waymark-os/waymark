@@ -33,7 +33,7 @@ inference = model_infer(
 )
 transitions = context_read(keys=["model_infer.transitions"], limit=1)
 emit({
-    "ready": inference.value.ready,
+    "ready": inference.value["ready"],
     "validation_attempts": inference.validation_attempts,
     "errors": inference.errors,
     "usage": inference.usage,

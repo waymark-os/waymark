@@ -16,7 +16,7 @@ class AttemptBestAuthorshipTests(unittest.TestCase):
 
     def test_transfer_case_derives_cost_and_minimizes(self) -> None:
         prompt = experiment.authorship_prompt({}, "min-derived-cost")
-        self.assertIn("input.setup_cost + input.run_cost", prompt)
+        self.assertIn('input["setup_cost"] + input["run_cost"]', prompt)
         self.assertIn('objective="min"', prompt)
         self.assertIn("without putting a precomputed total cost", prompt)
 
@@ -31,7 +31,7 @@ class AttemptBestAuthorshipTests(unittest.TestCase):
         source = """best = attempt_best(scope, objective="min")
 result = run_complete(["python3", "-c", "import definitely_missing_waymark_codec"])
 cost = stat("/app/archive.bin").size
-decision = attempt_best_consider(best, outcome, score=outcome.result.value.cost)
+decision = attempt_best_consider(best, outcome, score=outcome.result.value["cost"])
 penalty = 1000000000
 """
         features = experiment.source_features(source, "process-compression")
@@ -45,7 +45,7 @@ penalty = 1000000000
             self.assertTrue(features[key], key)
 
         aliased = source.replace(
-            "score=outcome.result.value.cost",
+            'score=outcome.result.value["cost"]',
             "candidate_result=outcome.result.value\nscore=candidate_result.cost",
         )
         self.assertTrue(
@@ -56,8 +56,8 @@ penalty = 1000000000
 
     def test_transfer_case_requires_minimizing_selector(self) -> None:
         minimizing = """best = attempt_best(scope, objective = "min")
-cost = input.setup_cost + input.run_cost
-decision = attempt_best_consider(best, outcome, score=outcome.result.value.cost)
+cost = input["setup_cost"] + input["run_cost"]
+decision = attempt_best_consider(best, outcome, score=outcome.result.value["cost"])
 """
         maximizing = 'best = attempt_best(scope, objective="max")'
         minimizing_features = experiment.source_features(

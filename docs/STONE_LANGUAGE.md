@@ -108,6 +108,13 @@ but operators stay strongly typed. Automatic text-to-number parsing is not part
 of operator evaluation. Use explicit conversions such as `int(value)` or
 `float(value)` when input text should become a number.
 
+Builtins follow the same rule: an argument that must be an int (`range`,
+slice bounds, `enumerate` start, `timeout_ms=`) rejects floats, text, and
+bools with a `TypeError`, and numeric builtins (`sum`, `round`) reject text.
+`int(x)` and `float(x)` are the conversions: `int` truncates a float toward
+zero, and `int(1e20)` or `int(float("nan"))` raises `ValueError` instead of
+saturating.
+
 Python `True`, `False`, and `None` are the canonical scalar literals. Stone also
 accepts the JSON spellings `true`, `false`, and `null`. This narrow compatibility
 rule keeps an otherwise valid agent-authored record from failing when generated
@@ -163,8 +170,10 @@ for any comparison that mixes a bool with an int or float, at any depth
 the error says to convert with `int(flag)` or `bool(count)`. Ordering
 unrelated types, such as `"1" < 2`, is an error.
 
-Membership supports strings, lists, and record keys: `"mark" in "waymark"`,
-`2 in [1, 2, 3]`, and `"path" in record`. Other containers are an error.
+Membership supports strings, lists, dict keys, sets, and record fields:
+`"mark" in "waymark"`, `2 in [1, 2, 3]`, `"path" in d`, and
+`"exit_code" in result` (true when the record has that field). Other
+containers are an error.
 
 Conditional expressions use Python's `then if condition else otherwise` shape
 and evaluate only the selected branch:
@@ -194,7 +203,7 @@ Functions support positional parameters, optional type annotations, return
 annotations, and default values:
 
 ```python
-def head(path: str, limit: int = 10) -> list:
+def first_lines(path: str, limit: int = 10) -> list:
     return read_text(path).splitlines()[0:limit]
 ```
 
@@ -295,7 +304,9 @@ handle, child/scope wait methods, root acceptance, and their functional
 completion and lowers to the same lifecycle as `run_complete(...)`, including
 internal observation slices and termination at the total timeout. Use ordinary
 `run(..., background=True)` when the program intentionally needs to interleave
-work or manage a service. `async with` remains limited to attempt scopes and
+work or manage a service. Background runs need the Gateway-backed runtime; a
+local `waymark eval` rejects `background=True` (use `start_daemon()` for a
+local service). `must_run` always waits, so it does not take `background=`. `async with` remains limited to attempt scopes and
 semantic frontiers.
 
 The interpreter lowers these boundaries onto existing blocking Gateway
@@ -309,12 +320,18 @@ with no repairs, but did not beat corrected synchronous scoped syntax: both
 averaged 27 lines, while async was about 2% larger. Keep async as an explicit
 effect-oriented option, not as evidence that Stone needs general-purpose async.
 
-Default expressions are evaluated when a call omits that argument. Mutable
-default literals such as `[]` and `{}` are rejected to avoid shared mutable
-state surprises. Calls to user-defined functions, stored named functions, and
+Default values are evaluated once, when the `def` statement runs, as in
+Python: `def g(x=i)` inside a loop keeps the `i` of that pass, and a call that
+omits `x` gets that stored value. Mutable default literals such as `[]` and
+`{}` are rejected to avoid shared mutable state surprises; use `None` and
+build the value in the body. Calls to user-defined functions, stored named functions, and
 lambdas accept positional and keyword arguments. Unknown keywords report the
 accepted parameter names; duplicate positional/keyword bindings and missing
-required arguments name the affected parameter.
+required arguments name the affected parameter. Builtins take their parameters by the names
+Python uses, as well as by position: `enumerate(xs, start=1)`,
+`round(x, ndigits=2)`, `text.split(sep=",", maxsplit=1)`,
+`get(d, key, default=0)`. An unknown keyword to a builtin is a `TypeError`
+that lists the keywords it takes.
 
 This permits readable policy interfaces:
 
@@ -380,6 +397,16 @@ emit(counter())  # 2
   function or builtin with the same name, so `len = 5` followed by
   `len(items)` is an error that names the hidden builtin and suggests
   renaming the variable.
+- Top-level definitions bind a name once, for the whole run. These are
+  rejected before the program runs: a top-level `def` or an import that
+  reuses a builtin's name (`def len(x): ...`, `from lib import f as len`), a
+  name defined twice at the top level, and a `def` or `class` inside a
+  top-level `if`, loop, `with`, or `try`. A function's own nested `def` is a
+  local and may reuse any name, as in Python.
+- `true`, `false`, and `null` are reserved: they always read as `True`,
+  `False`, and `None`, and cannot name a variable, parameter, or function.
+- Inside a `predicate()`, calls always mean the builtins, whatever the
+  program binds.
 
 ### Lists And Dicts
 
@@ -405,7 +432,25 @@ for row in sorted(rows, key=lambda r: r["n"]):
 emit(rows)  # both rows now have "seen": True
 ```
 
+- A dict's keys are read and written with brackets: `d["a"]`,
+  `d["a"] = 1`, `d.get("a")`. `d.a` is an `AttributeError` that says to write
+  `d["a"]`; attributes are for records (see Records). This holds for every
+  dict: literals, `json_loads` and `read_json` results, `task_input()`, and the
+  JSON a model returns. Dict methods (`d.keys()`, `d.items()`, `d.get(k)`) are
+  calls as usual.
+- A `for` loop over a list walks the live list, as in Python: items appended
+  during the loop are visited (`for n in queue: queue.extend(...)` drains a
+  worklist), and writes to later items are seen. Changing the size of a dict
+  or set while looping over it raises `RuntimeError`; loop over a copy
+  (`for k in list(d):`) or apply the changes after the loop.
+- A string iterates by character, as in Python: `for ch in word`,
+  `list("ab")`, `set("aab")`, and `xs.extend("ab")` see `"a"` and `"b"`.
+  Use `text.splitlines()` or `for line in open(path)` for lines.
 - `xs += ys` extends `xs` in place, including `d["xs"] += ys`.
+- `xs * n` and `"ab" * n` repeat a list or string, as in Python. The
+  repeated elements are shared: `grid = [[]] * 2` holds one inner list twice,
+  so `grid[0].append(1)` gives `[[1], [1]]`. Build independent rows with a
+  comprehension: `[[] for _ in range(2)]`.
 - `list(xs)`, `xs[:]`, and comprehensions make a new outer list; the elements
   are still shared. `{k: v for k, v in d.items()}` copies a dict the same way.
 - `a is b` is true only when both names refer to the same list, dict, or
@@ -419,8 +464,11 @@ emit(rows)  # both rows now have "seen": True
   slicing, and a dict's `.get`, `.values`, and `.items` hand out the same
   elements, and a list method such as `.append` changes the list it is
   called on even when that list came from a call: `groups()[0].append(x)`.
-  Other builtins, such as `unique`, `map`, and the JSON helpers, return
-  copies.
+  The function forms `get(d, k)`, `values(d)`, `items(d)`, `slice`,
+  `unique`, `map`, `min`, and `max` hand out the same elements too. The JSON
+  helpers return copies.
+- Dicts keep insertion order everywhere: `keys()`, `str()`, `json_dumps`,
+  `emit`, and JSON read from files all keep the order the keys were written.
 - Lists and dicts can hold functions and lambdas. Any expression that gives a
   function can be called: `handlers["save"](path)`, `fs[0](x)`,
   `make_adder(2)(3)`. Calling a value that is not a function is an error that
@@ -511,6 +559,19 @@ emit(str(plan.steps[0]))  # Step(title='read the failing test', done=True)
 - `str()`, `repr()`, f-strings, and `print` give Python's dataclass form,
   `Plan(steps=[...], risky=False, note=None)`. `emit`, JSON, and builtins
   such as `len` see a plain dict of the fields.
+- Builtins that report on the host return records too, so their fields are
+  attributes and are listed in errors: `run(...)` gives a `RunResult`
+  (`result.exit_code`, `result.stdout`), `stat(path)` a `FileStat`, `ls()` a
+  list of `DirEntry`, `ps()` a list of `ProcessInfo`, `model_call(...)` and
+  `model_infer(...)` their own result records, and transition hooks and
+  workflow stage handlers receive a `TransitionEvent` or `StageContext`.
+  Subscripting one (`result["exit_code"]`) is an error naming the attribute.
+  A field that carries program data stays plain data: `inference.value` (the
+  model's parsed JSON), a hook's `step.input`, a stage's `inputs` and
+  `outputs`, and other `value`/`data`/`payload` fields are dicts and lists,
+  read with brackets. Name-keyed maps such as `findings` and `stage_outputs`
+  are dicts whose values are records:
+  `step.stage_outputs["inspect"].findings["layout"].value`.
 - Record names are global, like error classes. A module may define records;
   they are imported under their own name, cannot be renamed with `as`, and
   two modules may not define the same record. Record classes persist in the
@@ -544,8 +605,9 @@ emit({"plan": calls_to_spend(helper), "spent": model.usage})
   `model: Model` parameter.
 - `model.usage` is what that model value has spent (`calls`,
   `input_tokens`, `output_tokens`). `model.remaining` is the smallest amount
-  left along its chain of budgets, plus `seconds` of wall-clock time; a
-  value is `None` when nothing limits it. Both are fresh snapshots.
+  left along its chain of budgets, plus the attempt's `tool_calls` (commands
+  left) and `seconds` of wall-clock time; a value is `None` when nothing
+  limits it. Both are fresh snapshots.
 - An `output_tokens` budget also caps each call's `max_output_tokens` to what
   is left, and `wall_time_ms` caps each command's `timeout_ms`. Token counts
   are those the model provider reports.
@@ -875,8 +937,17 @@ says so with `result.effects.enforced == False`.
 - `emit(value)`: set the program's structured result. The emitted value is the
   result even if statements run after it, and a second `emit` raises an error,
   because a program has one result. `emit` does not stop the program. A program
-  that never emits returns the value of its last statement.
-- `fail(message)`: return a structured failure.
+  that never emits returns the value of its final top-level expression
+  statement (`1 + 1` gives 2); a final loop, branch, assignment, or `print`
+  gives None. A function without `return` returns None. A function, the
+  `model`, or an open file standing alone as a statement is not an error; as
+  the final statement it gives its Python repr text (`<function f>`).
+- `print(*values, sep=" ", end="\n")`: write `str()` of each value to stdout
+  and return None, as Python does. What a program printed before it failed is
+  kept in the error response's `output.stdout`.
+- `fail(message, code=None, detail=None)`: raise an `Exception` that stops the
+  program with the outer code `task_failure` (see below). Caught with
+  `except Exception as e`, `e.code` is the declared `code`.
 - `workflow_evidence(satisfied_or_result, summary, references=[])`: construct
   bounded stage evidence from a boolean or a typed action result. Passing a
   result record derives satisfaction from `ok`, retains a bounded failure
@@ -1150,7 +1221,10 @@ says so with `result.effects.enforced == False`.
   status, cwd, CPU, memory, virtual memory, and owner uid fields.
 - `sysinfo(section="all")`: typed host system snapshot. Sections include
   `"os"`, `"cpu"`, `"cpu_long"`, `"mem"`, `"disks"`, `"net"`, `"temp"`,
-  and `"users"`. `sys()` is an alias.
+  and `"users"`. `sys()` is an alias. Sizes are ints in bytes and
+  `load_average` is a list of three floats.
+- `echo(value, ...)`: returns its argument (a list for several) and prints
+  nothing; it is not shell `echo`. Use `print` to write text.
 - `state()`: typed runtime snapshot with `cwd`, workspace root/relative path,
   git summary, and common tool availability/version probes.
 - `last_result()`: previous Waymark command response as typed data, or `None`

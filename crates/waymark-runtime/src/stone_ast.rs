@@ -192,6 +192,28 @@ pub struct FunctionDef {
     pub error_base: Option<String>,
     /// Filled by the scope resolver (`stone_scope`) after lowering.
     pub scope: std::sync::Arc<FunctionScope>,
+    /// The default argument values, evaluated once when the `def` statement
+    /// runs (as in Python) and stored here by the evaluator. Empty in the
+    /// lowered AST.
+    pub defaults: DefaultValues,
+}
+
+/// Evaluated default argument values. The evaluator owns their type; the
+/// AST only carries them.
+#[derive(Clone, Default)]
+pub struct DefaultValues(pub Option<std::rc::Rc<dyn std::any::Any>>);
+
+impl std::fmt::Debug for DefaultValues {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "DefaultValues(evaluated)" } else { "DefaultValues(none)" })
+    }
+}
+
+impl PartialEq for DefaultValues {
+    /// Evaluated values are not part of a function's syntax.
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 
 /// What lexical scope resolution found for one function.
@@ -965,6 +987,7 @@ fn lower_function_def(function: py::StmtFunctionDef) -> Result<Stmt, ShellError>
         stage: stage.map(Box::new),
         error_base: None,
         scope: Default::default(),
+        defaults: Default::default(),
     }))
 }
 
@@ -1522,6 +1545,7 @@ fn lower_error_class(class: py::StmtClassDef) -> Result<Stmt, ShellError> {
         stage: None,
         error_base: Some(base),
         scope: Default::default(),
+        defaults: Default::default(),
     }))
 }
 
@@ -2632,6 +2656,8 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
             let mut named = Vec::new();
             if !call.arguments.keywords.is_empty() {
                 if method == "split" {
+                    // str.split(sep=None, maxsplit=-1), as in Python.
+                    let mut slots: Vec<Option<Expr>> = positional.drain(..).map(Some).collect();
                     for keyword in call.arguments.keywords.into_vec() {
                         let Some(name) = keyword.arg else {
                             return Err(unsupported_message(
@@ -2639,26 +2665,28 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
                                 "keyword spread is not supported yet",
                             ));
                         };
-                        if name.as_str() != "maxsplit" {
-                            return Err(unsupported_message(
-                                "method call",
-                                format!("unsupported split() keyword argument `{name}`"),
-                            ));
-                        }
-                        match positional.len() {
-                            0 => {
-                                positional.push(Expr::None);
-                                positional.push(lower_expr(keyword.value)?);
-                            }
-                            1 => positional.push(lower_expr(keyword.value)?),
+                        let index = match name.as_str() {
+                            "sep" | "separator" => 0,
+                            "maxsplit" => 1,
                             _ => {
                                 return Err(unsupported_message(
                                     "method call",
-                                    "split() got multiple maxsplit values",
+                                    format!("unsupported split() keyword argument `{name}`; split accepts sep= and maxsplit="),
                                 ));
                             }
+                        };
+                        if slots.len() <= index {
+                            slots.resize(index + 1, None);
                         }
+                        if slots[index].is_some() {
+                            return Err(unsupported_message(
+                                "method call",
+                                format!("split() got multiple values for `{name}`"),
+                            ));
+                        }
+                        slots[index] = Some(lower_expr(keyword.value)?);
                     }
+                    positional = slots.into_iter().map(|slot| slot.unwrap_or(Expr::None)).collect();
                 } else if method == "sort" {
                     for keyword in call.arguments.keywords.into_vec() {
                         let Some(name) = keyword.arg else {

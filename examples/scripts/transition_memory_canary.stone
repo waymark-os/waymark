@@ -4,7 +4,7 @@ def prepare_decision(step):
         max_tokens=96,
     )
     return {
-        "messages": step.input.messages + [
+        "messages": step.input["messages"] + [
             {
                 "role": "user",
                 "content": "Active attempt memory:\n" + projection.text,

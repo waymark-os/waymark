@@ -27,7 +27,7 @@ def retain_early_requirement(step):
             "requirement.pivot_action",
             "requirement",
             {
-                "action_token": payload.action_token,
+                "action_token": payload["action_token"],
                 "source_transition_id": step.transition_id,
             },
             status="verified",
@@ -49,7 +49,7 @@ def prepare_decision(step):
             max_tokens=192,
         )
         return {
-            "messages": step.input.messages + [
+            "messages": step.input["messages"] + [
                 {
                     "role": "user",
                     "content": "Active attempt memory:\n" + projection.text,
@@ -59,7 +59,7 @@ def prepare_decision(step):
     if mode == "T":
         history = json_loads(read_file("raw-transcript.json", max_bytes=32768))
         return {
-            "messages": [step.input.messages[0]] + history + step.input.messages[1:]
+            "messages": [step.input["messages"][0]] + history + step.input["messages"][1:]
         }
     return None
 
@@ -83,7 +83,7 @@ def record_decision(step):
 
 
 def check_action(step):
-    if len(step.input.argv) == 0:
+    if len(step.input["argv"]) == 0:
         return {"allow": False, "reason": "empty action argv"}
     return None
 
@@ -159,7 +159,7 @@ else:
             hooks={"pre": prepare_decision, "post": record_decision},
         )
         decoded = json_loads(response.content)
-        selected_action = decoded.selected_action
+        selected_action = decoded["selected_action"]
         decisions.append(selected_action)
         model_transition_ids.append(response.transition_id)
         usage.append(response.usage)

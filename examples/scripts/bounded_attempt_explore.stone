@@ -247,10 +247,10 @@ def explore_control(
 
     ordered = []
     for item in candidates:
-        if item.name == proposed_name:
+        if item["name"] == proposed_name:
             ordered.append(item)
     for item in candidates:
-        if item.name != proposed_name:
+        if item["name"] != proposed_name:
             ordered.append(item)
 
     root = attempt_info()
@@ -310,23 +310,23 @@ def explore_control(
                 "candidate controller did not return an evaluable result",
                 code="explore_candidate_infrastructure_failure",
                 detail={
-                    "candidate": item.name,
+                    "candidate": item["name"],
                     "outcome": outcome,
                 },
             )
 
         gate = explore_validate_gate(
-            item.name,
+            item["name"],
             evaluate(item, outcome),
         )
-        if gate.accepted:
+        if gate["accepted"]:
             accepted = attempt_accept(root.attempt, outcome)
             outcomes.append({
-                "candidate": item.name,
+                "candidate": item["name"],
                 "attempt": outcome.attempt,
                 "status": "accepted",
-                "summary": gate.summary,
-                "evidence": gate.evidence,
+                "summary": gate["summary"],
+                "evidence": gate["evidence"],
                 "result": outcome.result.value,
             })
             cleanup = attempt_scope_close(scope)
@@ -369,14 +369,14 @@ def explore_control(
 
         attempt_discard(
             outcome,
-            reason="candidate rejected: " + gate.summary,
+            reason="candidate rejected: " + gate["summary"],
         )
         outcomes.append({
-            "candidate": item.name,
+            "candidate": item["name"],
             "attempt": outcome.attempt,
             "status": "rejected",
-            "summary": gate.summary,
-            "evidence": gate.evidence,
+            "summary": gate["summary"],
+            "evidence": gate["evidence"],
             "result": outcome.result.value,
         })
 

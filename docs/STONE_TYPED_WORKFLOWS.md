@@ -30,10 +30,10 @@ def repair_output(step):
     repair=repair_output,
     max_attempts=1,
 )
-def artifact(step):
+def build_artifact(step):
     return run(["sh", "-c", "exit 7"])
 
-report = workflow_run(workflow("build-artifact", artifact))
+report = workflow_run(workflow("build-artifact", build_artifact))
 ```
 
 `@stage` is syntax, not a general Python decorator. The frontend lowers the
@@ -889,10 +889,10 @@ def repair_output(step):
     repair=repair_output,
     max_attempts=1,
 )
-def artifact(step):
+def build_artifact(step):
     return run(["sh", "-c", "exit 7"])
 
-report = workflow_run(workflow("build-artifact", artifact))
+report = workflow_run(workflow("build-artifact", build_artifact))
 emit(report)
 ```
 

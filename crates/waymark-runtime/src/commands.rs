@@ -164,10 +164,10 @@ def name(step): ... -> workflow_stage"#,
     return run(["sh", "-c", "printf ready > artifact.txt"])
 
 @stage(evidence=file_nonempty("artifact.txt"), repair=repair_artifact, max_attempts=1)
-def artifact(step):
+def build_artifact(step):
     return run(["sh", "-c", "exit 7"])
 
-report = workflow_run(workflow("build", artifact))
+report = workflow_run(workflow("build", build_artifact))
 emit(report)"#,
         ],
         avoid: &[
@@ -356,7 +356,7 @@ except ModelOutputError as error:
     },
     StoneHelpEntry {
         name: "model.limit",
-        signature: r#"model.limit(calls: int = None, input_tokens: int = None, output_tokens: int = None) -> Model; model.usage -> {calls, input_tokens, output_tokens}; model.remaining -> {calls, input_tokens, output_tokens, seconds}"#,
+        signature: r#"model.limit(calls: int = None, input_tokens: int = None, output_tokens: int = None) -> Model; model.usage -> {calls, input_tokens, output_tokens}; model.remaining -> {calls, input_tokens, output_tokens, tool_calls, seconds}"#,
         use_when: "Give a function or loop a smaller share of the model budget, or read what is spent and left before deciding whether to continue. Budgets are checked only when a model is called or a command starts.",
         examples: &[
             r#"small = model.limit(calls=3, output_tokens=2000)
@@ -374,6 +374,7 @@ emit(calls_to_spend(model.limit(calls=5)))"#,
             "output_tokens also caps each call's max_output_tokens to what is left, so the model cannot overrun it. Token counts are those the provider reports.",
             "The host sets the attempt's budget: waymark eval --budget model_calls=40,output_tokens=60000,tool_calls=200,wall_time_ms=600000, or the Gateway attempt's resource limits. tool_calls counts commands started with run, run_complete, or must_run; wall_time_ms also bounds each command's timeout_ms.",
             "model.usage and model.remaining are fresh snapshots each time they are read.",
+            "The host can also give the whole attempt a budget (model_calls, input_tokens, output_tokens, tool_calls, wall_time_ms); the program cannot raise it, and model.remaining already counts it.",
         ],
         aliases: &["model.usage", "model.remaining", "budget"],
     },
@@ -420,6 +421,7 @@ except TypeError as e:
             "Field types: str, int, float, bool, None, Any, list[T], dict[str, T], Literal[...], Optional[T], A | B, Model, and other records (a quoted name such as list[\"Tree\"] refers ahead or to the record itself). A top-level alias such as Action = Read | Edit can be used in annotations.",
             "Build with keywords or positionally in field order. A missing field, an unknown field, or a value of the wrong type is a TypeError naming the field and path; a dict is not converted into a record.",
             "Read and assign fields as attributes (plan.note), not plan[\"note\"]; records cannot be iterated. A record is shared like a dict: b = a refers to the same record.",
+            "Dicts are the opposite: read keys with brackets (d[\"note\"], d.get(\"note\")); d.note is an AttributeError. Host results such as run(), stat(), ls() entries, model_infer() and hook events are records (result.exit_code); their data fields such as .value and .input hold plain dicts.",
             "Defaults are literals (0, \"\", None, [], {}) and are fresh for each record, so a default list is never shared.",
             "pydantic's Field() sets limits as the default: Field(default, ge=, gt=, le=, lt=, min_length=, max_length=, description=); Field(...) means required and default_factory=list or dict means an empty one. Number limits apply to int and float values, length limits to str (characters), list, and dict; None passes. Limits are checked when a record is built or assigned and when a model answer is read, and model.ask sends them in the JSON Schema. Annotated[...] and other Field options are not supported.",
             "No methods, inheritance, or class keywords: write def functions that take the record. class X(BaseModel): and @dataclass class X: are accepted as records; from typing/pydantic/dataclasses imports of those names are accepted and change nothing.",
@@ -569,7 +571,7 @@ emit(control(session).value)"#],
     StoneHelpEntry {
         name: "emit",
         signature: "emit(value: Any) -> Any",
-        use_when: "Use to set the structured result of a Stone script or MCP call. The emitted value is the program's result even if statements run after it; a program that never emits returns its last statement's value. emit returns the value and does not stop the program.",
+        use_when: "Use to set the structured result of a Stone script or MCP call. The emitted value is the program's result even if statements run after it; a program that never emits returns the value of its final top-level expression statement (a final loop, branch, or assignment gives None). emit returns the value and does not stop the program.",
         examples: &[
             r#"emit({"ok": True, "path": "/app/out.json"})"#,
             r#"def finish(path):
@@ -588,17 +590,17 @@ finish("/app/out.json")"#,
     StoneHelpEntry {
         name: "fail",
         signature: "fail(message: str, code: str? = None, detail: Any? = None) -> never",
-        use_when: "Use to intentionally mark a task as failed with a clear message.",
-        examples: &[r#"fail("missing required input", code="missing_input")"#],
+        use_when: "Use to intentionally mark a task as failed with a clear message. Raises an Exception; a handler sees e.code == code (\"task_failure\" when no code is given), e.message, and e.detail as the structured value passed.",
+        examples: &[r#"fail("missing required input", code="missing_input")"#, r#"fail("bad input", code="bad_input", detail={"field": "items"})"#],
         avoid: &["Do not use fail for ordinary recoverable probes; return/emit diagnostics instead."],
         aliases: &[],
     },
     StoneHelpEntry {
         name: "echo",
         signature: "echo(value: Any, ...values: Any) -> Any | list",
-        use_when: "Use for quick literal values in small probes.",
+        use_when: "Returns its argument (or a list of several arguments) and prints nothing; it is not shell echo.",
         examples: &[r#"emit(echo("hello"))"#, r#"emit(echo("name", 3))"#],
-        avoid: &["Prefer emit(value) for final task results."],
+        avoid: &["Use print(value) to write text to stdout.", "Prefer emit(value) for final task results."],
         aliases: &[],
     },
     StoneHelpEntry {
@@ -666,18 +668,18 @@ first, second = pair"#],
     },
     StoneHelpEntry {
         name: "min",
-        signature: "min(value: Any, ...values: Any) -> Any",
-        use_when: "Use for the smallest comparable value.",
-        examples: &[r#"lowest = min(a, b, c)"#],
-        avoid: &["Do not compare unrelated types such as strings and numbers."],
+        signature: "min(iterable: list | set | tuple, *, key: callable? = None, default: Any = <error>) -> Any | min(a: Any, b: Any, ...values: Any, *, key: callable? = None) -> Any",
+        use_when: "Use for the smallest of one iterable or of several values, as in Python. Numbers, strings, and lists are compared; key=fn compares fn(item) and returns the item itself. An empty iterable raises ValueError unless default= is given.",
+        examples: &[r#"lowest = min(a, b, c)"#, r#"cheapest = min(rows, key=lambda r: r["amount"])"#, r#"first_name = min(names, default=None)"#],
+        avoid: &["Do not compare unrelated types such as strings and numbers (TypeError); pass key= to compare one field."],
         aliases: &[],
     },
     StoneHelpEntry {
         name: "max",
-        signature: "max(value: Any, ...values: Any) -> Any",
-        use_when: "Use for the largest comparable value.",
-        examples: &[r#"highest = max(a, b, c)"#],
-        avoid: &["Use sort(rows, key=...) for top-N records."],
+        signature: "max(iterable: list | set | tuple, *, key: callable? = None, default: Any = <error>) -> Any | max(a: Any, b: Any, ...values: Any, *, key: callable? = None) -> Any",
+        use_when: "Use for the largest of one iterable or of several values, as in Python. Numbers, strings, and lists are compared; key=fn compares fn(item) and returns the item itself. An empty iterable raises ValueError unless default= is given.",
+        examples: &[r#"highest = max(a, b, c)"#, r#"top = max(rows, key=lambda r: r["score"])"#],
+        avoid: &["Use sorted(rows, key=..., reverse=True)[:n] for top-N records."],
         aliases: &[],
     },
     StoneHelpEntry {
@@ -937,10 +939,10 @@ for line in open("/app/input.txt"):
     },
     StoneHelpEntry {
         name: "save",
-        signature: "save(value: Any, path: str, append: bool = False, force: bool = False) -> record",
-        use_when: "Use to write an explicit value to a file when write_file/write_json do not fit.",
-        examples: &[r#"save(to_json(rows), "/app/rows.json", force=True)"#],
-        avoid: &["Do not rely on Nu pipeline input; pass the value explicitly as the first argument."],
+        signature: "save(path: str, value: Any, append: bool = False, force: bool = False) -> record",
+        use_when: "Use to write a value to a file, refusing to replace an existing file unless force=True. Text is written as is; other values are written as JSON. Path first, like write_file and write_json.",
+        examples: &[r#"save("/app/rows.json", rows, force=True)"#],
+        avoid: &["Prefer write_file(path, text) or write_json(path, value) unless you want the no-overwrite check."],
         aliases: &[],
     },
     StoneHelpEntry {
@@ -1249,21 +1251,21 @@ if starts_with(line, "ERROR"):
     },
     StoneHelpEntry {
         name: "print",
-        signature: "print(...values: Any) -> Any",
-        use_when: "Use only for diagnostic stdout during local probes. Writes str() of each value, as Python does: None, True, [1, 'x'], {'a': 1}, Plan(x=1), and the message of a caught error.",
-        examples: &[r#"print("debug:", count)"#],
+        signature: "print(...values: Any, sep: str = \" \", end: str = \"\\n\") -> None",
+        use_when: "Use for diagnostic stdout. Writes str() of each value joined by sep and followed by end, as Python does: None, True, [1, 'x'], {'a': 1}, Plan(x=1), and the message of a caught error. Returns None. Output printed before a failure is kept in the error response.",
+        examples: &[r#"print("debug:", count)"#, r#"print("a", "b", sep=",", end="")"#],
         avoid: &["Use emit(value) for structured results (emit writes JSON) and write_file/write_json for task outputs; use json_dumps(value) when printed text must be JSON."],
         aliases: &[],
     },
     StoneHelpEntry {
         name: "run",
         signature: r#"run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, expect: Expect? = None, effects: Effects? = None, background: bool = False, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> record"#,
-        use_when: "Use only when the task explicitly needs a POSIX program. Nonzero exits, timeouts, and missing commands return ok=false with stdout, stderr, and an explanation record; run() does not raise for them (unlike Python's subprocess). Pass expect=Expect(exit=0, ...) to raise ExpectationFailed when the result is not what you expect. Every finished result has effects.observed: the files under the project that changed while it ran (collapsed by directory; tool folders such as .git and node_modules are listed under not_scanned). Raises: FileNotFoundError or NotADirectoryError for a bad cwd; ExpectationFailed with expect=. Use run_complete for a bounded task command that must finish before the program continues; use background=True when the program intentionally manages a live run_id.",
+        use_when: "Use only when the task explicitly needs a POSIX program. Nonzero exits, timeouts, and missing commands return ok=false with stdout, stderr, and an explanation record; run() does not raise for them (unlike Python's subprocess). Pass expect=Expect(exit=0, ...) to raise ExpectationFailed when the result is not what you expect. Every finished result has effects.observed: the files under the project that changed while it ran (collapsed by directory; tool folders such as .git and node_modules are listed under not_scanned). Raises: FileNotFoundError or NotADirectoryError for a bad cwd; ExpectationFailed with expect=. Use run_complete for a bounded task command that must finish before the program continues; use background=True when the program intentionally manages a live run_id (background runs need the Gateway-backed runtime; a local `waymark eval` rejects them, so use start_daemon() there).",
         examples: &[
             r#"result = run(["wc", "-l", "/app/input.txt"])"#,
             r#"result = run(["printf", "ok"], timeout_ms=5000)"#,
             r#"result = run(["printf", "2 passed"], expect=Expect(exit=0, stdout_contains="passed"))"#,
-            r#"result = run(["printf", "ok"], hooks={"pre": lambda step: {"argv": step.input.argv}})"#,
+            r#"result = run(["printf", "ok"], hooks={"pre": lambda step: {"argv": step.input["argv"]}})"#,
             r#"result = run(["printf", "not executed"], hooks={"pre": lambda step: {"allow": False, "reason": "command denied"}})"#,
             r#"async def build():
     return await run(["sh", "-c", "sleep 0.01; printf done"], timeout_ms=5000)
@@ -1385,7 +1387,7 @@ if not info.ok:
         use_when: "Use to inspect live processes as typed records without scraping /proc or shelling out to ps.",
         examples: &[
             r#"procs = ps()"#,
-            r#"python = where(ps(), lambda p: p["command"].find("python") >= 0)"#,
+            r#"python = where(ps(), lambda p: p.command.find("python") >= 0)"#,
         ],
         avoid: &[
             "Do not parse `ps aux` text when process id, command, status, cwd, CPU, and memory fields are needed.",
@@ -1396,7 +1398,7 @@ if not info.ok:
     StoneHelpEntry {
         name: "sysinfo",
         signature: r#"sysinfo(section: "os" | "cpu" | "cpu_long" | "mem" | "disks" | "net" | "temp" | "users" | "all" = "all") -> record | list"#,
-        use_when: "Use to inspect typed host system facts without shelling out to uname, free, df, ip, or sysctl-style commands.",
+        use_when: "Use to inspect typed host system facts without shelling out to uname, free, df, ip, or sysctl-style commands. Memory and disk sizes are ints in bytes; a CPU's load_average is [1-min, 5-min, 15-min] floats.",
         examples: &[
             r#"host = sysinfo("os")"#,
             r#"mem = sysinfo("mem")"#,
@@ -2024,7 +2026,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "Lambdas: expression-only callbacks work in sort/map/filter, e.g. lambda r: r[\"name\"].",
             "String methods include strip/lstrip/rstrip, isdigit/isalpha/isalnum, count, split/rsplit/splitlines, replace, join, lower/upper, zfill, startswith, and endswith; split and rsplit accept optional maxsplit and default whitespace splitting.",
             "File handles support read(), readlines(), splitlines(), write(text), and close(). As in Python, for line in f and f.readlines() keep each line's \"\\n\" (use line.strip()); splitlines() drops it. with works only for open(...), attempt_scope(), and semantic_frontier().",
-            "Lists support append(value), extend(values), count(value), mutating sort(key=..., reverse=...), and set-style add(value) for unique append; xs += ys extends xs in place.",
+            "Lists support append(value), extend(values), count(value), index(value), and mutating sort(key=..., reverse=...); xs += ys extends xs in place. Lists have no add(); use a set (s = set(); s.add(x)) for unique values.",
             "Use emit(value) when you want structured data returned to the caller.",
             "Records: class Plan(Record): with typed fields such as steps: list[str] or risky: bool = False defines a checked, shared record; build it with Plan(steps=[...]) and use plan.steps. Annotations also take records, Literal[...], unions such as Read | Edit or str | None, and top-level aliases (Action = Read | Edit). See help(\"Record\") and help(\"model.ask\").",
             "Modules: from lib import name, other as alias loads lib.stone (pkg/util.stone for pkg.util) from the cwd, then .stone/lib, ~/.stone/lib, /usr/share/waymark/stone/lib (WAYMARK_STONE_LIB_DIRS overrides). Imports go at the top of a file and are checked before anything runs. A module only defines functions, records, error classes, and constants; its constants are read-only, and its functions see only its own names, its imports, and builtins.",
@@ -2039,7 +2041,7 @@ const STONE_HELP_TOPICS: &[StoneHelpTopic] = &[
             "No general classes or general Python decorators: a class is a field-only record (class Plan(Record): steps: list[str]; @dataclass and BaseModel spellings are accepted) or a field-only error type (class ConfigError(Exception): path: str). No methods or inheritance; write def functions that take the record. The only function decorator is Stone's @stage(...). from typing import Literal, Optional, Union, Any, List, Dict is accepted and changes nothing.",
             "No global or nonlocal: a function reads module variables and a closure reads its enclosing function's variables, but neither rebinds them. Keep shared state in a list or dict (count = [0], then count[0] += 1) or return the new value. A local assigned anywhere in a function hides the module variable for the whole function.",
             "Variables, functions, and builtins share one namespace: after len = 5, len(items) is an error. Rename the variable.",
-            "No mutable default args: write def f(items=None) and `if items is None: items = []` in the body. No *args, **kwargs, or keyword calls to user functions.",
+            "No mutable default args: write def f(items=None) and `if items is None: items = []` in the body. No *args or **kwargs; user functions accept positional and keyword arguments (f(1, limit=5)).",
             "No try/finally: the host releases attempts, daemons, and open files when an attempt ends; for your own cleanup use `except Exception as error:` + cleanup + `raise error`, and repeat the cleanup after the try.",
             "No bare except: (write except Exception as error:), no BaseException, and no except Exception: pass or except ToolError: pass (bind the error and use it, or catch a narrow type such as except KeyError: pass). No try/else, except*, or raise ... from ...",
             "Method keyword arguments are intentionally narrow: split(maxsplit=...) and sort(key=..., reverse=...) are supported; most other methods take positional arguments only.",
@@ -2182,6 +2184,7 @@ pub(crate) fn stone_help_topic(name: &str, span: Span) -> Value {
     if let Some(entry) = STONE_HELP_ENTRIES
         .iter()
         .find(|entry| entry.name == normalized)
+        .or_else(|| STONE_HELP_ENTRIES.iter().find(|entry| entry.aliases.contains(&normalized)))
     {
         let mut record = Record::with_capacity(7);
         record.push("name", Value::string(entry.name, span));

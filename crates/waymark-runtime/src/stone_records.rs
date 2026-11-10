@@ -101,6 +101,119 @@ impl RecordType {
     }
 }
 
+/// A result the host returns (a process run, a file's metadata, a process
+/// listing) as a typed record named `name`: its fields read as attributes
+/// (`r.exit_code`), and a misspelled field is an error that lists the
+/// fields, as for a record the program declares. Nested records, and lists
+/// of records, become records too (`r.effects.observed`), named after
+/// their parent and field (`RunResultEffects`) unless `nested_name` names
+/// them. A host result holds no program data, so nothing in it is a dict.
+pub(super) fn host_record(name: &str, value: Value) -> RuntimeValue {
+    match value {
+        // No fields: nothing to type (an empty map of findings, say).
+        Value::Record { ref val, .. } if val.is_empty() => RuntimeValue::Nu(value),
+        Value::Record { val, .. } => {
+            let record = val.into_owned();
+            let columns = record.columns().cloned().collect::<Vec<_>>();
+            let ty = Rc::new(RecordType::new(
+                name.to_string(),
+                Some(format!("A {name} the host returned.")),
+                columns
+                    .into_iter()
+                    .map(|column| RecordFieldDef {
+                        name: column,
+                        ty: TypeExpr::Any,
+                        default: None,
+                        limits: FieldLimits::default(),
+                    })
+                    .collect(),
+            ));
+            let values = record
+                .into_iter()
+                .map(|(field, value)| match value {
+                    Value::Record { val, .. } if is_named_map(&field) => {
+                        let child = nested_name(name, &field);
+                        dict_from_entries(
+                            val.into_owned()
+                                .into_iter()
+                                .map(|(key, value)| (key, host_record(&child, value)))
+                                .collect(),
+                        )
+                    }
+                    Value::Record { .. } | Value::List { .. }
+                        if !(holds_program_data(&field) || reported_by_child(name, &field))
+                            // A transition's outcome value is the effect's
+                            // own result (a RunResult).
+                            || (name.starts_with("TransitionEvent") && field == "value") =>
+                    {
+                        host_record(&nested_name(name, &field), value)
+                    }
+                    other => RuntimeValue::Nu(other),
+                })
+                .collect();
+            record_obj(ty, values)
+        }
+        Value::List { vals, .. } => {
+            if vals.iter().any(|value| matches!(value, Value::Record { .. })) {
+                list_from_values(vals.into_iter().map(|value| host_record(name, value)).collect())
+            } else {
+                RuntimeValue::Nu(Value::list(vals, Span::unknown()))
+            }
+        }
+        other => RuntimeValue::Nu(other),
+    }
+}
+
+/// Fields of a host result that carry program data (a child's emitted
+/// value, the task's input, an error's detail): they stay dicts and lists.
+/// JSON a child attempt reported about itself, shown by `attempt_inspect`.
+fn reported_by_child(parent: &str, field: &str) -> bool {
+    parent == "AttemptInspectResult" && matches!(field, "summary" | "details" | "error")
+}
+
+fn holds_program_data(field: &str) -> bool {
+    matches!(
+        field,
+        "value" | "values" | "input" | "inputs" | "output" | "outputs" | "detail" | "data"
+            | "json" | "payload" | "arguments" | "parsed" | "schema" | "properties"
+            // What the program stored with context_write.
+            | "content"
+            // Observations returned by Stone helper functions.
+            | "helpers"
+            // Name-keyed maps of the finding kinds the program declared.
+            | "stage_input_specs" | "input_specs"
+    )
+}
+
+/// Fields of a host result keyed by names the program chose (a workflow's
+/// findings by finding name): a dict, whose values are host records.
+fn is_named_map(field: &str) -> bool {
+    matches!(field, "stage_outputs" | "findings" | "finding_specs" | "probes")
+}
+
+/// The type name of a nested host record.
+fn nested_name(parent: &str, field: &str) -> String {
+    match (parent, field) {
+        ("WorkflowReport", "stages") => "StageReport".to_string(),
+        (_, "findings") => "Finding".to_string(),
+        (_, "finding_specs") => "FindingSpec".to_string(),
+        (_, "probes") => "Probe".to_string(),
+        (_, "stage_outputs") => "StageOutput".to_string(),
+        (_, "last_action" | "last_repair") => "RunResult".to_string(),
+        _ => {
+            let mut name = parent.to_string();
+            for part in field.split('_') {
+                let mut chars = part.chars();
+                if let Some(first) = chars.next() {
+                    name.extend(first.to_uppercase());
+                    name.push_str(chars.as_str());
+                }
+            }
+            name
+        }
+    }
+}
+
 /// A resolved type.
 #[derive(Clone)]
 pub(super) enum TypeSpec {
@@ -1552,7 +1665,9 @@ fn write_repr(value: &RuntimeValue, out: &mut String, depth: usize) -> Result<()
             TypeSpec::Error(name) => out.push_str(&format!("<class '{name}'>")),
             other => out.push_str(&other.display()),
         },
-        RuntimeValue::Model(_) => out.push_str("<model>"),
+        other if other.opaque_repr().is_some() => {
+            out.push_str(&other.opaque_repr().unwrap_or_default())
+        }
         other => out.push_str(&crate::stone_builtins::python_repr(
             &super::stone_containers::materialize(other, "str")?,
         )?),

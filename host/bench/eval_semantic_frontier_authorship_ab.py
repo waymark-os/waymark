@@ -229,7 +229,7 @@ the retained frontier created from repair_checkpoint and owner."""
         "kind":"repair-checkpoint",
         "workspace":root.workspace,
         "attempt":owner.attempt,
-        "checkpoint":repair_checkpoint.reference,
+        "checkpoint":repair_checkpoint["reference"],
     },
     ...,
   ).

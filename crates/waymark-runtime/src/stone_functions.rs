@@ -24,6 +24,9 @@ pub(super) enum CallableValue {
         params: Vec<String>,
         body: Box<Expr>,
         captures: Vec<(String, Cell)>,
+        /// Built by `predicate()`: its calls always mean the builtins, never
+        /// a program variable or function that reuses a builtin's name.
+        pure: bool,
     },
     Named {
         function_id: u64,
@@ -259,6 +262,18 @@ impl CallableValue {
             params,
             body,
             captures,
+            pure: false,
+        }
+    }
+
+    /// A lambda from `predicate()`, checked pure when it was compiled.
+    pub(super) fn pure_lambda(function_id: u64, params: Vec<String>, body: Box<Expr>) -> Self {
+        Self::Lambda {
+            function_id,
+            params,
+            body,
+            captures: Vec::new(),
+            pure: true,
         }
     }
 
@@ -331,6 +346,9 @@ pub(crate) struct StoneSession {
     /// The attempt's budget. It lives as long as the session, so every
     /// evaluation in it draws on the same budget.
     pub(crate) budget: Rc<super::stone_budget::Budget>,
+    /// What the last evaluation printed, kept so a failed run's error
+    /// response still shows its output. Taken by the response builder.
+    pub(super) last_stdout: String,
     #[cfg(test)]
     pub(crate) test_model: Option<std::rc::Rc<std::cell::RefCell<super::stone_model::TestModel>>>,
 }
@@ -341,6 +359,11 @@ impl StoneSession {
         let limits = super::stone_budget::HostLimits::parse(text)?;
         self.budget.configure(limits);
         Ok(())
+    }
+
+    /// What the last evaluation printed (cleared by this call).
+    pub(crate) fn take_last_stdout(&mut self) -> String {
+        std::mem::take(&mut self.last_stdout)
     }
 
     /// The `unfinished` record when the attempt's budget ran out.

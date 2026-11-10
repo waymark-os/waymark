@@ -118,10 +118,10 @@ def retain_action_receipt(step):
 def validate_receipt(state, receipt):
     return (
         receipt != None
-        and receipt.action_id == state.action_id
-        and receipt.input_sha256 == state.input_sha256
-        and receipt.transition_id == state.transition_id
-        and receipt.phase == "completed"
+        and receipt["action_id"] == state["action_id"]
+        and receipt["input_sha256"] == state["input_sha256"]
+        and receipt["transition_id"] == state["transition_id"]
+        and receipt["phase"] == "completed"
     )
 
 
@@ -133,21 +133,21 @@ def finalize_from_receipt(state, receipt):
         )
     terminal = {
         "version": 1,
-        "action_id": state.action_id,
-        "input_sha256": state.input_sha256,
+        "action_id": state["action_id"],
+        "input_sha256": state["input_sha256"],
         "phase": "terminal",
         "execution_state": "completed",
-        "transition_id": receipt.transition_id,
+        "transition_id": receipt["transition_id"],
         "decision": "record_outcome",
-        "outcome": receipt.outcome,
+        "outcome": receipt["outcome"],
     }
     write_action_state(terminal, "verified")
     context_write(
         RECEIPT_KEY,
         "transition_receipt",
-        {"transition_id": receipt.transition_id, "consolidated": True},
+        {"transition_id": receipt["transition_id"], "consolidated": True},
         status="archived",
-        evidence=["transition:" + receipt.transition_id],
+        evidence=["transition:" + receipt["transition_id"]],
     )
     return terminal
 
@@ -155,11 +155,11 @@ def finalize_from_receipt(state, receipt):
 def terminal_replan(state):
     terminal = {
         "version": 1,
-        "action_id": state.action_id,
-        "input_sha256": state.input_sha256,
+        "action_id": state["action_id"],
+        "input_sha256": state["input_sha256"],
         "phase": "terminal",
         "execution_state": "started_or_unknown",
-        "transition_id": state.transition_id,
+        "transition_id": state["transition_id"],
         "decision": "replan",
         "outcome": None,
     }
@@ -201,7 +201,7 @@ def controller():
             decision = "stop_before_consolidation"
         else:
             fail("unknown restart boundary: " + boundary, code="bad_restart_boundary")
-    elif state.phase == "prepared":
+    elif state["phase"] == "prepared":
         decision = "resume_once"
         result = run(
             ACTION_ARGV,
@@ -210,7 +210,7 @@ def controller():
         transition_id = result.transition_id
         state = action_state()
         state = finalize_from_receipt(state, action_receipt())
-    elif state.phase == "started_or_unknown":
+    elif state["phase"] == "started_or_unknown":
         receipt = action_receipt()
         if receipt == None:
             decision = "replan"
@@ -218,10 +218,10 @@ def controller():
         else:
             decision = "record_outcome"
             state = finalize_from_receipt(state, receipt)
-    elif state.phase == "terminal":
+    elif state["phase"] == "terminal":
         decision = "terminal_noop"
     else:
-        fail("unknown in-flight phase: " + state.phase, code="bad_inflight_phase")
+        fail("unknown in-flight phase: " + state["phase"], code="bad_inflight_phase")
 
     return {
         "boundary": boundary,

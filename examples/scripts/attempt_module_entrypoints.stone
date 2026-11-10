@@ -23,7 +23,7 @@ def main(input):
         fail("entrypoint scope cleanup failed", code="entrypoint_cleanup_failed", detail=cleanup)
 
     return {
-        "answer": input.answer,
+        "answer": input["answer"],
         "model_probe": probe.content,
         "worker": child.attempt,
         "worker_controller_state": outcome.controller_state,

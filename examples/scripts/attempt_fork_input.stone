@@ -1,6 +1,6 @@
 def worker(input):
-    write_file("/app/candidate.txt", input.message + "\n")
-    return {"answer": "worker complete", "strategy": input.strategy}
+    write_file("/app/candidate.txt", input["message"] + "\n")
+    return {"answer": "worker complete", "strategy": input["strategy"]}
 
 
 def main(input):
@@ -9,7 +9,7 @@ def main(input):
     child = attempt_fork(
         program=current_program(),
         entrypoint="worker",
-        input={"message": input.message, "strategy": "fork-input"},
+        input={"message": input["message"], "strategy": "fork-input"},
         start=True,
         scope=scope,
     )
@@ -23,7 +23,7 @@ def main(input):
         fail("fork input scope cleanup failed", code="fork_input_cleanup_failed", detail=cleanup)
 
     return {
-        "answer": input.answer,
+        "answer": input["answer"],
         "worker": child.attempt,
         "worker_controller_state": outcome.controller_state,
         "accepted_child": accepted.child.attempt,

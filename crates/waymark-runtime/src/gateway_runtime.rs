@@ -1259,7 +1259,7 @@ fn read_bytes_range(path: &Path, offset: u64, max_bytes: usize) -> Result<Vec<u8
     let config = required_config()?;
     let rel = workspace_path(&config, path)?;
     let max_bytes = u64::try_from(max_bytes).unwrap_or(u64::MAX);
-    let response = with_client(&config, |client| {
+    let response = with_file_client(&config, path, |client| {
         client.workspace_tx_read_range(&config.tx, rel, offset, max_bytes)
     })?;
     Ok(response.content)
@@ -1279,7 +1279,7 @@ pub(crate) fn read_text_lines(
     let mut line_number = 1usize;
     let mut output = Vec::with_capacity(max_bytes.min(CHUNK_BYTES));
     'chunks: loop {
-        let response = with_client(&config, |client| {
+        let response = with_file_client(&config, path, |client| {
             client.workspace_tx_read_range(
                 &config.tx,
                 rel.clone(),
@@ -1337,7 +1337,7 @@ pub(crate) fn read_bytes(path: &Path, max_bytes: usize) -> Result<Vec<u8>, Shell
     let config = required_config()?;
     let rel = workspace_path(&config, path)?;
     let max_bytes = u64::try_from(max_bytes).unwrap_or(u64::MAX);
-    Ok(with_client(&config, |client| {
+    Ok(with_file_client(&config, path, |client| {
         client.workspace_tx_read(&config.tx, rel, max_bytes)
     })?
     .content)
@@ -1346,7 +1346,7 @@ pub(crate) fn read_bytes(path: &Path, max_bytes: usize) -> Result<Vec<u8>, Shell
 pub(crate) fn write_text(path: &Path, text: &str, append: bool) -> Result<usize, ShellError> {
     let config = required_config()?;
     let rel = workspace_path(&config, path)?;
-    let response = with_client(&config, |client| {
+    let response = with_file_client(&config, path, |client| {
         client.workspace_tx_write(&config.tx, rel, text.as_bytes().to_vec(), append)
     })?;
     Ok(usize::try_from(response.bytes).unwrap_or(usize::MAX))
@@ -1355,13 +1355,13 @@ pub(crate) fn write_text(path: &Path, text: &str, append: bool) -> Result<usize,
 pub(crate) fn mkdir(path: &Path) -> Result<(), ShellError> {
     let config = required_config()?;
     let rel = workspace_path(&config, path)?;
-    with_client(&config, |client| client.workspace_tx_mkdir(&config.tx, rel))
+    with_file_client(&config, path, |client| client.workspace_tx_mkdir(&config.tx, rel))
 }
 
 pub(crate) fn remove(path: &Path) -> Result<(), ShellError> {
     let config = required_config()?;
     let rel = workspace_path(&config, path)?;
-    with_client(&config, |client| {
+    with_file_client(&config, path, |client| {
         client.workspace_tx_remove(&config.tx, rel)
     })
 }
@@ -1369,7 +1369,7 @@ pub(crate) fn remove(path: &Path) -> Result<(), ShellError> {
 pub(crate) fn stat_record(path: &Path, span: Span) -> Result<Value, ShellError> {
     let config = required_config()?;
     let rel = workspace_path(&config, path)?;
-    let entry = with_client(&config, |client| client.workspace_tx_stat(&config.tx, rel))?;
+    let entry = with_file_client(&config, path, |client| client.workspace_tx_stat(&config.tx, rel))?;
     Ok(Value::record(
         entry_record(entry, path.to_path_buf(), span),
         span,
@@ -1392,7 +1392,7 @@ pub(crate) fn stat_optional_record(path: &Path, span: Span) -> Result<Option<Val
 pub(crate) fn list_dir_records(path: &Path, span: Span) -> Result<Vec<Value>, ShellError> {
     let config = required_config()?;
     let rel = workspace_path(&config, path)?;
-    let entries = with_client(&config, |client| client.workspace_tx_list(&config.tx, rel))?;
+    let entries = with_file_client(&config, path, |client| client.workspace_tx_list(&config.tx, rel))?;
     Ok(entries
         .into_iter()
         .map(|entry| {
@@ -2479,6 +2479,41 @@ pub(crate) fn with_client<T>(
     })
 }
 
+/// A workspace file operation: a Gateway error for a missing file, a denied
+/// path, or a timeout gets the error type the local file operations raise
+/// (FileNotFoundError, PermissionError, TimeoutError), so the same
+/// `except` handler works with and without the Gateway.
+#[cfg(any(unix, target_os = "hermit"))]
+pub(crate) fn with_file_client<T>(
+    config: &GatewayRuntimeConfig,
+    path: &Path,
+    call: impl FnOnce(&mut GatewayRpcClient<GatewayClientStream>) -> waymark_gateway_client::Result<T>,
+) -> Result<T, ShellError> {
+    with_runtime_client(config, |client| {
+        call(client).map_err(|err| {
+            let error_type = match &err {
+                GatewayClientError::Rpc { kind, .. } => match kind.as_str() {
+                    "not_found" => Some("FileNotFoundError"),
+                    "permission_denied" => Some("PermissionError"),
+                    "timeout" | "timed_out" => Some("TimeoutError"),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match error_type {
+                Some(error_type) => ShellError::Generic(
+                    GenericError::new_internal(
+                        "Stone gateway file error",
+                        format!("{}: {err}", path.display()),
+                    )
+                    .with_code(crate::stone_errors::typed_error_code(error_type)),
+                ),
+                None => stone_error("gateway rpc", err.to_string()),
+            }
+        })
+    })
+}
+
 #[cfg(any(unix, target_os = "hermit"))]
 fn with_runtime_client<T>(
     config: &GatewayRuntimeConfig,
@@ -2542,6 +2577,17 @@ impl std::io::Write for UnsupportedGatewayStream {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+#[cfg(not(any(unix, target_os = "hermit")))]
+pub(crate) fn with_file_client<T>(
+    config: &GatewayRuntimeConfig,
+    _path: &Path,
+    call: impl FnOnce(
+        &mut GatewayRpcClient<UnsupportedGatewayStream>,
+    ) -> waymark_gateway_client::Result<T>,
+) -> Result<T, ShellError> {
+    with_client(config, call)
 }
 
 #[cfg(not(any(unix, target_os = "hermit")))]

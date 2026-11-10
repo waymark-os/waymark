@@ -145,7 +145,7 @@ attempt_scope_close."""
    attempt_fork already registered the child.
 4. A child for which not outcome.joined or
    outcome.result.status != "succeeded" is infrastructure failure. Otherwise
-   call evaluate_candidate(item, outcome). Candidate identity is item.name.
+   call evaluate_candidate(item, outcome). Candidate identity is item["name"].
 5. On rejected evidence, attempt_discard(outcome, reason=...) and append a
    bounded outcome record. On accepted evidence, call
    attempt_accept(root.attempt, outcome), append the accepted record, close the

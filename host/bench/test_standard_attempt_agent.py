@@ -69,13 +69,13 @@ class StandardAttemptAgentTests(unittest.TestCase):
             self.source,
         )
         self.assertIn("required_keys=required_keys", self.source)
-        self.assertIn("initial_projection = state.memory_projections == 0", self.source)
+        self.assertIn('initial_projection = state["memory_projections"] == 0', self.source)
         self.assertIn(
-            "else state.action_memory_required_keys",
+            'else state["action_memory_required_keys"]',
             self.source,
         )
         self.assertIn('"initial_action_memory_projection_keys":', self.source)
-        self.assertIn("messages = prepared.history", self.source)
+        self.assertIn('messages = prepared["history"]', self.source)
         self.assertIn(
             "standard_messages_characters(prepared)",
             self.source,
@@ -109,7 +109,7 @@ class StandardAttemptAgentTests(unittest.TestCase):
         )
         self.assertIsNotNone(critique_prompt)
         self.assertLess(len(critique_prompt.group(1)), 1024)
-        self.assertIn("read_file(args.path, max_bytes=", self.source)
+        self.assertIn('read_file(args["path"], max_bytes=', self.source)
         self.assertIn('"tool": {"const": "edit"}', self.source)
         self.assertIn("result = edit(", self.source)
         self.assertIn('"replacements": result.replacements', self.source)
@@ -120,7 +120,7 @@ class StandardAttemptAgentTests(unittest.TestCase):
         self.assertIn("cleanup = run_wait(", self.source)
         self.assertIn("except Exception as error:", self.source)
         self.assertIn(
-            "termination_attempts < options.run_cleanup_wait_attempts",
+            'termination_attempts < options["run_cleanup_wait_attempts"]',
             self.source,
         )
         self.assertIn('"run_cleanup_wait_ms": 5000', self.source)
@@ -158,7 +158,7 @@ class StandardAttemptAgentTests(unittest.TestCase):
         self.assertIn('"requirement.audit"', self.source)
         self.assertIn('"evidence.action." + str(slot)', self.source)
         self.assertIn(
-            "slot = (state.tool_calls - 1) % options.max_evidence_items",
+            'slot = (state["tool_calls"] - 1) % options["max_evidence_items"]',
             self.source,
         )
         self.assertIn('"completion_critique": True', self.source)
@@ -166,11 +166,11 @@ class StandardAttemptAgentTests(unittest.TestCase):
         self.assertIn('"max_actions": 0', self.source)
         self.assertIn('"max_model_calls": 0', self.source)
         self.assertIn(
-            "while options.max_rounds == 0 or round < options.max_rounds:",
+            'while options["max_rounds"] == 0 or round < options["max_rounds"]:',
             self.source,
         )
         self.assertIn(
-            "if options.max_actions > 0 and state.actions > options.max_actions:",
+            'if options["max_actions"] > 0 and state["actions"] > options["max_actions"]:',
             self.source,
         )
         self.assertIn('"max_completion_critiques": 2', self.source)
@@ -181,7 +181,7 @@ class StandardAttemptAgentTests(unittest.TestCase):
         self.assertIn('else "contradicted"', self.source)
         self.assertNotIn('else "rejected"', self.source)
         self.assertIn(
-            "state.model_calls + 1 + reserved_calls > options.max_model_calls",
+            'state["model_calls"] + 1 + reserved_calls > options["max_model_calls"]',
             self.source,
         )
         self.assertIn('"name": "stone.standard_action_v14"', self.source)
@@ -194,11 +194,11 @@ class StandardAttemptAgentTests(unittest.TestCase):
         self.assertIn('"stage": "budget_checkpoint"', self.source)
         self.assertIn('"budget_checkpoint_repair"', self.source)
         self.assertIn(
-            "state.model_calls >= checkpoint_at",
+            'state["model_calls"] >= checkpoint_at',
             self.source,
         )
         self.assertIn(
-            "state.model_calls + 4 <= options.max_model_calls",
+            'state["model_calls"] + 4 <= options["max_model_calls"]',
             self.source,
         )
         self.assertIn('"stage": "blocked"', self.source)

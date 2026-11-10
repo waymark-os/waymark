@@ -525,7 +525,7 @@ pub(crate) fn stone_helper_observations_from_value(value: Value) -> Result<Vec<V
             "helper",
             format!(
                 "helper callback must return a record, list of records, or None; got {}",
-                other.get_type()
+                crate::stone_builtins::value_type_name(&other)
             ),
         )),
     }

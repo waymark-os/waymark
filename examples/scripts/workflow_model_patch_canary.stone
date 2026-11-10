@@ -108,7 +108,7 @@ def main(input):
     report = selected_report
     if not selected_report.ok:
         fallback_replacement = "bundle_runtime_path_guard"
-        if inference.value.replacement == "bundle_runtime_path_guard":
+        if inference.value["replacement"] == "bundle_runtime_path_guard":
             fallback_replacement = "bundle_runtime"
         fallback_patch = {
             "target": "bundle_runtime_broken",

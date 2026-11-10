@@ -247,7 +247,7 @@ except BaseException:
 def len(x):
     return 42
 print(len([1, 2]))
-"""),
+""", target="error", note="a top-level def may not reuse a builtin's name"),
     p("l18_local_shadow", "L18", """
 def f():
     sum = 0

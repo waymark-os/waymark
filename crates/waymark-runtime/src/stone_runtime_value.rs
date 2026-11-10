@@ -207,6 +207,32 @@ impl RuntimeValue {
         }
     }
 
+    /// Python-style text for a value that lives only inside the running
+    /// program (functions, the model, open files, workflow and attempt
+    /// controls): `<function f>`, as Python prints `<function f at 0x...>`.
+    /// None for values that are data.
+    pub(super) fn opaque_repr(&self) -> Option<String> {
+        Some(match self {
+            RuntimeValue::Model(_) => "<model>".to_string(),
+            RuntimeValue::File(_) => "<file>".to_string(),
+            RuntimeValue::Callable(callable) => match callable {
+                super::stone_functions::CallableValue::Lambda { .. } => "<function <lambda>>".to_string(),
+                super::stone_functions::CallableValue::Named { function, .. } => {
+                    format!("<function {}>", function.name)
+                }
+            },
+            RuntimeValue::TransitionHooks(_) => "<transition hooks>".to_string(),
+            RuntimeValue::WorkflowEvidenceSource(_) => "<workflow evidence>".to_string(),
+            RuntimeValue::WorkflowStage(stage) => format!("<workflow stage {}>", stage.name),
+            RuntimeValue::Workflow(workflow) => format!("<workflow {}>", workflow.name),
+            RuntimeValue::AgentControl(control) => format!("<agent control {}>", control.name()),
+            RuntimeValue::AttemptBest(_) => "<attempt_best>".to_string(),
+            RuntimeValue::AttemptScope(_) => "<attempt scope>".to_string(),
+            RuntimeValue::SemanticFrontier(_) => "<semantic frontier>".to_string(),
+            _ => return None,
+        })
+    }
+
     pub(super) fn into_nu_value(self, context: &str) -> Result<Value, ShellError> {
         match self {
             RuntimeValue::Nu(value) => Ok(value),

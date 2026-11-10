@@ -27,7 +27,7 @@ def main(input):
     owner_outcome = attempt_join(owner, timeout_ms=30000)
     if not owner_outcome.joined or owner_outcome.result.status != "succeeded":
         fail("owner setup failed", code="frontier_authorship_owner_failed")
-    repair_checkpoint = owner_outcome.result.value.checkpoint
+    repair_checkpoint = owner_outcome.result.value["checkpoint"]
     attempt_finish("fail", attempt=owner, reason="injected late failure")
 
     repaired = attempt_spawn(
@@ -37,7 +37,7 @@ def main(input):
             "kind": "repair-checkpoint",
             "workspace": root.workspace,
             "attempt": owner.attempt,
-            "checkpoint": repair_checkpoint.reference,
+            "checkpoint": repair_checkpoint["reference"],
         },
         task_input={
             "label": "retained-branch",

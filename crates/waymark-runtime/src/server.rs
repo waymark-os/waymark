@@ -1721,7 +1721,7 @@ mod tests {
                         "runtime": { "frontend": "stone" },
                         "script": {
                             "source": format!(
-                                "marker = open(\"{}\", \"w\")\nmarker.write(\"marker\")\nnames = []\nfor item in ls(\"{}\"):\n    names.append(item[\"name\"])\nemit(names)",
+                                "marker = open(\"{}\", \"w\")\nmarker.write(\"marker\")\nnames = []\nfor item in ls(\"{}\"):\n    names.append(item.name)\nemit(names)",
                                 marker.display(),
                                 root.display()
                             )
@@ -1745,7 +1745,7 @@ mod tests {
                         "runtime": { "frontend": "stone" },
                         "script": {
                             "source": format!(
-                                "names = []\nfor item in ls(\"{}\"):\n    names.append(item[\"name\"])\nemit(names)",
+                                "names = []\nfor item in ls(\"{}\"):\n    names.append(item.name)\nemit(names)",
                                 root.display()
                             )
                         },
@@ -1776,7 +1776,7 @@ mod tests {
                         "runtime": { "frontend": "stone" },
                         "script": {
                             "source": format!(
-                                "names = []\nfor item in ls(\"{}\"):\n    names.append(item[\"name\"])\nemit(names)",
+                                "names = []\nfor item in ls(\"{}\"):\n    names.append(item.name)\nemit(names)",
                                 root.display()
                             )
                         },

@@ -85,7 +85,7 @@ def portfolio_materialize_strategy(strategy):
 
 
 def portfolio_read_only_dispatch(action, options):
-    if action.tool == "read":
+    if action["tool"] == "read":
         return standard_shell_dispatch(action, options)
     return {
         "ok": False,
@@ -107,7 +107,7 @@ def portfolio_verify_finish(candidate, session, state):
             "portfolio child lost its admitted requirement",
             code="portfolio_requirement_missing",
         )
-    expected = requirements[0].content.expected
+    expected = requirements[0].content["expected"]
     output = read_text("answer.txt").strip()
     verification = run(
         ["python3", "verify_candidate.py"],
@@ -121,7 +121,7 @@ def portfolio_verify_finish(candidate, session, state):
         "candidate.verification",
         "evidence",
         {
-            "strategy": session.input.strategy,
+            "strategy": session.input["strategy"],
             "output": output,
             "expected": expected,
             "passed": passed,
@@ -130,7 +130,7 @@ def portfolio_verify_finish(candidate, session, state):
         status="verified" if passed else "contradicted",
         evidence=["portfolio:shared-verifier"],
     )
-    candidate["strategy"] = session.input.strategy
+    candidate["strategy"] = session.input["strategy"]
     candidate["candidate_output"] = output
     candidate["passed"] = passed
     candidate["verification_exit_code"] = verification.exit_code
@@ -138,7 +138,7 @@ def portfolio_verify_finish(candidate, session, state):
 
 
 def portfolio_worker(input):
-    prepared = portfolio_materialize_strategy(input.strategy)
+    prepared = portfolio_materialize_strategy(input["strategy"])
     marker = read_text("shared-prefix.txt").strip()
     session = agent_session()
     options = standard_agent_options(session.input)
@@ -151,7 +151,7 @@ def portfolio_worker(input):
     )
     memory_keys = map(lambda item: item.key, context_read(limit=16))
     return {
-        "strategy": input.strategy,
+        "strategy": input["strategy"],
         "prepared_output": prepared,
         "shared_prefix": marker,
         "legacy_policy_in_input": (
@@ -171,7 +171,7 @@ def portfolio_trace_ops(inspection):
 
 
 def portfolio_parent(input):
-    if len(input.strategies) != 2:
+    if len(input["strategies"]) != 2:
         fail(
             "portfolio example requires exactly two strategies",
             code="portfolio_bad_strategy_count",
@@ -180,8 +180,8 @@ def portfolio_parent(input):
 
     # This is the expensive/common prefix. None of these files exist in the
     # canonical generation used by an ordinary spawn.
-    write_text("problem.txt", input.problem + "\n")
-    write_text("shared-prefix.txt", input.frontier_marker + "\n")
+    write_text("problem.txt", input["problem"] + "\n")
+    write_text("shared-prefix.txt", input["frontier_marker"] + "\n")
     write_text(
         "verify_candidate.py",
         (
@@ -195,7 +195,7 @@ def portfolio_parent(input):
         PORTFOLIO_REQUIREMENT_KEY,
         "requirement",
         {
-            "expected": input.expected,
+            "expected": input["expected"],
             "contract": "answer must equal the reverse of problem.txt",
         },
         status="verified",
@@ -226,10 +226,10 @@ def portfolio_parent(input):
         )
     baseline_result = baseline_outcome.result.value
     if (
-        baseline_result.problem_seen
-        or baseline_result.verifier_seen
-        or baseline_result.marker_seen
-        or baseline_result.memory_seen
+        baseline_result["problem_seen"]
+        or baseline_result["verifier_seen"]
+        or baseline_result["marker_seen"]
+        or baseline_result["memory_seen"]
     ):
         fail(
             "lifecycle-parented spawn unexpectedly inherited fork state",
@@ -250,14 +250,14 @@ def portfolio_parent(input):
 
     scope = attempt_scope(join_timeout_ms=60000)
     children = []
-    for strategy in input.strategies:
+    for strategy in input["strategies"]:
         children.append(attempt_fork(
             program=current_program(),
             entrypoint="portfolio_worker",
             input={
                 "strategy": strategy,
                 "action_memory_projection_tokens": 192,
-                "max_turns": input.max_turns,
+                "max_turns": input["max_turns"],
                 "completion_critique": False,
                 "proactive_completion_checkpoint": False,
             },
@@ -306,20 +306,20 @@ def portfolio_parent(input):
         trace_ops = portfolio_trace_ops(inspection)
         child_results.append({
             "attempt": outcome.attempt,
-            "strategy": child.strategy,
+            "strategy": child["strategy"],
             "result": child,
             "fork_memory_ref": outcome.record.fork_origin.memory_ref,
             "fork_memory_revision": outcome.record.fork_origin.memory_revision,
         })
         pre_inspections.append({
             "attempt": outcome.attempt,
-            "strategy": child.strategy,
+            "strategy": child["strategy"],
             "resource_state": inspection.resource_state,
             "resources_reclaimed": inspection.resources_reclaimed,
             "trace_ops": trace_ops,
-            "summary_passed": inspection.summary.agent_result.passed,
+            "summary_passed": inspection.summary["agent_result"]["passed"],
         })
-        if child.agent_result.passed:
+        if child["agent_result"]["passed"]:
             if winner != None:
                 fail(
                     "portfolio produced multiple verified winners",
@@ -357,11 +357,11 @@ def portfolio_parent(input):
         )
 
     answer = read_text("answer.txt").strip()
-    if answer != input.expected:
+    if answer != input["expected"]:
         fail(
             "accepted portfolio candidate has the wrong answer",
             code="portfolio_accept_failed",
-            detail={"expected": input.expected, "actual": answer},
+            detail={"expected": input["expected"], "actual": answer},
         )
     parent_keys = map(lambda item: item.key, context_read(limit=16))
     if parent_keys != [
@@ -378,8 +378,8 @@ def portfolio_parent(input):
         "answer": answer,
         "winner": winner.attempt,
         "loser": loser.attempt,
-        "winner_strategy": winner.result.value.strategy,
-        "loser_strategy": loser.result.value.strategy,
+        "winner_strategy": winner.result.value["strategy"],
+        "loser_strategy": loser.result.value["strategy"],
         "accepted": accepted.child.attempt,
         "baseline_attempt": baseline.attempt,
         "baseline_result": baseline_result,

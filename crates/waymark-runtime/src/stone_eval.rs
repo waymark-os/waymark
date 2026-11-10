@@ -60,7 +60,7 @@ use crate::stone_builtins::{
     add_values, bitwise_int_values, compare_values, div_values, enumerate_builtin,
     find_method_builtin, first_builtin, float_builtin, floor_div_values, format_builtin,
     index_method_builtin, int_builtin, join_builtin, last_builtin, len_builtin, list_builtin,
-    map_builtin_value, min_max_builtin, mod_values, mul_values, neg_value, parse_float_builtin,
+    map_builtin_value, value_ordering, mod_values, mul_values, neg_value, parse_float_builtin,
     parse_int_builtin, python_str, range_builtin, record_method_builtin, repr_builtin,
     round_builtin, shift_value, slice_builtin, sort_builtin_values,
     sort_key_for_value, sort_keyed, split_builtin, starts_with_builtin, str_builtin,
@@ -99,7 +99,7 @@ use crate::stone_vm::{
 };
 use crate::StoneGuest;
 use stone_model::ModelValue;
-use stone_records::{RecordType, TypeSpec, TypeTable};
+use stone_records::{host_record, RecordType, TypeSpec, TypeTable};
 
 #[path = "stone_budget.rs"]
 mod stone_budget;
@@ -199,6 +199,9 @@ pub struct EvalState {
     /// whatever statements follow; a program that never emits returns its
     /// last statement's value.
     emitted: Option<Value>,
+    /// True while a `predicate()` lambda's body runs: calls go straight to
+    /// the builtins.
+    pure_calls: bool,
     session_bound_names: Vec<String>,
     /// Modules linked into this program, for diagnostics.
     modules: Vec<JsonValue>,
@@ -1008,6 +1011,7 @@ fn eval_program_with_source_options(
                 .unwrap_or_default(),
             stdout: String::new(),
             emitted: None,
+            pure_calls: false,
             session_bound_names: Vec::new(),
             modules: Vec::new(),
             types: options
@@ -1066,6 +1070,7 @@ fn eval_program_with_source_options(
         session.update_context(&evaluator.state.context);
         session.update_transition_id(evaluator.state.next_transition_id);
         session.update_host_errors(&evaluator.state.host_errors);
+        session.last_stdout = evaluator.state.stdout.clone();
     }
     // What the program printed before its budget ran out belongs to the
     // unfinished result.
@@ -1376,10 +1381,10 @@ impl Evaluator<'_> {
                 .as_ref()
                 .map(|decorator| self.eval_stage_declaration(&module_function, decorator))
                 .transpose()?;
-            self.state.functions.insert(
-                module_function.name.clone(),
-                Rc::new(module_function.clone()),
-            );
+            let instance = self.instantiate_function(&module_function)?;
+            self.state
+                .functions
+                .insert(module_function.name.clone(), instance);
             if let Some(stage) = stage {
                 self.state.set_local(
                     module_function.name.clone(),
@@ -1432,8 +1437,16 @@ impl Evaluator<'_> {
                 let flow = self.eval_stmt(statement, input, record_session_bindings)?;
                 input = PipelineData::empty();
                 match flow {
+                    // Only an expression statement has a value: a program
+                    // that never emits returns its final expression, and a
+                    // loop, branch, or assignment gives None, never the
+                    // last value computed inside it.
                     EvalFlow::Output(value) => {
-                        output = value;
+                        output = if matches!(statement, Stmt::Expr(_)) {
+                            value
+                        } else {
+                            PipelineData::empty()
+                        };
                     }
                     EvalFlow::Break | EvalFlow::Continue | EvalFlow::Return(_) => return Ok(flow),
                 }
@@ -1606,18 +1619,18 @@ impl Evaluator<'_> {
                     // other value the function binds; it does not leak into
                     // the module's function table.
                     let captures = self.state.capture_cells(&function.scope.captures);
+                    let instance = self.instantiate_function(function)?;
                     let callable = CallableValue::closure(
                         self.state.next_callable_id(),
-                        Rc::new(function.clone()),
+                        instance,
                         captures,
                     );
                     self.state
                         .set_local(function.name.clone(), RuntimeValue::Callable(callable));
                     return Ok(EvalFlow::Output(PipelineData::empty()));
                 }
-                self.state
-                    .functions
-                    .insert(function.name.clone(), Rc::new(function.clone()));
+                let instance = self.instantiate_function(function)?;
+                self.state.functions.insert(function.name.clone(), instance);
                 if let Some(stage) = stage {
                     self.state
                         .set_local(function.name.clone(), RuntimeValue::WorkflowStage(stage));
@@ -1721,6 +1734,12 @@ impl Evaluator<'_> {
         let generic_loop_plan = hot_loop_enabled
             .then(|| try_lower_generic_loop(targets, iter, body))
             .flatten();
+        // `for i, x in enumerate(xs)` over a list walks it live too.
+        if let Expr::Call(call) = iter {
+            if let Some(flow) = self.try_eval_for_enumerate_live(targets, call, body)? {
+                return Ok(flow);
+            }
+        }
         let iterable = self.eval_expr_value(iter, PipelineData::empty())?;
         match iterable {
             RuntimeValue::JsonlRows(rows) => {
@@ -1755,6 +1774,37 @@ impl Evaluator<'_> {
                     .into_iter()
                     .map(|line| RuntimeValue::Nu(Value::string(line, Span::unknown())));
                 self.eval_for_values(targets, values, body)
+            }
+            // Python walks a list by position and re-reads its length at
+            // each step, so items the body appends are visited (a worklist)
+            // and writes to later items are seen. The loop engine works on
+            // copies, so a list loop always takes this path.
+            RuntimeValue::List(list) => {
+                let mut index = 0usize;
+                let live = std::iter::from_fn(move || {
+                    let item = (index < list.len())
+                        .then(|| list.get(index as i64))
+                        .flatten();
+                    index += 1;
+                    item
+                });
+                self.eval_for_values(targets, live, body)
+            }
+            // Changing a dict's or set's size while looping over it is an
+            // error, as in Python.
+            RuntimeValue::Dict(dict) => {
+                let size = dict.len();
+                let keys = dict
+                    .keys()
+                    .into_iter()
+                    .map(|key| RuntimeValue::Nu(Value::string(key, Span::unknown())))
+                    .collect::<Vec<_>>();
+                self.eval_for_values_sized(targets, keys, body, || dict.len() == size, "dictionary")
+            }
+            RuntimeValue::Set(set) => {
+                let size = set.len();
+                let values = set.values();
+                self.eval_for_values_sized(targets, values, body, || set.len() == size, "set")
             }
             value => {
                 let values = self.eval_iterable_value(value)?;
@@ -1922,6 +1972,84 @@ impl Evaluator<'_> {
         Ok(EvalFlow::Output(output))
     }
 
+    /// `for i, x in enumerate(xs[, start])` where `xs` is a list: positions
+    /// are read live, as in the plain list loop. Returns None for any other
+    /// iterable, which the caller evaluates as usual.
+    fn try_eval_for_enumerate_live(
+        &mut self,
+        targets: &[String],
+        call: &Call,
+        body: &[Stmt],
+    ) -> Result<Option<EvalFlow>, ShellError> {
+        if call.name != "enumerate"
+            || !call.named.is_empty()
+            || !matches!(call.positional.len(), 1 | 2)
+            || self.state.pure_calls
+            || self.state.get_local("enumerate").is_some()
+        {
+            return Ok(None);
+        }
+        let Expr::Name(_) = &call.positional[0] else {
+            return Ok(None);
+        };
+        let RuntimeValue::List(list) =
+            self.eval_expr_value(&call.positional[0], PipelineData::empty())?
+        else {
+            return Ok(None);
+        };
+        let start = match call.positional.get(1) {
+            Some(start) => {
+                let start = self
+                    .eval_expr_value(start, PipelineData::empty())?
+                    .into_nu_value("enumerate")?;
+                value_to_i64(&start, "enumerate")?
+            }
+            None => 0,
+        };
+        let mut offset = 0usize;
+        let live = std::iter::from_fn(move || {
+            let item = (offset < list.len())
+                .then(|| list.get(offset as i64))
+                .flatten()?;
+            let index = start.saturating_add(offset as i64);
+            offset += 1;
+            Some(list_from_values(vec![
+                RuntimeValue::Nu(Value::int(index, Span::unknown())),
+                item,
+            ]))
+        });
+        self.eval_for_values(targets, live, body).map(Some)
+    }
+
+    /// A loop over a dict's keys or a set's items: the body may change
+    /// values but not the size, as in Python.
+    fn eval_for_values_sized(
+        &mut self,
+        targets: &[String],
+        values: Vec<RuntimeValue>,
+        body: &[Stmt],
+        same_size: impl Fn() -> bool,
+        what: &str,
+    ) -> Result<EvalFlow, ShellError> {
+        let mut output = PipelineData::empty();
+        for value in values {
+            if !same_size() {
+                return Err(changed_size_error(what));
+            }
+            self.assign_loop_targets(targets, value)?;
+            match self.eval_block(body, PipelineData::empty(), false)? {
+                EvalFlow::Output(value) => output = value,
+                EvalFlow::Break => return Ok(EvalFlow::Output(output)),
+                EvalFlow::Continue => continue,
+                flow @ EvalFlow::Return(_) => return Ok(flow),
+            }
+        }
+        if !same_size() {
+            return Err(changed_size_error(what));
+        }
+        Ok(EvalFlow::Output(output))
+    }
+
     fn try_eval_fused_map_update_if(
         &mut self,
         condition: &Expr,
@@ -1995,7 +2123,7 @@ impl Evaluator<'_> {
             }
             if exists {
                 let current = dict.get(key).ok_or_else(|| {
-                    stone_error("assignment", format!("record has no key `{key}`"))
+                    stone_error("assignment", format!("dict has no key `{key}`"))
                 })?;
                 let current = materialize(&current, "assignment")?;
                 dict.insert(
@@ -2017,7 +2145,7 @@ impl Evaluator<'_> {
             let slot = val
                 .to_mut()
                 .get_mut(key)
-                .ok_or_else(|| stone_error("assignment", format!("record has no key `{key}`")))?;
+                .ok_or_else(|| stone_error("assignment", format!("dict has no key `{key}`")))?;
             *slot = add_values(slot, &addend)?;
         } else {
             val.to_mut().insert(key.to_owned(), addend);
@@ -2147,7 +2275,7 @@ impl Evaluator<'_> {
                 }
                 self.state.push_scope();
                 if let Some(name) = &handler.name {
-                    let value = RuntimeValue::Nu(error_record.clone());
+                    let value = RuntimeValue::Nu(with_declared_code(error_record.clone()));
                     // A host-reported error is attested by the host, so it is
                     // read-only; editing a copy is how to change it.
                     let value = if is_host_only_error_type(&error_type) {
@@ -2553,7 +2681,7 @@ impl Evaluator<'_> {
                             "function call",
                             format!(
                                 "{name}() message must be a string, got {}; use str(value) or an f-string",
-                                other.get_type()
+                                crate::stone_builtins::value_type_name(&other)
                             ),
                         ));
                     }
@@ -3009,16 +3137,10 @@ impl Evaluator<'_> {
                     || self.state.types.record(&call.name).is_some()
                     || self.state.get_local(&call.name).is_some() =>
             {
-                Ok(self
-                    .eval_expr_value(expression, input)?
-                    .into_nu_value("pipeline")?
-                    .into_pipeline_data())
+                statement_value(self.eval_expr_value(expression, input)?)
             }
             Expr::Call(call) => Err(unknown_stone_call_error(&call.name)),
-            other => Ok(self
-                .eval_expr_value(other, input)?
-                .into_nu_value("pipeline")?
-                .into_pipeline_data()),
+            other => statement_value(self.eval_expr_value(other, input)?),
         }
     }
 
@@ -3263,6 +3385,16 @@ impl Evaluator<'_> {
                         captures,
                     )))
                 }
+                // In a predicate, a call is a builtin: compile_predicate
+                // admitted only pure builtins, and no program name may stand
+                // in for one.
+                Expr::Call(call) if self.state.pure_calls => {
+                    if is_builtin_call(call) {
+                        self.eval_builtin_call(call, input)
+                    } else {
+                        Err(unknown_stone_call_error(&call.name))
+                    }
+                }
                 Expr::Call(call) => match self.state.get_local(&call.name) {
                     // Python's one namespace: a variable in scope (a nested
                     // def, a lambda, a callable passed in) is what the name
@@ -3389,7 +3521,9 @@ impl Evaluator<'_> {
             if call.name == "run" {
                 self.state.async_run_await_count =
                     self.state.async_run_await_count.saturating_add(1);
-                return self.eval_run_transition_call(call, "run_await", true);
+                return self
+                    .eval_run_transition_call(call, "run_await", true)
+                    .map(|value| type_host_result("run", value));
             }
         }
         let value = self.eval_expr_value(expression, PipelineData::empty())?;
@@ -3422,7 +3556,7 @@ impl Evaluator<'_> {
         let Some(value) = json_object_view_get(&view, key)? else {
             return Err(stone_error(
                 "subscript",
-                format!("record has no key `{key}`"),
+                format!("dict has no key `{key}`"),
             ));
         };
         Ok(Some(value))
@@ -3433,6 +3567,16 @@ impl Evaluator<'_> {
         call: &Call,
         input: PipelineData,
     ) -> Result<RuntimeValue, ShellError> {
+        // Documented keyword arguments (`enumerate(xs, start=1)`,
+        // `round(x, ndigits=2)`) are placed in their positional slots.
+        let normalized;
+        let call = match builtin_keyword_slots(&call.name) {
+            Some(slots) if !call.named.is_empty() => {
+                normalized = place_keyword_arguments(call, slots)?;
+                &normalized
+            }
+            _ => call,
+        };
         let started = self.state.profiler.start();
         let result = match call.name.as_str() {
             "int" => {
@@ -3696,7 +3840,7 @@ impl Evaluator<'_> {
         self.state
             .profiler
             .finish(EvalProfileBucket::BuiltinCall, started);
-        result
+        result.map(|value| type_host_result(&call.name, value))
     }
 
     /// Calling a variable that holds a non-function value. When the name is
@@ -3721,6 +3865,33 @@ impl Evaluator<'_> {
             ),
         };
         stone_error("callable", message)
+    }
+
+    /// The function a `def` statement binds: its default argument values
+    /// are evaluated now, once, in the scope where the `def` runs (as in
+    /// Python). A list or dict literal default is rejected at lowering, so
+    /// a container default is a value the program already holds, shared as
+    /// Python shares it. An error class's constructor keeps fresh field
+    /// defaults per instance, like a record's.
+    fn instantiate_function(
+        &mut self,
+        function: &FunctionDef,
+    ) -> Result<Rc<FunctionDef>, ShellError> {
+        if function.error_base.is_some()
+            || function.params.iter().all(|param| param.default.is_none())
+        {
+            return Ok(Rc::new(function.clone()));
+        }
+        let mut values = Vec::with_capacity(function.params.len());
+        for param in &function.params {
+            values.push(match &param.default {
+                Some(default) => Some(self.eval_expr_value(default, PipelineData::empty())?),
+                None => None,
+            });
+        }
+        let mut instance = function.clone();
+        instance.defaults = crate::stone_ast::DefaultValues(Some(Rc::new(values)));
+        Ok(Rc::new(instance))
     }
 
     fn eval_user_function_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -3831,10 +4002,18 @@ impl Evaluator<'_> {
             supplied[index] = Some(value);
         }
 
+        let defaults = function
+            .defaults
+            .0
+            .as_ref()
+            .and_then(|defaults| defaults.downcast_ref::<Vec<Option<RuntimeValue>>>());
         let mut bindings = Vec::with_capacity(function.params.len());
-        for (param, supplied) in function.params.iter().zip(supplied) {
+        for (index, (param, supplied)) in function.params.iter().zip(supplied).enumerate() {
             let value = match supplied {
                 Some(value) => value,
+                None if defaults.is_some_and(|defaults| defaults[index].is_some()) => {
+                    defaults.and_then(|defaults| defaults[index].clone()).expect("default")
+                }
                 None => self.eval_expr_value(
                     param.default.as_ref().ok_or_else(|| {
                         stone_error(
@@ -4001,19 +4180,22 @@ impl Evaluator<'_> {
             }
             RuntimeValue::Model(model) => {
                 return match attr {
-                    "usage" => Ok(RuntimeValue::Nu(json_to_nu_value(
-                        model.meter.usage_json(),
-                        Span::unknown(),
-                    ))),
+                    "usage" => Ok(host_record(
+                        "ModelUsage",
+                        json_to_nu_value(model.meter.usage_json(), Span::unknown()),
+                    )),
                     "remaining" => {
                         self.state.budget.ensure_loaded(gateway_attempt_limits);
-                        Ok(RuntimeValue::Nu(json_to_nu_value(
-                            self.state.budget.remaining_json(&model.meter),
-                            Span::unknown(),
-                        )))
+                        Ok(host_record(
+                            "ModelBudget",
+                            json_to_nu_value(
+                                self.state.budget.remaining_json(&model.meter),
+                                Span::unknown(),
+                            ),
+                        ))
                     }
                     "last" => Ok(match model.last.borrow().as_ref() {
-                        Some(last) => RuntimeValue::Nu(json_to_nu_value(last.clone(), Span::unknown())),
+                        Some(last) => host_record("ModelCall", json_to_nu_value(last.clone(), Span::unknown())),
                         None => RuntimeValue::Nu(Value::nothing(Span::unknown())),
                     }),
                     "ask" | "limit" => Err(stone_error(
@@ -4027,6 +4209,19 @@ impl Evaluator<'_> {
                 };
             }
             _ => {}
+        }
+        // A dict is read with `d[key]`. `d.key` would make keys and methods
+        // one namespace (`d.keys` would be a key, or the method). A caught
+        // error is the exception: its fields read as attributes.
+        if self.error_value_type(&receiver).is_none()
+            && matches!(
+                receiver,
+                RuntimeValue::Dict(_)
+                    | RuntimeValue::JsonObjectView(_)
+                    | RuntimeValue::Nu(Value::Record { .. })
+            )
+        {
+            return Err(dict_attribute_error(&receiver, attr));
         }
         if let RuntimeValue::JsonObjectView(view) = receiver {
             let Some(value) = json_object_view_get(&view, attr)? else {
@@ -4061,35 +4256,51 @@ impl Evaluator<'_> {
             };
             return Ok(RuntimeValue::Nu(value));
         }
+        // Fields of attempt values that hold records are host records too.
+        let host_field = |owner: &str, value: Value| host_record(&host_field_type(owner, attr), value);
         if let RuntimeValue::AttemptBest(best) = receiver {
             if attr == "outcome" {
                 return best.typed_outcome().map(RuntimeValue::AttemptOutcome);
             }
-            return best.attribute(attr).map(RuntimeValue::Nu);
+            return best.attribute(attr).map(|value| host_field("AttemptBest", value));
         }
         if let RuntimeValue::AttemptFailure(failure) = receiver {
             if attr == "outcome" {
                 return failure.typed_outcome().map(RuntimeValue::AttemptOutcome);
             }
-            return failure.attribute(attr).map(RuntimeValue::Nu);
+            return failure.attribute(attr).map(|value| host_field("AttemptFailure", value));
         }
         if let RuntimeValue::AttemptHandle(handle) = receiver {
-            return handle.attribute(attr).map(RuntimeValue::Nu);
+            return handle.attribute(attr).map(|value| host_field("AttemptHandle", value));
         }
         if let RuntimeValue::AttemptOutcome(outcome) = receiver {
-            return outcome.attribute(attr).map(RuntimeValue::Nu);
+            return outcome.attribute(attr).map(|value| host_field("AttemptOutcome", value));
         }
         if let RuntimeValue::AttemptAcceptance(acceptance) = receiver {
             if attr == "selected" {
                 return Ok(RuntimeValue::AttemptHandle(acceptance.selected_handle()));
             }
-            return acceptance.attribute(attr).map(RuntimeValue::Nu);
+            return acceptance
+                .attribute(attr)
+                .map(|value| host_field("AttemptAcceptance", value));
         }
         if let RuntimeValue::SemanticFrontier(frontier) = receiver {
-            return frontier.attribute(attr).map(RuntimeValue::Nu);
+            return frontier
+                .attribute(attr)
+                .map(|value| host_field("SemanticFrontier", value));
         }
         if let RuntimeValue::Dict(dict) = &receiver {
             if let Some(value) = dict.get(attr) {
+                // An error the host raised (ExpectationFailed, ...) carries
+                // host results, such as the process `result`: records.
+                if let Some(error_type) = self.error_value_type(&receiver) {
+                    if is_host_only_error_type(&error_type)
+                        && matches!(value, RuntimeValue::Dict(_) | RuntimeValue::List(_))
+                    {
+                        let plain = materialize(&value, "attribute")?;
+                        return Ok(host_record(&host_field_type(&error_type, attr), plain));
+                    }
+                }
                 return Ok(value);
             }
         }
@@ -4097,7 +4308,7 @@ impl Evaluator<'_> {
         let Value::Record { val, .. } = receiver else {
             return Err(stone_error(
                 "attribute",
-                format!("{} has no attribute `{attr}`", receiver.get_type()),
+                format!("{} has no attribute `{attr}`", crate::stone_builtins::value_type_name(&receiver)),
             ));
         };
         if let Some(value) = val.get(attr).cloned() {
@@ -4124,7 +4335,7 @@ impl Evaluator<'_> {
                 "callable",
                 format!(
                     "expected lambda/callable, got {}",
-                    other.into_nu_value("callable")?.get_type()
+                    runtime_type_name(&other)
                 ),
             )),
         }
@@ -4153,6 +4364,7 @@ impl Evaluator<'_> {
                 params,
                 body,
                 captures,
+                pure,
             } => {
                 if args.len() > params.len() {
                     return Err(stone_error(
@@ -4205,7 +4417,9 @@ impl Evaluator<'_> {
                 for (name, value) in bindings {
                     self.state.set_local(name.clone(), value);
                 }
+                let outer_pure = std::mem::replace(&mut self.state.pure_calls, *pure);
                 let result = self.eval_expr_value(body, PipelineData::empty());
+                self.state.pure_calls = outer_pure;
                 self.state.pop_scope()?;
                 result
             }
@@ -4940,7 +5154,7 @@ impl Evaluator<'_> {
         let Value::List { vals, .. } = rows else {
             return Err(stone_error(
                 "write_jsonl",
-                format!("expected list, got {}", rows.get_type()),
+                format!("expected list, got {}", crate::stone_builtins::value_type_name(&rows)),
             ));
         };
         Ok(RuntimeValue::Nu(write_jsonl_file(&target, vals)?))
@@ -5141,10 +5355,11 @@ impl Evaluator<'_> {
     }
 
     fn eval_save_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        let [value, path] = call.positional.as_slice() else {
+        // Path first, like write_file(path, text) and write_json(path, value).
+        let [path, value] = call.positional.as_slice() else {
             return Err(stone_error(
                 "save",
-                "save() requires value and path arguments; use save(value, path, force=True)",
+                "save() requires path and value arguments; use save(path, value, force=True)",
             ));
         };
         let mut append = false;
@@ -5332,7 +5547,7 @@ impl Evaluator<'_> {
         let Value::List { vals, .. } = values else {
             return Err(stone_error(
                 "where",
-                format!("expected list, got {}", values.get_type()),
+                format!("expected list, got {}", crate::stone_builtins::value_type_name(&values)),
             ));
         };
         let mut selected = Vec::new();
@@ -5449,11 +5664,10 @@ impl Evaluator<'_> {
             .into_nu_value("predicate")?;
         let text = value_to_string(&text, "predicate")?;
         let (params, body) = stone_predicate::compile_predicate(&text)?;
-        Ok(RuntimeValue::Callable(CallableValue::lambda(
+        Ok(RuntimeValue::Callable(CallableValue::pure_lambda(
             self.state.next_callable_id(),
             params,
             Box::new(body),
-            Vec::new(),
         )))
     }
 
@@ -5551,13 +5765,20 @@ impl Evaluator<'_> {
             Some(_) => Vec::new(),
             None => {
                 let values = values.into_nu_value("sort")?;
-                let Value::List { vals, .. } = values else {
-                    return Err(stone_error(
-                        "sort",
-                        format!("expected list, got {}", values.get_type()),
-                    ));
-                };
-                vals
+                match values {
+                    Value::List { vals, .. } => vals,
+                    // sorted("ba") sorts the characters, as in Python.
+                    Value::String { val, .. } => val
+                        .chars()
+                        .map(|ch| Value::string(ch.to_string(), Span::unknown()))
+                        .collect(),
+                    other => {
+                        return Err(stone_error(
+                            "sort",
+                            format!("expected list, got {}", crate::stone_builtins::value_type_name(&other)),
+                        ));
+                    }
+                }
             }
         };
 
@@ -5657,10 +5878,21 @@ impl Evaluator<'_> {
                 "unique() keyword arguments are not supported",
             ));
         }
-        let values = self
-            .eval_expr_value(values, PipelineData::empty())?
-            .into_nu_value("unique")?;
-        unique_builtin(&values).map(RuntimeValue::Nu)
+        let values = self.eval_expr_value(values, PipelineData::empty())?;
+        // The first of each equal group is kept as is (shared, and still a
+        // record if it was one).
+        if let RuntimeValue::List(list) = &values {
+            let mut seen = std::collections::HashSet::new();
+            let mut kept = Vec::new();
+            for item in list.shared_items() {
+                let key = crate::stone_builtins::value_identity_key(&materialize(&item, "unique")?, "unique")?;
+                if seen.insert(key) {
+                    kept.push(item);
+                }
+            }
+            return Ok(list_from_values(kept));
+        }
+        unique_builtin(&values.into_nu_value("unique")?).map(RuntimeValue::Nu)
     }
 
     fn eval_round_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5750,21 +5982,52 @@ impl Evaluator<'_> {
                 format!("{}() keyword arguments are not supported", call.name),
             ));
         }
-        let (record, arg_exprs) = if call.name == "get" && call.positional.len() == 1 {
-            let record = input
-                .into_value(Span::unknown())
-                .map_err(|err| stone_error("get", err.to_string()))?;
-            (record, call.positional.as_slice())
-        } else {
+        let _ = input;
+        if call.name == "get" && call.positional.len() < 2 {
+            return Err(stone_typed_error(
+                "TypeError",
+                "get",
+                "get() needs the dict or record to read from: write `get(d, key)`, `get(d, key, default)`, or `d.get(key)`",
+            ));
+        }
+        let (record, arg_exprs) = {
             let ([record] | [record, _] | [record, _, _]) = call.positional.as_slice() else {
                 return Err(stone_error(
                     &call.name,
                     format!("{}() requires a record argument", call.name),
                 ));
             };
-            let record = self
-                .eval_expr_value(record, PipelineData::empty())?
-                .into_nu_value(&call.name)?;
+            let receiver = self.eval_expr_value(record, PipelineData::empty())?;
+            // `get(x, key[, default])` hands out the stored value itself, as
+            // `x.key` / `x[key]` do: a nested record stays a record and a
+            // list or dict stays shared.
+            if call.name == "get"
+                && matches!(receiver, RuntimeValue::Record(_) | RuntimeValue::Dict(_))
+            {
+                if let [_, key_expr, rest @ ..] = call.positional.as_slice() {
+                    let key = self.eval_expr_value(key_expr, PipelineData::empty())?;
+                    if let RuntimeValue::Nu(Value::String { val: key, .. }) = &key {
+                        let found = match &receiver {
+                            RuntimeValue::Record(record) => {
+                                record.ty.field_index(key).map(|index| record.get(index))
+                            }
+                            RuntimeValue::Dict(dict) => dict.get(key),
+                            _ => None,
+                        };
+                        return match (found, rest) {
+                            (Some(value), _) => Ok(value),
+                            (None, [default]) => self.eval_expr_value(default, PipelineData::empty()),
+                            (None, _) => Ok(RuntimeValue::Nu(Value::nothing(Span::unknown()))),
+                        };
+                    }
+                }
+            }
+            if matches!(call.name.as_str(), "values" | "items") && call.positional.len() == 1 {
+                if let Some(value) = shared_dict_method(&receiver, &call.name, &[]) {
+                    return Ok(value);
+                }
+            }
+            let record = receiver.into_nu_value(&call.name)?;
             (record, &call.positional[1..])
         };
         let mut args = Vec::new();
@@ -5938,13 +6201,13 @@ impl Evaluator<'_> {
         self.state.active_transition_hook = true;
         let result = match handler {
             TransitionHookHandler::Callable(callable) => {
-                self.invoke_callable(callable, vec![RuntimeValue::Nu(event)])
+                self.invoke_callable(callable, vec![host_record("TransitionEvent", event)])
             }
             TransitionHookHandler::NamedFunction(name) => {
                 const EVENT_LOCAL: &str = "__waymark_transition_event";
                 self.state.push_scope();
                 self.state
-                    .set_local(EVENT_LOCAL.to_string(), RuntimeValue::Nu(event));
+                    .set_local(EVENT_LOCAL.to_string(), host_record("TransitionEvent", event));
                 let call = Call {
                     name: name.clone(),
                     positional: vec![Expr::Name(EVENT_LOCAL.to_string())],
@@ -7517,7 +7780,7 @@ impl Evaluator<'_> {
     ) -> Result<RuntimeValue, ShellError> {
         match handler {
             WorkflowHandler::Callable(callable) => {
-                self.invoke_callable(callable, vec![RuntimeValue::Nu(context)])
+                self.invoke_callable(callable, vec![host_record("StageContext", context)])
             }
             WorkflowHandler::NamedFunction(name) => {
                 let function = self.state.functions.get(name).cloned().ok_or_else(|| {
@@ -7525,7 +7788,7 @@ impl Evaluator<'_> {
                         "workflow handler function `{name}` is no longer defined"
                     ))
                 })?;
-                self.invoke_user_function_values(&function, vec![RuntimeValue::Nu(context)])
+                self.invoke_user_function_values(&function, vec![host_record("StageContext", context)])
             }
         }
     }
@@ -7719,6 +7982,13 @@ impl Evaluator<'_> {
         }
         self.check_tool_budget()?;
         let (positional, named) = self.eval_call_values(call)?;
+        if named.iter().any(|(name, _)| name == "background") {
+            return Err(stone_typed_error(
+                "TypeError",
+                "must_run",
+                "must_run() waits for the command and checks its exit, so it does not take background=; use run(argv, background=True) and check run_wait(run_id) yourself",
+            ));
+        }
         let (named, expect, declared) = take_run_contract(named, "must_run")?;
         let mut checks = Record::new();
         let user_checks = expect.unwrap_or_default();
@@ -8016,7 +8286,7 @@ impl Evaluator<'_> {
         if !matches!(schema, Value::Record { .. }) {
             return Err(model_infer_input_error(format!(
                 "model_infer schema must be a record, got {}",
-                schema.get_type()
+                crate::stone_builtins::value_type_name(&schema)
             )));
         }
         let schema = nu_to_json_value(schema);
@@ -8053,7 +8323,7 @@ impl Evaluator<'_> {
                         other => {
                             return Err(model_infer_input_error(format!(
                                 "model_infer retries must be an integer, got {}",
-                                other.get_type()
+                                crate::stone_builtins::value_type_name(&other)
                             )));
                         }
                     };
@@ -8950,10 +9220,10 @@ impl Evaluator<'_> {
                 }
             }
         };
-        Ok(RuntimeValue::Nu(json_to_nu_value(
-            result.to_json(),
-            Span::unknown(),
-        )))
+        Ok(host_record(
+            "AgentOutcome",
+            json_to_nu_value(result.to_json(), Span::unknown()),
+        ))
     }
 
     fn eval_ps_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -12192,35 +12462,104 @@ impl Evaluator<'_> {
         Ok(RuntimeValue::Nu(Value::string(name, Span::unknown())))
     }
 
+    /// Python's `min`/`max`: one iterable or two or more values, compared
+    /// with Stone's ordering (numbers, strings, lists), with optional
+    /// `key=` and `default=`. The chosen element itself is returned.
     fn eval_min_max_call(
         &mut self,
         call: &Call,
         operation: MinMax,
     ) -> Result<RuntimeValue, ShellError> {
-        if call.positional.is_empty() {
-            return Err(stone_error(
-                operation.name(),
-                format!(
-                    "{}() requires at least one numeric argument",
-                    operation.name()
-                ),
-            ));
+        let name = operation.name();
+        let mut key = None;
+        let mut default = None;
+        for (keyword, argument) in &call.named {
+            match keyword.as_str() {
+                "key" => match self.eval_expr_value(argument, PipelineData::empty())? {
+                    RuntimeValue::Callable(callable) => key = Some(callable),
+                    RuntimeValue::Nu(Value::Nothing { .. }) => {}
+                    other => {
+                        return Err(stone_typed_error(
+                            "TypeError",
+                            name,
+                            format!("{name}() key must be a function, got {}", runtime_type_name(&other)),
+                        ))
+                    }
+                },
+                "default" => default = Some(self.eval_expr_value(argument, PipelineData::empty())?),
+                other => {
+                    return Err(stone_typed_error(
+                        "TypeError",
+                        name,
+                        format!("{name}() got an unexpected keyword argument `{other}`; it accepts key= and default="),
+                    ))
+                }
+            }
         }
-        if !call.named.is_empty() {
-            return Err(stone_error(
-                operation.name(),
-                format!("{}() keyword arguments are not supported", operation.name()),
-            ));
+        let values = match call.positional.as_slice() {
+            [] => {
+                return Err(stone_typed_error(
+                    "TypeError",
+                    name,
+                    format!("{name}() expected at least 1 argument, got 0"),
+                ))
+            }
+            [iterable] => self.eval_iterable_expr(iterable)?,
+            arguments => {
+                if default.is_some() {
+                    return Err(stone_typed_error(
+                        "TypeError",
+                        name,
+                        format!("{name}() default= applies only to a single iterable argument"),
+                    ));
+                }
+                let mut values = Vec::with_capacity(arguments.len());
+                for argument in arguments {
+                    values.push(self.eval_expr_value(argument, PipelineData::empty())?);
+                }
+                values
+            }
+        };
+        let mut best: Option<(Value, RuntimeValue)> = None;
+        for value in values {
+            let ranked = match &key {
+                Some(callable) => self.invoke_callable(callable, vec![value.clone()])?,
+                None => value.clone(),
+            };
+            let ranked = materialize(&ranked, name)?;
+            let replace = match &best {
+                None => true,
+                Some((current, _)) => {
+                    let ordering = value_ordering(&ranked, current).map_err(|_| {
+                        stone_typed_error(
+                            "TypeError",
+                            name,
+                            format!(
+                                "{name}() cannot order {} and {}; compare values of one kind (numbers, strings, or lists), or pass key=",
+                                value_type_name(&ranked),
+                                value_type_name(current)
+                            ),
+                        )
+                    })?;
+                    match operation {
+                        MinMax::Min => ordering.is_lt(),
+                        MinMax::Max => ordering.is_gt(),
+                    }
+                }
+            };
+            if replace {
+                best = Some((ranked, value));
+            }
         }
-
-        let mut values = Vec::with_capacity(call.positional.len());
-        for argument in &call.positional {
-            values.push(
-                self.eval_expr_value(argument, PipelineData::empty())?
-                    .into_nu_value(operation.name())?,
-            );
+        match (best, default) {
+            (Some((_, value)), _) => Ok(value),
+            (None, Some(default)) => Ok(default),
+            (None, None) => Err(stone_typed_error(
+                "ValueError",
+                name,
+                format!("{name}() arg is an empty sequence; pass default= for an empty input"),
+            )),
         }
-        min_max_builtin(values, operation.name()).map(RuntimeValue::Nu)
     }
 
     fn eval_split_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -12318,9 +12657,7 @@ impl Evaluator<'_> {
                 "slice() requires value, optional start, and optional end",
             ));
         };
-        let value = self
-            .eval_expr_value(value, PipelineData::empty())?
-            .into_nu_value("slice")?;
+        let value = self.eval_expr_value(value, PipelineData::empty())?;
         let start = call
             .positional
             .get(1)
@@ -12333,7 +12670,14 @@ impl Evaluator<'_> {
             .map(|expr| self.eval_optional_slice_arg(expr, "slice end"))
             .transpose()?
             .flatten();
-        slice_builtin(&value, start, end).map(RuntimeValue::Nu)
+        // A list slice holds the same elements, as `xs[a:b]` does.
+        if let RuntimeValue::List(list) = &value {
+            let items = list.shared_items();
+            let (start, end) =
+                crate::stone_builtins::normalize_slice_bounds(start, end, items.len())?;
+            return Ok(list_from_values(items[start..end].to_vec()));
+        }
+        slice_builtin(&value.into_nu_value("slice")?, start, end).map(RuntimeValue::Nu)
     }
 
     fn eval_optional_slice_arg(
@@ -12397,18 +12741,31 @@ impl Evaluator<'_> {
         format_builtin(&template, &args).map(RuntimeValue::Nu)
     }
 
+    /// Python's print: writes str() of each value, joined by `sep` and
+    /// followed by `end`, and returns None.
     fn eval_print_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
-        if !call.named.is_empty() {
-            return Err(stone_error(
-                "print",
-                "print() keyword arguments are not supported",
-            ));
+        let mut sep = " ".to_string();
+        let mut end = "\n".to_string();
+        for (name, argument) in &call.named {
+            let value = self
+                .eval_expr_value(argument, PipelineData::empty())?
+                .into_nu_value("print")?;
+            let text = match &value {
+                Value::Nothing { .. } => None,
+                other => Some(value_to_string(other, &format!("print {name}"))?),
+            };
+            match name.as_str() {
+                "sep" => sep = text.unwrap_or_else(|| " ".to_string()),
+                "end" => end = text.unwrap_or_else(|| "\n".to_string()),
+                other => {
+                    return Err(stone_typed_error(
+                        "TypeError",
+                        "print",
+                        format!("print() got an unexpected keyword argument `{other}`; it accepts sep= and end="),
+                    ))
+                }
+            }
         }
-        if call.positional.is_empty() {
-            self.state.stdout.push('\n');
-            return Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())));
-        }
-        let mut values = Vec::with_capacity(call.positional.len());
         let mut parts = Vec::with_capacity(call.positional.len());
         for arg in &call.positional {
             // print writes str(value) as Python does; emit() is the JSON path.
@@ -12421,16 +12778,10 @@ impl Evaluator<'_> {
                 },
             };
             parts.push(text);
-            values.push(value.into_nu_value("print")?);
         }
-        self.state.stdout.push_str(&parts.join(" "));
-        self.state.stdout.push('\n');
-        let result = if values.len() == 1 {
-            values.remove(0)
-        } else {
-            Value::list(values, Span::unknown())
-        };
-        Ok(RuntimeValue::Nu(result))
+        self.state.stdout.push_str(&parts.join(&sep));
+        self.state.stdout.push_str(&end);
+        Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())))
     }
 
     fn eval_range_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -12535,8 +12886,10 @@ impl Evaluator<'_> {
                         if *closed {
                             return Err(stone_error("read", "I/O operation on closed file"));
                         }
+                        // read() consumes the rest of the file, as in Python:
+                        // a second read() returns "".
                         Ok(RuntimeValue::Nu(Value::string(
-                            text.clone(),
+                            std::mem::take(text),
                             Span::unknown(),
                         )))
                     }
@@ -12834,44 +13187,8 @@ impl Evaluator<'_> {
             if let RuntimeValue::JsonObjectView(view) = receiver {
                 return eval_json_object_view_method(&view, method, &args);
             }
-            if let RuntimeValue::Dict(dict) = &receiver {
-                // Values come back shared with the dict:
-                // `d.get("k").append(1)` and `for k, v in d.items():
-                // v.append(1)` change the dict's own lists.
-                match (method, args.as_slice()) {
-                    ("get", [Value::String { val: key, .. }]) => {
-                        return Ok(dict
-                            .get(key)
-                            .unwrap_or_else(|| RuntimeValue::Nu(Value::nothing(Span::unknown()))));
-                    }
-                    ("get", [Value::String { val: key, .. }, default]) => {
-                        return Ok(dict
-                            .get(key)
-                            .unwrap_or_else(|| RuntimeValue::Nu(default.clone())));
-                    }
-                    ("values", []) => {
-                        return Ok(list_from_values(
-                            dict.shared_entries()
-                                .into_iter()
-                                .map(|(_, value)| value)
-                                .collect(),
-                        ));
-                    }
-                    ("items", []) => {
-                        return Ok(list_from_values(
-                            dict.shared_entries()
-                                .into_iter()
-                                .map(|(key, value)| {
-                                    list_from_values(vec![
-                                        RuntimeValue::Nu(Value::string(key, Span::unknown())),
-                                        value,
-                                    ])
-                                })
-                                .collect(),
-                        ));
-                    }
-                    _ => {}
-                }
+            if let Some(value) = shared_dict_method(&receiver, method, &args) {
+                return Ok(value);
             }
 
             let receiver = receiver.into_nu_value("method call")?;
@@ -12914,6 +13231,11 @@ impl Evaluator<'_> {
             // `Read | Edit` on types (held in variables) is a union.
             if let Some(union) = type_union_value(&left, &right) {
                 return Ok(union);
+            }
+        }
+        if op == "multiplication" {
+            if let Some(value) = repeat_sequence(&left, &right)? {
+                return Ok(value);
             }
         }
         if let Some(value) = collection_binop(op, &left, &right)? {
@@ -13193,7 +13515,7 @@ impl Evaluator<'_> {
             }
             other => Err(stone_error(
                 "count",
-                format!("{} has no count()", other.get_type()),
+                format!("{} has no count()", crate::stone_builtins::value_type_name(&other)),
             )),
         }
     }
@@ -13219,7 +13541,7 @@ impl Evaluator<'_> {
             }
             RuntimeValue::Nu(value) => Err(stone_error(
                 context,
-                format!("{} has no {context}()", value.get_type()),
+                format!("{} has no {context}()", crate::stone_builtins::value_type_name(&value)),
             )),
             RuntimeValue::Dict(_) => {
                 Err(stone_error(context, format!("record has no {context}()")))
@@ -13255,14 +13577,13 @@ impl Evaluator<'_> {
             }
         }
         let callable = self.eval_callable_expr(func)?;
+        // Results are kept as returned: `map(lambda r: r, rows)` holds the
+        // rows themselves, and records stay records.
         values
             .into_iter()
-            .map(|value| {
-                self.invoke_callable(&callable, vec![value])?
-                    .into_nu_value("map")
-            })
+            .map(|value| self.invoke_callable(&callable, vec![value]))
             .collect::<Result<Vec<_>, _>>()
-            .map(|values| RuntimeValue::Nu(Value::list(values, Span::unknown())))
+            .map(list_from_values)
     }
 
     fn eval_filter_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -13566,6 +13887,267 @@ impl Evaluator<'_> {
 }
 
 /// Builtins the loop engine (stone_vm) matches by name.
+/// `d.key` on a dict: the error names the fix.
+fn dict_attribute_error(receiver: &RuntimeValue, attr: &str) -> ShellError {
+    let has_key = match receiver {
+        RuntimeValue::Dict(dict) => dict.get(attr).is_some(),
+        RuntimeValue::Nu(Value::Record { val, .. }) => val.contains(attr),
+        RuntimeValue::JsonObjectView(view) => json_object_view_get(view, attr).ok().flatten().is_some(),
+        _ => false,
+    };
+    let message = if has_key {
+        format!("a dict's keys are read with brackets, not as attributes: write `[\"{attr}\"]` instead of `.{attr}`. (Attributes are for records: declare `class Name(BaseModel):` with typed fields to read them as `.{attr}`)")
+    } else {
+        format!("a dict has no attribute `{attr}`; read keys with brackets (`d[\"{attr}\"]`, or `d.get(\"{attr}\")` when the key may be missing). Dict methods are called: `.keys()`, `.items()`, `.get(key)`")
+    };
+    stone_typed_error("AttributeError", "attribute", message)
+}
+
+/// The value of an expression statement. A value that only lives inside
+/// the program (a function, the model, an open file) is not an error when
+/// it stands alone as a statement: it becomes its Python repr text, as a
+/// Python prompt would show it.
+fn statement_value(value: RuntimeValue) -> Result<PipelineData, ShellError> {
+    if let Some(text) = value.opaque_repr() {
+        return Ok(Value::string(text, Span::unknown()).into_pipeline_data());
+    }
+    Ok(value.into_nu_value("pipeline")?.into_pipeline_data())
+}
+
+/// `d.get(k)`, `d.values()`, `d.items()` (and the `get(d, k)`,
+/// `values(d)`, `items(d)` forms): values come back shared with the dict,
+/// so `d.get("k").append(1)` and `for k, v in d.items(): v.append(1)`
+/// change the dict's own lists. None when `receiver` is not a dict or the
+/// call is not one of these.
+fn shared_dict_method(receiver: &RuntimeValue, method: &str, args: &[Value]) -> Option<RuntimeValue> {
+    let RuntimeValue::Dict(dict) = receiver else {
+        return None;
+    };
+    match (method, args) {
+        ("get", [Value::String { val: key, .. }]) => Some(
+            dict.get(key)
+                .unwrap_or_else(|| RuntimeValue::Nu(Value::nothing(Span::unknown()))),
+        ),
+        ("get", [Value::String { val: key, .. }, default]) => {
+            Some(dict.get(key).unwrap_or_else(|| RuntimeValue::Nu(default.clone())))
+        }
+        ("values", []) => Some(list_from_values(
+            dict.shared_entries().into_iter().map(|(_, value)| value).collect(),
+        )),
+        ("items", []) => Some(list_from_values(
+            dict.shared_entries()
+                .into_iter()
+                .map(|(key, value)| {
+                    list_from_values(vec![RuntimeValue::Nu(Value::string(key, Span::unknown())), value])
+                })
+                .collect(),
+        )),
+        _ => None,
+    }
+}
+
+/// Parameter names, by position, of builtins whose keyword arguments are
+/// placed into positional slots. Each slot lists the documented name first,
+/// then the Python spelling.
+fn builtin_keyword_slots(builtin: &str) -> Option<&'static [&'static [&'static str]]> {
+    Some(match builtin {
+        "enumerate" => &[&["values", "iterable"], &["start"]],
+        "round" => &[&["value", "number"], &["digits", "ndigits"]],
+        "split" => &[&["text"], &["separator", "sep"], &["maxsplit"]],
+        "join" => &[&["items", "iterable"], &["separator", "sep"]],
+        "get" => &[&["record"], &["key"], &["default"]],
+        "first" | "last" | "head" | "tail" => &[&["values"], &["count"]],
+        "range" => &[&["start"], &["stop"], &["step"]],
+        "ls" => &[&["path"]],
+        "parse_int" | "parse_float" => &[&["value"], &["default"]],
+        "help" => &[&["name"]],
+        "emit" => &[&["value"]],
+        _ => return None,
+    })
+}
+
+/// Move keyword arguments that name a positional slot into place. A keyword
+/// may not skip an earlier slot (`range(step=2)` without start and stop) or
+/// repeat one given positionally. These builtins take no other keywords.
+fn place_keyword_arguments(call: &Call, slots: &[&[&str]]) -> Result<Call, ShellError> {
+    let mut positional: Vec<Option<Expr>> = call.positional.iter().cloned().map(Some).collect();
+    for (name, value) in &call.named {
+        let Some(index) = slots.iter().position(|aliases| aliases.contains(&name.as_str())) else {
+            let accepted = slots.iter().flat_map(|aliases| aliases.iter().copied()).collect::<Vec<_>>();
+            return Err(stone_typed_error(
+                "TypeError",
+                &call.name,
+                format!(
+                    "{}() got an unexpected keyword argument `{name}`; it takes {}",
+                    call.name,
+                    accepted.join(", ")
+                ),
+            ));
+        };
+        if positional.len() <= index {
+            positional.resize(index + 1, None);
+        }
+        if positional[index].is_some() {
+            return Err(stone_typed_error(
+                "TypeError",
+                &call.name,
+                format!("{}() got multiple values for argument `{name}`", call.name),
+            ));
+        }
+        positional[index] = Some(value.clone());
+    }
+    let positional = positional
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value.ok_or_else(|| {
+                stone_typed_error(
+                    "TypeError",
+                    &call.name,
+                    format!(
+                        "{}() argument `{}` must be given before `{}`",
+                        call.name,
+                        slots[index][0],
+                        slots.iter().skip(index + 1).find_map(|aliases| {
+                            call.named.iter().find(|(name, _)| aliases.contains(&name.as_str())).map(|(name, _)| name.as_str())
+                        }).unwrap_or("it")
+                    ),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Call { name: call.name.clone(), positional, named: Vec::new() })
+}
+
+/// `xs * n`, `n * xs`, `text * n`: repetition, as in Python. A repeated
+/// list holds the same elements n times (`[[]] * 3` repeats one list, as
+/// Python does); n <= 0 gives an empty result.
+fn repeat_sequence(left: &RuntimeValue, right: &RuntimeValue) -> Result<Option<RuntimeValue>, ShellError> {
+    let (sequence, count) = match (left, right) {
+        (_, RuntimeValue::Nu(Value::Int { val, .. })) => (left, *val),
+        (RuntimeValue::Nu(Value::Int { val, .. }), _) => (right, *val),
+        _ => return Ok(None),
+    };
+    let times = usize::try_from(count.max(0)).unwrap_or(0);
+    const MAX_ITEMS: usize = 10_000_000;
+    let too_large = |len: usize| {
+        len.checked_mul(times).is_none_or(|total| total > MAX_ITEMS)
+    };
+    match sequence {
+        RuntimeValue::Nu(Value::String { val, .. }) => {
+            if too_large(val.len()) {
+                return Err(stone_error("multiplication", "repeated string is too large"));
+            }
+            Ok(Some(RuntimeValue::Nu(Value::string(val.repeat(times), Span::unknown()))))
+        }
+        RuntimeValue::List(_) | RuntimeValue::Nu(Value::List { .. }) => {
+            let items = match sequence {
+                RuntimeValue::List(list) => list.shared_items(),
+                // Containers become shared objects first, so every copy
+                // is the same object, as in Python.
+                RuntimeValue::Nu(Value::List { vals, .. }) => vals
+                    .iter()
+                    .cloned()
+                    .map(|value| stone_containers::share(RuntimeValue::Nu(value)))
+                    .collect(),
+                _ => unreachable!(),
+            };
+            if too_large(items.len()) {
+                return Err(stone_error("multiplication", "repeated list is too large"));
+            }
+            let mut repeated = Vec::with_capacity(items.len() * times);
+            for _ in 0..times {
+                repeated.extend(items.iter().cloned());
+            }
+            Ok(Some(list_from_values(repeated)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Builtins whose results are program data (parsed JSON, the task's input,
+/// elements of the program's own containers): their dicts stay dicts.
+fn returns_program_data(builtin: &str) -> bool {
+    matches!(
+        builtin,
+        "get" | "keys" | "values" | "items" | "first" | "last" | "head" | "tail" | "slice"
+            | "unique" | "sort" | "sorted" | "filter" | "map" | "where" | "min" | "max" | "set"
+            | "list" | "tuple" | "enumerate" | "sum" | "len" | "json_loads" | "from_json"
+            | "read_json" | "read_jsonl" | "read_csv" | "task_input" | "task_spec"
+            | "echo" | "print" | "emit" | "Expect"
+            | "Effects" | "split" | "range" | "int" | "float" | "str" | "repr" | "round"
+            | "parse_int" | "parse_float" | "format" | "join" | "type" | "isinstance"
+            | "any" | "all" | "cat" | "read_file" | "read_text" | "open" | "predicate"
+    )
+}
+
+/// The record type name of a record-valued field of a runtime value
+/// (`outcome.result` is an `AttemptOutcomeResult`).
+fn host_field_type(owner: &str, field: &str) -> String {
+    let mut name = owner.to_string();
+    for part in field.split('_') {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            name.extend(first.to_uppercase());
+            name.push_str(chars.as_str());
+        }
+    }
+    name
+}
+
+/// The record type name for a host builtin's result.
+fn host_result_type(builtin: &str) -> String {
+    match builtin {
+        "run" | "must_run" | "run_wait" | "run_complete" | "run_terminate" | "last_result" => {
+            "RunResult".to_string()
+        }
+        "start_daemon" | "daemon_status" | "stop_daemon" => "Daemon".to_string(),
+        "stat" => "FileStat".to_string(),
+        "ls" | "list_dir" => "DirEntry".to_string(),
+        "ps" | "process_list" => "ProcessInfo".to_string(),
+        "sysinfo" | "sys_info" => "SystemInfo".to_string(),
+        "search" => "SearchMatch".to_string(),
+        "help" => "Help".to_string(),
+        "workflow_run" | "workflow_main" => "WorkflowReport".to_string(),
+        other => {
+            let mut name = String::new();
+            for part in other.split('_') {
+                let mut chars = part.chars();
+                if let Some(first) = chars.next() {
+                    name.extend(first.to_uppercase());
+                    name.push_str(chars.as_str());
+                }
+            }
+            name.push_str("Result");
+            name
+        }
+    }
+}
+
+/// A host builtin's record result (or list of records) as typed records.
+fn type_host_result(builtin: &str, value: RuntimeValue) -> RuntimeValue {
+    if returns_program_data(builtin) {
+        return value;
+    }
+    match value {
+        RuntimeValue::Nu(value @ (Value::Record { .. } | Value::List { .. })) => {
+            host_record(&host_result_type(builtin), value)
+        }
+        value => value,
+    }
+}
+
+fn changed_size_error(what: &str) -> ShellError {
+    let copy = if what == "set" { "for x in list(s):" } else { "for k in list(d):" };
+    stone_typed_error(
+        "RuntimeError",
+        "iteration",
+        format!(
+            "{what} changed size during iteration. Loop over a copy (`{copy}`), or collect the changes and apply them after the loop"
+        ),
+    )
+}
+
 const VM_ASSUMED_BUILTINS: &[&str] = &[
     "int",
     "float",
@@ -13827,7 +14409,7 @@ fn csv_text_from_rows(rows: &Value, columns: Option<&Value>) -> Result<String, S
     let Value::List { vals, .. } = rows else {
         return Err(stone_error(
             "write_csv",
-            format!("expected list of records, got {}", rows.get_type()),
+            format!("expected list of records, got {}", crate::stone_builtins::value_type_name(&rows)),
         ));
     };
     let columns = match columns {
@@ -13841,7 +14423,7 @@ fn csv_text_from_rows(rows: &Value, columns: Option<&Value>) -> Result<String, S
         let Value::Record { val, .. } = row else {
             return Err(stone_error(
                 "write_csv",
-                format!("expected record row, got {}", row.get_type()),
+                format!("expected record row, got {}", crate::stone_builtins::value_type_name(&row)),
             ));
         };
         let mut fields = Vec::with_capacity(columns.len());
@@ -13864,7 +14446,7 @@ fn csv_columns_from_value(value: &Value) -> Result<Vec<String>, ShellError> {
             "write_csv",
             format!(
                 "columns must be a list of strings, got {}",
-                value.get_type()
+                crate::stone_builtins::value_type_name(&value)
             ),
         ));
     };
@@ -13881,7 +14463,7 @@ fn infer_csv_columns(rows: &[Value]) -> Result<Vec<String>, ShellError> {
         let Value::Record { val, .. } = row else {
             return Err(stone_error(
                 "write_csv",
-                format!("expected record row, got {}", row.get_type()),
+                format!("expected record row, got {}", crate::stone_builtins::value_type_name(&row)),
             ));
         };
         for (key, _) in val.iter() {
@@ -14015,7 +14597,7 @@ fn ensure_type(value: &Value, expected: StoneType, context: &str) -> Result<(), 
             format!(
                 "{context} expected {}, got {}",
                 stone_type_name(expected),
-                value.get_type()
+                crate::stone_builtins::value_type_name(&value)
             ),
         ))
     }
@@ -14149,10 +14731,34 @@ fn raised_error_parts(value: Value) -> Result<(String, String, Option<Value>), S
             "raise",
             format!(
                 "raise expects a string or record with message/code/detail, got {}",
-                value.get_type()
+                crate::stone_builtins::value_type_name(&value)
             ),
         )),
     }
+}
+
+/// The error a handler binds: for `fail(..., code="x")` and `raise
+/// {"code": "x", ...}`, `e.code` is the code the program declared ("x"),
+/// not the generic "task_failure"; `e.declared_code` keeps it as well.
+/// Only the bound value changes, so a declared code can never pass for a
+/// host code where the runtime checks error codes.
+fn with_declared_code(record: Value) -> Value {
+    let Value::Record { val, .. } = &record else {
+        return record;
+    };
+    let is_task_failure = matches!(val.get("code"), Some(Value::String { val, .. }) if val == "task_failure");
+    let Some(Value::String { val: declared, .. }) = val.get("declared_code") else {
+        return record;
+    };
+    if !is_task_failure {
+        return record;
+    }
+    let declared = declared.clone();
+    let mut fields = val.clone().into_owned();
+    if let Some(code) = fields.get_mut("code") {
+        *code = Value::string(declared, Span::unknown());
+    }
+    Value::record(fields, Span::unknown())
 }
 
 fn shell_error_record(err: &ShellError) -> Value {
@@ -14470,7 +15076,7 @@ fn workflow_evidence_references(value: &Value) -> Result<Vec<String>, ShellError
     let Value::List { vals, .. } = value else {
         return Err(workflow_error(format!(
             "workflow evidence references must be a list of strings, got {}",
-            value.get_type()
+            crate::stone_builtins::value_type_name(&value)
         )));
     };
     if vals.len() > 16 {
@@ -17110,11 +17716,24 @@ fn record_comparison(
         CompareOp::Is | CompareOp::IsNot => {
             unreachable!("identity is answered before record comparison")
         }
+        // `"field" in record` asks whether the record has that field: host
+        // results differ in their optional fields (a timed-out run has no
+        // exit status to report, say).
         CompareOp::In | CompareOp::NotIn if right_record => {
-            return Err(stone_error(
-                "membership",
-                "a record is not a container; read its fields as attributes, such as `value.field`",
-            ));
+            let (RuntimeValue::Record(record), RuntimeValue::Nu(Value::String { val, .. })) =
+                (right, left)
+            else {
+                return Err(stone_error(
+                    "membership",
+                    "a record is not a container: `\"name\" in record` asks whether it has a field; read fields as attributes, such as `value.field`",
+                ));
+            };
+            let present = record.ty.field_index(val).is_some();
+            if matches!(op, CompareOp::In) {
+                present
+            } else {
+                !present
+            }
         }
         CompareOp::In | CompareOp::NotIn => return Ok(None),
         CompareOp::Lt | CompareOp::LtE | CompareOp::Gt | CompareOp::GtE => {
@@ -17326,15 +17945,17 @@ fn value_to_iter_values(value: &RuntimeValue) -> Result<Vec<Value>, ShellError> 
             .iter()
             .map(|(key, _)| Value::string(key.clone(), Span::unknown()))
             .collect()),
+        // A string iterates by character, as in Python (`for ch in word`);
+        // `text.splitlines()` and `for line in open(path)` give lines.
         RuntimeValue::Nu(Value::String { val, .. }) | RuntimeValue::Nu(Value::Glob { val, .. }) => {
             Ok(val
-                .lines()
-                .map(|line| Value::string(line.to_owned(), Span::unknown()))
+                .chars()
+                .map(|ch| Value::string(ch.to_string(), Span::unknown()))
                 .collect())
         }
         RuntimeValue::Nu(other) => Err(stone_error(
             "iteration",
-            format!("cannot iterate {}", other.get_type()),
+            format!("cannot iterate {}", crate::stone_builtins::value_type_name(&other)),
         )),
         RuntimeValue::File(_) => Err(stone_error(
             "iteration",
@@ -17425,6 +18046,19 @@ fn value_to_iter_values(value: &RuntimeValue) -> Result<Vec<Value>, ShellError> 
         )),
         RuntimeValue::Model(_) => Err(stone_error("iteration", "cannot iterate the model")),
     }
+}
+
+/// An error raised as a specific builtin type (`RuntimeError`,
+/// `ValueError`, ...), whatever its message says.
+pub(super) fn stone_typed_error(
+    error_type: &str,
+    kind: &str,
+    message: impl Into<String>,
+) -> ShellError {
+    ShellError::Generic(
+        GenericError::new_internal(format!("Stone {kind} error"), message.into())
+            .with_code(crate::stone_errors::typed_error_code(error_type)),
+    )
 }
 
 pub(super) fn stone_error(kind: &str, message: impl Into<String>) -> ShellError {
@@ -17792,7 +18426,7 @@ fn transition_pre_hook_record(
                         effect,
                         format!(
                             "pre hook allow field must be bool, got {}",
-                            allow.get_type()
+                            crate::stone_builtins::value_type_name(&allow)
                         ),
                     ));
                 };
@@ -17811,7 +18445,7 @@ fn transition_pre_hook_record(
             effect,
             format!(
                 "pre hook must return None, bool, or a patch record; got {}",
-                other.get_type()
+                crate::stone_builtins::value_type_name(&other)
             ),
         )),
     }
@@ -17849,7 +18483,7 @@ fn apply_run_pre_hook_output(
             effect,
             format!(
                 "{effect} pre-hook argv must be a list, got {}",
-                argv.get_type()
+                crate::stone_builtins::value_type_name(&argv)
             ),
         ));
     }
@@ -17902,7 +18536,7 @@ fn attach_transition_id(
     let Value::Record { val, .. } = value else {
         return Err(transition_hook_error(
             effect,
-            format!("effect response must be a record, got {}", value.get_type()),
+            format!("effect response must be a record, got {}", crate::stone_builtins::value_type_name(&value)),
         ));
     };
     val.to_mut().push(
@@ -17948,7 +18582,7 @@ fn model_request_from_values(
                             operation,
                             format!(
                                 "{operation} {name} must be a number, got {}",
-                                other.get_type()
+                                crate::stone_builtins::value_type_name(&other)
                             ),
                         ));
                     }
@@ -17990,7 +18624,7 @@ fn model_request_from_values(
                             operation,
                             format!(
                                 "{operation} {name} must be an integer, got {}",
-                                other.get_type()
+                                crate::stone_builtins::value_type_name(&other)
                             ),
                         ));
                     }
@@ -18018,7 +18652,7 @@ fn model_request_from_values(
                         operation,
                         format!(
                             "{operation} response_format must be a string or record, got {}",
-                            other.get_type()
+                            crate::stone_builtins::value_type_name(&other)
                         ),
                     ));
                 }
@@ -18029,7 +18663,7 @@ fn model_request_from_values(
                         operation,
                         format!(
                             "{operation} metadata must be a record, got {}",
-                            value.get_type()
+                            crate::stone_builtins::value_type_name(&value)
                         ),
                     ));
                 };
@@ -18039,7 +18673,7 @@ fn model_request_from_values(
                             operation,
                             format!(
                                 "{operation} metadata field {key:?} must be a string, got {}",
-                                metadata_value.get_type()
+                                crate::stone_builtins::value_type_name(&metadata_value)
                             ),
                         ));
                     }
@@ -18078,7 +18712,7 @@ fn model_message_values_for(
             operation,
             format!(
                 "{operation} messages must be a list of records, got {}",
-                messages.get_type()
+                crate::stone_builtins::value_type_name(&messages)
             ),
         ));
     };
@@ -18096,7 +18730,7 @@ fn model_message_values_for(
                 operation,
                 format!(
                     "{operation} message {index} must be a record, got {}",
-                    value.get_type()
+                    crate::stone_builtins::value_type_name(&value)
                 ),
             ));
         };
@@ -18195,7 +18829,7 @@ fn model_response_content(response: &Value) -> Result<String, ShellError> {
     let Value::Record { val, .. } = response else {
         return Err(model_infer_validation_error(format!(
             "model response must be a record, got {}",
-            response.get_type()
+            crate::stone_builtins::value_type_name(&response)
         )));
     };
     let content = val.get("content").ok_or_else(|| {
@@ -18693,7 +19327,7 @@ fn attempt_id_from_value(value: &Value, context: &str) -> Result<String, ShellEr
             .and_then(|value| value_to_string(value, context)),
         _ => Err(stone_error(
             context,
-            format!("expected attempt id or record, got {}", value.get_type()),
+            format!("expected attempt id or record, got {}", crate::stone_builtins::value_type_name(&value)),
         )),
     }
 }
@@ -18759,7 +19393,7 @@ fn value_to_string_list(value: &Value, context: &str) -> Result<Vec<String>, She
     let Value::List { vals, .. } = value else {
         return Err(stone_error(
             context,
-            format!("expected list of strings, got {}", value.get_type()),
+            format!("expected list of strings, got {}", crate::stone_builtins::value_type_name(&value)),
         ));
     };
     vals.iter()
@@ -18788,7 +19422,7 @@ fn value_to_string_pairs(
     let Value::Record { val, .. } = value else {
         return Err(stone_error(
             context,
-            format!("expected record of string values, got {}", value.get_type()),
+            format!("expected record of string values, got {}", crate::stone_builtins::value_type_name(&value)),
         ));
     };
     val.iter()
@@ -18996,7 +19630,7 @@ fn value_record<'a>(value: &'a Value, context: &str) -> Result<&'a Record, Shell
     let Value::Record { val, .. } = value else {
         return Err(stone_error(
             context,
-            format!("expected record, got {}", value.get_type()),
+            format!("expected record, got {}", crate::stone_builtins::value_type_name(&value)),
         ));
     };
     Ok(val)
@@ -19014,7 +19648,7 @@ fn record_record_field<'a>(
             context,
             format!(
                 "record field `{field}` expected record, got {}",
-                other.get_type()
+                crate::stone_builtins::value_type_name(&other)
             ),
         )),
     }
@@ -19064,7 +19698,7 @@ fn record_optional_u64(
             context,
             format!(
                 "record field `{field}` expected int, got {}",
-                other.get_type()
+                crate::stone_builtins::value_type_name(&other)
             ),
         )),
     }
@@ -19125,7 +19759,7 @@ fn record_u32_field(record: &Record, field: &str, context: &str) -> Result<u32, 
             context,
             format!(
                 "record field `{field}` expected int, got {}",
-                other.get_type()
+                crate::stone_builtins::value_type_name(&other)
             ),
         )),
     }
@@ -19546,7 +20180,7 @@ attempt_best(scope, objective="largest")
         let program = lower_source(
             r#"new_cwd = cd("subdir")
 text = read_text("input.txt")
-emit({"cwd": pwd(), "new_cwd": new_cwd, "state_cwd": state()["cwd"], "text": text})
+emit({"cwd": pwd(), "new_cwd": new_cwd, "state_cwd": state().cwd, "text": text})
 "#,
         )?;
         let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
@@ -19572,7 +20206,7 @@ emit({"cwd": pwd(), "new_cwd": new_cwd, "state_cwd": state()["cwd"], "text": tex
         fs::write(root.join("input.txt"), "alpha\nbeta\nalpha\n").expect("write input");
         let program = lower_source(
             r#"mkdir("out")
-saved = save("one\ntwo\n", "out/data.txt", force=True)
+saved = save("out/data.txt", "one\ntwo\n", force=True)
 edited = edit("out/data.txt", "two", "three")
 entries = ls("out")
 found = find(".", "*.txt")
@@ -19583,8 +20217,8 @@ west = where(rows, "region", "west")
 json_text = to_json({"west": west})
 roundtrip = from_json(json_text)
 emit({
-    "saved_bytes": saved["bytes"],
-    "edited": edited["replacements"],
+    "saved_bytes": saved.bytes,
+    "edited": edited.replacements,
     "entries": len(entries),
     "found": len(found),
     "matches": len(matches),
@@ -19652,7 +20286,7 @@ emit({
     }
 
     #[test]
-    fn evaluates_python_compat_set_type_and_record_attributes() -> Result<(), ShellError> {
+    fn evaluates_python_compat_set_type_and_dict_subscripts() -> Result<(), ShellError> {
         let (engine_state, mut stack, root) = test_engine("python-compat-primitives")?;
         fs::write(root.join("large.txt"), "abcdef").expect("write large");
         let program = lower_source(
@@ -19663,20 +20297,20 @@ seen.add("bob")
 rows = [{"name": "alice", "score": 3}, {"name": "bob", "score": 5}]
 groups = {"alice": [], "bob": set()}
 groups["alice"].append("first")
-groups.alice.append("second")
+groups["alice"].append("second")
 rows[0]["tags"] = []
-rows[0].tags.append("blue")
+rows[0]["tags"].append("blue")
 groups["bob"].add("only")
 groups["bob"].add("only")
 result = run(["printf", "ok"])
 emit({
     "seen": seen,
     "unique": set(["x", "x", "y"]),
-    "name": rows[0].name,
+    "name": rows[0]["name"],
     "group": groups["alice"],
-    "tags": rows[0].tags,
-    "bob": groups.bob,
-    "score_type": type(rows[1].score),
+    "tags": rows[0]["tags"],
+    "bob": groups["bob"],
+    "score_type": type(rows[1]["score"]),
     "seen_type": type(seen),
     "stdout": result.stdout,
     "prefix": read_file("large.txt", limit=3),
@@ -20065,8 +20699,8 @@ echo(name)"#,
             r#"files = ls(".")
 names = []
 for file in files:
-    if file["type"] == "file":
-        names.append(file["name"])
+    if file.type == "file":
+        names.append(file.name)
 emit(names)
 "#,
         )?;
@@ -20253,7 +20887,7 @@ emit(inc(5))
         );
         write(
             "textutil.stone",
-            "\"\"\"Text helpers.\"\"\"\nfrom pkg.limits import MAX, LimitError\nSEP = \", \"\nDEFAULTS = {\"tags\": [\"a\"]}\ndef _clean(s):\n    return s.strip()\ndef join(items):\n    return SEP.join([_clean(x) for x in items])\ndef capped(items):\n    if len(items) > MAX:\n        raise LimitError(\"too many\")\n    return join(items)\ndef fact(n):\n    return 1 if n <= 1 else n * fact(n - 1)\nHANDLERS = {\"join\": join}\n",
+            "\"\"\"Text helpers.\"\"\"\nfrom pkg.limits import MAX, LimitError\nSEP = \", \"\nDEFAULTS = {\"tags\": [\"a\"]}\ndef _clean(s):\n    return s.strip()\ndef join_all(items):\n    return SEP.join([_clean(x) for x in items])\ndef capped(items):\n    if len(items) > MAX:\n        raise LimitError(\"too many\")\n    return join_all(items)\ndef fact(n):\n    return 1 if n <= 1 else n * fact(n - 1)\nHANDLERS = {\"join\": join_all}\n",
         );
         let mut session = StoneSession::default();
         let mut run = |source: &str| -> Result<serde_json::Value, ShellError> {
@@ -20269,14 +20903,14 @@ emit(inc(5))
 
         // The module's own SEP and _clean are used, not the importer's.
         let value = run(
-            "from textutil import join, capped, fact, DEFAULTS, HANDLERS, MAX as limit\nfrom pkg.limits import LimitError\nSEP = \"|\"\ndef _clean(s):\n    return \"WRONG\"\nout = {\"join\": join([\" a \", \"b \"]), \"fact\": fact(4), \"handler\": HANDLERS[\"join\"]([\"x\"]), \"limit\": limit}\ntry:\n    capped([\"1\", \"2\", \"3\", \"4\"])\nexcept LimitError as e:\n    out[\"caught\"] = e.message\nemit(out)\n",
+            "from textutil import join_all, capped, fact, DEFAULTS, HANDLERS, MAX as limit\nfrom pkg.limits import LimitError\nSEP = \"|\"\ndef _clean(s):\n    return \"WRONG\"\nout = {\"join\": join_all([\" a \", \"b \"]), \"fact\": fact(4), \"handler\": HANDLERS[\"join\"]([\"x\"]), \"limit\": limit}\ntry:\n    capped([\"1\", \"2\", \"3\", \"4\"])\nexcept LimitError as e:\n    out[\"caught\"] = e.message\nemit(out)\n",
         )?;
         assert_eq!(
             value,
             json_value!({"join": "a, b", "fact": 24, "handler": "x", "limit": 3, "caught": "too many"})
         );
         // Imported names stay bound in a warm session.
-        assert_eq!(run("emit(join([\"p\", \"q\"]))\n")?, json_value!("p, q"));
+        assert_eq!(run("emit(join_all([\"p\", \"q\"]))\n")?, json_value!("p, q"));
         // A module may name the types `isinstance` checks, bool and dict
         // included, as a program can.
         write(
@@ -20380,9 +21014,9 @@ emit(inc(5))
         // Records from a module; aliases from a module work in annotations.
         let value = run(concat!(
             "from shapes import Read, Edit, Action, describe\n",
-            "def first(actions: list[Action]) -> Action | None:\n    return actions[0] if actions else None\n",
+            "def first_action(actions: list[Action]) -> Action | None:\n    return actions[0] if actions else None\n",
             "a = Edit(path=\"x.py\", new=\"y\")\n",
-            "emit([describe(a), isinstance(a, Action), isinstance(Read(path=\"r\"), Edit), first([]), describe(first([a]))])\n",
+            "emit([describe(a), isinstance(a, Action), isinstance(Read(path=\"r\"), Edit), first_action([]), describe(first_action([a]))])\n",
         ))?;
         assert_eq!(
             value,
@@ -20884,7 +21518,7 @@ emit(inc(5))
 
         // An answer that never matches raises ModelOutputError.
         let (value, requests) = run(
-            "try:\n    model.ask(\"next\", output=Action, retries=1)\nexcept ModelOutputError as e:\n    emit([e.attempts, e.expected, e.issues[0][\"path\"], isinstance(e, ToolError)])\n",
+            "try:\n    model.ask(\"next\", output=Action, retries=1)\nexcept ModelOutputError as e:\n    emit([e.attempts, e.expected, e.issues[0].path, isinstance(e, ToolError)])\n",
             &[r#"{"kind": "edit", "path": "a.py"}"#, "not json"],
         );
         assert_eq!(value?, json_value!([2, "Read | Edit", "$", true]));
@@ -20971,7 +21605,7 @@ emit(inc(5))
         assert_eq!(
             value?,
             json_value!([
-                {"calls": 4, "input_tokens": null, "output_tokens": 100, "seconds": null},
+                {"calls": 4, "input_tokens": null, "output_tokens": 100, "tool_calls": null, "seconds": null},
                 {"calls": 0, "input_tokens": 0, "output_tokens": 0}
             ])
         );
@@ -20987,7 +21621,7 @@ emit(inc(5))
             json_value!([
                 "x", "y", "z",
                 {"calls": 1, "input_tokens": 10, "output_tokens": 5},
-                {"calls": 1, "input_tokens": null, "output_tokens": 3, "seconds": null},
+                {"calls": 1, "input_tokens": null, "output_tokens": 3, "tool_calls": null, "seconds": null},
                 {"calls": 3, "input_tokens": 30, "output_tokens": 15},
                 1, 85
             ])
@@ -21988,7 +22622,7 @@ print()
     }
 
     #[test]
-    fn print_records_stdout_while_preserving_value() -> Result<(), ShellError> {
+    fn print_writes_python_str_and_returns_none() -> Result<(), ShellError> {
         let (engine_state, mut stack, root) = test_engine("print-stdout")?;
         let program = lower_source(
             r#"class P(Record):
@@ -22008,9 +22642,9 @@ print({"name": "beta", "count": 2})
 
         assert_eq!(
             json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())?,
-            json_value!({"name": "beta", "count": 2})
+            json_value!(null)
         );
-        // print writes Python's str(); emit() is the JSON path.
+        // print writes Python's str() and returns None; emit() is the JSON path.
         assert_eq!(
             output.stdout,
             "alpha\n{'name': 'beta', 'count': 2}\n[1, None, True] P(x=1) <class 'ValueError'>\ncaught: bad\n{'name': 'beta', 'count': 2}\n"
@@ -22029,7 +22663,7 @@ print({"name": "beta", "count": 2})
 written = f.write("hello\n")
 f.write("world\n")
 f.close()
-print({"written": written, "content": cat("out.txt")})
+emit({"written": written, "content": cat("out.txt")})
 "#,
         )?;
         let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
@@ -22059,10 +22693,10 @@ entries = list_dir("nested")
 emit({
     "text": text,
     "alias": alias,
-    "type": info["type"],
-    "is_file": info["is_file"],
-    "listed": entries[0]["name"],
-    "listed_type": entries[0]["type"],
+    "type": info.type,
+    "is_file": info.is_file,
+    "listed": entries[0].name,
+    "listed_type": entries[0].type,
 })
 "#,
         )?;
@@ -22098,21 +22732,21 @@ agent_session = help("agent_session")
 attempt_best = help("attempt_best")
 missing = help("not_a_builtin")
 emit({
-    "language": overview["language"],
-    "has_unsupported": len(overview["unsupported"]) > 0,
-    "has_session_topic": "session" in overview["topics"],
-    "has_agent_control_topic": "agent_control" in overview["topics"],
-    "for_llm_mentions_bindings": "bindings persist" in overview["for_llm"],
-    "for_llm_mentions_multiline_eval": "multi-line script" in overview["for_llm"],
-    "session_mentions_live_bindings": "live name binding" in session["bullets"][1],
-    "session_mentions_binding_ack": "bound names" in session["bullets"][2],
-    "agent_control_mentions_builtin": "optimized AgentControl" in agent_control["bullets"][6],
-    "agent_session_signature": agent_session["signature"],
-    "attempt_best_mentions_counters": "best.considered" in attempt_best["use_when"] and "best.replacements" in attempt_best["use_when"],
-    "write_signature": write["signature"],
-    "write_example": write["examples"][0],
-    "edit_signature": edit["signature"],
-    "missing_found": missing["found"],
+    "language": overview.language,
+    "has_unsupported": len(overview.unsupported) > 0,
+    "has_session_topic": "session" in overview.topics,
+    "has_agent_control_topic": "agent_control" in overview.topics,
+    "for_llm_mentions_bindings": "bindings persist" in overview.for_llm,
+    "for_llm_mentions_multiline_eval": "multi-line script" in overview.for_llm,
+    "session_mentions_live_bindings": "live name binding" in session.bullets[1],
+    "session_mentions_binding_ack": "bound names" in session.bullets[2],
+    "agent_control_mentions_builtin": "optimized AgentControl" in agent_control.bullets[6],
+    "agent_session_signature": agent_session.signature,
+    "attempt_best_mentions_counters": "best.considered" in attempt_best.use_when and "best.replacements" in attempt_best.use_when,
+    "write_signature": write.signature,
+    "write_example": write.examples[0],
+    "edit_signature": edit.signature,
+    "missing_found": missing.found,
 })
 "#,
         )?;
@@ -23137,12 +23771,12 @@ emit({
         fail("dependent stage did not receive its declared input list")
     if step.stage_input_specs != {"inspect": {"source_layout": "path"}}:
         fail("dependent stage did not receive its typed input specification")
-    finding = step.stage_outputs.inspect.findings.source_layout
+    finding = step.stage_outputs["inspect"].findings["source_layout"]
     if finding.kind != "path" or finding.state != "resolved":
         fail("dependent stage did not receive the typed finding")
     if finding.value != "sources are under src":
         fail("dependent stage received the wrong finding value")
-    if get(step.stage_outputs.inspect.findings, "toolchain", None) is not None:
+    if get(step.stage_outputs["inspect"].findings, "toolchain", None) is not None:
         fail("dependent stage received an unrequested finding")
     return run(["sh", "-c", "printf '%s' \"$1\" > artifact.txt", "stage-output", finding.value])
 
@@ -23297,6 +23931,17 @@ emit({
             "{}\n{}",
             include_str!("../../../examples/scripts/standard_stage_agent.stone"),
             r#"
+class StageStep(BaseModel):
+    attempt: int
+    max_actions: int = 0
+    contracts: list = []
+    decision_fields: list = []
+    resolved_decision_fields: list = []
+    findings: dict = {}
+    probes: dict = {}
+    finding_specs: dict = {}
+    outcome: dict | None = None
+
 outcome = {
     "ok": False,
     "kind": "exec_failed",
@@ -23305,50 +23950,50 @@ outcome = {
     "stderr": "warning at the beginning",
     "stderr_tail": "collect2: error: ld returned 1 exit status",
 }
-step = {"attempt": 3}
+step = StageStep(attempt=3)
 action = {"tool": "run_complete", "input": {"argv": ["make"]}}
 summary = stage_agent_outcome_summary(outcome)
 history = stage_agent_history_item(step, action, outcome)
-failed_gate = {
-    "attempt": 2,
-    "max_actions": 3,
-    "contracts": ["file_valid"],
-    "outcome": {"tool": "run_complete"},
-}
-diagnostic = {
-    "attempt": 2,
-    "max_actions": 3,
-    "contracts": ["file_valid"],
-    "outcome": {"tool": "read"},
-}
-linux_failed_gate = {
-    "attempt": 2,
-    "max_actions": 3,
-    "contracts": ["file_valid"],
-    "outcome": {"tool": "run_linux"},
-}
-decision = {
-    "attempt": 4,
-    "max_actions": 4,
-    "contracts": ["decision_recorded"],
-    "decision_fields": [],
-    "outcome": None,
-}
-typed_decision = {
-    "attempt": 4,
-    "max_actions": 4,
-    "contracts": ["decision_recorded"],
-    "decision_fields": ["source_layout", "toolchain"],
-    "outcome": None,
-}
+failed_gate = StageStep(
+    attempt=2,
+    max_actions=3,
+    contracts=["file_valid"],
+    outcome={"tool": "run_complete"},
+)
+diagnostic = StageStep(
+    attempt=2,
+    max_actions=3,
+    contracts=["file_valid"],
+    outcome={"tool": "read"},
+)
+linux_failed_gate = StageStep(
+    attempt=2,
+    max_actions=3,
+    contracts=["file_valid"],
+    outcome={"tool": "run_linux"},
+)
+decision = StageStep(
+    attempt=4,
+    max_actions=4,
+    contracts=["decision_recorded"],
+    decision_fields=[],
+    outcome=None,
+)
+typed_decision = StageStep(
+    attempt=4,
+    max_actions=4,
+    contracts=["decision_recorded"],
+    decision_fields=["source_layout", "toolchain"],
+    outcome=None,
+)
 typed_schema = stage_agent_action_schema(typed_decision)
-resolved_decision = {
-    "attempt": 2,
-    "max_actions": 4,
-    "contracts": ["decision_recorded"],
-    "decision_fields": [],
-    "resolved_decision_fields": ["source_layout", "toolchain", "runtime_contract"],
-    "findings": {
+resolved_decision = StageStep(
+    attempt=2,
+    max_actions=4,
+    contracts=["decision_recorded"],
+    decision_fields=[],
+    resolved_decision_fields=["source_layout", "toolchain", "runtime_contract"],
+    findings={
         "source_layout": {
             "state": "resolved",
             "value": "sources found",
@@ -23365,49 +24010,49 @@ resolved_decision = {
             "basis": "no retained observation",
         },
     },
-    "probes": {
+    probes={
         "toolchain": {
             "status": "observed",
             "basis": "runtime:action:1:run_linux",
         },
     },
-    "outcome": {
+    outcome={
         "tool": "read",
         "kind": "read",
     },
-}
-resolved_schema = stage_agent_action_schema({
-    "attempt": 4,
-    "max_actions": 4,
-    "contracts": ["decision_recorded"],
-    "decision_fields": [],
-    "resolved_decision_fields": ["source_layout", "toolchain", "runtime_contract"],
-    "findings": resolved_decision.findings,
-    "probes": resolved_decision.probes,
-    "outcome": resolved_decision.outcome,
-})
+)
+resolved_schema = stage_agent_action_schema(StageStep(
+    attempt=4,
+    max_actions=4,
+    contracts=["decision_recorded"],
+    decision_fields=[],
+    resolved_decision_fields=["source_layout", "toolchain", "runtime_contract"],
+    findings=resolved_decision.findings,
+    probes=resolved_decision.probes,
+    outcome=resolved_decision.outcome,
+))
 resolved_tool_schema = stage_agent_action_schema(resolved_decision)
-resolved_initial_schema = stage_agent_action_schema({
-    "attempt": 1,
-    "max_actions": 4,
-    "contracts": ["decision_recorded"],
-    "decision_fields": [],
-    "resolved_decision_fields": ["source_layout", "toolchain", "runtime_contract"],
-    "outcome": None,
-})
-refinement_schema = stage_agent_action_schema({
-    "attempt": 3,
-    "max_actions": 5,
-    "contracts": ["decision_recorded"],
-    "decision_fields": [],
-    "resolved_decision_fields": ["toolchain", "runtime_contract"],
-    "findings": {},
-    "probes": {
+resolved_initial_schema = stage_agent_action_schema(StageStep(
+    attempt=1,
+    max_actions=4,
+    contracts=["decision_recorded"],
+    decision_fields=[],
+    resolved_decision_fields=["source_layout", "toolchain", "runtime_contract"],
+    outcome=None,
+))
+refinement_schema = stage_agent_action_schema(StageStep(
+    attempt=3,
+    max_actions=5,
+    contracts=["decision_recorded"],
+    decision_fields=[],
+    resolved_decision_fields=["toolchain", "runtime_contract"],
+    findings={},
+    probes={
         "toolchain": {"status": "observed"},
         "runtime_contract": {"status": "observed"},
     },
-    "outcome": None,
-})
+    outcome=None,
+))
 fair_refinement_focus = stage_agent_least_revised_field(
     ["toolchain", "interface_contract"],
     {
@@ -23416,18 +24061,18 @@ fair_refinement_focus = stage_agent_least_revised_field(
     },
 )
 budget_assistance = stage_agent_budget_assistance(
-    {"attempt": 1, "max_actions": 6},
+    StageStep(attempt=1, max_actions=6),
     ["source_layout", "toolchain", "interface_contract", "runtime_contract", "deployment_policy"],
     ["source_layout", "toolchain", "interface_contract", "runtime_contract", "deployment_policy"],
     [],
 )
-capability_schema = stage_agent_action_schema({
-    "attempt": 1,
-    "max_actions": 3,
-    "contracts": ["decision_recorded"],
-    "decision_fields": [],
-    "resolved_decision_fields": ["toolchain"],
-    "finding_specs": {
+capability_schema = stage_agent_action_schema(StageStep(
+    attempt=1,
+    max_actions=3,
+    contracts=["decision_recorded"],
+    decision_fields=[],
+    resolved_decision_fields=["toolchain"],
+    finding_specs={
         "toolchain": {
             "kind": "command",
             "question": "Which command provides the required capability?",
@@ -23438,48 +24083,48 @@ capability_schema = stage_agent_action_schema({
             },
         },
     },
-    "outcome": None,
-})
-capability_action = capability_schema.properties.actions.items.oneOf[6]
+    outcome=None,
+))
+capability_action = capability_schema["properties"]["actions"]["items"]["oneOf"][6]
 emit({
-    "summary_stdout": summary.stdout,
-    "summary_stderr": summary.stderr,
+    "summary_stdout": summary["stdout"],
+    "summary_stderr": summary["stderr"],
     "terminal_stderr": stage_agent_diagnostic_stream(
         outcome, "stderr", "stderr_tail", 11
     ),
-    "history_stdout": history.stdout,
-    "history_stderr": history.stderr,
+    "history_stdout": history["stdout"],
+    "history_stderr": history["stderr"],
     "failed_gate_mode": stage_agent_mode(failed_gate),
-    "failed_gate_choices": len(stage_agent_action_schema(failed_gate).properties.actions.items.oneOf),
+    "failed_gate_choices": len(stage_agent_action_schema(failed_gate)["properties"]["actions"]["items"]["oneOf"]),
     "diagnostic_mode": stage_agent_mode(diagnostic),
-    "diagnostic_choices": len(stage_agent_action_schema(diagnostic).properties.actions.items.oneOf),
+    "diagnostic_choices": len(stage_agent_action_schema(diagnostic)["properties"]["actions"]["items"]["oneOf"]),
     "linux_failed_gate_mode": stage_agent_mode(linux_failed_gate),
     "decision_mode": stage_agent_mode(decision),
-    "decision_choices": len(stage_agent_action_schema(decision).properties.actions.items.oneOf),
-    "typed_decision_required": typed_schema.properties.actions.items.oneOf[0].properties.input.required,
-    "typed_finding_required": typed_schema.properties.actions.items.oneOf[0].properties.input.properties.findings.required,
+    "decision_choices": len(stage_agent_action_schema(decision)["properties"]["actions"]["items"]["oneOf"]),
+    "typed_decision_required": typed_schema["properties"]["actions"]["items"]["oneOf"][0]["properties"]["input"]["required"],
+    "typed_finding_required": typed_schema["properties"]["actions"]["items"]["oneOf"][0]["properties"]["input"]["properties"]["findings"]["required"],
     "resolved_mode": stage_agent_mode(resolved_decision),
-    "resolved_choices": len(stage_agent_action_schema(resolved_decision).properties.actions.items.oneOf),
-    "resolved_decision_required": resolved_schema.properties.actions.items.oneOf[0].properties.input.required,
-    "resolved_finding_required": resolved_schema.properties.actions.items.oneOf[0].properties.input.properties.findings.properties.toolchain.required,
-    "resolved_state_enum": resolved_schema.properties.actions.items.oneOf[0].properties.input.properties.findings.properties.toolchain.properties.state.enum,
-    "resolved_resolution_type": resolved_schema.properties.actions.items.oneOf[0].properties.resolves.properties.toolchain.type,
-    "resolved_unknown_type": resolved_schema.properties.actions.items.oneOf[0].properties.unknown.properties.toolchain.type,
-    "tool_resolution_type": resolved_tool_schema.properties.actions.items.oneOf[0].properties.resolves.properties.toolchain.type,
-    "tool_required": resolved_tool_schema.properties.actions.items.oneOf[0].required,
-    "tool_probe_targets": resolved_tool_schema.properties.actions.items.oneOf[0].properties.for_field.enum,
-    "initial_resolves": get(resolved_initial_schema.properties.actions.items.oneOf[0].properties, "resolves", None),
-    "refinement_choices": len(refinement_schema.properties.actions.items.oneOf),
-    "refinement_targets": refinement_schema.properties.actions.items.oneOf[0].properties.for_field.enum,
+    "resolved_choices": len(stage_agent_action_schema(resolved_decision)["properties"]["actions"]["items"]["oneOf"]),
+    "resolved_decision_required": resolved_schema["properties"]["actions"]["items"]["oneOf"][0]["properties"]["input"]["required"],
+    "resolved_finding_required": resolved_schema["properties"]["actions"]["items"]["oneOf"][0]["properties"]["input"]["properties"]["findings"]["properties"]["toolchain"]["required"],
+    "resolved_state_enum": resolved_schema["properties"]["actions"]["items"]["oneOf"][0]["properties"]["input"]["properties"]["findings"]["properties"]["toolchain"]["properties"]["state"]["enum"],
+    "resolved_resolution_type": resolved_schema["properties"]["actions"]["items"]["oneOf"][0]["properties"]["resolves"]["properties"]["toolchain"]["type"],
+    "resolved_unknown_type": resolved_schema["properties"]["actions"]["items"]["oneOf"][0]["properties"]["unknown"]["properties"]["toolchain"]["type"],
+    "tool_resolution_type": resolved_tool_schema["properties"]["actions"]["items"]["oneOf"][0]["properties"]["resolves"]["properties"]["toolchain"]["type"],
+    "tool_required": resolved_tool_schema["properties"]["actions"]["items"]["oneOf"][0]["required"],
+    "tool_probe_targets": resolved_tool_schema["properties"]["actions"]["items"]["oneOf"][0]["properties"]["for_field"]["enum"],
+    "initial_resolves": get(resolved_initial_schema["properties"]["actions"]["items"]["oneOf"][0]["properties"], "resolves", None),
+    "refinement_choices": len(refinement_schema["properties"]["actions"]["items"]["oneOf"]),
+    "refinement_targets": refinement_schema["properties"]["actions"]["items"]["oneOf"][0]["properties"]["for_field"]["enum"],
     "fair_refinement_focus": fair_refinement_focus,
-    "budget_pressure": budget_assistance.pressure,
-    "budget_slack": budget_assistance.refinement_slack,
-    "budget_warning": budget_assistance.warning,
-    "capability_choices": len(capability_schema.properties.actions.items.oneOf),
-    "capability_tool": capability_action.properties.tool.const,
-    "capability_targets": capability_action.properties.for_field.enum,
-    "capability_input_required": capability_action.properties.input.required,
-    "provision_required": capability_action.properties.input.properties.provision.required,
+    "budget_pressure": budget_assistance["pressure"],
+    "budget_slack": budget_assistance["refinement_slack"],
+    "budget_warning": budget_assistance["warning"],
+    "capability_choices": len(capability_schema["properties"]["actions"]["items"]["oneOf"]),
+    "capability_tool": capability_action["properties"]["tool"]["const"],
+    "capability_targets": capability_action["properties"]["for_field"]["enum"],
+    "capability_input_required": capability_action["properties"]["input"]["required"],
+    "provision_required": capability_action["properties"]["input"]["properties"]["provision"]["required"],
 })
 "#,
         );
@@ -23574,14 +24219,14 @@ edited = stage_agent_dispatch({
     },
 })
 emit({
-    "find_ok": found.ok,
-    "find_content": found.content,
-    "search_ok": searched.ok,
-    "search_content": searched.content,
-    "range_content": ranged.content,
-    "tail_content": ending.content,
-    "edit_ok": edited.ok,
-    "edit_replacements": edited.replacements,
+    "find_ok": found["ok"],
+    "find_content": found["content"],
+    "search_ok": searched["ok"],
+    "search_content": searched["content"],
+    "range_content": ranged["content"],
+    "tail_content": ending["content"],
+    "edit_ok": edited["ok"],
+    "edit_replacements": edited["replacements"],
     "edited_content": read_text("pkg/sub/frame_backend.c"),
 })
 "#,
@@ -23642,15 +24287,15 @@ retained = stage_agent_dispatch({
     "input": {"command": "./fixture-command"},
 })
 emit({
-    "missing_ok": missing.ok,
-    "missing_kind": missing.kind,
-    "missing_transition": missing.environment_transition.state,
-    "provisioned_ok": provisioned.ok,
-    "provisioned_kind": provisioned.kind,
-    "provisioned_transition": provisioned.environment_transition.state,
-    "provisioned_attempted": provisioned.environment_transition.attempted,
-    "verified": provisioned.verification.ok,
-    "retained_transition": retained.environment_transition.state,
+    "missing_ok": missing["ok"],
+    "missing_kind": missing["kind"],
+    "missing_transition": missing["environment_transition"]["state"],
+    "provisioned_ok": provisioned["ok"],
+    "provisioned_kind": provisioned["kind"],
+    "provisioned_transition": provisioned["environment_transition"]["state"],
+    "provisioned_attempted": provisioned["environment_transition"]["attempted"],
+    "verified": provisioned["verification"]["ok"],
+    "retained_transition": retained["environment_transition"]["state"],
 })
 "#,
         );
@@ -23915,7 +24560,7 @@ emit({
                 "source_layout": "sources are nested under doomgeneric",
             },
         }
-    if step.findings.source_layout.state != "resolved":
+    if step.findings["source_layout"].state != "resolved":
         fail("ordinary action finding update was not merged into stage state")
     return {
         "ok": True,
@@ -23971,13 +24616,13 @@ emit({
         let (engine_state, mut stack, root) = test_engine("workflow-field-probes")?;
         let program = lower_source(
             r#"def agent_loop(step):
-    if step.finding_specs.source_layout.kind != "path":
+    if step.finding_specs["source_layout"].kind != "path":
         fail("typed finding kind was not exposed")
-    if step.finding_specs.toolchain.question != "Which compiler builds a MIPS ELF?":
+    if step.finding_specs["toolchain"].question != "Which compiler builds a MIPS ELF?":
         fail("typed finding question was not exposed")
-    if step.finding_specs.toolchain.evidence.tool != "run_linux":
+    if step.finding_specs["toolchain"].evidence.tool != "run_linux":
         fail("typed finding evidence tool was not exposed")
-    if step.finding_specs.toolchain.evidence.contains != ["mipsel-linux-gnu-gcc"]:
+    if step.finding_specs["toolchain"].evidence.contains != ["mipsel-linux-gnu-gcc"]:
         fail("typed finding evidence text was not exposed")
     if step.attempt == 1:
         if step.probes != {}:
@@ -23991,7 +24636,7 @@ emit({
             "probe_field": "source_layout",
         }
     if step.attempt == 2:
-        if step.probes.source_layout.status != "observed":
+        if step.probes["source_layout"].status != "observed":
             fail("the source-layout observation was not retained")
         return {
             "ok": True,
@@ -24004,11 +24649,11 @@ emit({
             },
             "probe_field": "toolchain",
         }
-    if step.findings.source_layout.basis != "runtime:action:1:read:.":
+    if step.findings["source_layout"].basis != "runtime:action:1:read:.":
         fail("the runtime did not own source-layout provenance")
-    if step.probes.source_layout.status != "resolved":
+    if step.probes["source_layout"].status != "resolved":
         fail("the resolved probe was not marked resolved")
-    if step.probes.toolchain.status != "observed":
+    if step.probes["toolchain"].status != "observed":
         fail("the toolchain observation was not retained")
     return {
         "ok": True,
@@ -24125,7 +24770,7 @@ workflow_run(task)
             "probe_field": "toolchain",
         }
     if step.attempt == 2:
-        if step.probes.toolchain.status != "insufficient":
+        if step.probes["toolchain"].status != "insufficient":
             fail("empty probe must remain insufficient")
         return {
             "ok": True,
@@ -24134,7 +24779,7 @@ workflow_run(task)
             "stdout": "/usr/bin/mipsel-linux-gnu-gcc\n",
             "probe_field": "toolchain",
         }
-    if step.probes.toolchain.status != "observed":
+    if step.probes["toolchain"].status != "observed":
         fail("non-empty refinement must become observable evidence")
     return {
         "ok": True,
@@ -24159,8 +24804,8 @@ workflow task:
 report = workflow_run(task)
 emit({
     "ok": report.ok,
-    "status": report.stages[0].probes.toolchain.status,
-    "revision": report.stages[0].probes.toolchain.revision,
+    "status": report.stages[0].probes["toolchain"].status,
+    "revision": report.stages[0].probes["toolchain"].revision,
 })
 "#,
         )?;
@@ -24207,7 +24852,7 @@ emit({
             "probe_field": "integration_contract",
         }
     if step.attempt == 2:
-        probe = step.probes.integration_contract
+        probe = step.probes["integration_contract"]
         if probe.status != "insufficient":
             fail("self-generated markers must remain insufficient")
         if "echo/printf" not in probe.insufficiency:
@@ -24224,7 +24869,7 @@ emit({
             "stderr": "producer exposes producer_entry; consumer selects consumer_entry; runtime applies startup_policy",
             "probe_field": "integration_contract",
         }
-    if step.probes.integration_contract.status != "observed":
+    if step.probes["integration_contract"].status != "observed":
         fail("external diagnostic must become observed evidence")
     return {
         "ok": True,
@@ -24254,8 +24899,8 @@ workflow task:
 report = workflow_run(task)
 emit({
     "ok": report.ok,
-    "status": report.stages[0].probes.integration_contract.status,
-    "revision": report.stages[0].probes.integration_contract.revision,
+    "status": report.stages[0].probes["integration_contract"].status,
+    "revision": report.stages[0].probes["integration_contract"].revision,
 })
 "#,
         )?;
@@ -24285,7 +24930,7 @@ emit({
             "probe_field": "entry_points",
         }
     if step.attempt == 2:
-        probe = step.probes.entry_points
+        probe = step.probes["entry_points"]
         if probe.status != "insufficient":
             fail("literal regex search must remain insufficient")
         if "regex=false" not in probe.warnings[0]:
@@ -24327,7 +24972,7 @@ workflow task:
         })
 
 report = workflow_run(task)
-emit({"ok": report.ok, "revision": report.stages[0].probes.entry_points.revision})
+emit({"ok": report.ok, "revision": report.stages[0].probes["entry_points"].revision})
 "#,
         )?;
         let output =
@@ -24354,7 +24999,7 @@ emit({"ok": report.ok, "revision": report.stages[0].probes.entry_points.revision
             "probe_field": "toolchain",
         }
     if step.attempt == 2:
-        probe = step.probes.toolchain
+        probe = step.probes["toolchain"]
         if probe.status != "insufficient":
             fail("an absent capability must keep the finding open")
         if probe.recommendations[0].tool != "ensure_command":
@@ -24370,7 +25015,7 @@ emit({"ok": report.ok, "revision": report.stages[0].probes.entry_points.revision
             "message": "command `fixture-command` is available at /opt/bin/fixture-command",
             "probe_field": "toolchain",
         }
-    if step.probes.toolchain.status != "observed":
+    if step.probes["toolchain"].status != "observed":
         fail("verified capability evidence must become observed")
     return {
         "ok": True,
@@ -24400,8 +25045,8 @@ workflow task:
 report = workflow_run(task)
 emit({
     "ok": report.ok,
-    "status": report.stages[0].probes.toolchain.status,
-    "revision": report.stages[0].probes.toolchain.revision,
+    "status": report.stages[0].probes["toolchain"].status,
+    "revision": report.stages[0].probes["toolchain"].revision,
 })
 "#,
         )?;
@@ -24439,7 +25084,7 @@ emit({
                 "toolchain": "use /opt/bin/fixture-command",
             },
         }
-    if step.findings.toolchain.state != "resolved":
+    if step.findings["toolchain"].state != "resolved":
         fail("same-action redundant probe erased the resolution")
     return {
         "ok": True,
@@ -24466,8 +25111,8 @@ workflow task:
 report = workflow_run(task)
 emit({
     "ok": report.ok,
-    "status": report.stages[0].probes.toolchain.status,
-    "revision": report.stages[0].probes.toolchain.revision,
+    "status": report.stages[0].probes["toolchain"].status,
+    "revision": report.stages[0].probes["toolchain"].revision,
 })
 "#,
         )?;
@@ -24496,9 +25141,9 @@ emit({
             "probe_field": "toolchain",
         }
     if step.attempt == 2:
-        if step.probes.toolchain.status != "insufficient":
+        if step.probes["toolchain"].status != "insufficient":
             fail("wrong evidence tool must remain insufficient")
-        if "expected tool `run_linux`" not in step.probes.toolchain.insufficiency:
+        if "expected tool `run_linux`" not in step.probes["toolchain"].insufficiency:
             fail("wrong-tool recovery was not explained")
         return {
             "ok": True,
@@ -24508,9 +25153,9 @@ emit({
             "probe_field": "toolchain",
         }
     if step.attempt == 3:
-        if step.probes.toolchain.status != "insufficient":
+        if step.probes["toolchain"].status != "insufficient":
             fail("missing required text must remain insufficient")
-        if "mipsel-linux-gnu-gcc" not in step.probes.toolchain.insufficiency:
+        if "mipsel-linux-gnu-gcc" not in step.probes["toolchain"].insufficiency:
             fail("missing-text recovery was not explained")
         return {
             "ok": True,
@@ -24519,9 +25164,9 @@ emit({
             "stdout": "/usr/bin/mipsel-linux-gnu-gcc\n",
             "probe_field": "toolchain",
         }
-    if step.probes.toolchain.status != "observed":
+    if step.probes["toolchain"].status != "observed":
         fail("matching evidence must become resolvable")
-    if len(step.probes.toolchain.summaries) != 3:
+    if len(step.probes["toolchain"].summaries) != 3:
         fail("bounded refinement summaries were not retained")
     return {
         "ok": True,
@@ -24551,8 +25196,8 @@ workflow task:
 report = workflow_run(task)
 emit({
     "ok": report.ok,
-    "status": report.stages[0].probes.toolchain.status,
-    "revision": report.stages[0].probes.toolchain.revision,
+    "status": report.stages[0].probes["toolchain"].status,
+    "revision": report.stages[0].probes["toolchain"].revision,
 })
 "#,
         )?;
@@ -24645,9 +25290,9 @@ workflow_run(task)
             "content": "vm.run(process.argv[2]); console.log('frame complete')",
             "probe_field": "runtime_contract",
         }
-    if step.probes.runtime_contract.revision != 2:
+    if step.probes["runtime_contract"].revision != 2:
         fail("probe refinement revision was not retained")
-    if len(step.probes.runtime_contract.bases) != 2:
+    if len(step.probes["runtime_contract"].bases) != 2:
         fail("probe refinement bases were not retained")
     return {
         "ok": True,
@@ -24672,8 +25317,8 @@ workflow task:
 report = workflow_run(task)
 emit({
     "ok": report.ok,
-    "basis": report.stages[0].findings.runtime_contract.basis,
-    "revision": report.stages[0].probes.runtime_contract.revision,
+    "basis": report.stages[0].findings["runtime_contract"].basis,
+    "revision": report.stages[0].probes["runtime_contract"].revision,
 })
 "#,
         )?;
@@ -25182,8 +25827,8 @@ emit({
     fn stone_help_supported_and_unsupported_syntax_stay_current() -> Result<(), ShellError> {
         let (engine_state, mut stack, root) = test_engine("stone-help-syntax")?;
         let program = lower_source(
-            r#"syntax = "\n".join(help("syntax")["bullets"])
-unsupported = "\n".join(help("unsupported")["bullets"])
+            r#"syntax = "\n".join(help("syntax").bullets)
+unsupported = "\n".join(help("unsupported").bullets)
 emit({
     "syntax_mentions_try": "try/except catches runtime evaluation errors" in syntax,
     "syntax_mentions_raise": "raise \"message\" is shorthand" in syntax,
@@ -25711,12 +26356,12 @@ emit({"string": string_result, "record": record_result})
             json::pipeline_to_json_value(output, Span::unknown())?,
             json_value!({
                 "string": {
-                    "code": "task_failure",
+                    "code": "stone_raised",
                     "declared_code": "stone_raised",
                     "message": "candidate failed",
                 },
                 "record": {
-                    "code": "task_failure",
+                    "code": "candidate_failed",
                     "declared_code": "candidate_failed",
                     "message": "evidence gate failed",
                 },
@@ -25801,7 +26446,7 @@ emit(f.read())
         let (engine_state, mut stack, root) = test_engine("file-boundary")?;
         fs::write(root.join("input.txt"), "content").expect("write input");
 
-        let program = lower_source(r#"open("input.txt")"#)?;
+        let program = lower_source(r#"emit(open("input.txt"))"#)?;
         let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
             .expect_err("file object should not serialize");
         let debug = format!("{err:?}");
@@ -26882,7 +27527,7 @@ emit(counts)
             r#"rows = [{"name": "Ada", "score": 3}, {"name": "Grace", "score": 5}, {"name": "Linus", "score": 5}]
 scores = []
 for row in rows:
-    scores.append(row.score)
+    scores.append(row["score"])
 best = sort(rows, key=lambda row: row["name"])[-1]
 counts = {}
 for score in scores:
@@ -26899,10 +27544,10 @@ for score in scores:
 emit({
     "first_two": scores[0:2],
     "last": scores[-1],
-    "best_name": best.name,
+    "best_name": best["name"],
     "counts": counts,
     "scaled": scaled,
-    "filtered": map(lambda row: row.name, filter(lambda row: row.score == 5, rows)),
+    "filtered": map(lambda row: row["name"], filter(lambda row: row["score"] == 5, rows)),
 })
 "#,
         )?;
@@ -27180,6 +27825,279 @@ emit({{"results": [checks[0](r), checks[1](r), checks[2]({{"n": 2}})], "errors":
         assert!(errors[0].as_str().unwrap().contains("calling `run()`"), "{value}");
         assert!(errors[1].as_str().unwrap().contains("`limit` is not available"), "{value}");
         assert!(errors[2].as_str().unwrap().contains("exactly one lambda"), "{value}");
+
+        // A module variable that reuses a builtin's name does not reach into
+        // a predicate: its calls are the builtins.
+        let program = lower_source(
+            "len = lambda x: 7\np = predicate(\"lambda x: len(x) > 2\")\nemit([p([1, 2, 3]), p([1]), len([1])])\n",
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value, json_value!([true, false, 7]));
+        Ok(())
+    }
+
+    #[test]
+    fn loops_walk_the_live_list_and_defaults_bind_once() -> Result<(), ShellError> {
+        let (engine_state, mut stack, _root) = test_engine("live-loops")?;
+        let program = lower_source(
+            r#"graph = {"a": ["b", "c"], "b": ["d"], "c": [], "d": []}
+queue = ["a"]
+for n in queue:
+    queue.extend(graph[n])
+xs = [1, 2, 3]
+seen = []
+for i, x in enumerate(xs):
+    if i == 0:
+        xs[2] = 30
+        xs.append(4)
+    seen.append(x)
+d = {"a": 1, "b": 2}
+for k in d:
+    d[k] = d[k] * 10
+errors = []
+try:
+    for k in d:
+        d["c"] = 3
+except RuntimeError as e:
+    errors.append(str(e))
+s = set([1])
+try:
+    for x in s:
+        s.add(2)
+except RuntimeError as e:
+    errors.append(str(e))
+def make():
+    fs = []
+    for i in range(3):
+        def g(x=i):
+            return x
+        fs.append(g)
+    return [f() for f in fs]
+n = 5
+def h(x=n):
+    return x
+n = 9
+emit({"queue": queue, "seen": seen, "d": d, "errors": errors, "made": make(), "h": h()})"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value["queue"], json_value!(["a", "b", "c", "d"]));
+        assert_eq!(value["seen"], json_value!([1, 2, 30, 4]));
+        assert_eq!(value["d"], json_value!({"a": 10, "b": 20, "c": 3}));
+        let errors = value["errors"].as_array().expect("errors");
+        assert_eq!(errors.len(), 2, "{value}");
+        assert!(errors[0].as_str().unwrap().contains("dictionary changed size"), "{value}");
+        assert!(errors[1].as_str().unwrap().contains("set changed size"), "{value}");
+        assert_eq!(value["made"], json_value!([0, 1, 2]));
+        assert_eq!(value["h"], json_value!(5));
+        Ok(())
+    }
+
+    #[test]
+    fn numbers_are_never_parsed_or_truncated_implicitly() -> Result<(), ShellError> {
+        let (engine_state, mut stack, _root) = test_engine("strict-numbers")?;
+        let program = lower_source(
+            r#"cases = [
+    lambda: sum(["1", "2"]), lambda: range(2.7), lambda: round("2.5"),
+    lambda: [1, 2, 3, 4][:4 / 2], lambda: enumerate([1], "5"), lambda: int(1e20),
+    lambda: int(float("nan")), lambda: 1 << 63, lambda: int("x"), lambda: float("y"),
+    lambda: int(None),
+]
+names = []
+for case in cases:
+    try:
+        case()
+        names.append("returned")
+    except TypeError:
+        names.append("TypeError")
+    except ValueError:
+        names.append("ValueError")
+    except Exception:
+        names.append("other")
+emit({"names": names, "explicit": [int(" 7 "), int(2.9), int(-2.9), float("1.5"), int(True), sum([1, 2.5]), parse_int("x", -1), parse_float("2.5", 0)]})"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(
+            value["names"],
+            json_value!([
+                "TypeError", "TypeError", "TypeError", "TypeError", "TypeError", "ValueError",
+                "ValueError", "other", "ValueError", "ValueError", "TypeError"
+            ])
+        );
+        assert_eq!(value["explicit"], json_value!([7, 2, -2, 1.5, 1, 3.5, -1, 2.5]));
+        Ok(())
+    }
+
+    #[test]
+    fn builtins_answer_like_python() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("python-answers")?;
+        std::fs::write(root.join("two.txt"), "one\ntwo\n").expect("write fixture");
+        let program = lower_source(
+            r#"chars = []
+for c in "ab\ncd":
+    chars.append(c)
+xs = []
+xs.extend("ab")
+f = open("two.txt")
+first_read = f.read()
+rows = [{"k": 1}, {"k": 3}, {"k": 2}]
+top = max(rows, key=lambda r: r["k"])
+top["top"] = True
+d = {"b": [1], "a": [2]}
+values(d)[0].append(9)
+part = slice(rows, 0, 1)
+part[0]["sliced"] = True
+emit({
+    "offsets": ["é-x".index("x"), "aé-x".find("x")],
+    "chars": chars, "extend": xs, "list": list("ab"), "sorted": sorted("ba"),
+    "reads": [first_read, f.read()],
+    "unique": unique([1, 1.0, {"a": 1, "b": 2}, {"b": 2, "a": 1}]),
+    "sum": sum([0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]),
+    "exact": [9007199254740993 == 9007199254740992.0, 9007199254740993 > 9007199254740992.0],
+    "minmax": [min([3, 1, 2]), max(3, 7), min("b", "a"), max([], default=None)],
+    "rows": rows, "d": d, "keys": json_dumps({"z": 1, "a": 2}),
+    "print": print("x"),
+})"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value["offsets"], json_value!([2, 3]));
+        assert_eq!(value["chars"], json_value!(["a", "b", "\n", "c", "d"]));
+        assert_eq!(value["extend"], json_value!(["a", "b"]));
+        assert_eq!(value["list"], json_value!(["a", "b"]));
+        assert_eq!(value["sorted"], json_value!(["a", "b"]));
+        assert_eq!(value["reads"], json_value!(["one\ntwo\n", ""]));
+        assert_eq!(value["unique"], json_value!([1, {"a": 1, "b": 2}]));
+        assert_eq!(value["sum"], json_value!(1.0));
+        assert_eq!(value["exact"], json_value!([false, true]));
+        assert_eq!(value["minmax"], json_value!([1, 7, "a", null]));
+        assert_eq!(value["rows"], json_value!([{"k": 1, "sliced": true}, {"k": 3, "top": true}, {"k": 2}]));
+        assert_eq!(value["d"], json_value!({"b": [1, 9], "a": [2]}));
+        assert_eq!(value["keys"], json_value!(r#"{"z":1,"a":2}"#));
+        assert_eq!(value["print"], json_value!(null));
+
+        // Without emit, only a final expression statement is the result.
+        for (source, expected) in [
+            ("for i in range(3):\n    i * 10", json_value!(null)),
+            ("if True:\n    7", json_value!(null)),
+            ("def f():\n    3\nf()", json_value!(null)),
+            ("1 + 1", json_value!(2)),
+        ] {
+            let program = lower_source(source)?;
+            let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+            assert_eq!(
+                json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+                expected,
+                "{source}"
+            );
+        }
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn keywords_repetition_and_bare_values_follow_python() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("python-calls")?;
+        let program = lower_source(
+            r#"codes = []
+try:
+    fail("boom", code="my_code")
+except Exception as e:
+    codes.append(e.code)
+errors = []
+for bad in [lambda: get("x"), lambda: must_run(["true"], background=True), lambda: run(["true"], bogus=1), lambda: enumerate([1], bogus=1)]:
+    try:
+        bad()
+    except TypeError as e:
+        errors.append(str(e))
+grid = [[]] * 2
+grid[0].append(1)
+def f():
+    return 1
+emit({
+    "kw": [list(enumerate(["a"], start=1)), round(2.567, ndigits=1), "a,b".split(sep=","), join(["a", "b"], sep="-")],
+    "help": help("budget").name, "codes": codes, "errors": errors,
+    "grid": grid, "rep": ["ab" * 2, [0] * 3],
+    "repr": [repr(f), repr(lambda x: x)],
+})"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value["kw"], json_value!([[[1, "a"]], 2.6, ["a", "b"], "a-b"]));
+        assert_eq!(value["help"], json_value!("model.limit"));
+        assert_eq!(value["codes"], json_value!(["my_code"]));
+        let errors = value["errors"].as_array().expect("errors");
+        assert_eq!(errors.len(), 4, "{errors:?}");
+        assert!(errors[0].as_str().unwrap().contains("get(d, key)"), "{errors:?}");
+        assert!(errors[1].as_str().unwrap().contains("does not take background="), "{errors:?}");
+        assert!(errors[2].as_str().unwrap().contains("expect, effects, and hooks"), "{errors:?}");
+        assert!(errors[3].as_str().unwrap().contains("unexpected keyword argument `bogus`; it takes values, iterable, start"), "{errors:?}");
+        assert_eq!(value["grid"], json_value!([[1], [1]]));
+        assert_eq!(value["rep"], json_value!(["abab", [0, 0, 0]]));
+        assert_eq!(value["repr"], json_value!(["<function f>", "<function <lambda>>"]));
+
+        // A function, the model, or an open file standing alone as a
+        // statement is not an error; as the last statement it is its repr.
+        std::fs::write(root.join("in.txt"), "x").expect("write fixture");
+        for (source, expected) in [
+            ("def g():\n    return 1\ng\nemit(1)", json_value!(1)),
+            ("def g():\n    return 1\ng", json_value!("<function g>")),
+            ("model\nemit(2)", json_value!(2)),
+            ("open(\"in.txt\")", json_value!("<file>")),
+        ] {
+            let program = lower_source(source)?;
+            let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+            assert_eq!(
+                json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+                expected,
+                "{source}"
+            );
+        }
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn dicts_use_brackets_and_host_results_are_records() -> Result<(), ShellError> {
+        let (engine_state, mut stack, _root) = test_engine("dict-record-access")?;
+        let program = lower_source(
+            r#"d = {"keys": 1, "xs": [1]}
+errors = []
+for read in [lambda: d.keys, lambda: d.missing]:
+    try:
+        read()
+    except AttributeError as e:
+        errors.append(str(e))
+r = run(["true"])
+try:
+    r["exit_code"]
+except TypeError as e:
+    errors.append(str(e))
+get(d, "xs").append(2)
+seen = []
+def post(step):
+    value = get(step.outcome, "value", None)
+    seen.append([value.exit_code == step.outcome.value.exit_code, "exit_code" in value])
+    return None
+run(["true"], hooks={"post": post})
+emit({"errors": errors, "code": r.exit_code, "has": ["exit_code" in r, "nope" in r],
+      "xs": d["xs"], "missing": get(d, "zz", 5), "seen": seen, "type": type(r)})"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        let errors = value["errors"].as_array().expect("errors");
+        assert_eq!(errors.len(), 3, "{value}");
+        assert!(errors[0].as_str().unwrap().contains(r#"write `["keys"]` instead of `.keys`"#), "{value}");
+        assert!(errors[1].as_str().unwrap().contains("a dict has no attribute `missing`"), "{value}");
+        assert!(errors[2].as_str().unwrap().contains("cannot subscript a RunResult record"), "{value}");
+        assert_eq!(value["code"], json_value!(0));
+        assert_eq!(value["has"], json_value!([true, false]));
+        assert_eq!(value["xs"], json_value!([1, 2]));
+        assert_eq!(value["missing"], json_value!(5));
+        assert_eq!(value["seen"], json_value!([[true, true]]));
+        assert_eq!(value["type"], json_value!("RunResult"));
         Ok(())
     }
 
@@ -27317,7 +28235,7 @@ emit({
             ),
             ("bad-add", r#"emit("1" + 1)"#, "cannot add"),
             ("bad-sub", r#"emit("1" - 1)"#, "cannot subtract"),
-            ("bad-mul", r#"emit("1" * 2)"#, "cannot multiply"),
+            ("bad-mul", r#"emit("1" * 1.5)"#, "cannot multiply"),
             ("bad-div", r#"emit("1" / 2)"#, "cannot divide"),
             ("bad-floor-div", r#"emit("1" // 2)"#, "cannot divide"),
             ("bad-mod", r#"emit("1" % 2)"#, "cannot modulo"),
@@ -27338,8 +28256,8 @@ emit({
                 "shift count is too large",
             ),
             ("bad-unary-minus", r#"emit(-"not-number")"#, "cannot negate"),
-            ("bad-bitwise", r#"emit("1" & 1)"#, "expected integer"),
-            ("bad-bitwise-invert", r#"emit(~"1")"#, "expected integer"),
+            ("bad-bitwise", r#"emit("1" & 1)"#, "expected int, got str"),
+            ("bad-bitwise-invert", r#"emit(~"1")"#, "expected int, got str"),
         ];
 
         for (name, source, expected) in cases {
@@ -27459,7 +28377,7 @@ value -= 1
                 r#"value = "1"
 value |= 1
 "#,
-                "expected integer",
+                "expected int, got str",
             ),
             (
                 "bad-augassign-zero-div",
@@ -27763,17 +28681,17 @@ emit({
 bad = run(["sh", "-c", "printf nope >&2; exit 7"])
 quiet = run(["sh", "-c", "exit 9"])
 emit({
-    "ok": ok["ok"],
-    "stdout": ok["stdout"],
-    "bad_ok": bad["ok"],
-    "bad_kind": bad["kind"],
-    "bad_exit": bad["exit_code"],
-    "bad_stderr": bad["stderr"],
-    "bad_explanation": bad["explanation"]["summary"],
-    "bad_scope": bad["explanation"]["scope"],
-    "quiet_kind": quiet["explanation"]["kind"],
-    "quiet_summary": quiet["explanation"]["summary"],
-    "quiet_step_count": len(quiet["explanation"]["next_steps"]),
+    "ok": ok.ok,
+    "stdout": ok.stdout,
+    "bad_ok": bad.ok,
+    "bad_kind": bad.kind,
+    "bad_exit": bad.exit_code,
+    "bad_stderr": bad.stderr,
+    "bad_explanation": bad.explanation.summary,
+    "bad_scope": bad.explanation.scope,
+    "quiet_kind": quiet.explanation.kind,
+    "quiet_summary": quiet.explanation.summary,
+    "quiet_step_count": len(quiet.explanation.next_steps),
 })
 "#,
         )?;
@@ -27874,18 +28792,18 @@ positional_timeout = run(["sh", "-c", "sleep 1"], 20)
 named_none = run(["pwd"], cwd=None, stdin=None, timeout_ms=None, env=None)
 positional_none = run(["sh", "-c", "printf none"], None, None, None)
 emit({
-    "echoed_ok": echoed["ok"],
-    "echoed": echoed["stdout"],
-    "timed_ok": timed["ok"],
-    "timed_kind": timed["kind"],
-    "timed_out": timed["timed_out"],
-    "timed_summary": timed["explanation"]["summary"],
-    "timed_timeout_ms": timed["explanation"]["timeout_ms"],
-    "timed_steps": timed["explanation"]["next_steps"],
-    "positional_cwd": positional_cwd["stdout"],
-    "positional_timeout": positional_timeout["timed_out"],
-    "named_none": named_none["stdout"],
-    "positional_none": positional_none["stdout"],
+    "echoed_ok": echoed.ok,
+    "echoed": echoed.stdout,
+    "timed_ok": timed.ok,
+    "timed_kind": timed.kind,
+    "timed_out": timed.timed_out,
+    "timed_summary": timed.explanation.summary,
+    "timed_timeout_ms": timed.explanation.timeout_ms,
+    "timed_steps": timed.explanation.next_steps,
+    "positional_cwd": positional_cwd.stdout,
+    "positional_timeout": positional_timeout.timed_out,
+    "named_none": named_none.stdout,
+    "positional_none": positional_none.stdout,
 })
 "#,
         )?;
@@ -27931,17 +28849,17 @@ emit({
 suppressed = run(["sh", "-c", "printf hidden; printf also-hidden >&2"], stdout="suppress", stderr="discard")
 merged = run(["sh", "-c", "printf out; printf err >&2"], stderr="stdout")
 emit({
-    "limited_stdout": limited["stdout"],
-    "limited_stderr": limited["stderr"],
-    "limited_stdout_truncated": limited["truncated"]["stdout"],
-    "limited_stderr_truncated": limited["truncated"]["stderr"],
-    "suppressed_stdout": suppressed["stdout"],
-    "suppressed_stderr": suppressed["stderr"],
-    "suppressed_stdout_flag": suppressed["suppressed"]["stdout"],
-    "suppressed_stderr_flag": suppressed["suppressed"]["stderr"],
-    "merged_stdout": merged["stdout"],
-    "merged_stderr": merged["stderr"],
-    "merged_flag": merged["stderr_to_stdout"],
+    "limited_stdout": limited.stdout,
+    "limited_stderr": limited.stderr,
+    "limited_stdout_truncated": limited.truncated.stdout,
+    "limited_stderr_truncated": limited.truncated.stderr,
+    "suppressed_stdout": suppressed.stdout,
+    "suppressed_stderr": suppressed.stderr,
+    "suppressed_stdout_flag": suppressed.suppressed.stdout,
+    "suppressed_stderr_flag": suppressed.suppressed.stderr,
+    "merged_stdout": merged.stdout,
+    "merged_stderr": merged.stderr,
+    "merged_flag": merged.stderr_to_stdout,
 })
 "#,
         )?;
@@ -28000,13 +28918,13 @@ emit({
         let program = lower_source(
             r#"result = run(["python3", "-c", "print('ok')"])
 emit({
-    "ok": result["ok"],
-    "stdout": result["stdout"],
-    "runtime_kind": result["runtime"]["kind"],
-    "command_name": result["runtime"]["command_name"],
-    "resolved_is_string": type(result["runtime"]["resolved_executable"]) == "str",
-    "python_executable_is_string": type(result["runtime"]["python_executable"]) == "str",
-    "marker_count": len(result["runtime"]["cwd_project_markers"]),
+    "ok": result.ok,
+    "stdout": result.stdout,
+    "runtime_kind": result.runtime.kind,
+    "command_name": result.runtime.command_name,
+    "resolved_is_string": type(result.runtime.resolved_executable) == "str",
+    "python_executable_is_string": type(result.runtime.python_executable) == "str",
+    "marker_count": len(result.runtime.cwd_project_markers),
 })
 "#,
         )?;
@@ -28035,16 +28953,16 @@ emit({
         let program = lower_source(
             r#"result = run(["python3", "-c", "import stone_definitely_missing_module"])
 emit({
-    "ok": result["ok"],
-    "kind": result["explanation"]["kind"],
-    "runtime_kind": result["runtime"]["kind"],
-    "helper_count": len(result["helpers"]),
-    "helper": result["helpers"][0]["helper"],
-    "helper_kind": result["helpers"][0]["kind"],
-    "helper_family": result["helpers"][0]["family"],
-    "module": result["helpers"][0]["evidence"]["module"],
-    "package": result["helpers"][0]["evidence"]["package"],
-    "next_check": result["helpers"][0]["next_checks"][0],
+    "ok": result.ok,
+    "kind": result.explanation.kind,
+    "runtime_kind": result.runtime.kind,
+    "helper_count": len(result.helpers),
+    "helper": result.helpers[0]["helper"],
+    "helper_kind": result.helpers[0]["kind"],
+    "helper_family": result.helpers[0]["family"],
+    "module": result.helpers[0]["evidence"]["module"],
+    "package": result.helpers[0]["evidence"]["package"],
+    "next_check": result.helpers[0]["next_checks"][0],
 })
 "#,
         )?;
@@ -28091,15 +29009,15 @@ emit({
         let program = lower_source(
             r#"result = run(["python3", "-c", "import math; math.stone_definitely_missing_attribute"])
 emit({
-    "ok": result["ok"],
-    "kind": result["explanation"]["kind"],
-    "runtime_kind": result["runtime"]["kind"],
-    "helper_count": len(result["helpers"]),
-    "helper_kind": result["helpers"][0]["kind"],
-    "module": result["helpers"][0]["evidence"]["module"],
-    "attribute": result["helpers"][0]["evidence"]["attribute"],
-    "package": result["helpers"][0]["evidence"]["package"],
-    "next_checks": result["helpers"][0]["next_checks"],
+    "ok": result.ok,
+    "kind": result.explanation.kind,
+    "runtime_kind": result.runtime.kind,
+    "helper_count": len(result.helpers),
+    "helper_kind": result.helpers[0]["kind"],
+    "module": result.helpers[0]["evidence"]["module"],
+    "attribute": result.helpers[0]["evidence"]["attribute"],
+    "package": result.helpers[0]["evidence"]["package"],
+    "next_checks": result.helpers[0]["next_checks"],
 })
 "#,
         )?;
@@ -28142,14 +29060,14 @@ emit({
             r#"script = "import sys; print('demo 1.0 has requirement dep<2, but you have dep 3.0.', file=sys.stderr); sys.exit(1)"
 result = run(["python3", "-c", script])
 emit({
-    "ok": result["ok"],
-    "kind": result["explanation"]["kind"],
-    "helper_count": len(result["helpers"]),
-    "helper_kind": result["helpers"][0]["kind"],
-    "dependent": result["helpers"][0]["evidence"]["dependent"],
-    "requirement": result["helpers"][0]["evidence"]["requirement"],
-    "installed": result["helpers"][0]["evidence"]["installed"],
-    "next_checks": result["helpers"][0]["next_checks"],
+    "ok": result.ok,
+    "kind": result.explanation.kind,
+    "helper_count": len(result.helpers),
+    "helper_kind": result.helpers[0]["kind"],
+    "dependent": result.helpers[0]["evidence"]["dependent"],
+    "requirement": result.helpers[0]["evidence"]["requirement"],
+    "installed": result.helpers[0]["evidence"]["installed"],
+    "next_checks": result.helpers[0]["next_checks"],
 })
 "#,
         )?;
@@ -28214,14 +29132,14 @@ emit({
         let program = lower_source(&format!(
             r#"result = run({argv})
 emit({{
-    "ok": result["ok"],
-    "kind": result["explanation"]["kind"],
-    "helper_count": len(result["helpers"]),
-    "helper_kind": result["helpers"][0]["kind"],
-    "helper": result["helpers"][0]["helper"],
-    "requested": result["helpers"][0]["evidence"]["requested"],
-    "evidence": result["helpers"][0]["evidence"]["evidence"],
-    "next_checks": result["helpers"][0]["next_checks"],
+    "ok": result.ok,
+    "kind": result.explanation.kind,
+    "helper_count": len(result.helpers),
+    "helper_kind": result.helpers[0]["kind"],
+    "helper": result.helpers[0]["helper"],
+    "requested": result.helpers[0]["evidence"]["requested"],
+    "evidence": result.helpers[0]["evidence"]["evidence"],
+    "next_checks": result.helpers[0]["next_checks"],
 }})
 "#
         ))?;
@@ -28367,10 +29285,10 @@ hook("run.after_timeout", family="build", argv0=["make"], handler="build.after_t
         let program = lower_source(
             r#"result = run(["sh", "-c", "echo 'libOpenGL.so.0 => not found' >&2; exit 1"])
 emit({
-    "ok": result["ok"],
-    "helper": result["helpers"][0]["helper"],
-    "kind": result["helpers"][0]["kind"],
-    "missing": result["helpers"][0]["evidence"]["missing_libraries"][0],
+    "ok": result.ok,
+    "helper": result.helpers[0]["helper"],
+    "kind": result.helpers[0]["kind"],
+    "missing": result.helpers[0]["evidence"]["missing_libraries"][0],
 })
 "#,
         )?;
@@ -28397,8 +29315,8 @@ emit({
             r#"write_file(".stone/helpers/z-late.stone", "hook(\"run.after_failure\", family=\"generic\", handler=\"generic.after_failure\", priority=1000)\n")
 result = run(["sh", "-c", "echo 'libLate.so => not found' >&2; exit 1"])
 emit({
-    "helper": result["helpers"][0]["helper"],
-    "kind": result["helpers"][0]["kind"],
+    "helper": result.helpers[0]["helper"],
+    "kind": result.helpers[0]["kind"],
 })
 "#,
         )?;
@@ -28428,12 +29346,12 @@ emit({
         let source = format!(
             r#"result = run(["{}", "-i", "input.wav", "out.mp4"])
 emit({{
-    "ok": result["ok"],
-    "helper": result["helpers"][0]["helper"],
-    "family": result["helpers"][0]["family"],
-    "kind": result["helpers"][0]["kind"],
-    "media_path": result["helpers"][0]["evidence"]["candidate_paths"][1],
-    "next_check": result["helpers"][0]["next_checks"][0][0],
+    "ok": result.ok,
+    "helper": result.helpers[0]["helper"],
+    "family": result.helpers[0]["family"],
+    "kind": result.helpers[0]["kind"],
+    "media_path": result.helpers[0]["evidence"]["candidate_paths"][1],
+    "next_check": result.helpers[0]["next_checks"][0][0],
 }})
 "#,
             fake_ffmpeg.display()
@@ -28478,11 +29396,11 @@ hook("run.after_failure", family="conda", argv0=["sh"], handler="conda.after_fai
         let program = lower_source(
             r#"result = run(["sh", "-c", "echo conda solve failed >&2; exit 1"])
 emit({
-    "helper": result["helpers"][0]["helper"],
-    "kind": result["helpers"][0]["kind"],
-    "family": result["helpers"][0]["family"],
-    "argv0": result["helpers"][0]["evidence"]["argv0"],
-    "next_check": result["helpers"][0]["next_checks"][0][0],
+    "helper": result.helpers[0]["helper"],
+    "kind": result.helpers[0]["kind"],
+    "family": result.helpers[0]["family"],
+    "argv0": result.helpers[0]["evidence"]["argv0"],
+    "next_check": result.helpers[0]["next_checks"][0][0],
 })
 "#,
         )?;
@@ -28519,10 +29437,10 @@ emit({
         let source = format!(
             r#"result = run(["{}", "install", "demo"])
 emit({{
-    "helper": result["helpers"][0]["helper"],
-    "kind": result["helpers"][0]["kind"],
-    "conflict": result["helpers"][0]["evidence"]["conflict_excerpt"],
-    "next_check": result["helpers"][0]["next_checks"][0][0],
+    "helper": result.helpers[0]["helper"],
+    "kind": result.helpers[0]["kind"],
+    "conflict": result.helpers[0]["evidence"]["conflict_excerpt"],
+    "next_check": result.helpers[0]["next_checks"][0][0],
 }})
 "#,
             fake_conda.display()
@@ -28563,10 +29481,10 @@ emit({{
         let source = format!(
             r#"result = run(["{}", "paper.tex"])
 emit({{
-    "helper": result["helpers"][0]["helper"],
-    "kind": result["helpers"][0]["kind"],
-    "overfull": result["helpers"][0]["evidence"]["overfull_lines"],
-    "next_check": result["helpers"][0]["next_checks"][0][0],
+    "helper": result.helpers[0]["helper"],
+    "kind": result.helpers[0]["kind"],
+    "overfull": result.helpers[0]["evidence"]["overfull_lines"],
+    "next_check": result.helpers[0]["next_checks"][0][0],
 }})
 "#,
             fake_pdflatex.display()
@@ -28598,7 +29516,7 @@ emit({{
         let program = lower_source(
             r#"result = run(["sh", "-c", "exit 1"])
 emit({
-    "ok": result["ok"],
+    "ok": result.ok,
     "helper_count": len(result.get("helpers", [])),
 })
 "#,
@@ -28627,8 +29545,8 @@ hook("run.after_failure", family="generic", handler="broken.after_failure", prio
         let program = lower_source(
             r#"result = run(["sh", "-c", "exit 1"])
 emit({
-    "kind": result["helpers"][0]["kind"],
-    "source": result["helpers"][0]["evidence"]["source"],
+    "kind": result.helpers[0]["kind"],
+    "source": result.helpers[0]["evidence"]["source"],
 })
 "#,
         )?;
@@ -28655,11 +29573,11 @@ emit({
         let program = lower_source(
             r#"result = run(["sh", "-c", "printf building; sleep 1"], timeout_ms=100)
 emit({
-    "ok": result["ok"],
-    "kind": result["kind"],
-    "helper": result["helpers"][0]["helper"],
-    "helper_kind": result["helpers"][0]["kind"],
-    "stdout_tail": result["helpers"][0]["evidence"]["stdout_tail"],
+    "ok": result.ok,
+    "kind": result.kind,
+    "helper": result.helpers[0]["helper"],
+    "helper_kind": result.helpers[0]["kind"],
+    "stdout_tail": result.helpers[0]["evidence"]["stdout_tail"],
 })
 "#,
         )?;
@@ -28682,15 +29600,15 @@ emit({
             r#"found = resolve_command("sh")
 missing = resolve_command("stone-command-that-does-not-exist")
 emit({
-    "found_ok": found["ok"],
-    "found_path_is_string": type(found["path"]) == "str",
-    "found_matches": len(found["matches"]) > 0,
-    "found_searched": len(found["searched"]) > 0,
-    "found_kind": found["explanation"]["kind"],
-    "missing_ok": missing["ok"],
-    "missing_path": missing["path"],
-    "missing_matches": len(missing["matches"]),
-    "missing_kind": missing["explanation"]["kind"],
+    "found_ok": found.ok,
+    "found_path_is_string": type(found.path) == "str",
+    "found_matches": len(found.matches) > 0,
+    "found_searched": len(found.searched) > 0,
+    "found_kind": found.explanation.kind,
+    "missing_ok": missing.ok,
+    "missing_path": missing.path,
+    "missing_matches": len(missing.matches),
+    "missing_kind": missing.explanation.kind,
 })
 "#,
         )?;
@@ -28710,12 +29628,17 @@ emit({
             })
         );
 
-        let program = lower_source(r#"run(["stone-command-that-does-not-exist"])"#)?;
-        let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
-            .expect_err("missing executable should fail before returning a run record");
-        let text = format!("{error:?}");
-        assert!(text.contains("was not found in PATH"), "{text}");
-        assert!(text.contains("resolve_command"), "{text}");
+        // A missing executable is a process outcome (ok=False, exit 127),
+        // as run()'s help promises, not an exception.
+        let program = lower_source(
+            r#"r = run(["stone-command-that-does-not-exist"])
+emit([r.ok, r.exit_code, r.kind, r.explanation.kind, "was not found in PATH" in r.stderr, "resolve_command" in r.stderr])"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!([false, 127, "command_not_found", "command_not_found", true, true])
+        );
 
         let program = lower_source(r#"run(["sh", "-c", "true"], cwd="missing-dir")"#)?;
         let error = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
@@ -28757,16 +29680,16 @@ udp = wait_port(9, protocol="udp", timeout_ms=20)
 stopped = stop_daemon(daemon, timeout_ms=1000)
 after = daemon_status(daemon)
 emit({
-    "started": daemon["ok"],
-    "pid_positive": daemon["pid"] > 0,
-    "running": status["running"],
-    "status_ok": status["ok"],
-    "closed_ok": closed["ok"],
-    "closed_kind": closed["kind"],
-    "closed_protocol": closed["protocol"],
-    "udp_protocol": udp["protocol"],
-    "stopped": stopped["ok"],
-    "after_running": after["running"],
+    "started": daemon.ok,
+    "pid_positive": daemon.pid > 0,
+    "running": status.running,
+    "status_ok": status.ok,
+    "closed_ok": closed.ok,
+    "closed_kind": closed.kind,
+    "closed_protocol": closed.protocol,
+    "udp_protocol": udp.protocol,
+    "stopped": stopped.ok,
+    "after_running": after.running,
 })
 "#
         .to_owned();
@@ -28801,12 +29724,12 @@ mem = sysinfo("mem")
 cpu = sys("cpu")
 procs = ps()
 emit({
-    "os": info["os"],
-    "arch_is_string": type(info["arch"]) == "str",
-    "cpu_count_positive": info["cpu_count"] > 0,
+    "os": info.os,
+    "arch_is_string": type(info.arch) == "str",
+    "cpu_count_positive": info.cpu_count > 0,
     "mem_has_total": "total" in mem,
     "cpu_is_list": type(cpu) == "list",
-    "has_self": len(where(procs, lambda p: p["pid"] == info["current_pid"])) > 0,
+    "has_self": len(where(procs, lambda p: p.pid == info.current_pid)) > 0,
     "process_fields": len(procs) == 0 or ("command" in procs[0] and "memory_bytes" in procs[0]),
 })
 "#,
@@ -28841,7 +29764,7 @@ rows = read_jsonl(files[0])
 ordered = sort(rows, "score", reverse=True)
 emit({
     "file_count": len(files),
-    "file_name": files[0]["name"],
+    "file_name": files[0].name,
     "top": ordered[0]["name"],
 })
 "#,
@@ -28874,8 +29797,8 @@ emit({
 small = find(".", path_glob="**/*.txt", type="file", max_size=0)
 old = find(".", type="file", modified_before_ms=1)
 emit({
-    "py_names": sort([file["name"] for file in py]),
-    "small_names": [file["name"] for file in small],
+    "py_names": sort([file.name for file in py]),
+    "small_names": [file.name for file in small],
     "old_count": len(old),
 })
 "#,
@@ -28918,8 +29841,8 @@ tail_text = read_text(path="pkg/main.py", tail_bytes=6)
 matches = search(path=".", query="needle")
 rm(paths=["a.tmp", "b.tmp", "missing.tmp"], force=True)
 emit({
-    "named": [file["name"] for file in named],
-    "shallow": [file["name"] for file in shallow],
+    "named": [file.name for file in named],
+    "shallow": [file.name for file in shallow],
     "lines": lines,
     "deep_lines": deep_lines,
     "offset_text": offset_text,
@@ -28958,14 +29881,14 @@ emit({
         let program = lower_source(
             r#"changes = diff("before.txt", "after.txt")
 emit({
-    "changed": changes["changed"],
-    "hunk_count": len(changes["hunks"]),
-    "old_start": changes["hunks"][0]["old_start"],
-    "new_start": changes["hunks"][0]["new_start"],
-    "first_kind": changes["hunks"][0]["lines"][0]["kind"],
-    "first_text": changes["hunks"][0]["lines"][0]["text"],
-    "last_kind": changes["hunks"][1]["lines"][0]["kind"],
-    "last_text": changes["hunks"][1]["lines"][0]["text"],
+    "changed": changes.changed,
+    "hunk_count": len(changes.hunks),
+    "old_start": changes.hunks[0].old_start,
+    "new_start": changes.hunks[0].new_start,
+    "first_kind": changes.hunks[0].lines[0].kind,
+    "first_text": changes.hunks[0].lines[0].text,
+    "last_kind": changes.hunks[1].lines[0].kind,
+    "last_text": changes.hunks[1].lines[0].text,
 })
 "#,
         )?;
@@ -29220,7 +30143,7 @@ emit({
                 "mixed_digits": false,
                 "positions": ["0:alpha", "1:bee"],
                 "keys": ["region", "qty", "count"],
-                "json_line": "{\"count\":3,\"qty\":\"12\",\"region\":\"west\"}",
+                "json_line": "{\"region\":\"west\",\"qty\":\"12\",\"count\":3}",
             })
         );
 
