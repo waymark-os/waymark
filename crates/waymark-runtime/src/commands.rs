@@ -855,6 +855,20 @@ for line in open("/app/input.txt"):
         aliases: &["from_json"],
     },
     StoneHelpEntry {
+        name: "predicate",
+        signature: "predicate(text: str) -> callable",
+        use_when: "Use when a check arrives as text (for example a field a model filled in) and the program should run it: predicate compiles one pure lambda and returns it as a function. The lambda may use only its own parameters, comparisons, and/or/not, arithmetic, indexing, attributes, f-strings, comprehensions, and pure builtins and methods (len, any, all, sorted, str, int, ...; .startswith, .splitlines, .strip, .count, ...). Bad or impure text raises ValueError naming what is not allowed.",
+        examples: &[
+            r#"passes = predicate("lambda r: r['exit_code'] == 0 and 'ok' in r['stdout']")({"exit_code": 0, "stdout": "ok"})"#,
+            r#"check = predicate("lambda r: not any(w in r['stderr'] for w in ['Warning', 'Error'])")"#,
+        ],
+        avoid: &[
+            "The text cannot run commands, call models, read files, or see the program's variables; run the command yourself and pass its result to the predicate.",
+            "Write one lambda, not a statement or a def.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "json_dumps",
         signature: "json_dumps(value: Any, indent: int? = None, separators: list? = None) -> str",
         use_when: "Use to serialize a value to JSON text. Supports compact output, indent=2, and separators=(\",\", \":\") for Python-shaped agent code.",

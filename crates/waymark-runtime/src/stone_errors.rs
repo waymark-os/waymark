@@ -155,6 +155,7 @@ pub(crate) const PURE_BUILTINS: &[&str] = &[
     "min",
     "parse_float",
     "parse_int",
+    "predicate",
     "print",
     "pwd",
     "range",
@@ -407,6 +408,11 @@ pub(crate) fn classify_error(kind: &str, code: &str, message: &str) -> &'static 
         return "IndexError";
     }
     if message.starts_with("failed to parse") || message.contains("invalid literal") {
+        return "ValueError";
+    }
+    // A predicate's text is a value the program received: bad text is a
+    // ValueError, as int("x") is.
+    if kind == "predicate" {
         return "ValueError";
     }
     if matches!(

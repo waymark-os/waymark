@@ -917,6 +917,26 @@ says so with `result.effects.enforced == False`.
 - `where(rows, key, expected)`, `where(rows, key, op, expected)`, or
   `where(rows, lambda r: ...)`: filter record lists by equality, comparison
   (`==`, `!=`, `>`, `>=`, `<`, `<=`, `in`, `not in`), or a predicate.
+- `predicate(text)`: compile one lambda written as text, for checks that
+  arrive as data (for example a field a model filled in), and return it as a
+  function. The lambda must be pure: it may use only its own parameters (and
+  names its comprehensions bind), literals, comparisons, `and`/`or`/`not`,
+  arithmetic, indexing, attributes, f-strings, comprehensions, the builtins
+  `all any first float int isinstance last len list max min repr round set
+  sorted str sum tuple unique`, and the methods `count endswith find get
+  index isdigit items join keys lower lstrip replace rstrip split splitlines
+  startswith strip upper values`. It cannot run commands, call models,
+  read files, or see the program's variables: run the command in the program
+  and pass the result in. Text that does not parse, is not exactly one
+  lambda, or uses anything else raises `ValueError` naming what is not
+  allowed.
+
+  ```python
+  passes = predicate("lambda r: r.exit_code == 0 and 'ok' in r.stdout")
+  result = run(["sh", "-c", "echo ok"])
+  if passes(result):
+      print("check passed")
+  ```
 - `any(iterable)`, `all(iterable)`, `sum(iterable)`, `join(iterable)`, and
   `set(iterable)`: aggregate lists or supported generator expressions with
   Stone truthiness, typed numeric semantics, or deterministic first-seen

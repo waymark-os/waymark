@@ -105,6 +105,8 @@ use stone_records::{RecordType, TypeSpec, TypeTable};
 mod stone_budget;
 #[path = "stone_collections.rs"]
 mod stone_collections;
+#[path = "stone_predicate.rs"]
+mod stone_predicate;
 #[path = "stone_containers.rs"]
 mod stone_containers;
 #[path = "stone_context.rs"]
@@ -3544,6 +3546,7 @@ impl Evaluator<'_> {
             "format" => self.eval_format_call(call),
             "json_dumps" => self.eval_json_dumps_call(call),
             "json_loads" => self.eval_json_loads_call(call),
+            "predicate" => self.eval_predicate_call(call),
             "help" => self.eval_help_call(call),
             "transition_hooks" => self.eval_transition_hooks_call(call),
             "workflow_evidence" => self.eval_workflow_evidence_call(call),
@@ -5413,6 +5416,35 @@ impl Evaluator<'_> {
             }
         }
         Ok(RuntimeValue::Nu(Value::string(text, Span::unknown())))
+    }
+
+    /// `predicate(text)`: a function value from one pure lambda written as
+    /// text (see stone_predicate.rs).
+    #[inline(never)]
+    fn eval_predicate_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let [text] = call.positional.as_slice() else {
+            return Err(stone_error(
+                "predicate",
+                "predicate() requires exactly one string: the lambda's source text",
+            ));
+        };
+        if !call.named.is_empty() {
+            return Err(stone_error(
+                "predicate",
+                "predicate() takes no keyword arguments",
+            ));
+        }
+        let text = self
+            .eval_expr_value(text, PipelineData::empty())?
+            .into_nu_value("predicate")?;
+        let text = value_to_string(&text, "predicate")?;
+        let (params, body) = stone_predicate::compile_predicate(&text)?;
+        Ok(RuntimeValue::Callable(CallableValue::lambda(
+            self.state.next_callable_id(),
+            params,
+            Box::new(body),
+            Vec::new(),
+        )))
     }
 
     fn eval_json_loads_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -13535,6 +13567,7 @@ const VM_ASSUMED_BUILTINS: &[&str] = &[
 ];
 
 const STONE_BUILTIN_NAMES: &[&str] = &[
+    "predicate",
     "cat",
     "diff",
     "edit",
@@ -27073,6 +27106,37 @@ emit({"looped": looped, "read": read, "split": split, "total": total, "stripped"
             assert!(format!("{err:?}").contains("cannot be used in `with`"), "{source}: {err:?}");
         }
         cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn predicates_compile_pure_lambdas_from_text() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("predicate")?;
+        let program = lower_source(&format!(
+            r#"r = run(["sh", "-c", "printf 'arg[b' && printf 'oops' >&2"], cwd="{root}")
+texts = [
+    "lambda r: r.exit_code == 0 and 'arg[b' in r.stdout",
+    "lambda r: not any(w in r.stderr for w in ['oops'])",
+    "lambda d: d['n'] + 1 == 3",
+]
+checks = [predicate(t) for t in texts]
+errors = []
+for bad in ["lambda r: run(['ls'])", "lambda r: r.exit_code == limit", "r.exit_code == 0"]:
+    try:
+        predicate(bad)
+    except ValueError as e:
+        errors.append(str(e))
+emit({{"results": [checks[0](r), checks[1](r), checks[2]({{"n": 2}})], "errors": errors}})"#,
+            root = root.display()
+        ))?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value["results"], json_value!([true, false, true]));
+        let errors = value["errors"].as_array().expect("errors list");
+        assert_eq!(errors.len(), 3, "{value}");
+        assert!(errors[0].as_str().unwrap().contains("calling `run()`"), "{value}");
+        assert!(errors[1].as_str().unwrap().contains("`limit` is not available"), "{value}");
+        assert!(errors[2].as_str().unwrap().contains("exactly one lambda"), "{value}");
         Ok(())
     }
 
