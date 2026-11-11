@@ -31,7 +31,7 @@ use std::rc::Rc;
 use nu_protocol::{ShellError, Span, Value};
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
 
-use super::stone_containers::{dict_from_entries, list_from_values, record_obj, ItemRef};
+use super::stone_containers::{dict_from_entries, freeze, list_from_values, record_obj, ItemRef};
 use super::stone_runtime_value::RuntimeValue;
 use crate::json::json_to_nu_value;
 use crate::stone_ast::{Expr, FieldLimits, LiteralValue, RecordFieldDef, TypeExpr};
@@ -44,6 +44,10 @@ pub(super) struct RecordType {
     pub(super) name: String,
     pub(super) doc: Option<String>,
     pub(super) fields: Vec<RecordFieldDef>,
+    /// A result the runtime returned (`run`, `run_tests`, `stat`, ...). Only
+    /// the runtime makes these; they are read-only, and `isinstance(x,
+    /// RunResult)` is true only for them.
+    pub(super) host: bool,
     resolved: OnceCell<Vec<TypeSpec>>,
 }
 
@@ -53,6 +57,7 @@ impl RecordType {
             name,
             doc,
             fields,
+            host: false,
             resolved: OnceCell::new(),
         }
     }
@@ -115,7 +120,7 @@ pub(super) fn host_record(name: &str, value: Value) -> RuntimeValue {
         Value::Record { val, .. } => {
             let record = val.into_owned();
             let columns = record.columns().cloned().collect::<Vec<_>>();
-            let ty = Rc::new(RecordType::new(
+            let mut ty = RecordType::new(
                 name.to_string(),
                 Some(format!("A {name} the host returned.")),
                 columns
@@ -127,7 +132,9 @@ pub(super) fn host_record(name: &str, value: Value) -> RuntimeValue {
                         limits: FieldLimits::default(),
                     })
                     .collect(),
-            ));
+            );
+            ty.host = true;
+            let ty = Rc::new(ty);
             let values = record
                 .into_iter()
                 .map(|(field, value)| match value {
@@ -151,7 +158,8 @@ pub(super) fn host_record(name: &str, value: Value) -> RuntimeValue {
                     other => RuntimeValue::Nu(other),
                 })
                 .collect();
-            record_obj(ty, values)
+            // Evidence of what happened: the program reads it, never edits it.
+            freeze(record_obj(ty, values))
         }
         Value::List { vals, .. } => {
             if vals.iter().any(|value| matches!(value, Value::Record { .. })) {

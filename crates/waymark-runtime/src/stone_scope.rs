@@ -319,6 +319,11 @@ fn bind_target(target: &AssignTarget, bound: &mut Names) {
             bound.insert(name.clone());
         }
         AssignTarget::Tuple(names) => bound.extend(names.iter().cloned()),
+        AssignTarget::Unpack(targets) => {
+            for target in targets {
+                bind_target(target, bound);
+            }
+        }
         // `x[k] = v` and `x.f = v` read x; they do not bind it.
         AssignTarget::Subscript { .. } | AssignTarget::Attribute { .. } | AssignTarget::Expr(_) => {}
     }
@@ -437,6 +442,11 @@ fn qualify_target(target: &mut AssignTarget, stack: &Ctx) {
                 stack.qualify(name);
             }
         }
+        AssignTarget::Unpack(targets) => {
+            for target in targets {
+                qualify_target(target, stack);
+            }
+        }
         AssignTarget::Subscript { value, .. } | AssignTarget::Attribute { value, .. } => {
             qualify_target(value, stack)
         }
@@ -452,6 +462,12 @@ fn read_target(
 ) -> Result<(), ShellError> {
     match target {
         AssignTarget::Name(_) | AssignTarget::Tuple(_) => Ok(()),
+        AssignTarget::Unpack(targets) => {
+            for target in targets {
+                read_target(target, stack, reads)?;
+            }
+            Ok(())
+        }
         AssignTarget::Subscript { value, index } => {
             read_target_base(value, reads);
             read_target(value, stack, reads)?;
@@ -470,7 +486,7 @@ fn read_target_base(target: &AssignTarget, reads: &mut Names) {
         AssignTarget::Name(name) => {
             reads.insert(name.clone());
         }
-        AssignTarget::Tuple(_) | AssignTarget::Expr(_) => {}
+        AssignTarget::Tuple(_) | AssignTarget::Unpack(_) | AssignTarget::Expr(_) => {}
         AssignTarget::Subscript { value, .. } | AssignTarget::Attribute { value, .. } => {
             read_target_base(value, reads)
         }

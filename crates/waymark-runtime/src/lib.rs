@@ -23,6 +23,7 @@ mod json;
 mod linux_tools;
 mod server;
 mod stone_admission;
+mod stone_record_access;
 mod stone_agent_control;
 mod stone_ast;
 mod stone_attempt_best;
@@ -41,6 +42,8 @@ mod stone_json_schema;
 mod stone_modules;
 mod stone_raises;
 mod stone_scope;
+mod stone_snapshots;
+mod stone_test_results;
 mod stone_vm;
 #[cfg(test)]
 mod stone_vm_tests;

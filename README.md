@@ -180,6 +180,11 @@ Imports are linked before the program runs, and a module's top level only
 defines functions, records, error classes, and constants. See
 [docs/STONE_LANGUAGE.md](./docs/STONE_LANGUAGE.md#modules).
 
+`snapshot()`, `diff(since=...)`, and `apply_patch(snapshot, patch)` keep
+directory snapshots in a Git object store Waymark owns, where commands run:
+`WAYMARK_SNAPSHOT_STORE`, default `~/.local/state/waymark/snapshots.git`. The
+workspace's own `.git` is never changed.
+
 ## Helpers
 
 Stone helpers are dynamic extension scripts. The shell loads helper registrations

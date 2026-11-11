@@ -9,8 +9,9 @@ only irreversible effects. Milestones M1-M5 have implemented part of P1
 (Section 14 marks each item **done**). Draft v3.2 adds the checks-as-feedback
 framing (1.1), the typed-workflow pilot on SWE-bench (11.3), and the
 plan-check proposal it motivates (L12, 5.2). Sections 11.5 and 11.6
-(2026-11-10) record the task spec experiments that followed and the design of
-the next one, with the reason for each part of its template. Items marked **H-n** are
+(2026-11-10) record the task spec experiments that followed, and experiment
+6 with the reason for each part of its template and its results; L23-L26
+are the language changes it led to. Items marked **H-n** are
 hypotheses to test, **L-n** are language decisions (Section 7), and **R-n**
 are review decisions (Section 3).
 
@@ -1284,8 +1285,8 @@ keeping reference semantics.
 | L8 | Host-defined opaque types (`Verified[T]` as a sealed box, `Evidence`) | Adopt | Outcome contracts (5.2) | Deep copy at seal time, once per verify |
 | L9 | Modules: `from lib import name` for pure Stone modules (top-level `def`, records, and constants only; no effects). Module-level values are deep-frozen (R5). | Adopt | Agent libraries without pasted bundles; pure modules hold no authority | Compiled prototypes and frozen constants can be cached per module |
 | L10 | `from typing import Literal`, `from pydantic import BaseModel` | Accept known names as no-ops; reject unknown names loudly | Absorbs strong Python priors (H-6) | None |
-| L11 | `match` statement | Defer | `isinstance` chains suffice | — |
-| L12 | Static checking at admission: the cheap plan check (1.1) | Linear pass per program: ambient authority, unknown record fields, unknown capability methods, visibly wrong return types, bare `except`, `pass` handlers. **Done:** name and module linking, handler rules, unreachable-handler warnings, and workflow admission of field-typed stage inputs (`STONE_TYPED_WORKFLOWS.md`). **Proposed (2026-11-08, not decided):** one type vocabulary for stage findings and records, and a check that the final stage establishes the task's goal type (5.2); warn on an unchecked `run()` result and on a model loop that never reads `model.remaining`; report the assumptions a claim rests on. 0-CFA stays dropped (D-3). | Agents run many small commands; a model checking its own plan needs feedback before spending budget | Per-program cost stays linear; annotations are matched, not inferred |
+| L11 | `match` statement | Defer | `isinstance` chains suffice. Rechecked after experiment 6 (11.6): the action loop stopped only on `kind == "done"` and treated two new action records as unknown; `isinstance(action, Done \| Upheld \| Revised)` already expresses the fix, and exhaustiveness over a union would not have flagged a loop that ignores members | — |
+| L12 | Static checking at admission: the cheap plan check (1.1) | Linear pass per program: ambient authority, unknown record fields, unknown capability methods, visibly wrong return types, bare `except`, `pass` handlers. **Done:** name and module linking, handler rules, unreachable-handler warnings, and workflow admission of field-typed stage inputs (`STONE_TYPED_WORKFLOWS.md`); `x["field"]` on a name that only ever holds a record (a record constructor, `model.ask(output=R)`, a host builtin that returns one record, an annotated parameter, a stage context or hook event) is rejected before the run with the attribute to write (2026-11-10, after experiment 6 crashed mid-run on `step["phase"]`). **Proposed (2026-11-08, not decided):** one type vocabulary for stage findings and records, and a check that the final stage establishes the task's goal type (5.2); warn on an unchecked `run()` result and on a model loop that never reads `model.remaining`; report the assumptions a claim rests on. 0-CFA stays dropped (D-3). | Agents run many small commands; a model checking its own plan needs feedback before spending budget | Per-program cost stays linear; annotations are matched, not inferred |
 | L13 | Effects as internal handlers (record, replay, mock, approval); hooks become one handler kind | Adopt, no user syntax | Replay and durable loops without new constructs | Effect calls are already off the hot path |
 | L14 | Syscall contracts: Gateway-owned effect signatures for every syscall; models declare only tier-3 effects of `Exec` (`effects=`); `expect=` optional on any syscall | Adopt (R25a-R25c, R26; D-1) | Safeguards each syscall and gives checked feedback with the fewest declarations | Checks run on syscalls only; tier-1 diff cost per command is one diff (Section 12) |
 | L15 | `ExpectationFailed` and `UndeclaredEffect` are `ToolError` subclasses carrying the full result | Adopt (R12) | Loud by default, recoverable, one handler in loops | None |
@@ -1296,6 +1297,10 @@ keeping reference semantics.
 | L20 | `d.a` on a dict is an `AttributeError` that names `d["a"]`; host results with fixed fields (`run`, `stat`, `ls`, `ps`, `model_infer`, hook events, stage contexts, ...) are typed records read only as attributes; their data fields (`value`, `input`, `outputs`, ...) stay dicts. Examples converted in the same change. **Decided 2026-11-10.** | Done | `d = {"keys": 1}; d.keys` returned 1; one access form per value kind, and both mistakes fail with the fix in the message | Record fields have fixed slots |
 | L21 | `for` over a list walks the live list (Python); changing a dict's or set's size during a loop raises `RuntimeError`. **Decided 2026-11-10.** | Done | Worklist loops stopped early and writes to later items were lost | List loops index the live list; the loop engine no longer takes them |
 | L22 | Default argument values are evaluated once, when `def` runs (Python). **Decided 2026-11-10.** | Done | `def g(x=i)` in a loop captured the last `i` | Defaults are stored with the function instance |
+| L23 | `zip(*iterables, strict=False)` and unpacking into items and fields (`a, d["k"], p.x = ...`), left to right as in Python; starred and nested unpacking stay rejected with the rewrite in the message. **Done 2026-11-10.** | Done | Missing while writing the experiment 6 programs (11.6) | `zip` returns a list; unpacking assigns through the same place resolution as single assignment |
+| L24 | `model.ask(..., output=R, validate=fn)`: `fn(answer)` returns a list of problem strings; a non-empty list is sent back as a repair turn and counts against `retries=`, and the last problems are in the `ModelOutputError`. `fn` may run commands, unlike `Expect(check=fn)` (L16). **Done 2026-11-10.** | Done | Experiment 6 checked specs (gate 1) in hand-written repair loops around `model.ask` | One call per retry, on the existing repair path |
+| L25 | `run_tests(argv, runner="pytest"\|"django"\|"sympy")` returns a `TestRun` record (per-test names, the runner's counts, `complete`, `ok`, `problem`). `ok` needs the runner's final summary, a passing test, no failures, and exit 0, so a crash or an empty run is never read as a pass. **Done 2026-11-10.** | Done | The experiment programs scraped test names from text with substring matching (`failing_tests` in `swe_wf2.stone`) | The parser is a linear pass over the output |
+| L26 | Runtime results are sealed evidence: only the runtime makes `RunResult`, `TestRun`, `FileStat`, and the other host result records; they are read-only (data fields included; `dict(...)` copies); a program cannot define a record with one of their names; `isinstance(x, RunResult)` is true only for a genuine one. This is the `Evidence` half of 5.2 and replaces the host-minted `Verified[T]` box (L8) for the SWE harness: a verdict is a library record holding sealed results, and anyone can re-check it against the registered tests. Next, in order: `run(..., files={path: content})` with the written files' hashes in the result (**done 2026-11-11**; the workspace state comes with snapshots); `snapshot()` / `diff(since=)` / `apply_patch(snapshot, patch)` (**done 2026-11-11**: a snapshot is a tree id in a Git object store Waymark owns, built with plumbing commands only, borrowing the workspace repository's objects; the workspace's `.git` is never touched and any directory works; Django: first snapshot 0.35 s, repeat 0.13 s; every runtime result carries `seq`, its order). A first version ran commands on a snapshot by switching the tree in place and back (`run(..., at=)`); it was dropped: the goal is only that the harness runs its own copies of the test files, not a second tree, and switching cost about a second per run (an mtime guard for Python's bytecode cache). Then `register_tests` / `check` / `verify` / `revise` as a Stone library (**done 2026-11-11**: `host/bench/swe_spec/swe_suite.stone`; registering copies every test file the tests use, including the repository files keep runs name, and every run writes those copies first, warning when the agent edited one; the unfixed code is run only while the tree is the unfixed code; `verify` proves by snapshot id that the tree is exactly the unfixed code plus the patch, then runs the suite and returns a `Verdict` of sealed results; `accepts(suite, verdict)` re-checks it without running a test). Building it fixed three runtime gaps: list `+` turned records into dicts, modules could not name result types for `isinstance`, and `TestRun.command` was wrapped in an extra list. **Done 2026-11-11.** | Done (first step) | Before: a program could define `class TestRun(Record)` and set `r.exit_code = 5` on a real result, so no result could serve as evidence | Freezing is a flag set once per result |
 
 Compatibility: L1-L4, L6a, and L18 change existing behavior. Measure their
 impact on examples, help examples, task specs, and the conformance corpus
@@ -2392,7 +2397,7 @@ Caveats: four or five tasks, three runs per cell, and by experiment 5 we
 knew these tasks well. Differences such as 9 against 6 are suggestive, not
 settled.
 
-### 11.6 Experiment 6 Design: Tests As Gates (Set Up 2026-11-10, Not Run)
+### 11.6 Experiment 6: Tests As Gates (Run 2026-11-10)
 
 **Framing.** A SWE-bench fix is graded by tests, so the hidden tests are the
 spec of record; the reference fix is one patch that passes them, not the
@@ -2540,11 +2545,66 @@ the spec is compatible.
   instead of forcing one (`WAYMARK_MODEL`), so a per-call `model=` takes
   effect within one provider.
 
-**Stone gaps found while writing the programs** (not fixed yet):
+**Stone gaps found while writing the programs:**
 
-- no `zip` builtin;
-- unpacking into an item (`a, d["k"] = f()`) is not supported;
-- record class names are global across modules (the error says so clearly).
+- no `zip` builtin (fixed, L23);
+- unpacking into an item (`a, d["k"] = f()`) is not supported (fixed, L23);
+- record class names are global across modules. Kept: a record's name is
+  part of what the model sees (schema titles, union members), so
+  module-scoped names would need qualified names in schemas. The duplicate
+  error already names the clash and says to rename.
+
+**Results.** 64 runs, two per task and setup, Haiku as the fixer. pytest-5840
+is left out of the tallies: its hidden tests check that a private table is
+keyed by resolved paths (the bug shows only on Windows), so no run in any
+setup passes them.
+
+| Setup | Resolved | Right when the verifier said "verified" | Model calls per run |
+|---|---|---|---|
+| none | 12/14 | 11/12 | 22 Haiku |
+| single_strong | 14/14 | 13/13 | 19 Sonnet + 10 Haiku |
+| single_default | 13/14 | 13/14 | 22 Haiku |
+| split | 12/14 | 11/13 | 24 Haiku + 11 Sonnet |
+
+- "Verified" was right in 47 of 51 cases. All four misses are xarray-2905:
+  the fixes test `type(data).__module__.startswith("xarray")`, and the hidden
+  test's stand-in object is defined inside xarray's own test package.
+- Five of seven tasks were solved by every setup. The spec helped on sympy:
+  all six spec runs were resolved, against one of two without a spec. Route
+  back worked there: in four of six runs the fixer objected to a spec test,
+  the spec was revised, and the fix was then verified. Of the two that were
+  not verified, one kept a whole-file command the revised test could not be
+  exempted from, and one revision failed gate 1 and was not retried.
+- The no-spec setup is not test-free: its workflow (experiment 2) already
+  has the fixer reproduce the bug and run tests, which is most of the gain.
+- Specs graded on their own against the hidden tests (pytest left out,
+  14 specs per setup):
+
+  | Setup | Agrees | Compatible | Contrary |
+  |---|---|---|---|
+  | single_strong (Sonnet) | 7 | 4 | 3 |
+  | single_default (Haiku) | 8 | 6 | 0 |
+  | split | 6 | 7 | 1 |
+
+  The contrary specs are read by hand. Two Sonnet specs (django, matplotlib)
+  run scripts under `/tmp/spec/` that the spec does not carry: the writer
+  created them with shell commands, so they existed for gates 1 and 2 in the
+  same container but not in a fresh one. Gate 1 should require every file a
+  command names to be in the spec. The other two (sympy) keep a whole-file
+  test command that includes the test the hidden patch revises, so no
+  patch can pass it. Every compatible spec but xarray's is stricter than
+  the hidden tests (it rejects patches they accept; 8 of 11 reject the
+  reference fix);
+  the six xarray specs accept the same four wrong patches the verifier did.
+- Revised tests: specs listed sympy's one revised test in 5 of 6 runs, and
+  none of scikit-learn's two or pytest's four.
+
+**Fixed during the run.** 13 runs were set aside and rerun after three bugs:
+the no-spec program indexed stage contexts with `step["phase"]` after they
+became records (now caught before the run, L12); the action loop stopped
+only on `Done`, so revisions never landed (a program bug, L11); and a blank
+model reply was echoed back in a repair turn, which the provider rejects
+with HTTP 400 (the repair turn now says `(empty reply)`).
 
 **Limits.** Nothing checks that a test's expected output is right, only that
 it is consistent with the unfixed code; a wider test whose expected output

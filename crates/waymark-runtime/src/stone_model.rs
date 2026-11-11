@@ -126,6 +126,18 @@ pub(super) fn repair_message(issues: &[JsonValue], format: TypeFormat) -> String
     message
 }
 
+/// The repair request after the program's `validate=` function rejected a
+/// well-typed answer.
+pub(super) fn validate_message(issues: &[JsonValue]) -> String {
+    let mut message = String::from("The program checked your answer and found problems:\n");
+    for issue in issues {
+        let text = issue.get("message").and_then(JsonValue::as_str).unwrap_or("");
+        message.push_str(&format!("- {text}\n"));
+    }
+    message.push_str("Fix them and return only the corrected JSON object.");
+    message
+}
+
 /// Parse the model's text as one JSON value. A Markdown code fence around
 /// the object is tolerated, since models add one out of habit.
 pub(super) fn parse_answer(content: &str) -> Result<JsonValue, String> {

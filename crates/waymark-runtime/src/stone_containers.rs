@@ -308,15 +308,26 @@ pub(super) fn is_frozen(value: &RuntimeValue) -> bool {
 pub(super) fn ensure_mutable(container: &RuntimeValue, context: &str) -> Result<(), ShellError> {
     let (kind, copy) = match container {
         RuntimeValue::List(_) => ("list", "copy = list(items)"),
-        RuntimeValue::Dict(_) => ("dict", "copy = {k: v for k, v in record.items()}"),
+        RuntimeValue::Dict(_) => ("dict", "copy = dict(value)"),
         RuntimeValue::Record(_) => ("record", "copy = Name(field=value.field, ...)"),
         _ => return Ok(()),
     };
+    if let RuntimeValue::Record(record) = container {
+        if record.ty.host && is_frozen(container) {
+            let name = &record.ty.name;
+            return Err(stone_error(
+                context,
+                format!(
+                    "this {name} is read-only: results the runtime returns (run(), run_tests(), stat(), ...) record what happened and cannot be changed. Keep what you need in your own variable or dict, e.g. `out = {{\"stdout\": r.stdout.strip()}}`"
+                ),
+            ));
+        }
+    }
     if is_frozen(container) {
         return Err(stone_error(
             context,
             format!(
-                "this {kind} is read-only: errors the host reports (ExpectationFailed, UndeclaredEffect) and values imported from modules cannot be changed. Change a copy instead: `{copy}`"
+                "this {kind} is read-only: results the runtime returns (and the data inside them), errors the host reports (ExpectationFailed, UndeclaredEffect), and values imported from modules cannot be changed. Change a copy instead: `{copy}`"
             ),
         ));
     }

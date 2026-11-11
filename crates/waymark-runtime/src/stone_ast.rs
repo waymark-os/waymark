@@ -280,6 +280,10 @@ pub enum StoneType {
 pub enum AssignTarget {
     Name(String),
     Tuple(Vec<String>),
+    /// `a, d["k"] = ...` or `x.f, y = ...`: unpacking where some item is not
+    /// a plain name. Items are assigned left to right after the value is
+    /// evaluated (Python). All-name unpacking stays `Tuple`.
+    Unpack(Vec<AssignTarget>),
     Subscript {
         value: Box<AssignTarget>,
         index: Expr,
@@ -1877,15 +1881,34 @@ fn lower_assign_base(base: &py::Expr) -> Result<AssignTarget, ShellError> {
 }
 
 fn lower_tuple_assign_targets(elements: &[py::Expr]) -> Result<AssignTarget, ShellError> {
+    if elements.iter().any(|element| !matches!(element, py::Expr::Name(_))) {
+        let mut targets = Vec::with_capacity(elements.len());
+        for element in elements {
+            match element {
+                py::Expr::Name(_) | py::Expr::Subscript(_) | py::Expr::Attribute(_) => {
+                    targets.push(lower_assign_target(element)?)
+                }
+                py::Expr::Starred(_) => {
+                    return Err(unsupported_message(
+                        "assignment",
+                        "starred unpacking (`a, *rest = ...`) is not supported; slice instead: `a = xs[0]` and `rest = xs[1:]`",
+                    ))
+                }
+                _ => {
+                    return Err(unsupported_message(
+                        "assignment",
+                        "unpacking targets must be names, `x[key]`, or `x.field`; nested unpacking is not supported",
+                    ))
+                }
+            }
+        }
+        return Ok(AssignTarget::Unpack(targets));
+    }
     let mut targets = Vec::with_capacity(elements.len());
     for element in elements {
-        let py::Expr::Name(name) = element else {
-            return Err(unsupported_message(
-                "assignment",
-                "tuple/list destructuring only supports simple name targets",
-            ));
-        };
-        targets.push(name.id.to_string());
+        if let py::Expr::Name(name) = element {
+            targets.push(name.id.to_string());
+        }
     }
     if targets.is_empty() {
         return Err(unsupported_message(

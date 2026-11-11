@@ -61,7 +61,8 @@ pub(crate) fn validate_program(
         async_context: false,
     };
 
-    validate_statements(&program.statements, &names)
+    validate_statements(&program.statements, &names)?;
+    crate::stone_record_access::check_program(program)
 }
 
 fn validate_statements(statements: &[Stmt], names: &AdmissionNames) -> Result<(), ShellError> {
@@ -306,6 +307,11 @@ fn validate_record_name(name: &str) -> Result<(), ShellError> {
     if stone_builtin_names().contains(&name) || name == "model" {
         return Err(admission_error(format!(
             "`class {name}(Record)`: `{name}` is a builtin name; choose another record name"
+        )));
+    }
+    if crate::stone_record_access::HOST_RECORD_TYPES.contains(&name) {
+        return Err(admission_error(format!(
+            "`class {name}(Record)`: `{name}` is the type of a result only the runtime returns (run(), run_tests(), stat(), ...); choose another record name"
         )));
     }
     Ok(())
@@ -659,6 +665,11 @@ fn collect_assign_target(target: &AssignTarget, names: &mut HashSet<String>) {
         }
         AssignTarget::Tuple(items) => {
             names.extend(items.iter().cloned());
+        }
+        AssignTarget::Unpack(targets) => {
+            for target in targets {
+                collect_assign_target(target, names);
+            }
         }
         AssignTarget::Subscript { value, index } => {
             collect_assign_target(value, names);

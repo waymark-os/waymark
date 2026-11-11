@@ -46,7 +46,7 @@ pub(crate) struct EffectClock {
 /// wall clock by a scheduler tick (up to 10 ms), so the start is moved back by
 /// a margin. A file written in that margin just before the command may be
 /// reported as changed by it.
-const CLOCK_MARGIN: Duration = Duration::from_millis(20);
+pub(crate) const CLOCK_MARGIN: Duration = Duration::from_millis(20);
 
 pub(crate) fn effect_clock() -> EffectClock {
     let now = SystemTime::now();

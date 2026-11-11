@@ -329,6 +329,7 @@ lambdas accept positional and keyword arguments. Unknown keywords report the
 accepted parameter names; duplicate positional/keyword bindings and missing
 required arguments name the affected parameter. Builtins take their parameters by the names
 Python uses, as well as by position: `enumerate(xs, start=1)`,
+`zip(xs, ys, strict=True)`,
 `round(x, ndigits=2)`, `text.split(sep=",", maxsplit=1)`,
 `get(d, key, default=0)`. An unknown keyword to a builtin is a `TypeError`
 that lists the keywords it takes.
@@ -559,7 +560,15 @@ emit(str(plan.steps[0]))  # Step(title='read the failing test', done=True)
 - Fields are read and assigned as attributes. Assignment is checked:
   `plan.risky = "no"` is `cannot set Plan.risky: expected bool, got str`.
   `plan["note"]` is an error that names the attribute to use, and a record
-  cannot be iterated.
+  cannot be iterated. When the source shows that a name holds a record, the
+  error comes before the program runs: the name is only ever assigned a
+  record constructor call, `model.ask(..., output=R)` with `R` a record or a
+  union of records, or a host builtin that returns one record (`run`,
+  `must_run`, `run_tests`, `stat`, ...); or it is a parameter annotated with a record
+  (`def f(plan: Plan)`), or the first parameter of a function passed to
+  `workflow_stage(evidence=..., action=..., repair=...)` (a `StageContext`)
+  or `transition_hooks(pre=..., post=...)` (a `TransitionEvent`). A name that
+  may also hold a dict is left to the runtime check.
 - A record is shared like a list or dict: `same = plan` refers to the same
   record, and a change through either name is seen by both.
 - Lists and dicts held by a record are checked when assigned, not when later
@@ -581,7 +590,18 @@ emit(str(plan.steps[0]))  # Step(title='read the failing test', done=True)
   A field that carries program data stays plain data: `inference.value` (the
   model's parsed JSON), a hook's `step.input`, a stage's `inputs` and
   `outputs`, and other `value`/`data`/`payload` fields are dicts and lists,
-  read with brackets. Name-keyed maps such as `findings` and `stage_outputs`
+  read with brackets.
+- Only the runtime makes these result records, and they record what
+  happened, so they are read-only, data fields included:
+  `result.exit_code = 0` raises, and `dict(inference.value)` gives a copy to
+  change. A program cannot define a record named after one (`RunResult`,
+  `TestRun`, `FileStat`, `DirEntry`, `ProcessInfo`, `SystemInfo`,
+  `SearchMatch`, `Daemon`, `WorkflowReport`, `StageReport`, `StageContext`,
+  `TransitionEvent`, `Finding`, `FindingSpec`, `Probe`, `StageOutput`, `Snapshot`,
+  `TreeDiff`), and
+  `isinstance(x, RunResult)` is true only for a result the runtime returned,
+  never for a dict or record with the same fields. A library can therefore
+  accept a `RunResult` or `TestRun` as evidence that a command ran. Name-keyed maps such as `findings` and `stage_outputs`
   are dicts whose values are records:
   `step.stage_outputs["inspect"].findings["layout"].value`.
 - Record names are global, like error classes. A module may define records;
@@ -670,7 +690,8 @@ emit(join([" a ", "b "]))  # "a, b"
   functions, loop, or branch at its top level, because importing a module
   runs no code.
 - A module's functions see only the module's own names, its imports,
-  builtins, and error types. They never see the importing program's
+  builtins, error types, and the runtime's result types (`RunResult`,
+  `TestRun`, ..., for `isinstance`). They never see the importing program's
   variables; using a name the module neither defines nor imports is an error.
   The importer's names never collide with the module's: a module's private
   `_clean` and the importer's `_clean` are different functions.
@@ -1003,6 +1024,30 @@ says so with `result.effects.enforced == False`.
   `symlink`, or `any`.
 - `diff(path_a, path_b)`: compare two text files and return structured hunks
   with line numbers and inserted/deleted lines.
+- `snapshot(path=None)`: save the state of a directory tree (the cwd by
+  default) and return a `Snapshot` record with `root` and `id`. The id names
+  the content (a Git tree id), so the same files give the same id. Files the
+  tree's `.gitignore` files ignore (build outputs, caches) are not part of a
+  snapshot and are never changed by one. Snapshots are kept in a Git object
+  store Waymark owns, where commands run: `WAYMARK_SNAPSHOT_STORE`, default
+  `~/.local/state/waymark/snapshots.git`. The store is used only as an object
+  database through Git's plumbing commands; the directory's own `.git`
+  (index, refs, HEAD, config, hooks) is never read or changed, apart from
+  borrowing its objects so nothing is copied, and the directory need not be a
+  Git repository. Needs the `git` program where commands run. A repeat
+  snapshot of the Django repository (6644 files) takes about 0.13 s. A
+  `Snapshot` also has `seq` (see `run()`).
+- `diff(since=snapshot, to=None)`: what changed in the snapshot's root since
+  it was taken (or up to the snapshot `to=`), as a `TreeDiff` record: `root`,
+  `since` and `to` (snapshot ids), `files` (each `path` with `change`
+  `"added"`, `"modified"`, `"deleted"`, or `"type_changed"`), and `patch`
+  (Git-style patch text).
+- `apply_patch(snapshot, patch)`: the `Snapshot` of `snapshot` with `patch` (a
+  `diff(since=...)` result, patch text, or `None`) applied, built in the
+  snapshot store without writing any file. `snapshot(root).id ==
+  apply_patch(base, patch).id` shows that a directory is exactly `base` plus
+  `patch` (ignored files aside). Raises `ValueError` if the patch does not
+  apply.
 - `search(root, needle, regex=False)`: content search. Literal search is the
   default fast path; pass `regex=True` for Rust-regex patterns. Results remain
   structured records with `path`, `line`, and `text`.
@@ -1042,6 +1087,10 @@ says so with `result.effects.enforced == False`.
   indexed, and mixing bools with numbers in one set raises. There is no
   `{1, 2}` literal; write `set([1, 2])`. `unique(xs)` gives a de-duplicated
   list instead. Lists have no `.add()`.
+- `dict()`, `dict(d)`, `dict(pairs)`, and `dict(d, k=v)`: a dict, as in
+  Python; `dict(d)` is a shallow copy, `pairs` is a list of `[key, value]`
+  pairs, and keyword arguments add entries (later ones win). A record is not
+  a dict: `dict(record)` raises `TypeError`; read its fields as attributes.
 - `str(value)` and `repr(value)`: Python's text forms (`str(None)` is
   `"None"`, `repr("x")` is `"'x'"`, `str({"a": 1})` is `"{'a': 1}"`); use
   `json_dumps(value)` when valid JSON text is required.
@@ -1066,12 +1115,25 @@ says so with `result.effects.enforced == False`.
   `count` and `index` and cannot change. A tuple or set never equals a list:
   `(1, 2) == [1, 2]` raises (Python says `False`), and the error says to
   convert with `list(t)`. Emitted JSON and builtins that take plain data see
-  tuples and sets as arrays; `enumerate` and `d.items()` give lists.
-- `run(argv, cwd=None, stdin=None, timeout_ms=None, env=None, expect=None,
-  effects=None, background=False, stdout="capture", stderr="capture",
-  max_stdout_bytes=1048576, max_stderr_bytes=1048576, hooks={})`: Linux command
-  execution with structured stdout, stderr, status, truncation flags, observed
-  effects, and helper observations. See "Call Contracts" below for `expect=`,
+  tuples and sets as arrays; `enumerate`, `zip`, and `d.items()` give lists.
+- Unpacking assigns to names, items, and fields alike, left to right after
+  the value is computed, as in Python: `a, d["k"], plan.x = 1, 2, 3` and
+  `i, xs[i] = 1, 5` (which sets `xs[1]`). Starred (`a, *rest = xs`) and
+  nested (`(a, b), c = ...`) unpacking are rejected with what to write
+  instead.
+- `run(argv, cwd=None, stdin=None, files=None, timeout_ms=None, env=None,
+  expect=None, effects=None, background=False, stdout="capture",
+  stderr="capture", max_stdout_bytes=1048576, max_stderr_bytes=1048576,
+  hooks={})`: Linux command execution with structured stdout, stderr, status,
+  truncation flags, observed effects, and helper observations.
+  `files={path: text}` writes those files (and their directories) just before
+  the command, where it runs (locally or in the Gateway's container), relative
+  paths against the command's cwd; the result's `files` lists each one's
+  absolute `path`, `bytes`, and `sha256`, so a result records what the command
+  ran on, and the files are not reported as the command's effects. `must_run`,
+  `run_complete`, and `run_tests` take `files=` too.
+  Every result has `seq`, a number that increases with each result the
+  runtime makes (`Snapshot` too), so results can be put in order. See "Call Contracts" below for `expect=`,
   `effects=`, and `result.effects`. Agent loops should
   normally set much smaller output bounds (for example 16 KiB/8 KiB) so one
   noisy command cannot dominate every later model call. Set `stdout` or
@@ -1080,7 +1142,7 @@ says so with `result.effects.enforced == False`.
   terminate or wait for that handle explicitly before finishing the attempt.
   A call-local pre hook may veto or replace `argv`; a post hook observes the
   structured success/failure outcome.
-- `must_run(argv, cwd=None, stdin=None, timeout_ms=None, env=None,
+- `must_run(argv, cwd=None, stdin=None, files=None, timeout_ms=None, env=None,
   expect=None, effects=None, stdout="capture", stderr="capture",
   max_stdout_bytes=1048576, max_stderr_bytes=1048576)`: checked Linux command
   execution for `set -e`-style scripts. `must_run(argv)` is
@@ -1088,6 +1150,22 @@ says so with `result.effects.enforced == False`.
   raises `ExpectationFailed`, with the run record in `error.result`, when the
   process exits nonzero, times out, or cannot start. Extra checks go in
   `expect=`.
+- `run_tests(argv, runner="pytest", cwd=None, stdin=None, files=None, timeout_ms=None,
+  env=None, max_stdout_bytes=1048576, max_stderr_bytes=1048576)`: runs a test
+  command and returns its outcome as a `TestRun` record instead of text to
+  scrape. `runner` is `"pytest"`, `"django"` (`tests/runtests.py`), or
+  `"sympy"` (`bin/test`); the record reads the combined output, so a wrapper
+  such as `["bash", "-lc", ...]` or `docker exec` works. Fields: `ok`,
+  `runner`, `command`, `exit_code`, `timed_out`, `complete`, `passed`,
+  `failed` (failures and errors), `skipped`, `xfailed`, `passed_tests`,
+  `failed_tests`, `skipped_tests`, `problem`, and `output` (the last 4000
+  characters). Counts come from the runner's final summary; `complete` is
+  `False` when that summary is missing (a crash, a timeout, or a command that
+  is not a run of that runner). `ok` is `True` only when the run is complete,
+  at least one test passed, none failed, and the command exited 0; otherwise
+  `problem` says why. Test names are the runner's own (pytest node ids,
+  Django `name (dotted.path)`, SymPy `path::name`); passing tests are named
+  when the runner lists them (`-rA`, `--verbosity 2`, `-v`).
 - `model_call(messages, model_class="agent", hooks={}, ...)`: one explicit Gateway-backed
   model effect. The Stone program supplies the ordered structured messages and
   owns conversation state, retry, tool dispatch, and stopping policy. The
@@ -1118,7 +1196,7 @@ says so with `result.effects.enforced == False`.
   [`model_infer_repair.stone`](../examples/scripts/model_infer_repair.stone),
   and the reusable
   [`typed_react_agent.stone`](../examples/scripts/typed_react_agent.stone).
-- `model.ask(prompt, output=T, system="", retries=2, hooks={}, ...)`: ask the
+- `model.ask(prompt, output=T, system="", retries=2, validate=None, hooks={}, ...)`: ask the
   Gateway model for an answer of type `T`, where `T` is a record, a union of
   records, or any annotation type (`list[str]`, `Literal["yes", "no"]`, ...).
   `prompt` is a string or a message list; `system` adds a system message, and
@@ -1138,8 +1216,18 @@ says so with `result.effects.enforced == False`.
   model, and the inner value is returned. A wrong answer is sent back with
   each problem and its path (`$.steps[1]: expected string, got 3`), up to
   `retries` times (at most 4); every attempt is an ordinary traced model call
-  that hooks see. When no answer matches, `ModelOutputError` carries
-  `expected` (the type), `issues`, `attempts`, and the last `answer`.
+  that hooks see. `validate=f` adds the program's own check of a well-typed
+  answer: `f(answer)` returns a list of problem strings, empty (or `None`)
+  when the answer is acceptable. Problems go back to the model as "The
+  program checked your answer and found problems: ...", in the same retry
+  loop and budget as type errors, so a program does not hand-write its own
+  ask-check-repair loop. `f` is ordinary Stone code and may run commands
+  (check a test against the repository, say); unlike `Expect(check=...)`, it
+  need not be pure. An exception in `f` propagates; a non-list result is a
+  `TypeError`. When no answer matches, `ModelOutputError` carries
+  `expected` (the type), `issues` (each with `path` and `message`; a
+  `validate=` problem also has `check: "validate"`), `attempts`, and the last
+  `answer`.
   Every model call (`model.ask`, `model_call`) retries a temporary provider
   failure (HTTP 429 or 5xx, a dropped connection) up to 3 times, after 1, 4,
   and 16 seconds; a response that needed retries has `provider_retries`. A

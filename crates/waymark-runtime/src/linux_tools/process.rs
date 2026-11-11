@@ -240,8 +240,9 @@ pub(crate) fn run_call_values(
                     format!(
                         "{context}() got an unexpected keyword argument `{other}`; it accepts {}",
                         match context {
-                            "run" | "run_complete" => "cwd, env, stdin, timeout_ms, background, max_stdout_bytes, max_stderr_bytes, stdout, stderr, expect, effects, and hooks",
-                            "must_run" => "cwd, env, stdin, timeout_ms, max_stdout_bytes, max_stderr_bytes, stdout, stderr, expect, and effects",
+                            "run" | "run_complete" => "cwd, env, stdin, files, timeout_ms, background, max_stdout_bytes, max_stderr_bytes, stdout, stderr, expect, effects, and hooks",
+                            "must_run" => "cwd, env, stdin, files, timeout_ms, max_stdout_bytes, max_stderr_bytes, stdout, stderr, expect, and effects",
+                            "run_tests" => "runner, cwd, env, stdin, files, timeout_ms, max_stdout_bytes, and max_stderr_bytes",
                             _ => "cwd, env, stdin, timeout_ms, background, max_stdout_bytes, max_stderr_bytes, stdout, and stderr",
                         }
                     ),

@@ -2,7 +2,8 @@
 11.5, 11.6) from the run directories.
 
 Writes data/results.csv (one row per run: experiment, setup, model, task,
-outcome, harness verdict, calls) and data/specs.jsonl (every spec or spec
+outcome, harness verdict, calls, and for experiment 6 the spec's grade
+against the hidden tests) and data/specs.jsonl (every spec or spec
 type a model wrote, with the run it came from). Smoke and probe runs are
 left out. Usage: python3 export_results.py [RUNS_DIR] [OUT_DIR]
 """
@@ -68,16 +69,24 @@ def main():
             continue
         if prefix.startswith("-e6") and script == "swe_e6":
             experiment, setup = "6", E6.get(prefix[3:], prefix)
+            if value.get("spec"):
+                specs.append({"run": run_dir.name, "task": meta["task"], "tag": tag, "model": model, "script": script,
+                              "setup": setup, "spec": value["spec"], "first_spec_hash": value.get("first_spec_hash"),
+                              "grade": {k: v for k, v in (load(run_dir / "spec_grade.json") or {}).items() if k != "rows"}})
         elif (prefix, script) in SETUPS:
             experiment, setup = SETUPS[(prefix, script)]
         else:
             continue
         grade = load(run_dir / "grade.json") or {}
+        spec_grade = load(run_dir / "spec_grade.json") or {}
         spec_in = load(run_dir / "spec_in.json")
         rows.append({"experiment": experiment, "setup": setup, "model": model, "task": meta["task"], "tag": tag,
                      "outcome": value.get("outcome", "error" if result.get("ok") is False else ""),
                      "resolved": grade.get("resolved", ""), "calls": calls_of(value.get("usage")),
                      "spec_given": bool(spec_in) if experiment in ("3", "4", "5") else "",
+                     "spec_class": spec_grade.get("class", ""),
+                     "spec_false_reject": ";".join(spec_grade.get("false_reject") or []),
+                     "spec_false_accept": ";".join(spec_grade.get("false_accept") or []),
                      "run": run_dir.name})
     # A run that was interrupted and rerun has the same tag; the tallies in
     # the design doc count the latest graded run per (task, setup, tag).

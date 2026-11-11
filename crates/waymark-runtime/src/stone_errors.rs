@@ -126,6 +126,8 @@ const RUN_EXPECT_RAISES: &[&str] = &[
     "ExpectationFailed",
 ];
 const SERVICE_RAISES: &[&str] = &["ToolError"];
+const SNAPSHOT_RAISES: &[&str] = &["FileNotFoundError", "NotADirectoryError", "OSError"];
+const APPLY_PATCH_RAISES: &[&str] = &["FileNotFoundError", "ValueError", "OSError"];
 
 pub(crate) const PURE_BUILTINS: &[&str] = &[
     "abs",
@@ -195,8 +197,10 @@ pub(crate) fn builtin_call_raises(name: &str, has_expect: bool) -> Option<&'stat
         "write_text" | "write_file" | "write_json" | "write_csv" | "write_jsonl" | "save"
         | "mkdir" | "rm" => FILE_WRITE_RAISES,
         "edit" | "edit_file" => EDIT_RAISES,
+        "snapshot" => SNAPSHOT_RAISES,
+        "apply_patch" => APPLY_PATCH_RAISES,
         "run" | "run_complete" if has_expect => RUN_EXPECT_RAISES,
-        "run" | "run_complete" => RUN_RAISES,
+        "run" | "run_complete" | "run_tests" => RUN_RAISES,
         "must_run" => RUN_EXPECT_RAISES,
         "model_call" | "model_infer" | "start_daemon" | "stop_daemon" | "daemon_status"
         | "wait_port" | "wait_for" => SERVICE_RAISES,

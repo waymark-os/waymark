@@ -5,7 +5,7 @@ The programs, harness, and results of the SWE-bench experiments recorded in
 
 - 11.3: experiment 1, typed versus untyped workflow;
 - 11.5: experiments 2-5, from fact statuses to task specs;
-- 11.6: experiment 6, a task spec with tests as gates (set up, not yet run).
+- 11.6: experiment 6, a task spec with tests as gates.
 
 The design doc holds the results and the reasons; this directory holds what
 produced them. It is an archive of the files as they ran, from one flat
@@ -22,42 +22,31 @@ working directory on the host. Paths in `run_stone.py` are machine-specific.
 | 4 | `swe_spec2.stone`, `swe_wf2.stone`, `swe_wf_spec2.stone` | `pilot_e4.py`, `analyze_e4.py`, `dump_e4.py` |
 | 5 | `swe_design.stone`, `spec_design.stone`, `spec_blocks.stone` (type design), `swe_fill.stone` (fill), `swe_wf3.stone`, `swe_wf_spec3.stone` | `pilot_e5.py`, `analyze_e5.py`, `designs_e5.py`, `dump_e5.py` |
 | 6 | `swe_plan.stone` (template, gate 1, writers, revision), `swe_wf4.stone` (fixer, gate 2, route back), `swe_tree.stone`, `swe_verify.stone` (final verifier), `swe_e6.stone` (driver), `swe_plan_grade.stone` (grades a spec on patches) | `pilot_e6.py`, `grade_plans_e6.py`, `e6cfg/` |
+| 8 (library) | `swe_suite.stone`: test suites the workflow holds, run on snapshots (see below) | |
 
-Tasks: `pilot_tasks.json` (experiments 1-5) and `pilot_tasks_e6.json`
-(experiment 6). `hidden_e3.json` and `hidden_e6.json` hold the public
-SWE-bench Verified fields the grading scripts read (reference patch, test
-patch, fail-to-pass and pass-to-pass tests); the programs never see them.
+## `swe_suite.stone`
 
-`data/`:
+A Stone module for the gates of experiments 6-7, built on `run(..., files=)`,
+`run_tests()`, `snapshot()`, and `apply_patch()`. The workflow holds a suite;
+registering copies every test file the tests use, and every run writes those
+copies first, so editing a test file cannot change a gate (a run that finds a
+repository test file edited warns, and puts the edit back afterwards).
 
-- `results.csv`: one row per run (experiment, setup, model, task, outcome,
-  harness verdict, model calls). `counted` marks the run each tally uses: a
-  run that was interrupted and rerun shares its tag, and the latest graded
-  one counts.
-- `specs.jsonl`: every spec, spec type, or filled spec a model wrote, with
-  its run.
-- `e3_opus_specs/`: experiment 3's D specs and the issue text they were
-  written from.
-- `lab_notes.md`: working notes from experiments 1-2 and the correction
-  (entries 1-20).
-- `logs/`, `pilot_summary.txt`, `reps_summary.txt`: run logs and
-  experiment 1's tables.
-
-Run directories (about 2.4 GB, with task repository copies and Gateway data)
-are not kept; `export_results.py RUNS_DIR OUT_DIR` rebuilds `data/` from them.
-
-## Running
-
-Everything runs from one directory that also holds `runs/`, `repos/`, and a
-`venv/` with the `swebench` package (`.gitignore` covers them). Needs Docker
-with the SWE-bench task images, a built `waymark-gateway` (the
-`anthropic-provider` branch for Haiku and Sonnet), and API keys in
-`~/waymark.env`; keys go only to the Gateway's environment.
-
-```sh
-python3 run_stone.py haiku swe_e6.stone --task django__django-16485 --spec e6cfg/split.json
-python3 pilot_e6.py --jobs 4 --reps 2
-python3 grade_plans_e6.py
-```
-
-`Q2_WAYMARK` selects the `waymark` binary.
+- `new_suite(root, wrap, runner)`: snapshot the unfixed code.
+- `register_tests(suite, tests, keep, revised)`: copy the test files (the new
+  tests' files and the repository files keep runs name) and, while the tree
+  is the unfixed code, run each new part there: fail-to-pass must fail,
+  pass-to-pass must pass, keep runs must finish and pass some tests. Parts
+  registered later are listed in `suite["unchecked"]`; unchanged parts are not
+  run again. `revise(suite, tests=, keep=, revised=)` re-registers with the
+  other parts as they are.
+- `check(suite)`: run the suite on the current tree (feedback for the fixer,
+  with warnings for edited test files); `rejecting(report)` names the parts
+  that reject it.
+- `verify(suite, patch)`: prove by snapshot id that the tree is exactly the
+  unfixed code plus the patch (listing any extra or missing files), run the
+  suite, and return a `Verdict` holding the results.
+- `accepts(suite, verdict)`: re-check a verdict without running a test:
+  genuine results and snapshots, this suite and patch, every run between the
+  two snapshots (by `seq`), the registered commands and test-file copies,
+  every test passing, and no keep run newly failing beyond the revised tests.

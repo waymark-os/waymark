@@ -2832,6 +2832,34 @@ impl Evaluator<'_> {
                 let value = value.into_nu_value("assignment")?;
                 self.assign_unpack_targets("assignment", targets, value)
             }
+            AssignTarget::Unpack(targets) => {
+                let items = match shared_sequence_items(&value) {
+                    Some(items) => items,
+                    None => match value.into_nu_value("assignment")? {
+                        Value::List { vals, .. } => vals.into_iter().map(RuntimeValue::Nu).collect(),
+                        _ => {
+                            return Err(stone_error(
+                                "assignment",
+                                "tuple/list destructuring requires a list value to unpack",
+                            ))
+                        }
+                    },
+                };
+                if items.len() != targets.len() {
+                    return Err(stone_error(
+                        "assignment",
+                        format!(
+                            "tuple/list destructuring expected {} values, got {}",
+                            targets.len(),
+                            items.len()
+                        ),
+                    ));
+                }
+                for (target, item) in targets.iter().zip(items) {
+                    self.assign_value(target, item, record_session_bindings)?;
+                }
+                Ok(())
+            }
             AssignTarget::Subscript { .. } | AssignTarget::Attribute { .. } => {
                 let place = self.resolve_place(target, "assignment")?;
                 self.write_place(place, value)
@@ -2942,7 +2970,7 @@ impl Evaluator<'_> {
                     attr: attr.clone(),
                 })
             }
-            AssignTarget::Tuple(_) => Err(stone_error(
+            AssignTarget::Tuple(_) | AssignTarget::Unpack(_) => Err(stone_error(
                 context,
                 "tuple/list destructuring cannot be used with augmented assignment",
             )),
@@ -2995,7 +3023,7 @@ impl Evaluator<'_> {
                 TargetRoot::Value(self.eval_expr_value(expr)?),
                 Vec::new(),
             )),
-            AssignTarget::Tuple(_) => Err(stone_error(
+            AssignTarget::Tuple(_) | AssignTarget::Unpack(_) => Err(stone_error(
                 context,
                 "tuple/list destructuring does not support item assignment",
             )),
@@ -3798,11 +3826,14 @@ impl Evaluator<'_> {
             "any" => self.eval_any_all_call(call, true),
             "all" => self.eval_any_all_call(call, false),
             "enumerate" => self.eval_enumerate_call(call),
+            "zip" => self.eval_zip_call(call),
             "echo" => self.eval_echo_call(call),
             "emit" => self.eval_emit_call(call),
             "fail" => self.eval_fail_call(call),
             "find" => self.eval_find_call(call),
             "diff" => self.eval_diff_call(call),
+            "snapshot" => self.eval_snapshot_call(call),
+            "apply_patch" => self.eval_apply_patch_call(call),
             "format" => self.eval_format_call(call),
             "json_dumps" => self.eval_json_dumps_call(call),
             "json_loads" => self.eval_json_loads_call(call),
@@ -3871,6 +3902,7 @@ impl Evaluator<'_> {
             "run" => self.eval_run_call(call),
             "run_complete" => self.eval_run_complete_call(call),
             "must_run" => self.eval_must_run_call(call),
+            "run_tests" => self.eval_run_tests_call(call),
             "run_status" => self.eval_run_status_call(call),
             "run_wait" => self.eval_run_wait_call(call),
             "run_terminate" => self.eval_run_terminate_call(call),
@@ -3930,6 +3962,7 @@ impl Evaluator<'_> {
             "wait_for" => self.eval_wait_for_call(call),
             "sort" | "sorted" => self.eval_sort_call(call),
             "set" => self.eval_set_call(call),
+            "dict" => self.eval_dict_call(call),
             "unique" => self.eval_unique_call(call),
             "write_csv" => self.eval_write_csv_call(call),
             "write_json" => self.eval_write_json_call(call),
@@ -5023,6 +5056,9 @@ impl Evaluator<'_> {
     }
 
     fn eval_diff_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if call.named.iter().any(|(name, _)| name == "since" || name == "to") {
+            return self.eval_snapshot_diff_call(call);
+        }
         let [left, right] = call.positional.as_slice() else {
             return Err(stone_error("diff", "diff() requires two file paths"));
         };
@@ -5044,6 +5080,191 @@ impl Evaluator<'_> {
             &left_path,
             &right_path,
         )?))
+    }
+
+    /// `snapshot(path=None)`: the state of the directory tree at `path` (the
+    /// cwd by default), saved in Waymark's snapshot store.
+    fn eval_snapshot_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        let mut path = None;
+        if positional.len() > 1 {
+            return Err(stone_typed_error("TypeError", "snapshot", "snapshot() takes one optional path"));
+        }
+        if let Some(value) = positional.into_iter().next() {
+            path = Some(value);
+        }
+        for (name, value) in named {
+            match name.as_str() {
+                "path" if path.is_none() => path = Some(value),
+                _ => {
+                    return Err(stone_typed_error(
+                        "TypeError",
+                        "snapshot",
+                        format!("snapshot() got an unexpected keyword argument `{name}`; it accepts path"),
+                    ))
+                }
+            }
+        }
+        let root = match path {
+            None | Some(Value::Nothing { .. }) => self.current_cwd_path("snapshot")?,
+            Some(value) => {
+                let path = value_to_path_string(&value, "snapshot")?;
+                let path = PathBuf::from(path);
+                if path.is_absolute() { path } else { self.current_cwd_path("snapshot")?.join(path) }
+            }
+        };
+        let root = root.display().to_string();
+        let stdout = self.snapshot_step("snapshot", &["save", &root], None, &root)?;
+        let snapshot = crate::stone_snapshots::parse_save(&stdout, "snapshot")?;
+        Ok(RuntimeValue::Nu(Value::record(
+            crate::stone_snapshots::snapshot_record(&snapshot),
+            Span::unknown(),
+        )))
+    }
+
+    /// `apply_patch(snapshot, patch)`: the snapshot of `snapshot` with `patch`
+    /// applied, built in the snapshot store; no file is written.
+    fn eval_apply_patch_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        use crate::stone_snapshots::{patch_spec, snapshot_ref, PatchSpec};
+        let (positional, named) = self.eval_call_values(call)?;
+        let mut values: Vec<Option<Value>> = vec![positional.first().cloned(), positional.get(1).cloned()];
+        if positional.len() > 2 {
+            return Err(stone_typed_error("TypeError", "apply_patch", "apply_patch() takes a snapshot and a patch"));
+        }
+        for (name, value) in named {
+            let slot = match name.as_str() {
+                "snapshot" => 0,
+                "patch" => 1,
+                _ => {
+                    return Err(stone_typed_error(
+                        "TypeError",
+                        "apply_patch",
+                        format!("apply_patch() got an unexpected keyword argument `{name}`; it accepts snapshot and patch"),
+                    ))
+                }
+            };
+            values[slot] = Some(value);
+        }
+        let (Some(snapshot), Some(patch)) = (values[0].take(), values[1].take()) else {
+            return Err(stone_typed_error("TypeError", "apply_patch", "apply_patch() takes a snapshot and a patch"));
+        };
+        let base = snapshot_ref(&snapshot, "apply_patch", "snapshot")?;
+        let mut args = vec!["apply".to_string(), base.root.clone(), base.id.clone()];
+        let mut stdin = None;
+        match patch_spec(&patch, "apply_patch")? {
+            PatchSpec::None => {}
+            PatchSpec::Text(text) => stdin = Some(text),
+            PatchSpec::Trees { since, to } => args.extend([since, to]),
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let stdout = self.snapshot_step("apply_patch", &args, stdin.as_deref(), &base.root)?;
+        let result = crate::stone_snapshots::parse_save(&stdout, "apply_patch")?;
+        Ok(RuntimeValue::Nu(Value::record(
+            crate::stone_snapshots::snapshot_record(&result),
+            Span::unknown(),
+        )))
+    }
+
+    /// `diff(since=snapshot, to=None)`: what changed in the snapshot's root
+    /// since it was taken (or between two snapshots).
+    fn eval_snapshot_diff_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let (positional, named) = self.eval_call_values(call)?;
+        if !positional.is_empty() {
+            return Err(stone_typed_error(
+                "TypeError",
+                "diff",
+                "diff(since=...) compares snapshots and takes no paths; use diff(left, right) for two files",
+            ));
+        }
+        let mut since = None;
+        let mut to = None;
+        for (name, value) in &named {
+            match name.as_str() {
+                "since" => since = Some(crate::stone_snapshots::snapshot_ref(value, "diff", "since=")?),
+                "to" if !matches!(value, Value::Nothing { .. }) => {
+                    to = Some(crate::stone_snapshots::snapshot_ref(value, "diff", "to=")?)
+                }
+                "to" => {}
+                _ => {
+                    return Err(stone_typed_error(
+                        "TypeError",
+                        "diff",
+                        format!("diff() got an unexpected keyword argument `{name}`; diff(since=snapshot, to=None) accepts since and to"),
+                    ))
+                }
+            }
+        }
+        let Some(since) = since else {
+            return Err(stone_typed_error("TypeError", "diff", "diff(to=...) needs since=, the snapshot to compare from"));
+        };
+        let mut args = vec!["diff".to_string(), since.root.clone(), since.id.clone()];
+        if let Some(to) = &to {
+            args.push(to.id.clone());
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let stdout = self.snapshot_step("diff", &args, None, &since.root)?;
+        let record = crate::stone_snapshots::parse_diff(&stdout, &since.id, "diff")?;
+        Ok(RuntimeValue::Nu(Value::record(record, Span::unknown())))
+    }
+
+    /// Run one snapshot step (see `stone_snapshots::SCRIPT`) where commands
+    /// run, in `root`. Not metered: it is part of the call that asked for it.
+    fn snapshot_step(
+        &mut self,
+        context: &str,
+        args: &[&str],
+        stdin: Option<&str>,
+        root: &str,
+    ) -> Result<String, ShellError> {
+        let span = Span::unknown();
+        let mut argv = vec![
+            Value::string("sh", span),
+            Value::string("-c", span),
+            Value::string(crate::stone_snapshots::SCRIPT, span),
+            Value::string("waymark-snapshot", span),
+        ];
+        argv.extend(args.iter().map(|arg| Value::string(*arg, span)));
+        let named = vec![
+            ("cwd".to_string(), Value::string(root, span)),
+            ("stdin".to_string(), Value::string(stdin.unwrap_or(""), span)),
+            ("timeout_ms".to_string(), Value::int(600_000, span)),
+            ("max_stdout_bytes".to_string(), Value::int(256 * 1024 * 1024, span)),
+        ];
+        let default_cwd = PathBuf::from(root);
+        let invocation = run_call_values(context, &[Value::list(argv, span)], &named, default_cwd, true, |path| {
+            self.resolve_script_path(path)
+        })?;
+        let text = |name: &str| match invocation.record.get(name) {
+            Some(Value::String { val, .. }) => val.clone(),
+            _ => String::new(),
+        };
+        let exit = match invocation.record.get("exit_code") {
+            Some(Value::Int { val, .. }) => Some(*val),
+            _ => None,
+        };
+        if exit != Some(0) {
+            let mut stderr = text("stderr").trim().to_string();
+            if matches!(invocation.record.get("timed_out"), Some(Value::Bool { val: true, .. })) {
+                stderr.push_str(" (timed out)");
+            }
+            if stderr.is_empty() {
+                let stdout = text("stdout");
+                let tail: String = stdout.chars().rev().take(600).collect::<Vec<_>>().into_iter().rev().collect();
+                stderr = format!("exit {}, no error output; output: {}", exit.map_or("none".to_string(), |code| code.to_string()), tail.trim());
+            }
+            return Err(crate::stone_snapshots::step_error(context, exit, &stderr));
+        }
+        if matches!(
+            invocation.record.get("truncated"),
+            Some(Value::Record { val, .. }) if matches!(val.get("stdout"), Some(Value::Bool { val: true, .. }))
+        ) {
+            return Err(stone_typed_error(
+                "OSError",
+                context,
+                format!("{context}(): the snapshot step's output was larger than 256 MiB"),
+            ));
+        }
+        Ok(text("stdout"))
     }
 
     fn eval_read_json_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5968,6 +6189,47 @@ impl Evaluator<'_> {
             _ => unreachable!(),
         };
         Ok(RuntimeValue::Set(SetObj::from_values(values)?))
+    }
+
+    /// `dict()`, `dict(d)` (a shallow copy), `dict(pairs)`, and `dict(d, k=v)`,
+    /// as in Python. A record is not a dict: its fields are read as attributes.
+    fn eval_dict_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let mut entries = match call.positional.as_slice() {
+            [] => Vec::new(),
+            [other] => {
+                let value = self.eval_expr_value(other)?;
+                if matches!(value, RuntimeValue::Record(_)) {
+                    return Err(stone_typed_error(
+                        "TypeError",
+                        "dict",
+                        format!(
+                            "dict() takes a dict or a list of [key, value] pairs, not a {} record; read its fields as attributes, or build the dict you need: {{\"name\": r.name}}",
+                            runtime_type_name(&value)
+                        ),
+                    ));
+                }
+                self.update_entries(&value, "dict")?
+            }
+            _ => {
+                return Err(stone_typed_error(
+                    "TypeError",
+                    "dict",
+                    "dict() takes at most one positional argument: a dict or a list of [key, value] pairs",
+                ))
+            }
+        };
+        for (name, value) in &call.named {
+            entries.push((name.clone(), self.eval_expr_value(value)?));
+        }
+        // Later entries win and keep the first one's position, as in Python.
+        let mut merged: Vec<(String, RuntimeValue)> = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            match merged.iter_mut().find(|(seen, _)| *seen == key) {
+                Some(slot) => slot.1 = value,
+                None => merged.push((key, value)),
+            }
+        }
+        Ok(stone_containers::dict_from_entries(merged))
     }
 
     fn eval_unique_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -8110,6 +8372,107 @@ impl Evaluator<'_> {
         }
     }
 
+    /// `run_tests(argv, runner="pytest")` runs a test command and reads the
+    /// runner's output into a `TestRun` record: per-test names and the
+    /// runner's own counts. `ok` is True only when the runner's final summary
+    /// was found, at least one test passed, none failed, and the command
+    /// exited 0; `problem` says why otherwise.
+    fn eval_run_tests_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        if self.state.active_transition_hook {
+            return Err(transition_hook_error(
+                "run_tests",
+                "run_tests() cannot be called from a transition hook",
+            ));
+        }
+        self.check_tool_budget()?;
+        let (positional, named) = self.eval_call_values(call)?;
+        let mut runner = "pytest".to_string();
+        let mut rest = Vec::with_capacity(named.len());
+        for (name, value) in named {
+            match name.as_str() {
+                "runner" => {
+                    runner = value.coerce_string().unwrap_or_default();
+                    if !crate::stone_test_results::RUNNERS.contains(&runner.as_str()) {
+                        return Err(stone_typed_error(
+                            "ValueError",
+                            "run_tests",
+                            format!(
+                                "run_tests() runner= must be one of {}, got {runner:?}",
+                                crate::stone_test_results::RUNNERS.join(", ")
+                            ),
+                        ));
+                    }
+                }
+                "background" | "expect" | "effects" | "hooks" | "pre" | "post" | "stdout"
+                | "stderr" => {
+                    return Err(stone_typed_error(
+                        "TypeError",
+                        "run_tests",
+                        format!(
+                            "run_tests() reads the runner's output itself, so it does not take {name}=; it accepts runner, cwd, env, stdin, files, timeout_ms, max_stdout_bytes, and max_stderr_bytes"
+                        ),
+                    ));
+                }
+                _ => rest.push((name, value)),
+            }
+        }
+        let run = self.eval_run_values(&positional, &rest, "run_tests", true)?;
+        Ok(RuntimeValue::Nu(Value::record(
+            test_run_record(&runner, &positional, &run),
+            Span::unknown(),
+        )))
+    }
+
+    /// Write `files=` for a command: each file is created (with its parent
+    /// directories) by a small `sh` step in the command's own environment and
+    /// cwd, so it lands where the command will look. These steps are part of
+    /// the one metered call. Returns (path as given, content) for the result.
+    fn write_run_files(
+        &mut self,
+        files: &[(String, String)],
+        named: &[(String, Value)],
+        default_cwd: PathBuf,
+        context: &str,
+    ) -> Result<Vec<(String, String)>, ShellError> {
+        let span = Span::unknown();
+        let cwd = named.iter().find(|(name, _)| name == "cwd").map(|(_, value)| value.clone());
+        for (path, content) in files {
+            let argv = Value::list(
+                ["sh", "-c", "mkdir -p -- \"$(dirname -- \"$1\")\" && cat > \"$1\"", "waymark-files", path.as_str()]
+                    .iter()
+                    .map(|part| Value::string(*part, span))
+                    .collect(),
+                span,
+            );
+            let mut write_named = vec![
+                ("stdin".to_string(), Value::string(content.clone(), span)),
+                ("timeout_ms".to_string(), Value::int(60_000, span)),
+            ];
+            if let Some(cwd) = cwd.clone() {
+                write_named.push(("cwd".to_string(), cwd));
+            }
+            let invocation = run_call_values(context, &[argv], &write_named, default_cwd.clone(), true, |path| {
+                self.resolve_script_path(path)
+            })?;
+            let exit = match invocation.record.get("exit_code") {
+                Some(Value::Int { val, .. }) => Some(*val),
+                _ => None,
+            };
+            if exit != Some(0) {
+                let stderr = match invocation.record.get("stderr") {
+                    Some(Value::String { val, .. }) => val.trim().to_string(),
+                    _ => String::new(),
+                };
+                return Err(stone_typed_error(
+                    "OSError",
+                    context,
+                    format!("{context}() could not write its input file {path}: {stderr}"),
+                ));
+            }
+        }
+        Ok(files.to_vec())
+    }
+
     fn eval_run_values(
         &mut self,
         positional: &[Value],
@@ -8121,6 +8484,8 @@ impl Evaluator<'_> {
         // A command is a metered call: it counts against the attempt's
         // tool-call budget and may not outlive its wall-clock budget.
         let remaining_ms = self.check_tool_budget()?;
+        let (files, named) = take_run_files(named, context)?;
+        let named = named.as_slice();
         let bounded;
         let named = match remaining_ms {
             Some(remaining_ms) => {
@@ -8129,6 +8494,14 @@ impl Evaluator<'_> {
             }
             None => named,
         };
+        // Input files are written where the command runs (locally or in the
+        // Gateway's container), just before it, as part of this one call.
+        let written = self.write_run_files(&files, named, default_cwd.clone(), context)?;
+        if !written.is_empty() && !crate::gateway_runtime::enabled() {
+            // Let the input files fall outside the effect clock's margin, so
+            // they are not reported as changes the command made.
+            thread::sleep(crate::stone_effects::CLOCK_MARGIN + Duration::from_millis(5));
+        }
         let clock = crate::stone_effects::effect_clock();
         let invocation =
             run_call_values(context, positional, named, default_cwd, complete, |path| {
@@ -8146,6 +8519,10 @@ impl Evaluator<'_> {
             }
         };
         let mut record = invocation.record;
+        if !written.is_empty() {
+            record.insert("files", run_files_value(&written, &invocation.cwd));
+        }
+        record.insert("seq", Value::int(crate::stone_snapshots::next_seq(), Span::unknown()));
         // Tier-1 effects: what changed in the workspace while the command ran.
         let effects = if crate::gateway_runtime::enabled() {
             crate::stone_effects::unobserved_effects(
@@ -8539,7 +8916,7 @@ impl Evaluator<'_> {
                 .expect("model request builder always supplies messages");
             messages.push(json!({
                 "role": "assistant",
-                "content": bounded_text(&content, MAX_REPAIR_CONTENT_CHARS),
+                "content": echoed_reply(&content, MAX_REPAIR_CONTENT_CHARS),
             }));
             messages.push(json!({"role": "user", "content": repair_message}));
         }
@@ -8561,6 +8938,7 @@ impl Evaluator<'_> {
             ));
         }
         let mut output = None;
+        let mut validate = None;
         let mut rest = Vec::with_capacity(named.len());
         for (name, expr) in named {
             if name == "output" {
@@ -8568,6 +8946,8 @@ impl Evaluator<'_> {
                     return Err(model_ask_input_error("output= may be given only once"));
                 }
                 output = Some(self.eval_type_argument(expr, "model.ask() output=")?);
+            } else if name == "validate" {
+                validate = self.eval_validate_handler(expr)?;
             } else {
                 rest.push((name.clone(), expr.clone()));
             }
@@ -8653,6 +9033,11 @@ impl Evaluator<'_> {
             message_values.insert(0, json!({"role": "system", "content": system}));
         }
         let Some(ty) = output else {
+            if validate.is_some() {
+                return Err(model_ask_input_error(
+                    "model.ask() validate= checks a typed answer; give the answer's type with output=",
+                ));
+            }
             let response = self.execute_model_request(request, &hooks, &model.meter)?;
             let content = model_response_content(&response)?;
             model.record_last(
@@ -8696,6 +9081,7 @@ impl Evaluator<'_> {
         let mut content = String::new();
         let mut transition_ids = Vec::new();
         for attempt in 0..=retries {
+            let mut rejected_by_validate = false;
             let response = self.execute_model_request(request.clone(), &hooks, &model.meter)?;
             transition_ids.push(model_response_transition_id(&response));
             content = model_response_content(&response)?;
@@ -8714,8 +9100,19 @@ impl Evaluator<'_> {
                     };
                     match stone_records::convert_json(&target, &ty, &self.state.types) {
                         Ok(value) => {
-                            model.record_last(transition_ids, &content, true);
-                            return Ok(value);
+                            let problems = match &validate {
+                                Some(handler) => self.run_validate(handler, value.clone())?,
+                                None => Vec::new(),
+                            };
+                            if problems.is_empty() {
+                                model.record_last(transition_ids, &content, true);
+                                return Ok(value);
+                            }
+                            rejected_by_validate = true;
+                            problems
+                                .into_iter()
+                                .map(|problem| json!({"path": "$", "message": problem, "check": "validate"}))
+                                .collect()
                         }
                         Err(found) => found.iter().map(|issue| issue.to_json()).collect(),
                     }
@@ -8730,9 +9127,14 @@ impl Evaluator<'_> {
                 .expect("model request builder always supplies messages");
             messages.push(json!({
                 "role": "assistant",
-                "content": bounded_text(&content, stone_model::MAX_REPAIR_CONTENT_CHARS),
+                "content": echoed_reply(&content, stone_model::MAX_REPAIR_CONTENT_CHARS),
             }));
-            messages.push(json!({"role": "user", "content": stone_model::repair_message(&issues, type_format)}));
+            let repair = if rejected_by_validate {
+                stone_model::validate_message(&issues)
+            } else {
+                stone_model::repair_message(&issues, type_format)
+            };
+            messages.push(json!({"role": "user", "content": repair}));
         }
         model.record_last(transition_ids, &content, false);
         Err(host_error(model_output_error(
@@ -8741,6 +9143,74 @@ impl Evaluator<'_> {
             &issues,
             &content,
         )))
+    }
+
+    /// The function given as `model.ask(..., validate=f)`: a named Stone
+    /// function, a lambda, or a callable local taking the typed answer.
+    /// `validate=fn`, or None (`validate=None` is the same as leaving it out,
+    /// so a wrapper can pass its own optional check through).
+    fn eval_validate_handler(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<Option<WorkflowHandler>, ShellError> {
+        if let Expr::Name(name) = expression {
+            if self.state.get_local(name).is_none() {
+                if let Some(function) = self.state.functions.get(name) {
+                    if !function_accepts_arity(function, 1) {
+                        return Err(model_ask_input_error(format!(
+                            "model.ask() validate= function `{name}` must take one argument, the typed answer"
+                        )));
+                    }
+                    return Ok(Some(WorkflowHandler::NamedFunction(name.clone())));
+                }
+            }
+        }
+        match self.eval_expr_value(expression)? {
+            RuntimeValue::Nu(Value::Nothing { .. }) => Ok(None),
+            RuntimeValue::Callable(callable) if callable.accepts_arity(1) => {
+                Ok(Some(WorkflowHandler::Callable(*callable)))
+            }
+            RuntimeValue::Callable(callable) => Err(model_ask_input_error(format!(
+                "model.ask() validate= function {} must take one argument, the typed answer",
+                callable.display_name()
+            ))),
+            other => Err(model_ask_input_error(format!(
+                "model.ask() validate= must be a function that takes the answer and returns a list of problems; got {}",
+                runtime_type_name(&other)
+            ))),
+        }
+    }
+
+    /// Call a `validate=` function on a typed answer. It returns a list of
+    /// problem strings, empty (or None) when the answer is acceptable.
+    fn run_validate(&mut self, handler: &WorkflowHandler, answer: RuntimeValue) -> Result<Vec<String>, ShellError> {
+        let result = match handler {
+            WorkflowHandler::Callable(callable) => self.invoke_callable(callable, vec![answer])?,
+            WorkflowHandler::NamedFunction(name) => {
+                let function = self.state.functions.get(name).cloned().ok_or_else(|| {
+                    model_ask_input_error(format!("validate= function `{name}` is no longer defined"))
+                })?;
+                self.invoke_user_function_values(&function, vec![answer])?
+            }
+        };
+        let wrong = |got: &str| {
+            stone_typed_error(
+                "TypeError",
+                "model.ask",
+                format!("model.ask() validate= must return a list of problem strings (empty when the answer is acceptable), got {got}"),
+            )
+        };
+        match result.into_nu_value("model.ask validate")? {
+            Value::Nothing { .. } => Ok(Vec::new()),
+            Value::List { vals, .. } => vals
+                .into_iter()
+                .map(|value| match value {
+                    Value::String { val, .. } => Ok(val),
+                    other => Err(wrong(&format!("a list holding {}", value_type_name(&other)))),
+                })
+                .collect(),
+            other => Err(wrong(value_type_name(&other))),
+        }
     }
 
     /// `model.limit(calls=, input_tokens=, output_tokens=)`: a model value
@@ -12471,6 +12941,12 @@ impl Evaluator<'_> {
                 if let Some(matches) = builtin_isinstance(name, value)? {
                     return Ok(matches);
                 }
+                // A runtime result type: true only for a result the runtime
+                // returned, never for a look-alike dict or record.
+                if crate::stone_record_access::HOST_RECORD_TYPES.contains(&name.as_str()) {
+                    return Ok(matches!(value, RuntimeValue::Record(record)
+                        if record.ty.host && record.ty.name == *name));
+                }
             }
         }
         // A record type, an alias, or a union written in place.
@@ -12953,6 +13429,52 @@ impl Evaluator<'_> {
             })
             .collect::<Result<Vec<_>, ShellError>>()?;
         Ok(list_from_values(pairs))
+    }
+
+    /// `zip(a, b, ...)`: lists of corresponding items, stopping at the
+    /// shortest input (Python). `strict=True` raises ValueError when the
+    /// inputs differ in length. Items are shared, as with `enumerate`.
+    fn eval_zip_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let mut strict = false;
+        for (name, value) in &call.named {
+            if name != "strict" {
+                return Err(stone_error(
+                    "zip",
+                    format!("zip() has no keyword `{name}`; it takes iterables and optional strict=True"),
+                ));
+            }
+            let value = self.eval_expr_value(value)?;
+            strict = runtime_truthy(&value, "zip")?;
+        }
+        let mut columns = Vec::with_capacity(call.positional.len());
+        for iterable in &call.positional {
+            columns.push(self.eval_iterable_expr(iterable)?);
+        }
+        let shortest = columns.iter().map(Vec::len).min().unwrap_or(0);
+        if strict && columns.iter().any(|column| column.len() != shortest) {
+            let lengths = columns
+                .iter()
+                .map(|column| column.len().to_string())
+                .collect::<Vec<_>>();
+            return Err(stone_typed_error(
+                "ValueError",
+                "zip",
+                format!(
+                    "zip() inputs differ in length ({}) and strict=True",
+                    lengths.join(", ")
+                ),
+            ));
+        }
+        let mut iterators = columns.into_iter().map(Vec::into_iter).collect::<Vec<_>>();
+        let mut rows = Vec::with_capacity(shortest);
+        for _ in 0..shortest {
+            let row = iterators
+                .iter_mut()
+                .filter_map(Iterator::next)
+                .collect::<Vec<_>>();
+            rows.push(list_from_values(row));
+        }
+        Ok(list_from_values(rows))
     }
 
     fn eval_optional_index(
@@ -13777,7 +14299,7 @@ impl Evaluator<'_> {
                 "update" => {
                     let mut entries = match args.as_slice() {
                         [] => Vec::new(),
-                        [other] => self.update_entries(other)?,
+                        [other] => self.update_entries(other, "update")?,
                         _ => return Err(arity("at most 1 positional argument")),
                     };
                     for (name, value) in named {
@@ -13824,6 +14346,7 @@ impl Evaluator<'_> {
     fn update_entries(
         &mut self,
         other: &RuntimeValue,
+        context: &str,
     ) -> Result<Vec<(String, RuntimeValue)>, ShellError> {
         if let RuntimeValue::Dict(other) = other {
             return Ok(other.shared_entries());
@@ -13849,8 +14372,8 @@ impl Evaluator<'_> {
                 _ => {
                     return Err(stone_typed_error(
                         "TypeError",
-                        "update",
-                        "update() takes a dict, a list of [key, value] pairs with string keys, or key=value arguments",
+                        context,
+                        format!("{context}() takes a dict, a list of [key, value] pairs with string keys, or key=value arguments"),
                     ))
                 }
             }
@@ -14442,7 +14965,7 @@ fn returns_program_data(builtin: &str) -> bool {
         builtin,
         "get" | "keys" | "values" | "items" | "first" | "last" | "head" | "tail" | "slice"
             | "unique" | "sort" | "sorted" | "filter" | "map" | "where" | "min" | "max" | "set"
-            | "list" | "tuple" | "enumerate" | "sum" | "len" | "json_loads" | "from_json"
+            | "list" | "tuple" | "dict" | "enumerate" | "zip" | "sum" | "len" | "json_loads" | "from_json"
             | "read_json" | "read_jsonl" | "read_csv" | "task_input" | "task_spec"
             | "echo" | "print" | "emit" | "Expect"
             | "Effects" | "split" | "range" | "int" | "float" | "str" | "repr" | "round"
@@ -14471,6 +14994,8 @@ fn host_result_type(builtin: &str) -> String {
         "run" | "must_run" | "run_wait" | "run_complete" | "run_terminate" | "last_result" => {
             "RunResult".to_string()
         }
+        "run_tests" => "TestRun".to_string(),
+        "snapshot" | "apply_patch" => "Snapshot".to_string(),
         "start_daemon" | "daemon_status" | "stop_daemon" => "Daemon".to_string(),
         "stat" => "FileStat".to_string(),
         "ls" | "list_dir" => "DirEntry".to_string(),
@@ -14501,6 +15026,10 @@ fn type_host_result(builtin: &str, value: RuntimeValue) -> RuntimeValue {
     }
     match value {
         RuntimeValue::Nu(value @ (Value::Record { .. } | Value::List { .. })) => {
+            // diff(since=snapshot) compares snapshots, not two files.
+            if builtin == "diff" && matches!(&value, Value::Record { val, .. } if val.contains("since")) {
+                return host_record("TreeDiff", value);
+            }
             host_record(&host_result_type(builtin), value)
         }
         value => value,
@@ -14533,6 +15062,8 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "predicate",
     "cat",
     "diff",
+    "snapshot",
+    "apply_patch",
     "edit",
     "edit_file",
     "echo",
@@ -14651,6 +15182,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "run_complete",
     "run_status",
     "run_terminate",
+    "run_tests",
     "run_wait",
     "slice",
     "split",
@@ -14681,6 +15213,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "to_json",
     "to_jsonl",
     "set",
+    "dict",
     "unique",
     "type",
     "isinstance",
@@ -14698,6 +15231,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "all",
     "any",
     "enumerate",
+    "zip",
 ];
 
 pub(crate) fn stone_builtin_names() -> &'static [&'static str] {
@@ -17914,6 +18448,22 @@ fn collection_binop(
                 runtime_type_name(right)
             ),
         )),
+        // `a + b` is a new list of the same element objects, as in Python:
+        // records (runtime results included) stay records.
+        _ if op == "addition" && is_list(left) && is_list(right) => {
+            let items_of = |value: &RuntimeValue| match value {
+                RuntimeValue::List(list) => list.shared_items(),
+                RuntimeValue::Nu(Value::List { vals, .. }) => vals
+                    .iter()
+                    .cloned()
+                    .map(|value| stone_containers::share(RuntimeValue::Nu(value)))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let mut items = items_of(left);
+            items.extend(items_of(right));
+            Ok(Some(list_from_values(items)))
+        }
         _ if is_list(left) && is_list(right) && matches!(symbol, "|" | "&" | "^" | "-") => {
             Err(stone_error(
                 "set",
@@ -19271,6 +19821,18 @@ fn model_output_error(ty: &TypeSpec, attempts: i64, issues: &[JsonValue], answer
     )
 }
 
+/// The model's rejected reply, sent back before the repair request. A blank
+/// reply becomes a placeholder: some providers (Anthropic) reject a message
+/// whose text is empty or only whitespace, which would turn a repairable reply
+/// into a provider error.
+fn echoed_reply(content: &str, max_chars: usize) -> String {
+    if content.trim().is_empty() {
+        "(empty reply)".to_string()
+    } else {
+        bounded_text(content, max_chars)
+    }
+}
+
 fn model_infer_repair_message(repair_prompt: &str, attempt: i64, issues: &[JsonValue]) -> String {
     let prefix = if repair_prompt.trim().is_empty() {
         "Your previous response failed JSON Schema validation. Correct it."
@@ -19294,6 +19856,166 @@ fn model_infer_schema_instruction(schema_bytes: &[u8], schema_prompt: &str) -> S
     }
     format!(
         "Return exactly one JSON object. Do not add prose or Markdown.\nOutput contract:\n{schema_prompt}"
+    )
+}
+
+/// The `TestRun` record for one `run_tests()` call.
+fn test_run_record(runner: &str, argv: &[Value], run: &Record) -> Record {
+    let span = Span::unknown();
+    let text_field = |name: &str| match run.get(name) {
+        Some(Value::String { val, .. }) => val.clone(),
+        _ => String::new(),
+    };
+    let exit_code = match run.get("exit_code") {
+        Some(Value::Int { val, .. }) => Some(*val),
+        _ => None,
+    };
+    let timed_out = matches!(run.get("timed_out"), Some(Value::Bool { val: true, .. }));
+    let stdout = text_field("stdout");
+    let stderr = text_field("stderr");
+    let output = if stderr.is_empty() {
+        stdout
+    } else if stdout.is_empty() {
+        stderr
+    } else {
+        format!("{stdout}\n{stderr}")
+    };
+    let outcomes = crate::stone_test_results::parse(runner, &output);
+    let problem = if timed_out {
+        Some("the command timed out before the runner finished".to_string())
+    } else if exit_code.is_none() {
+        Some(format!("the command did not run: {}", text_field("error")))
+    } else if !outcomes.complete {
+        Some(format!(
+            "the {runner} summary line was not found (the command crashed, collected nothing, or is not a {runner} run); read output"
+        ))
+    } else if outcomes.failed > 0 {
+        Some(format!("{} test(s) failed", outcomes.failed))
+    } else if outcomes.passed == 0 {
+        Some("no tests passed (none ran, or all were skipped)".to_string())
+    } else if exit_code != Some(0) {
+        Some(format!(
+            "the runner reported no failures but exited {}; read output",
+            exit_code.unwrap_or_default()
+        ))
+    } else {
+        None
+    };
+    let names = |list: &[String]| {
+        Value::list(
+            list.iter().map(|name| Value::string(name.clone(), span)).collect(),
+            span,
+        )
+    };
+    let mut record = Record::new();
+    record.push("ok", Value::bool(problem.is_none(), span));
+    record.push("runner", Value::string(runner, span));
+    // The argv the runner ran (the first positional argument), as in
+    // RunResult.argv.
+    let command = match argv.first() {
+        Some(list @ Value::List { .. }) => list.clone(),
+        _ => Value::list(argv.to_vec(), span),
+    };
+    record.push("command", command);
+    record.push(
+        "exit_code",
+        exit_code.map_or_else(|| Value::nothing(span), |code| Value::int(code, span)),
+    );
+    record.push("timed_out", Value::bool(timed_out, span));
+    record.push("complete", Value::bool(outcomes.complete, span));
+    record.push("passed", Value::int(outcomes.passed, span));
+    record.push("failed", Value::int(outcomes.failed, span));
+    record.push("skipped", Value::int(outcomes.skipped, span));
+    record.push("xfailed", Value::int(outcomes.xfailed, span));
+    record.push("passed_tests", names(&outcomes.passed_tests));
+    record.push("failed_tests", names(&outcomes.failed_tests));
+    record.push("skipped_tests", names(&outcomes.skipped_tests));
+    record.push(
+        "problem",
+        problem.map_or_else(|| Value::nothing(span), |text| Value::string(text, span)),
+    );
+    let tail_start = output
+        .char_indices()
+        .rev()
+        .nth(TEST_OUTPUT_TAIL_CHARS)
+        .map_or(0, |(index, _)| index);
+    record.push("output", Value::string(&output[tail_start..], span));
+    for field in ["files", "seq"] {
+        if let Some(value) = run.get(field) {
+            record.push(field, value.clone());
+        }
+    }
+    record
+}
+
+const TEST_OUTPUT_TAIL_CHARS: usize = 4000;
+
+/// Split `files={path: content}` off a command's keyword arguments.
+fn take_run_files(
+    named: &[(String, Value)],
+    context: &str,
+) -> Result<(Vec<(String, String)>, Vec<(String, Value)>), ShellError> {
+    let mut files = Vec::new();
+    let mut rest = Vec::with_capacity(named.len());
+    for (name, value) in named {
+        if name != "files" {
+            rest.push((name.clone(), value.clone()));
+            continue;
+        }
+        match value {
+            Value::Nothing { .. } => {}
+            Value::Record { val, .. } => {
+                for (path, content) in val.iter() {
+                    let Value::String { val: content, .. } = content else {
+                        return Err(stone_typed_error(
+                            "TypeError",
+                            context,
+                            format!("{context}() files= maps each path to its text; {path} is not a string"),
+                        ));
+                    };
+                    if path.trim().is_empty() {
+                        return Err(stone_typed_error("ValueError", context, format!("{context}() files= has an empty path")));
+                    }
+                    files.push((path.clone(), content.clone()));
+                }
+            }
+            _ => {
+                return Err(stone_typed_error(
+                    "TypeError",
+                    context,
+                    format!("{context}() files= takes a dict of path -> text, e.g. files={{\"/tmp/t/test_a.py\": source}}"),
+                ))
+            }
+        }
+    }
+    Ok((files, rest))
+}
+
+/// The `files` field of a command's result: each input file's path
+/// (absolute), size, and sha256, so the result shows what the command ran on.
+fn run_files_value(files: &[(String, String)], cwd: &Path) -> Value {
+    let span = Span::unknown();
+    Value::list(
+        files
+            .iter()
+            .map(|(path, content)| {
+                let absolute = if Path::new(path).is_absolute() {
+                    path.clone()
+                } else {
+                    cwd.join(path).display().to_string()
+                };
+                let mut record = Record::new();
+                record.push("path", Value::string(absolute, span));
+                record.push("bytes", Value::int(content.len() as i64, span));
+                record.push(
+                    "sha256",
+                    crate::stone_hash::hash_builtin("sha256", content)
+                        .unwrap_or_else(|_| Value::nothing(span)),
+                );
+                Value::record(record, span)
+            })
+            .collect(),
+        span,
     )
 }
 
@@ -19590,7 +20312,7 @@ fn agent_session_value_at(
     );
     tools.push(
         "files",
-        names(&["read_file", "write_file", "find", "search", "diff"]),
+        names(&["read_file", "write_file", "find", "search", "diff", "snapshot", "apply_patch"]),
     );
     tools.push(
         "linux",
@@ -19598,6 +20320,7 @@ fn agent_session_value_at(
             "run",
             "run_complete",
             "must_run",
+            "run_tests",
             "run_status",
             "run_wait",
             "run_terminate",
@@ -21300,11 +22023,11 @@ emit(inc(5))
         // included, as a program can.
         write(
             "kinds.stone",
-            "def kinds(x):\n    return [isinstance(x, bool), isinstance(x, dict), isinstance(x, int)]\n",
+            "def kinds(x):\n    return [isinstance(x, bool), isinstance(x, dict), isinstance(x, int), isinstance(x, RunResult)]\n",
         );
         assert_eq!(
-            run("from kinds import kinds\nemit(kinds(True))\n")?,
-            json_value!([true, false, true])
+            run("from kinds import kinds\nemit(kinds(True) + kinds(run([\"true\"])))\n")?,
+            json_value!([true, false, true, false, false, false, false, true])
         );
 
         // Module values are read-only all the way down.
@@ -21889,6 +22612,51 @@ emit(inc(5))
             "{repair}"
         );
         assert!(repair.contains("unexpected field `extra`"), "{repair}");
+
+        // A blank answer is echoed back as a placeholder, never as empty text
+        // (some providers reject an empty message).
+        let (value, requests) = run(
+            "plan = model.ask(\"plan it\", output=Plan)\nemit(plan.steps[0].title)\n",
+            &["  \n", r#"{"steps": [{"title": "ok"}]}"#],
+        );
+        assert_eq!(value?, json_value!("ok"));
+        let messages = requests[1]["messages"].as_array().expect("messages");
+        assert_eq!(
+            messages[messages.len() - 2],
+            json_value!({"role": "assistant", "content": "(empty reply)"})
+        );
+
+        // validate= runs the program's own check on a well-typed answer; its
+        // problems go back to the model like type errors, sharing retries.
+        let (value, requests) = run(
+            "def has_steps(plan):\n    return [] if plan.steps else [\"give at least one step\"]\nplan = model.ask(\"plan it\", output=Plan, validate=has_steps)\nemit(plan.steps[0].title)\n",
+            &[r#"{"steps": []}"#, r#"{"steps": [{"title": "ok"}]}"#],
+        );
+        assert_eq!(value?, json_value!("ok"));
+        assert_eq!(requests.len(), 2);
+        let repair = requests[1]["messages"].as_array().expect("messages").last().expect("repair")["content"]
+            .as_str()
+            .expect("text")
+            .to_string();
+        assert!(repair.contains("The program checked your answer") && repair.contains("give at least one step"), "{repair}");
+        let (value, _) = run(
+            "try:\n    model.ask(\"plan it\", output=Plan, retries=0, validate=lambda p: [\"never\"])\nexcept ModelOutputError as e:\n    emit([e.attempts, e.issues[0].message])\n",
+            &[r#"{"steps": []}"#],
+        );
+        assert_eq!(value?, json_value!([1, "never"]));
+        let (value, _) = run(
+            "try:\n    model.ask(\"plan it\", output=Plan, validate=lambda p: \"bad\")\nexcept TypeError as e:\n    emit(\"TypeError\")\n",
+            &[r#"{"steps": []}"#],
+        );
+        assert_eq!(value?, json_value!("TypeError"));
+        // validate=None is the same as no check, so wrappers can pass theirs through.
+        let (value, _) = run(
+            "plan = model.ask(\"plan it\", output=Plan, validate=None)\nemit(plan.steps)\n",
+            &[r#"{"steps": []}"#],
+        );
+        assert_eq!(value?, json_value!([]));
+        let (value, _) = run("model.ask(\"hi\", validate=lambda p: [])\n", &["hello"]);
+        assert!(format!("{:?}", value.expect_err("needs output=")).contains("give the answer's type with output="));
 
         // A union is decided by its Literal field; other types are wrapped.
         let (value, _) = run(
@@ -26948,6 +27716,279 @@ emit({
             })
         );
 
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn run_tests_reads_runner_output_into_a_test_run_record() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("run-tests")?;
+        let program = lower_source(
+            r#"failing = run_tests(["sh", "-c", "printf 'PASSED t.py::test_a\nFAILED t.py::test_b - boom\n1 failed, 1 passed in 0.01s\n'; exit 1"])
+passing = run_tests(["sh", "-c", "printf 'test_a (m.T.test_a) ... ok\nRan 1 test in 0.1s\n\nOK\n' >&2"], runner="django")
+crashed = run_tests(["sh", "-c", "printf 'ImportError: no module named x\n' >&2; exit 4"])
+quiet = run_tests(["sh", "-c", "printf 'no tests ran in 0.01s\n'"])
+lying = run_tests(["sh", "-c", "printf '1 passed in 0.01s\n'; exit 2"])
+try:
+    run_tests(["true"], runner="nose")
+    bad_runner = "no error"
+except ValueError as e:
+    bad_runner = "ValueError"
+try:
+    run_tests(["true"], background=True)
+    bad_arg = "no error"
+except TypeError as e:
+    bad_arg = "TypeError"
+emit({
+    "type": str(type(failing)),
+    "failing": [failing.ok, failing.complete, failing.passed, failing.failed, failing.passed_tests, failing.failed_tests, failing.problem],
+    "passing": [passing.ok, passing.passed, passing.passed_tests, passing.problem],
+    "crashed": [crashed.ok, crashed.complete, crashed.exit_code, crashed.command[0]],
+    "quiet": [quiet.ok, quiet.complete, quiet.problem],
+    "lying": [lying.ok, lying.problem],
+    "bad_runner": bad_runner,
+    "bad_arg": bad_arg,
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value["type"], json_value!("<class 'TestRun'>"));
+        assert_eq!(
+            value["failing"],
+            json_value!([false, true, 1, 1, ["t.py::test_a"], ["t.py::test_b"], "1 test(s) failed"])
+        );
+        assert_eq!(
+            value["passing"],
+            json_value!([true, 1, ["test_a (m.T.test_a)"], null])
+        );
+        assert_eq!(value["crashed"], json_value!([false, false, 4, "sh"]));
+        assert_eq!(
+            value["quiet"],
+            json_value!([false, true, "no tests passed (none ran, or all were skipped)"])
+        );
+        assert_eq!(
+            value["lying"],
+            json_value!([false, "the runner reported no failures but exited 2; read output"])
+        );
+        assert_eq!(value["bad_runner"], json_value!("ValueError"));
+        assert_eq!(value["bad_arg"], json_value!("TypeError"));
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_results_are_read_only_and_cannot_be_forged() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("sealed-results")?;
+        let program = lower_source(
+            r#"r = run(["printf", "a"])
+t = run_tests(["sh", "-c", "printf '1 passed in 0.01s\n'"])
+try:
+    r.exit_code = 5
+    edit = "no error"
+except Exception as e:
+    edit = "read-only" if "read-only" in str(e) else str(e)
+look_alike = {"ok": True, "exit_code": 0, "stdout": "a"}
+mine = {"stdout": r.stdout}
+mine["stdout"] = mine["stdout"] + "b"
+emit({
+    "genuine": [isinstance(r, RunResult), isinstance(t, TestRun), isinstance(t, (RunResult, TestRun))],
+    "forged": [isinstance(look_alike, RunResult), isinstance(r, TestRun), isinstance(stat("."), RunResult)],
+    "edit": edit, "mine": mine["stdout"],
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "genuine": [true, true, true], "forged": [false, false, false],
+                "edit": "read-only", "mine": "ab",
+            })
+        );
+        let named = lower_source("class RunResult(Record):\n    ok: bool = True\n")?;
+        let named = crate::stone_admission::validate_program(&named, &[]);
+        assert!(
+            format!("{:?}", named.expect_err("reserved name")).contains("only the runtime returns"),
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn commands_write_their_input_files_and_record_them() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("run-files")?;
+        let program = lower_source(
+            r#"src = "printf 'PASSED t.py::test_a\n1 passed in 0.01s\n'"
+t = run_tests(["sh", "in/run.sh"], files={"in/run.sh": src})
+r = must_run(["cat", "in/a.txt", "in/deep/b.txt"], files={"in/a.txt": "A", "in/deep/b.txt": "B"})
+plain = run(["true"])
+bad = []
+for files in [["a"], {"a": 3}]:
+    try:
+        run(["true"], files=files)
+        bad.append("no error")
+    except TypeError as e:
+        bad.append("TypeError")
+ran = run(["true"], files={"in/quiet.txt": "q"})
+emit({
+    "inputs_not_effects": ran.effects.observed.changed,
+    "t": [t.ok, len(t.files), t.files[0].path.endswith("/in/run.sh"), t.files[0].sha256 == sha256(src), t.files[0].bytes == len(src)],
+    "r": [r.stdout, [f.path.endswith(p) for f, p in zip(r.files, ["/in/a.txt", "/in/deep/b.txt"])]],
+    "plain": "files" in json_loads(json_dumps(plain)),
+    "bad": bad,
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "inputs_not_effects": [],
+                "t": [true, 1, true, true, true], "r": ["AB", [true, true]],
+                "plain": false, "bad": ["TypeError", "TypeError"],
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshots_diffs_and_patched_snapshots() -> Result<(), ShellError> {
+        // One store for every test in this process (never the user's own).
+        let store = std::env::temp_dir().join(format!("waymark-test-snapshots-{}", std::process::id()));
+        unsafe { std::env::set_var(crate::stone_snapshots::STORE_ENV, &store) };
+        let (engine_state, mut stack, root) = test_engine("snapshots")?;
+        let program = lower_source(
+            r#"write_text("m.txt", "one\n")
+write_text(".gitignore", "*.log\n")
+write_text("build.log", "ignored")
+base = snapshot()
+r = run(["true"])
+write_text("m.txt", "two\n")
+write_text("n.txt", "new\n")
+change = diff(since=base)
+now = snapshot()
+from_diff = apply_patch(base, change)
+from_text = apply_patch(base, change.patch)
+same = apply_patch(base, None)
+write_text("build.log", "changed")
+errors = []
+for patch in ["garbage", 3]:
+    try:
+        apply_patch(base, patch)
+        errors.append("no error")
+    except ValueError as e:
+        errors.append("ValueError")
+    except TypeError as e:
+        errors.append("TypeError")
+try:
+    diff(since={"root": base.root, "id": "0" * 40})
+    errors.append("no error")
+except FileNotFoundError as e:
+    errors.append("FileNotFoundError")
+emit({
+    "ids": [snapshot().id == now.id, base.id != now.id, from_diff.id == now.id, from_text.id == now.id, same.id == base.id],
+    "types": [isinstance(base, Snapshot), isinstance(from_diff, Snapshot), isinstance(change, TreeDiff)],
+    "files": [[f.path, f.change] for f in change.files],
+    "between": len(diff(since=base, to=now).files),
+    "seq": base.seq < r.seq and r.seq < now.seq and now.seq < from_diff.seq,
+    "untouched": [read_text("m.txt"), read_text("n.txt")],
+    "errors": errors,
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "ids": [true, true, true, true, true],
+                "types": [true, true, true],
+                "files": [["m.txt", "modified"], ["n.txt", "added"]],
+                "between": 2,
+                "seq": true,
+                "untouched": ["two\n", "new\n"],
+                "errors": ["ValueError", "TypeError", "FileNotFoundError"],
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn dict_builds_and_copies_like_python() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("dict-builtin")?;
+        let program = lower_source(
+            r#"class P(Record):
+    x: int = 0
+base = {"a": 1, "b": 2}
+copy = dict(base, b=3)
+copy["c"] = 4
+try:
+    dict(P())
+    record = "no error"
+except TypeError as e:
+    record = "TypeError"
+try:
+    dict([1, 2])
+    pairs = "no error"
+except TypeError as e:
+    pairs = "TypeError"
+emit({"base": base, "copy": copy, "empty": dict(), "pairs": dict([["x", 1]], y=2), "kw": dict(k="v"), "record": record, "bad_pairs": pairs})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "base": {"a": 1, "b": 2}, "copy": {"a": 1, "b": 3, "c": 4}, "empty": {},
+                "pairs": {"x": 1, "y": 2}, "kw": {"k": "v"}, "record": "TypeError", "bad_pairs": "TypeError",
+            })
+        );
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn zip_and_unpacking_into_items_follow_python() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("zip-unpack")?;
+        let program = lower_source(
+            r#"class P(Record):
+    x: int = 0
+p = P()
+d = {}
+xs = [0, 0, 0]
+i = 0
+a, d["k"], p.x = 1, 2, 3
+i, xs[i] = 1, 5
+seen = []
+for n, s in zip([1, 2, 3], ["a", "b"]):
+    seen.append(s + str(n))
+try:
+    zip([1], [1, 2], strict=True)
+    strict = "no error"
+except ValueError as e:
+    strict = "ValueError"
+r = run(["true"])
+joined = [p] + [r] + []
+inner = [[1]]
+outer = inner + [[2]]
+outer[0].append(9)
+emit({"a": a, "d": d, "x": p.x, "xs": xs, "seen": seen, "empty": zip(), "strict": strict,
+      "joined": [isinstance(joined[0], P), isinstance(joined[1], RunResult), joined[0] is p], "shared": inner})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "a": 1, "d": {"k": 2}, "x": 3, "xs": [0, 5, 0],
+                "seen": ["a1", "b2"], "empty": [], "strict": "ValueError",
+                "joined": [true, true, true], "shared": [[1, 9]],
+            })
+        );
+        let starred = lower_source("a, *rest = [1, 2]").expect_err("starred");
+        assert!(format!("{starred:?}").contains("slice instead"), "{starred:?}");
         cleanup_dir(&root);
         Ok(())
     }

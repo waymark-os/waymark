@@ -50,7 +50,7 @@ initialize an approved VM-global cache through the typed API.
 
 The allow-list contains only:
 
-- three scalar id counters;
+- four scalar id counters (run, daemon, host domain, and result sequence numbers);
 - one process-wide cleanup `Once` that retains no closure data;
 - one immutable zero-sized filesystem adapter;
 - process-thread TLS for Gateway configuration, its attached client, and a

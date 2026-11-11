@@ -318,7 +318,7 @@ emit(inference.value.ready)"#,
     },
     StoneHelpEntry {
         name: "model.ask",
-        signature: r#"model.ask(prompt: str | list[record], output: type = None, system: str = "", retries: int = 2, type_format: "python" | "json_schema" = "python", model_class: str = "agent", model: str = "", temperature: float? = None, max_output_tokens: int = 0, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> output type, or str without output="#,
+        signature: r#"model.ask(prompt: str | list[record], output: type = None, system: str = "", retries: int = 2, validate: callable? = None, type_format: "python" | "json_schema" = "python", model_class: str = "agent", model: str = "", temperature: float? = None, max_output_tokens: int = 0, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> output type, or str without output="#,
         use_when: "Gateway mode only. Ask the model for an answer of a declared type: a record class, a union of records, list[T], Literal[...], or any other annotation type. The description the model sees comes from the type, and the answer comes back as a checked value, so no schema dict or JSON probing is needed.",
         examples: &[
             r#"class Plan(Record):
@@ -340,6 +340,11 @@ if isinstance(action, Finish):
 except ModelOutputError as error:
     answer = "unknown"
     emit(error.issues)"#,
+            r#"class Plan(Record):
+    steps: list[str]
+def check_plan(plan):
+    return [] if plan.steps else ["give at least one step"]
+plan = model.ask("Plan the fix.", output=Plan, validate=check_plan)"#,
         ],
         avoid: &[
             "Do not write a JSON Schema by hand or pass response_format; output= derives the type description and the check from the type.",
@@ -659,6 +664,16 @@ finish("/app/out.json")"#,
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "dict",
+        signature: "dict(value: dict | list[[str, Any]] = {}, **entries: Any) -> dict",
+        use_when: "Build a dict, as in Python: dict() is empty, dict(d) is a shallow copy of d, dict(pairs) takes [key, value] pairs, and keyword arguments add entries (later ones win). Keys are strings.",
+        examples: &[r#"base = {"a": 1}
+copy = dict(base, b=2)
+[base, copy]"#, r#"dict([["x", 1], ["y", 2]])"#],
+        avoid: &["A record is not a dict: read its fields as attributes, or build the dict you need ({\"name\": r.name})."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "tuple",
         signature: "tuple(value: iterable) -> tuple",
         use_when: "Build an immutable tuple, as in Python. (1, 2) and return a, b also make tuples. Tuples index, slice, iterate, unpack, compare element by element, join with +, and can be set members; they have count() and index() and cannot change. A tuple never equals a list (comparing them raises; convert with list(t)). Emitted JSON writes a tuple as an array.",
@@ -793,10 +808,45 @@ for line in open("/app/input.txt"):
     },
     StoneHelpEntry {
         name: "diff",
-        signature: "diff(path_a: str, path_b: str) -> record",
-        use_when: "Use to compare two text files and inspect structured hunks with line numbers.",
-        examples: &[r#"changes = diff("expected.txt", "actual.txt")"#],
+        signature: "diff(path_a: str, path_b: str) -> record | diff(since: Snapshot, to: Snapshot? = None) -> TreeDiff",
+        use_when: "Use to compare two text files and inspect structured hunks with line numbers. diff(since=snapshot) instead returns what changed in the snapshot's directory since it was taken (or up to the snapshot to=), as a TreeDiff: root, since, to (snapshot ids), files (each path with change \"added\", \"modified\", \"deleted\", or \"type_changed\"), and patch (git-style text). apply_patch(snapshot, change) gives the snapshot that change leads to.",
+        examples: &[
+            r#"changes = diff("expected.txt", "actual.txt")"#,
+            r#"base = snapshot()
+write_text("fix.py", "x = 1\n")
+change = diff(since=base)
+[[f.path, f.change] for f in change.files]"#,
+        ],
         avoid: &["For binary files or very large files, use run([\"diff\", ...]) explicitly."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "snapshot",
+        signature: "snapshot(path: str? = None) -> Snapshot",
+        use_when: "Use to save the state of a directory tree (the cwd by default) so you can later see what changed (diff(since=snapshot)) or check that the tree is exactly a known state (snapshot().id == expected.id). A Snapshot has root, id, and seq; the id names the content, so the same files give the same id, and seq orders it among the runtime's results. Files the tree's .gitignore ignores (build outputs, caches) are not part of it. Snapshots are kept in Waymark's own store (WAYMARK_SNAPSHOT_STORE, default ~/.local/state/waymark/snapshots.git where commands run); the directory's own .git is never changed, and the directory does not have to be a Git repository. Needs the git program where commands run.",
+        examples: &[
+            r#"write_text("a.txt", "one")
+base = snapshot()
+[base.id == snapshot().id, len(base.id)]"#,
+        ],
+        avoid: &[
+            "Do not snapshot a huge directory (a home directory, /) when you mean the project; pass the project root.",
+            "Do not keep your own copies of a tree to compare later; a snapshot costs little and diff(since=) lists the changes.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "apply_patch",
+        signature: "apply_patch(snapshot: Snapshot, patch: TreeDiff | str | None) -> Snapshot",
+        use_when: "Use to get the snapshot a patch leads to from a snapshot, without changing any file: the tree is built in the snapshot store. Compare its id with snapshot().id to check that a directory is exactly that snapshot plus that patch (a graded diff, say). Raises ValueError if the patch does not apply.",
+        examples: &[
+            r#"write_text("a.txt", "one\n")
+base = snapshot()
+write_text("a.txt", "two\n")
+change = diff(since=base)
+[apply_patch(base, change).id == snapshot().id, apply_patch(base, change.patch).id == snapshot().id]"#,
+        ],
+        avoid: &["Do not apply the patch to the files to compare states; apply_patch() never touches them."],
         aliases: &[],
     },
     StoneHelpEntry {
@@ -1118,6 +1168,7 @@ ok = type(scope) == "attempt_scope""#,
         examples: &[
             r#"ok = isinstance("x", str)"#,
             r#"ok = isinstance(3, (int, float))"#,
+            r#"ran = isinstance(run(["true"]), RunResult)"#,
             r#"retry_on = [TimeoutError, ExpectationFailed]
 try:
     must_run(["false"])
@@ -1126,7 +1177,7 @@ except Exception as error:
         ],
         avoid: &[
             "tuple and set are their own types, as in Python: isinstance((1, 2), list) is false.",
-            "isinstance(x, ExpectationFailed) is true only for an error the host raised, never for a dict that merely has type=\"ExpectationFailed\".",
+            "isinstance(x, ExpectationFailed) is true only for an error the host raised, never for a dict that merely has type=\"ExpectationFailed\". Likewise isinstance(x, RunResult) or isinstance(x, TestRun) is true only for a result the runtime returned.",
             "Use error.type == FileNotFoundError only for an exact match; isinstance also matches subclasses. Comparing a type with a string (error.type == \"FileNotFoundError\") raises: a type never equals its name.",
         ],
         aliases: &[],
@@ -1202,6 +1253,18 @@ for i, row in enumerate(rows):
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "zip",
+        signature: "zip(*values: iterable, strict: bool = False) -> list[list[Any]]",
+        use_when: "Use to walk two or more lists in step; it stops at the shortest.",
+        examples: &[r#"names = ["a", "b"]
+sizes = [1, 2]
+pairs = []
+for name, size in zip(names, sizes):
+    pairs.append(name + "=" + str(size))"#, r#"rows = zip([1, 2], ["x", "y"], strict=True)"#],
+        avoid: &["Pass strict=True when the lists must have the same length; plain zip() drops the extra items silently."],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "split",
         signature: "split(text: str, separator: str? = None, maxsplit: int? = None) -> list[str]",
         use_when: "Use for top-level text splitting; string method syntax also works.",
@@ -1260,12 +1323,14 @@ if starts_with(line, "ERROR"):
     },
     StoneHelpEntry {
         name: "run",
-        signature: r#"run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, expect: Expect? = None, effects: Effects? = None, background: bool = False, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> record"#,
-        use_when: "Use only when the task explicitly needs a POSIX program. Nonzero exits, timeouts, and missing commands return ok=false with stdout, stderr, and an explanation record; run() does not raise for them (unlike Python's subprocess). Pass expect=Expect(exit=0, ...) to raise ExpectationFailed when the result is not what you expect. Every finished result has effects.observed: the files under the project that changed while it ran (collapsed by directory; tool folders such as .git and node_modules are listed under not_scanned). Raises: FileNotFoundError or NotADirectoryError for a bad cwd; ExpectationFailed with expect=. Use run_complete for a bounded task command that must finish before the program continues; use background=True when the program intentionally manages a live run_id (background runs need the Gateway-backed runtime; a local `waymark eval` rejects them, so use start_daemon() there).",
+        signature: r#"run(argv: list[str], cwd: str? = None, stdin: str? = None, files: dict[str, str]? = None, timeout_ms: int? = None, env: record? = None, expect: Expect? = None, effects: Effects? = None, background: bool = False, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> record"#,
+        use_when: "Use only when the task explicitly needs a POSIX program. Nonzero exits, timeouts, and missing commands return ok=false with stdout, stderr, and an explanation record; run() does not raise for them (unlike Python's subprocess). Pass expect=Expect(exit=0, ...) to raise ExpectationFailed when the result is not what you expect. Every finished result has effects.observed: the files under the project that changed while it ran (collapsed by directory; tool folders such as .git and node_modules are listed under not_scanned). Raises: FileNotFoundError or NotADirectoryError for a bad cwd; ExpectationFailed with expect=. files={path: text} writes those files (creating their directories) just before the command, where it runs, and the result's files lists each one's path, bytes, and sha256, so the result shows what the command ran on; must_run, run_complete, and run_tests take files= too. Every result has seq, a number that increases with each result the runtime makes, so results can be put in order. Use run_complete for a bounded task command that must finish before the program continues; use background=True when the program intentionally manages a live run_id (background runs need the Gateway-backed runtime; a local `waymark eval` rejects them, so use start_daemon() there).",
         examples: &[
             r#"result = run(["wc", "-l", "/app/input.txt"])"#,
             r#"result = run(["printf", "ok"], timeout_ms=5000)"#,
             r#"result = run(["printf", "2 passed"], expect=Expect(exit=0, stdout_contains="passed"))"#,
+            r#"result = run(["sh", "check.sh"], files={"check.sh": "printf checked"})
+[result.stdout, result.files[0].bytes]"#,
             r#"result = run(["printf", "ok"], hooks={"pre": lambda step: {"argv": step.input["argv"]}})"#,
             r#"result = run(["printf", "not executed"], hooks={"pre": lambda step: {"allow": False, "reason": "command denied"}})"#,
             r#"async def build():
@@ -1300,7 +1365,7 @@ result = run(["sh", "-c", "printf failed >&2; exit 7"], hooks={"post": record_ru
     },
     StoneHelpEntry {
         name: "must_run",
-        signature: r#"must_run(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, expect: Expect? = None, effects: Effects? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576) -> record"#,
+        signature: r#"must_run(argv: list[str], cwd: str? = None, stdin: str? = None, files: dict[str, str]? = None, timeout_ms: int? = None, env: record? = None, expect: Expect? = None, effects: Effects? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576) -> record"#,
         use_when: "Use for set -e style process steps. must_run(argv) is run(argv, expect=Expect(exit=0)): it returns the run record on success and raises ExpectationFailed (a ToolError) with expected, observed, diff, and the full result when the process exits nonzero, times out, or cannot start. Add checks with expect=Expect(stdout_contains=...).",
         examples: &[
             r#"must_run(["mkdir", "-p", "target/out"])"#,
@@ -1316,8 +1381,25 @@ result = run(["sh", "-c", "printf failed >&2; exit 7"], hooks={"post": record_ru
         aliases: &[],
     },
     StoneHelpEntry {
+        name: "run_tests",
+        signature: r#"run_tests(argv: list[str], runner: str = "pytest", cwd: str? = None, stdin: str? = None, files: dict[str, str]? = None, timeout_ms: int? = None, env: record? = None, max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576) -> TestRun"#,
+        use_when: "Use to run a test command and get the outcome as a TestRun record instead of scraping its output. runner is \"pytest\", \"django\" (tests/runtests.py), or \"sympy\" (bin/test). Fields: ok, runner, command, exit_code, timed_out, complete, passed, failed (failures and errors), skipped, xfailed, passed_tests, failed_tests, skipped_tests, problem, output (the last 4000 characters). ok is True only when the runner's final summary was found, at least one test passed, none failed, and the command exited 0; problem says why otherwise. Test names are the runner's own: pytest node ids, Django `name (dotted.path)`, SymPy `path::name`.",
+        examples: &[
+            r#"t = run_tests(["printf", "PASSED t.py::test_a\nFAILED t.py::test_b - boom\n1 failed, 1 passed in 0.01s\n"])
+[t.ok, t.failed_tests, t.problem]"#,
+            r#"t = run_tests(["sh", "-c", "printf 'test_a (m.T.test_a) ... ok\nRan 1 test in 0.1s\n\nOK\n' >&2"], runner="django")
+t.passed_tests"#,
+        ],
+        avoid: &[
+            "Do not treat a run with complete == False as passing: the runner crashed, timed out, or the command was not a run of that runner; read output.",
+            "Pass -rA (pytest) or --verbosity 2 (django) or -v (sympy) to list passing tests by name; failing tests are named either way.",
+            "Do not pass shell strings; pass argv lists. A wrapper such as [\"bash\", \"-lc\", ...] or docker exec is fine: the record reads the combined output.",
+        ],
+        aliases: &[],
+    },
+    StoneHelpEntry {
         name: "run_complete",
-        signature: r#"run_complete(argv: list[str], cwd: str? = None, stdin: str? = None, timeout_ms: int? = None, env: record? = None, expect: Expect? = None, effects: Effects? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> record"#,
+        signature: r#"run_complete(argv: list[str], cwd: str? = None, stdin: str? = None, files: dict[str, str]? = None, timeout_ms: int? = None, env: record? = None, expect: Expect? = None, effects: Effects? = None, stdout: str = "capture", stderr: str = "capture", max_stdout_bytes: int = 1048576, max_stderr_bytes: int = 1048576, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> record"#,
         use_when: "Use for a bounded task command that may outlive one Gateway observation window but must reach a terminal result before the Stone program continues. It lowers to run plus bounded waits, owns the run_id, and terminates the process if the total timeout expires.",
         examples: &[
             r#"built = run_complete(["sh", "-c", "printf built"], cwd="/app", timeout_ms=360000, max_stdout_bytes=4096, max_stderr_bytes=8192)"#,

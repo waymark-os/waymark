@@ -139,10 +139,14 @@ def work(model, messages, actions, max_steps, log, phase, use=""):
             log.append({"phase": phase, "step": step, "kind": "provider_error", "status": error.status,
                         "attempts": error.attempts, "message": clip(error.message, 300)})
             return None
-        if action.kind == "done":
+        # "upheld" and "revised" are the two final answers of the spec revision step.
+        if action.kind in ["done", "upheld", "revised"]:
             log.append({"phase": phase, "step": step, "kind": "done", "final": json_dumps(action)})
             return action
         observation = perform(action)
+        if not observation.strip():
+            # The Anthropic API rejects an empty text message (HTTP 400).
+            observation = "(no output)"
         log.append({"phase": phase, "step": step, "kind": action.kind, "detail": clip(json_dumps(action), 4000),
                     "result": clip(observation, 1000)})
         if left <= 3:

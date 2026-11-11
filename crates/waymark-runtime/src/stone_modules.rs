@@ -263,7 +263,8 @@ impl Linker {
                     let names = match target {
                         AssignTarget::Name(name) => vec![name.clone()],
                         AssignTarget::Tuple(names) => names.clone(),
-                        AssignTarget::Subscript { .. }
+                        AssignTarget::Unpack(_)
+                        | AssignTarget::Subscript { .. }
                         | AssignTarget::Attribute { .. }
                         | AssignTarget::Expr(_) => Vec::new(),
                     };
@@ -335,6 +336,8 @@ impl Linker {
                 !builtins.contains(&name.as_str())
                     && !MODULE_EXTRA_NAMES.contains(&name.as_str())
                     && !is_builtin_error_type(name)
+                    // Runtime result types (`isinstance(r, RunResult)`).
+                    && !crate::stone_record_access::HOST_RECORD_TYPES.contains(&name.as_str())
                     && !error_classes.contains(name.as_str())
             })
             .map(|name| format!("`{name}`"))

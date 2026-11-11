@@ -6,5 +6,6 @@ linux_tools/process.rs CLEANUP vm_once
 linux_tools/process.rs DAEMON_ID vm_atomic
 linux_tools/process.rs RUN_ID vm_atomic
 server.rs DEBUG_TLS_PAYLOAD process_tls
+stone_snapshots.rs RESULT_SEQ vm_atomic
 stone_file_ops.rs STD_STONE_FILE_ADAPTER vm_frozen
 vm_supervisor.rs NEXT_HOST_DOMAIN vm_atomic
