@@ -26,101 +26,6 @@ impl From<EvalError> for ShellError {
     }
 }
 
-/// Where the error now unwinding came from: one frame per function it left,
-/// innermost first. A frame is the statement that was running in that
-/// function (or at top level), recorded by the innermost block that saw the
-/// error. Kept beside the error, not in it, so error types are unchanged;
-/// `key` ties the frames to their error.
-#[derive(Default)]
-pub(crate) struct ErrorTrace {
-    frames: Vec<TraceFrame>,
-    /// True once the error has left a function: the caller's block records
-    /// the next frame.
-    open: bool,
-    key: String,
-}
-
-struct TraceFrame {
-    file: Option<Arc<SourceFile>>,
-    offset: Option<u32>,
-    function: Option<String>,
-}
-
-/// What ties recorded frames to an error: its message.
-fn error_trace_key(error: &ShellError) -> String {
-    match error {
-        ShellError::Generic(generic) => generic.msg.to_string(),
-        other => other.to_string(),
-    }
-}
-
-impl ErrorTrace {
-    fn clear(&mut self) {
-        self.frames.clear();
-        self.open = false;
-        self.key.clear();
-    }
-
-    /// `error` is leaving the statement at `offset` in `file`.
-    fn note(&mut self, error: &ShellError, file: Option<Arc<SourceFile>>, offset: Option<u32>) {
-        let key = error_trace_key(error);
-        if self.frames.is_empty() || key != self.key {
-            // A new error (anything recorded before was handled).
-            self.clear();
-            self.key = key;
-            self.open = true;
-        }
-        if self.open {
-            self.frames.push(TraceFrame {
-                file,
-                offset,
-                function: None,
-            });
-            self.open = false;
-        }
-    }
-
-    /// The error left function `name`.
-    fn leave_function(&mut self, name: &str) {
-        if let Some(frame) = self.frames.last_mut() {
-            if !self.open {
-                frame.function = Some(name.to_string());
-                self.open = true;
-            }
-        }
-    }
-
-    /// The frames for `error`, outermost first, as `{file, line, code,
-    /// function}` records; None when none were recorded for it.
-    pub(crate) fn take_json(&mut self, error: &ShellError) -> Option<JsonValue> {
-        if self.frames.is_empty() || error_trace_key(error) != self.key {
-            self.clear();
-            return None;
-        }
-        let frames = self
-            .frames
-            .iter()
-            .rev()
-            .map(|frame| {
-                let mut fields = serde_json::Map::new();
-                if let Some(file) = &frame.file {
-                    fields.insert("file".into(), JsonValue::String(file.name.clone()));
-                    if let Some(offset) = frame.offset {
-                        let (line, code) = file.line_at(offset);
-                        fields.insert("line".into(), json!(line));
-                        fields.insert("code".into(), JsonValue::String(code.to_string()));
-                    }
-                }
-                if let Some(function) = &frame.function {
-                    fields.insert("function".into(), JsonValue::String(function.clone()));
-                }
-                JsonValue::Object(fields)
-            })
-            .collect();
-        self.clear();
-        Some(JsonValue::Array(frames))
-    }
-}
 use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -244,6 +149,9 @@ mod stone_records;
 mod stone_runtime_value;
 #[path = "stone_state.rs"]
 mod stone_state;
+#[path = "stone_trace.rs"]
+mod stone_trace;
+use stone_trace::ErrorTrace;
 #[path = "stone_vm/interp.rs"]
 mod stone_vm_interp;
 #[path = "stone_vm/jsonl_runtime.rs"]
@@ -1606,16 +1514,19 @@ impl Evaluator<'_> {
             for (index, statement) in statements.iter().enumerate() {
                 let flow = match self.eval_stmt(statement, record_session_bindings) {
                     Ok(flow) => {
-                        if !self.state.error_trace.frames.is_empty() {
+                        if self.state.error_trace.is_recording() {
                             // An error was handled since it was recorded.
                             self.state.error_trace.clear();
                         }
                         flow
                     }
                     Err(error) => {
-                        let offset = offsets.get(index).copied();
-                        let file = self.state.code_origin.clone();
-                        self.state.error_trace.note(&error.0, file, offset);
+                        if self.state.error_trace.wants_frame(&error.0) {
+                            let values = self.line_values(statement);
+                            let offset = offsets.get(index).copied();
+                            let file = self.state.code_origin.clone();
+                            self.state.error_trace.push(file, offset, values);
+                        }
                         return Err(error);
                     }
                 };

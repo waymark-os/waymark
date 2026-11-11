@@ -1379,9 +1379,13 @@ emit(first(map(lambda row: row["name"], dirs)))"#,
         assert_eq!(
             response["error"]["trace"],
             json!([
-                {"file": "<program>", "line": 10, "code": "emit(summarize(rows))"},
-                {"file": "<program>", "line": 7, "code": "result = pick(rows, \"v\")", "function": "summarize"},
-                {"file": "lib.stone", "line": 8, "code": "total += item[key]", "function": "lib.pick"},
+                {"file": "<program>", "line": 10, "code": "emit(summarize(rows))",
+                 "values": {"rows": "[{'n': 1, 'v': 2}, {'n': 5}]"}},
+                {"file": "<program>", "line": 7, "code": "result = pick(rows, \"v\")", "function": "summarize",
+                 "values": {"rows": "[{'n': 1, 'v': 2}, {'n': 5}]"}},
+                // A module's qualified names show as the line spells them.
+                {"file": "lib.stone", "line": 8, "code": "total += item[key]", "function": "lib.pick",
+                 "values": {"total": "0", "item": "{'n': 5}", "key": "'v'"}},
             ])
         );
 
@@ -1394,6 +1398,23 @@ emit(first(map(lambda row: row["name"], dirs)))"#,
             response["error"]["trace"],
             json!([{"file": "<program>", "line": 10, "code": "raise ValueError(\"late\")"}])
         );
+
+        // Long values are cut short with a count of what was left out;
+        // functions, the target of a plain assignment, and comprehension
+        // variables are not shown.
+        let response = guest.command_response(
+            "text = \"x\" * 500\nrows = list(range(100))\nlimit = 3\ndef f(v):\n    return v\ny = 0\ny = f(text) + [r for r in rows if r > limit] + {\"k\": 1}[\"missing\"]\n",
+        );
+        let values = &response["error"]["trace"][0]["values"];
+        assert_eq!(
+            values.as_object().map(|values| values.keys().cloned().collect::<Vec<_>>()),
+            Some(vec!["text".to_string(), "rows".to_string(), "limit".to_string()])
+        );
+        let text = values["text"].as_str().unwrap_or_default();
+        assert!(text.ends_with("... (500 chars)") && text.len() < 220, "{text}");
+        let rows = values["rows"].as_str().unwrap_or_default();
+        assert!(rows.starts_with("[0, 1, 2") && rows.ends_with(" more]") && rows.len() < 220, "{rows}");
+        assert_eq!(values["limit"], json!("3"));
 
         // An error in an elif branch names that branch's line.
         let response =

@@ -14,15 +14,27 @@ valuable for review and debugging.
 An error that ends a program carries `error.trace`, a list of frames,
 outermost first. Each frame names the file (`<program>` for the program
 itself, the module's path for an imported module), the line, the code on that
-line, and the function the statement was in (no `function` at top level):
+line, the function the statement was in (no `function` at top level), and the
+values of the variables the line reads:
 
 ```json
 "trace": [
-  {"file": "<program>", "line": 10, "code": "emit(summarize(rows))"},
-  {"file": "<program>", "line": 7, "code": "result = pick(rows, \"v\")", "function": "summarize"},
-  {"file": "lib.stone", "line": 8, "code": "total += item[key]", "function": "lib.pick"}
+  {"file": "<program>", "line": 10, "code": "emit(summarize(rows))",
+   "values": {"rows": "[{'n': 1, 'v': 2}, {'n': 5}]"}},
+  {"file": "<program>", "line": 7, "code": "result = pick(rows, \"v\")", "function": "summarize",
+   "values": {"rows": "[{'n': 1, 'v': 2}, {'n': 5}]"}},
+  {"file": "lib.stone", "line": 8, "code": "total += item[key]", "function": "lib.pick",
+   "values": {"total": "0", "item": "{'n': 5}", "key": "'v'"}}
 ]
 ```
+
+`values` holds each value's Python text (`repr`), cut to about 160
+characters: a long list or dict shows its first items and `... N more`, a long
+string its start and `... (N chars)`. It lists at most eight variables per
+line and leaves out functions, types, the model, a plain assignment's target
+(its old value is not what the line computes), and lambda or comprehension
+variables. For a compound statement only its own line counts: an `if`'s
+condition, a `for`'s iterable.
 
 The last frame is where the error happened. Locations are statements, not
 expressions: an error inside a long expression names the statement's first

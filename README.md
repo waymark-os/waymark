@@ -101,7 +101,8 @@ WAYMARK_START_DIR="$PWD" target/debug/waymark eval -c 'write_json("out.json", {"
 The command prints one JSON result envelope to stdout on success and one JSON
 error envelope to stderr on failure. An error from a running program carries
 `error.trace`: the file, line, and code of each statement the error left,
-outermost first, with the function it was in (see `docs/STONE_LANGUAGE.md`,
+outermost first, with the function it was in and the values of the variables
+on that line (see `docs/STONE_LANGUAGE.md`,
 "Where an Error Came From"). Set `WAYMARK_ERROR_DEBUG=1` to also get the
 runtime's own detail (`error.debug` and the Rust source `error.location`).
 
