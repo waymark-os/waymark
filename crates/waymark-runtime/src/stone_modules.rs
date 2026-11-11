@@ -30,7 +30,7 @@ use nu_protocol::{shell_error::generic::GenericError, ShellError};
 use sha2::{Digest, Sha256};
 
 use crate::stone_ast::{
-    Block,
+    at_statement, locate_in, Block,
     import_suggestions_for_module, lower_module_source, AssignTarget, ImportKind, ModuleInit,
     Program, Stmt,
 };
@@ -73,7 +73,9 @@ pub(crate) fn link_program(program: &mut Program, cwd: &Path) -> Result<(), Shel
         error_classes: HashMap::new(),
         linked: Block::new(),
     };
-    linker.link_imports(&mut program.statements, None)?;
+    linker
+        .link_imports(&mut program.statements, None)
+        .map_err(|err| locate_in(err, &program.origin))?;
     let linked = std::mem::take(&mut linker.linked);
     program.statements.prepend(linked);
     Ok(())
@@ -110,15 +112,28 @@ impl Linker {
     /// `importer`, or the program itself).
     fn link_imports(
         &mut self,
-        statements: &mut [Stmt],
+        statements: &mut Block,
         importer: Option<&str>,
     ) -> Result<(), ShellError> {
-        for statement in statements {
+        for (offset, statement) in statements.located_mut() {
             let Stmt::Import { module, names } = statement else {
                 continue;
             };
+            self.link_import(module, names, importer)
+                .map_err(|err| at_statement(err, offset))?;
+        }
+        Ok(())
+    }
+
+    fn link_import(
+        &mut self,
+        module: &str,
+        names: &mut [crate::stone_ast::ImportName],
+        importer: Option<&str>,
+    ) -> Result<(), ShellError> {
+        {
             self.load(module, importer)?;
-            let exports = &self.exports[module.as_str()];
+            let exports = &self.exports[module];
             for import in names {
                 let Some(kind) = exports.get(&import.name) else {
                     let mut available = exports.keys().cloned().collect::<Vec<_>>();
@@ -213,9 +228,10 @@ impl Linker {
         self.loading.push(module.to_string());
         let linked = self.link_imports(&mut program.statements, Some(module));
         self.loading.pop();
-        linked.map_err(|err| in_module(err, module, &shown))?;
-        let reads =
-            resolve_module(&mut program, module).map_err(|err| in_module(err, module, &shown))?;
+        let origin = program.origin.clone();
+        let here = |err| in_module(locate_in(err, &origin), module, &shown);
+        linked.map_err(here)?;
+        let reads = resolve_module(&mut program, module).map_err(here)?;
         self.check_free_names(&program.statements, &reads)
             .map_err(|err| in_module(err, module, &shown))?;
 

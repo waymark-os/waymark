@@ -5,7 +5,8 @@ use std::collections::HashSet;
 use nu_protocol::{shell_error::generic::GenericError, ShellError};
 
 use crate::stone_ast::{
-    AssignTarget, ComprehensionClause, ExceptHandler, Expr, FormattedStringPart, Program, Stmt,
+    at_statement, locate_in, AssignTarget, Block, ComprehensionClause, ExceptHandler, Expr,
+    FormattedStringPart, Program, Stmt,
 };
 use crate::stone_correction::expected_keywords;
 use crate::stone_errors::{
@@ -40,7 +41,8 @@ pub(crate) fn validate_program(
             "`{name}` is reserved: it reads as {python}, the way JSON spells it, so it cannot name a variable, parameter, function, or import. Choose another name"
         )));
     }
-    validate_top_level(&program.statements, None)?;
+    validate_top_level(&program.statements, None)
+        .map_err(|err| locate_in(err, &program.origin))?;
     let mut bound_names = session_bound_names.iter().cloned().collect::<HashSet<_>>();
     bound_names.extend(program_bindings);
 
@@ -61,12 +63,20 @@ pub(crate) fn validate_program(
         async_context: false,
     };
 
-    validate_statements(&program.statements, &names)?;
+    validate_statements(&program.statements, &names)
+        .map_err(|err| locate_in(err, &program.origin))?;
     crate::stone_record_access::check_program(program)
 }
 
-fn validate_statements(statements: &[Stmt], names: &AdmissionNames) -> Result<(), ShellError> {
-    for statement in statements {
+fn validate_statements(statements: &Block, names: &AdmissionNames) -> Result<(), ShellError> {
+    for (offset, statement) in statements.located() {
+        validate_statement(statement, names).map_err(|err| at_statement(err, offset))?;
+    }
+    Ok(())
+}
+
+fn validate_statement(statement: &Stmt, names: &AdmissionNames) -> Result<(), ShellError> {
+    {
         match statement {
             Stmt::Assign { value, .. } | Stmt::AugAssign { value, .. } => {
                 validate_expr(value, names)?;
@@ -138,7 +148,8 @@ fn validate_statements(statements: &[Stmt], names: &AdmissionNames) -> Result<()
                 }
                 let mut function_names = names.clone();
                 function_names.async_context = function.is_async;
-                validate_statements(&function.body, &function_names)?;
+                validate_statements(&function.body, &function_names)
+                    .map_err(|err| locate_in(err, &function.origin))?;
             }
             Stmt::Raise(Some(Expr::Name(name)))
                 if is_host_only_error_type(name) && !names.schema_shadow.contains(name) =>
@@ -153,7 +164,8 @@ fn validate_statements(statements: &[Stmt], names: &AdmissionNames) -> Result<()
             }
             Stmt::Import { .. } => {}
             Stmt::RecordDef(record) => validate_record_name(&record.name)?,
-            Stmt::Module(module) => validate_statements(&module.body, names)?,
+            Stmt::Module(module) => validate_statements(&module.body, names)
+                .map_err(|err| locate_in(err, &module.origin))?,
             Stmt::Raise(None) | Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Pass => {}
         }
     }
@@ -177,9 +189,10 @@ fn is_reserved_builtin_name(name: &str) -> bool {
 /// top-level `if`, loop, `with`, or `try`. So every call means one thing,
 /// and it can be resolved before the program runs. A function's own nested
 /// `def` is a local, like any other variable, and is not checked here.
-fn validate_top_level(statements: &[Stmt], module: Option<&str>) -> Result<(), ShellError> {
+fn validate_top_level(statements: &Block, module: Option<&str>) -> Result<(), ShellError> {
     let mut defined = HashSet::new();
-    for statement in statements {
+    for (offset, statement) in statements.located() {
+        let at = |err| at_statement(err, offset);
         let (keyword, name) = match statement {
             Stmt::FunctionDef(function) if function.error_base.is_some() => ("class", &function.name),
             Stmt::FunctionDef(function) => ("def", &function.name),
@@ -187,17 +200,18 @@ fn validate_top_level(statements: &[Stmt], module: Option<&str>) -> Result<(), S
             Stmt::Import { names, .. } => {
                 for import in names {
                     if is_reserved_builtin_name(&import.local) {
-                        return Err(admission_error(format!(
+                        return Err(at(admission_error(format!(
                             "`import ... {local}` binds `{local}`, which is a builtin; importing it would change what `{local}(...)` means for the whole program. Import it under another name (`from lib import {name} as {name}_fn`)",
                             local = import.local,
                             name = import.name,
-                        )));
+                        ))));
                     }
                 }
                 continue;
             }
             Stmt::Module(init) => {
-                validate_top_level(&init.body, Some(&init.name))?;
+                validate_top_level(&init.body, Some(&init.name))
+                    .map_err(|err| locate_in(err, &init.origin))?;
                 continue;
             }
             Stmt::If {
@@ -205,26 +219,26 @@ fn validate_top_level(statements: &[Stmt], module: Option<&str>) -> Result<(), S
                 else_branch,
                 ..
             } => {
-                reject_nested_definitions(then_branch, "an `if` statement")?;
-                reject_nested_definitions(else_branch, "an `if` statement")?;
+                reject_nested_definitions(then_branch, "an `if` statement").map_err(at)?;
+                reject_nested_definitions(else_branch, "an `if` statement").map_err(at)?;
                 continue;
             }
             Stmt::For { body, .. } => {
-                reject_nested_definitions(body, "a `for` loop")?;
+                reject_nested_definitions(body, "a `for` loop").map_err(at)?;
                 continue;
             }
             Stmt::While { body, .. } => {
-                reject_nested_definitions(body, "a `while` loop")?;
+                reject_nested_definitions(body, "a `while` loop").map_err(at)?;
                 continue;
             }
             Stmt::With { body, .. } => {
-                reject_nested_definitions(body, "a `with` statement")?;
+                reject_nested_definitions(body, "a `with` statement").map_err(at)?;
                 continue;
             }
             Stmt::Try { body, handlers } => {
-                reject_nested_definitions(body, "a `try` statement")?;
+                reject_nested_definitions(body, "a `try` statement").map_err(at)?;
                 for handler in handlers {
-                    reject_nested_definitions(&handler.body, "a `try` statement")?;
+                    reject_nested_definitions(&handler.body, "a `try` statement").map_err(at)?;
                 }
                 continue;
             }
@@ -244,35 +258,36 @@ fn validate_top_level(statements: &[Stmt], module: Option<&str>) -> Result<(), S
         };
         // Records have their own message (validate_record_name).
         if keyword == "def" && is_reserved_builtin_name(plain) {
-            return Err(admission_error(format!(
+            return Err(at(admission_error(format!(
                 "`def {plain}(...)`{place}: `{plain}` is a builtin, and a program cannot redefine builtins: the new definition would change what every `{plain}(...)` means, including calls in code that never mentions it. Give the function its own name"
-            )));
+            ))));
         }
         if !defined.insert(plain.to_string()) {
-            return Err(admission_error(format!(
+            return Err(at(admission_error(format!(
                 "`{keyword} {plain}` is defined twice{place}. A top-level name has one definition for the whole run, so a call means the same thing before and after it. Keep one definition, or give the other a different name"
-            )));
+            ))));
         }
     }
     Ok(())
 }
 
 /// `def` and `class` belong at the top level, unconditionally.
-fn reject_nested_definitions(statements: &[Stmt], container: &str) -> Result<(), ShellError> {
-    for statement in statements {
-        let nested: &[&[Stmt]] = match statement {
+fn reject_nested_definitions(statements: &Block, container: &str) -> Result<(), ShellError> {
+    for (offset, statement) in statements.located() {
+        let at = |err| at_statement(err, offset);
+        let nested: &[&Block] = match statement {
             Stmt::FunctionDef(function) => {
                 let keyword = if function.error_base.is_some() { "class" } else { "def" };
-                return Err(admission_error(format!(
+                return Err(at(admission_error(format!(
                     "`{keyword} {}` is inside {container} at the top level. Define functions and classes at the top level, unconditionally, so a name means one thing for the whole run. Put the condition inside the function, or define two functions with different names and choose between them",
                     function.name
-                )));
+                ))));
             }
             Stmt::RecordDef(record) => {
-                return Err(admission_error(format!(
+                return Err(at(admission_error(format!(
                     "`class {}` is inside {container} at the top level. Define classes at the top level, unconditionally",
                     record.name
-                )));
+                ))));
             }
             Stmt::If {
                 then_branch,
@@ -281,16 +296,16 @@ fn reject_nested_definitions(statements: &[Stmt], container: &str) -> Result<(),
             } => &[then_branch, else_branch],
             Stmt::For { body, .. } | Stmt::While { body, .. } | Stmt::With { body, .. } => &[body],
             Stmt::Try { body, handlers } => {
-                reject_nested_definitions(body, container)?;
+                reject_nested_definitions(body, container).map_err(at)?;
                 for handler in handlers {
-                    reject_nested_definitions(&handler.body, container)?;
+                    reject_nested_definitions(&handler.body, container).map_err(at)?;
                 }
                 continue;
             }
             _ => continue,
         };
         for block in nested {
-            reject_nested_definitions(block, container)?;
+            reject_nested_definitions(block, container).map_err(at)?;
         }
     }
     Ok(())

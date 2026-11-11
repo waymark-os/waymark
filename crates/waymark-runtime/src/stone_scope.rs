@@ -31,7 +31,7 @@ use nu_protocol::{shell_error::generic::GenericError, ShellError};
 
 use crate::stone_ast::{
     AssignTarget, ComprehensionClause, Expr, FormattedStringPart, FunctionDef, FunctionScope,
-    ImportKind, Program, Stmt,
+    ImportKind, Program, Stmt, Block, at_statement,
 };
 
 /// The walk's context: the enclosing functions (innermost last) and, for a
@@ -133,8 +133,8 @@ pub(crate) fn resolve_module(
     name: &str,
 ) -> Result<BTreeSet<String>, ShellError> {
     let mut names = Names::new();
-    for statement in &program.statements {
-        check_module_statement(statement, name)?;
+    for (offset, statement) in program.statements.located() {
+        check_module_statement(statement, name).map_err(|err| at_statement(err, offset))?;
         match statement {
             Stmt::Assign { target, .. } => bind_target(target, &mut names),
             Stmt::FunctionDef(function) if function.error_base.is_none() => {
@@ -230,7 +230,8 @@ fn resolve_function(function: &mut FunctionDef, stack: &mut Ctx) -> Result<Names
                 function.name
             ),
         };
-        return Err(scope_error(message));
+        let offset = augmented_at(&function.body, name);
+        return Err(at_statement(scope_error(message), offset));
     }
 
     stack.push(Enclosing {
@@ -258,6 +259,31 @@ fn resolve_function(function: &mut FunctionDef, stack: &mut Ctx) -> Result<Names
 /// Names a function body binds, not descending into nested functions or
 /// lambdas (their bindings are their own). Comprehension targets are local
 /// to the comprehension, as in Python 3.
+/// The offset of the first `name += ...` in `block`, outside nested
+/// functions.
+fn augmented_at(block: &Block, name: &str) -> Option<u32> {
+    block.located().find_map(|(offset, statement)| match statement {
+        Stmt::AugAssign {
+            target: AssignTarget::Name(target),
+            ..
+        } if target == name => offset,
+        Stmt::For { body, .. } | Stmt::While { body, .. } | Stmt::With { body, .. } => {
+            augmented_at(body, name)
+        }
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => augmented_at(then_branch, name).or_else(|| augmented_at(else_branch, name)),
+        Stmt::Try { body, handlers } => augmented_at(body, name).or_else(|| {
+            handlers
+                .iter()
+                .find_map(|handler| augmented_at(&handler.body, name))
+        }),
+        _ => None,
+    })
+}
+
 fn collect_bindings(statements: &[Stmt], bound: &mut Names, augmented: &mut Names) {
     for statement in statements {
         match statement {
@@ -330,11 +356,18 @@ fn bind_target(target: &AssignTarget, bound: &mut Names) {
 }
 
 fn resolve_stmts(
-    statements: &mut [Stmt],
+    statements: &mut Block,
     stack: &mut Ctx,
     reads: &mut Names,
 ) -> Result<(), ShellError> {
-    for statement in statements {
+    for (offset, statement) in statements.located_mut() {
+        resolve_stmt(statement, stack, reads).map_err(|err| at_statement(err, offset))?;
+    }
+    Ok(())
+}
+
+fn resolve_stmt(statement: &mut Stmt, stack: &mut Ctx, reads: &mut Names) -> Result<(), ShellError> {
+    {
         match statement {
             Stmt::Assign { target, value } => {
                 qualify_target(target, stack);

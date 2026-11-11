@@ -301,11 +301,18 @@ fn shell_error_json(err: &ShellError) -> JsonValue {
                 .iter()
                 .filter(|inner| {
                     !matches!(inner, ShellError::Generic(generic) if generic.code.to_string() == "stone_host_error_record")
+                        && !crate::stone_ast::is_location_marker(inner)
                 })
                 .map(shell_error_json)
                 .collect::<Vec<_>>();
             if !related.is_empty() {
                 map.insert("related".into(), JsonValue::Array(related));
+            }
+            // An error found before the program ran (syntax, scope, imports,
+            // admission) names its statement the way a runtime error's
+            // trace does, as a one-frame trace.
+            if let Some(frame) = crate::stone_ast::error_location_of(err) {
+                map.insert("trace".into(), JsonValue::Array(vec![frame]));
             }
             if let Some(source) = &err.source {
                 map.insert("source".into(), JsonValue::String(source.to_string()));

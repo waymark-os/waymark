@@ -36,6 +36,13 @@ line and leaves out functions, types, the model, a plain assignment's target
 variables. For a compound statement only its own line counts: an `if`'s
 condition, a `for`'s iterable.
 
+Errors found before the program runs (syntax errors, unsupported Python
+forms such as `global` or `del`, scope errors, unknown functions or error
+types, missing modules or module names) carry a one-frame `trace` naming the
+statement, in the program or in the module where it is. A syntax error at
+the end of the file, such as an unclosed bracket, names the last line with
+code.
+
 The last frame is where the error happened. Locations are statements, not
 expressions: an error inside a long expression names the statement's first
 line. A program that uses `workflow` block syntax is numbered after the

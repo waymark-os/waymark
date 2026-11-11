@@ -72,6 +72,24 @@ impl Block {
     pub fn as_slice(&self) -> &[Stmt] {
         &self.stmts
     }
+
+    /// Each statement with its source offset (None when unknown).
+    pub fn located(&self) -> impl Iterator<Item = (Option<u32>, &Stmt)> {
+        let offsets = self.offsets();
+        self.stmts
+            .iter()
+            .enumerate()
+            .map(move |(index, statement)| (offsets.get(index).copied(), statement))
+    }
+
+    pub fn located_mut(&mut self) -> impl Iterator<Item = (Option<u32>, &mut Stmt)> {
+        let known = self.offsets.len() == self.stmts.len();
+        let offsets = &self.offsets;
+        self.stmts
+            .iter_mut()
+            .enumerate()
+            .map(move |(index, statement)| (known.then(|| offsets[index]), statement))
+    }
 }
 
 impl PartialEq for Block {
@@ -152,6 +170,88 @@ impl SourceFile {
         let line = self.text[..offset].matches('\n').count() + 1;
         (line, self.text[start..end].trim())
     }
+}
+
+/// The inner error that carries where an error found before the program
+/// runs (syntax, lowering, scope, imports, admission) came from: `@offset`
+/// while only the statement's offset is known, then the JSON frame
+/// `{file, line, code}` once the file's text is.
+const SOURCE_LOCATION_CODE: &str = "stone_source_location";
+
+fn location_marker(error: &GenericError) -> Option<&str> {
+    error.inner.iter().find_map(|inner| match inner {
+        ShellError::Generic(inner) if inner.code.as_ref() == SOURCE_LOCATION_CODE => {
+            Some(inner.msg.as_ref())
+        }
+        _ => None,
+    })
+}
+
+fn with_marker(mut error: GenericError, text: String) -> GenericError {
+    error.inner.push(ShellError::Generic(
+        GenericError::new_internal("Stone source location", text).with_code(SOURCE_LOCATION_CODE),
+    ));
+    error
+}
+
+/// Note that `error` came from the statement at `offset`, unless an inner
+/// statement already said where.
+pub(crate) fn at_statement(error: ShellError, offset: Option<u32>) -> ShellError {
+    match (error, offset) {
+        (ShellError::Generic(generic), Some(offset)) if location_marker(&generic).is_none() => {
+            ShellError::Generic(with_marker(generic, format!("@{offset}")))
+        }
+        (error, _) => error,
+    }
+}
+
+fn location_frame(file: &SourceFile, offset: u32) -> String {
+    let (mut line, mut code) = file.line_at(offset);
+    // A syntax error at the end of the file (an unclosed bracket) points
+    // past the last line; name the last line with code instead.
+    let mut start = file.text[..(offset as usize).min(file.text.len())]
+        .rfind('\n')
+        .unwrap_or(0);
+    while code.is_empty() && start > 0 {
+        let (previous, text) = file.line_at(start as u32 - 1);
+        line = previous;
+        code = text;
+        start = file.text[..start].rfind('\n').unwrap_or(0);
+    }
+    serde_json::json!({"file": file.name, "line": line, "code": code}).to_string()
+}
+
+/// Turn a noted statement offset into the file, line, and code of
+/// `origin`, the file the statement is in.
+pub(crate) fn locate_in(error: ShellError, origin: &Origin) -> ShellError {
+    let (mut generic, file) = match (error, &origin.0) {
+        (ShellError::Generic(generic), Some(file)) => (generic, file),
+        (error, _) => return error,
+    };
+    for inner in &mut generic.inner {
+        if let ShellError::Generic(inner) = inner {
+            if inner.code.as_ref() == SOURCE_LOCATION_CODE {
+                if let Some(offset) = inner.msg.strip_prefix('@').and_then(|o| o.parse().ok()) {
+                    inner.msg = location_frame(file, offset).into();
+                }
+            }
+        }
+    }
+    ShellError::Generic(generic)
+}
+
+/// Where an error found before the program ran came from, as a
+/// `{file, line, code}` frame.
+pub(crate) fn error_location_of(error: &GenericError) -> Option<serde_json::Value> {
+    let frame = location_marker(error)?;
+    if frame.starts_with('@') {
+        return None;
+    }
+    serde_json::from_str(frame).ok()
+}
+
+pub(crate) fn is_location_marker(error: &ShellError) -> bool {
+    matches!(error, ShellError::Generic(generic) if generic.code.as_ref() == SOURCE_LOCATION_CODE)
 }
 
 /// Where a piece of code came from. Metadata: always equal.
@@ -694,9 +794,17 @@ fn set_function_origins(statements: &mut [Stmt], origin: &Origin) {
 
 fn lower_source_as(source: &str, resolve: bool, file: &str) -> Result<Program, ShellError> {
     let expanded = expand_workflow_block_syntax(source)?;
+    let source_file = std::sync::Arc::new(SourceFile {
+        name: file.to_string(),
+        text: expanded.as_ref().into(),
+    });
     let parsed = ruff_python_parser::parse_module(&expanded).map_err(|err| {
-        let mut error = GenericError::new_internal("python parse error", err.to_string())
-            .with_code("stone_parse_error");
+        let offset = u32::from(err.location.start());
+        let mut error = with_marker(
+            GenericError::new_internal("python parse error", err.error.to_string())
+                .with_code("stone_parse_error"),
+            location_frame(&source_file, offset),
+        );
         if source
             .lines()
             .any(|line| line.trim_start().starts_with("//"))
@@ -710,11 +818,8 @@ fn lower_source_as(source: &str, resolve: bool, file: &str) -> Result<Program, S
 
     // Offsets index the text the parser read (the workflow-block expansion
     // when the program uses that syntax).
-    let origin = Origin(Some(std::sync::Arc::new(SourceFile {
-        name: file.to_string(),
-        text: expanded.as_ref().into(),
-    })));
-    lower_module(parsed.into_syntax(), resolve, origin)
+    let origin = Origin(Some(source_file));
+    lower_module(parsed.into_syntax(), resolve, origin.clone()).map_err(|err| locate_in(err, &origin))
 }
 
 fn expand_workflow_block_syntax(source: &str) -> Result<Cow<'_, str>, ShellError> {
@@ -2362,7 +2467,8 @@ fn lower_stmt_block(statements: Vec<py::Stmt>) -> Result<Block, ShellError> {
     let mut block = Block::new();
     for statement in statements {
         let offset = u32::from(ruff_text_size::Ranged::start(&statement));
-        block.push_at(lower_stmt(statement)?, offset);
+        let lowered = lower_stmt(statement).map_err(|err| at_statement(err, Some(offset)))?;
+        block.push_at(lowered, offset);
     }
     Ok(block)
 }

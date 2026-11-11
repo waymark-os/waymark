@@ -1429,6 +1429,39 @@ emit(first(map(lambda row: row["name"], dirs)))"#,
     }
 
     #[test]
+    fn errors_found_before_running_name_their_line() -> Result<(), ShellError> {
+        let start_dir = test_root("error-location");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+        fs::write(start_dir.join("broken.stone"), "def f(x)\n    return 1\n").expect("write module");
+        fs::write(start_dir.join("rebinds.stone"), "LIMIT = 3\n\ndef f(x):\n    global LIMIT\n").expect("write module");
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let frame = |file: &str, line: usize, code: &str| json!([{"file": file, "line": line, "code": code}]);
+        for (source, code, trace) in [
+            // Syntax: the detail no longer carries a byte range.
+            ("x = 1\nif x:\n    y = 2 3\n", "stone_parse_error", frame("<program>", 3, "y = 2 3")),
+            // An unclosed bracket names the last line with code.
+            ("x = [1,\n\n", "stone_parse_error", frame("<program>", 1, "x = [1,")),
+            ("x = 1\nfor i in range(3):\n    del x\n", "stone_script_unsupported", frame("<program>", 3, "del x")),
+            ("total = 0\ndef add(v):\n    if v:\n        total += v\n", "stone_script_unsupported", frame("<program>", 4, "total += v")),
+            ("x = 1\nemit(lenn(x))\n", "stone_admission_error", frame("<program>", 2, "emit(lenn(x))")),
+            ("x = 1\nif x:\n    def g():\n        pass\n", "stone_admission_error", frame("<program>", 3, "def g():")),
+            ("x = 1\nfrom nosuchmod import f\n", "stone_module_error", frame("<program>", 2, "from nosuchmod import f")),
+            // Inside a module, the module's file and line.
+            ("from broken import f\n", "stone_parse_error", frame("broken.stone", 1, "def f(x)")),
+            ("x = 0\nfrom rebinds import f\n", "stone_script_unsupported", frame("rebinds.stone", 4, "global LIMIT")),
+        ] {
+            let response = guest.command_response(source);
+            assert_eq!(response["error"]["code"], json!(code), "{source}");
+            assert_eq!(response["error"]["trace"], trace, "{source}");
+            assert!(response["error"].get("related").is_none(), "{source}");
+            let detail = response["error"]["detail"].as_str().unwrap_or_default();
+            assert!(!detail.contains("byte range"), "{detail}");
+        }
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
     fn parse_errors_have_stable_json_schema() -> Result<(), ShellError> {
         let start_dir = test_root("error-parse");
         fs::create_dir_all(&start_dir).expect("create start dir");
