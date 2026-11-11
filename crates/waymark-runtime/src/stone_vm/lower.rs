@@ -1327,7 +1327,7 @@ fn matches_blank_line_continue(line_target: &str, stmt: &Stmt) -> bool {
     else {
         return false;
     };
-    if !else_branch.is_empty() || then_branch != &[Stmt::Continue] {
+    if !else_branch.is_empty() || then_branch.as_slice() != [Stmt::Continue] {
         return false;
     }
     match condition {

@@ -18,7 +18,7 @@ use super::{
     stone_const_string, stone_error, value_to_f64, value_to_i64, value_to_string, EvalFlow,
     EvalProfileBucket, Evaluator,
 };
-use crate::stone_ast::Stmt;
+use crate::stone_ast::Block;
 use crate::stone_vm::{
     compile_hot_jsonl_loop_ir_function, compile_hot_jsonl_trace_plan,
     compile_hot_jsonl_trace_plan_from_ir, compile_hot_jsonl_vm_function,
@@ -959,7 +959,7 @@ impl Evaluator<'_> {
         &mut self,
         targets: &[String],
         lines: TextLines,
-        body: &[Stmt],
+        body: &Block,
         plan: &HotLoopPlan,
     ) -> Result<EvalFlow, ShellError> {
         let remaining_body = body.get(plan.body_start..).unwrap_or(&[]);

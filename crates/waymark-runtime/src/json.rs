@@ -221,7 +221,12 @@ fn shell_error_json(err: &ShellError) -> JsonValue {
     for (key, value) in host_fields {
         map.insert(key, value);
     }
-    map.insert("debug".into(), JsonValue::String(format!("{err:?}")));
+    // Rust-side detail (the error's debug form, the runtime source line
+    // that raised it) is for runtime developers, not for programs.
+    let internals = std::env::var_os("WAYMARK_ERROR_DEBUG").is_some_and(|value| value != "0");
+    if internals {
+        map.insert("debug".into(), JsonValue::String(format!("{err:?}")));
+    }
 
     match err {
         ShellError::TypeMismatch { err_message, span } => {
@@ -261,7 +266,7 @@ fn shell_error_json(err: &ShellError) -> JsonValue {
             if let Some(context) = &err.additional_context {
                 map.insert("context".into(), JsonValue::String(context.to_string()));
             }
-            if let Some(location) = &err.location {
+            if let (true, Some(location)) = (internals, &err.location) {
                 map.insert("location".into(), JsonValue::String(location.clone()));
             }
             insert_span(&mut map, err.span);
@@ -284,7 +289,9 @@ fn shell_error_json(err: &ShellError) -> JsonValue {
             match &err.site {
                 ErrorSite::Span(span) => insert_span(&mut map, *span),
                 ErrorSite::Location(location) => {
-                    map.insert("location".into(), JsonValue::String(location.clone()));
+                    if internals {
+                        map.insert("location".into(), JsonValue::String(location.clone()));
+                    }
                 }
             }
             // A host error's record travels as an inner error; its fields

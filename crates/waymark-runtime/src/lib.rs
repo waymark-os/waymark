@@ -198,6 +198,11 @@ impl StoneGuest {
                     Err(err) => {
                         let mut response =
                             json::error_response_with_source(&err, Some(self.current_cwd()), source);
+                        // Where the error came from: file, line, and code of
+                        // each function it left, outermost first.
+                        if let Some(trace) = self.stone_session.take_last_error_trace() {
+                            response["error"]["trace"] = trace;
+                        }
                         // What the program printed before it failed is often
                         // the evidence for why.
                         let printed = self.stone_session.take_last_stdout();
@@ -208,6 +213,7 @@ impl StoneGuest {
                     }
                 };
             self.stone_session.take_last_stdout();
+            self.stone_session.take_last_error_trace();
             match self.stone_session.budget_stopped() {
                 Some(unfinished) => json::unfinished_response(
                     unfinished,
@@ -1356,6 +1362,52 @@ emit(first(map(lambda row: row["name"], dirs)))"#,
     }
 
     #[test]
+    fn uncaught_errors_carry_a_trace_of_file_line_and_code() -> Result<(), ShellError> {
+        let start_dir = test_root("error-trace");
+        fs::create_dir_all(&start_dir).expect("create start dir");
+        fs::write(
+            start_dir.join("lib.stone"),
+            "LIMIT = 3\n\n\ndef pick(items, key):\n    total = 0\n    for item in items:\n        if item[\"n\"] > LIMIT:\n            total += item[key]\n    return total\n",
+        )
+        .expect("write module");
+
+        let mut guest = StoneGuest::new(start_dir.clone())?;
+        let program = "from lib import pick\n\nrows = [{\"n\": 1, \"v\": 2}, {\"n\": 5}]\n\n\ndef summarize(rows):\n    result = pick(rows, \"v\")\n    return result\n\nemit(summarize(rows))\n";
+        let response = guest.command_response(program);
+        assert_eq!(response["error"]["type"], json!("KeyError"));
+        // Outermost first: the program's statement, then each function.
+        assert_eq!(
+            response["error"]["trace"],
+            json!([
+                {"file": "<program>", "line": 10, "code": "emit(summarize(rows))"},
+                {"file": "<program>", "line": 7, "code": "result = pick(rows, \"v\")", "function": "summarize"},
+                {"file": "lib.stone", "line": 8, "code": "total += item[key]", "function": "lib.pick"},
+            ])
+        );
+
+        // A handled error leaves no trace behind: the next error's trace is
+        // its own.
+        let response = guest.command_response(
+            "def fails():\n    return {}[\"k\"]\n\nfor i in range(3):\n    try:\n        fails()\n    except KeyError:\n        pass\nx = 1\nraise ValueError(\"late\")\n",
+        );
+        assert_eq!(
+            response["error"]["trace"],
+            json!([{"file": "<program>", "line": 10, "code": "raise ValueError(\"late\")"}])
+        );
+
+        // An error in an elif branch names that branch's line.
+        let response =
+            guest.command_response("x = 2\nif x == 1:\n    pass\nelif x == 2:\n    y = 1 // 0\n");
+        assert_eq!(
+            response["error"]["trace"],
+            json!([{"file": "<program>", "line": 5, "code": "y = 1 // 0"}])
+        );
+
+        cleanup_dir(&start_dir);
+        Ok(())
+    }
+
+    #[test]
     fn parse_errors_have_stable_json_schema() -> Result<(), ShellError> {
         let start_dir = test_root("error-parse");
         fs::create_dir_all(&start_dir).expect("create start dir");
@@ -1365,7 +1417,9 @@ emit(first(map(lambda row: row["name"], dirs)))"#,
         assert_eq!(response["ok"], json!(false));
         assert_eq!(response["error"]["kind"], json!("generic"));
         assert_eq!(response["error"]["code"], json!("stone_script_error"));
-        assert!(response["error"]["location"].is_string());
+        // The runtime's own source location is not shown to programs.
+        assert!(response["error"].get("location").is_none());
+        assert!(response["error"].get("debug").is_none());
 
         cleanup_dir(&start_dir);
         Ok(())

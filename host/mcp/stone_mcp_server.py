@@ -1462,7 +1462,7 @@ def normalize_stone_error(error: Any) -> dict[str, Any]:
     if not isinstance(error, dict):
         return {"kind": "stone_error", "code": "stone_error", "message": str(error)}
     normalized: dict[str, Any] = {}
-    for key in ("kind", "code", "message", "detail", "span", "hint", "location"):
+    for key in ("kind", "code", "type", "message", "detail", "span", "hint", "location", "trace"):
         value = error.get(key)
         if value not in (None, "", [], {}):
             normalized[key] = value

@@ -25,6 +25,102 @@ impl From<EvalError> for ShellError {
         *error.0
     }
 }
+
+/// Where the error now unwinding came from: one frame per function it left,
+/// innermost first. A frame is the statement that was running in that
+/// function (or at top level), recorded by the innermost block that saw the
+/// error. Kept beside the error, not in it, so error types are unchanged;
+/// `key` ties the frames to their error.
+#[derive(Default)]
+pub(crate) struct ErrorTrace {
+    frames: Vec<TraceFrame>,
+    /// True once the error has left a function: the caller's block records
+    /// the next frame.
+    open: bool,
+    key: String,
+}
+
+struct TraceFrame {
+    file: Option<Arc<SourceFile>>,
+    offset: Option<u32>,
+    function: Option<String>,
+}
+
+/// What ties recorded frames to an error: its message.
+fn error_trace_key(error: &ShellError) -> String {
+    match error {
+        ShellError::Generic(generic) => generic.msg.to_string(),
+        other => other.to_string(),
+    }
+}
+
+impl ErrorTrace {
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.open = false;
+        self.key.clear();
+    }
+
+    /// `error` is leaving the statement at `offset` in `file`.
+    fn note(&mut self, error: &ShellError, file: Option<Arc<SourceFile>>, offset: Option<u32>) {
+        let key = error_trace_key(error);
+        if self.frames.is_empty() || key != self.key {
+            // A new error (anything recorded before was handled).
+            self.clear();
+            self.key = key;
+            self.open = true;
+        }
+        if self.open {
+            self.frames.push(TraceFrame {
+                file,
+                offset,
+                function: None,
+            });
+            self.open = false;
+        }
+    }
+
+    /// The error left function `name`.
+    fn leave_function(&mut self, name: &str) {
+        if let Some(frame) = self.frames.last_mut() {
+            if !self.open {
+                frame.function = Some(name.to_string());
+                self.open = true;
+            }
+        }
+    }
+
+    /// The frames for `error`, outermost first, as `{file, line, code,
+    /// function}` records; None when none were recorded for it.
+    pub(crate) fn take_json(&mut self, error: &ShellError) -> Option<JsonValue> {
+        if self.frames.is_empty() || error_trace_key(error) != self.key {
+            self.clear();
+            return None;
+        }
+        let frames = self
+            .frames
+            .iter()
+            .rev()
+            .map(|frame| {
+                let mut fields = serde_json::Map::new();
+                if let Some(file) = &frame.file {
+                    fields.insert("file".into(), JsonValue::String(file.name.clone()));
+                    if let Some(offset) = frame.offset {
+                        let (line, code) = file.line_at(offset);
+                        fields.insert("line".into(), json!(line));
+                        fields.insert("code".into(), JsonValue::String(code.to_string()));
+                    }
+                }
+                if let Some(function) = &frame.function {
+                    fields.insert("function".into(), JsonValue::String(function.clone()));
+                }
+                JsonValue::Object(fields)
+            })
+            .collect();
+        self.clear();
+        Some(JsonValue::Array(frames))
+    }
+}
 use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -67,9 +163,9 @@ use crate::linux_tools::{
 };
 use crate::stone_agent_control::{AgentControlKind, AgentControlValue};
 use crate::stone_ast::{
-    AssignTarget, AugOp, BoolOp, Call, CompareOp, ComprehensionClause, ExceptHandler, Expr,
+    AssignTarget, AugOp, Block, BoolOp, Call, CompareOp, ComprehensionClause, ExceptHandler, Expr,
     FormattedStringPart, FunctionDef, FunctionScope, ImportKind, LiteralValue, Program, RecordDef,
-    StageDecorator, Stmt, StoneFormatSpec, StoneType, TypeExpr,
+    SourceFile, StageDecorator, Stmt, StoneFormatSpec, StoneType, TypeExpr,
 };
 use crate::stone_attempt_best::{
     AttemptBestCandidate, AttemptBestObjective, AttemptBestPlan, AttemptBestValue,
@@ -219,6 +315,10 @@ pub struct EvalState {
     next_semantic_frontier_id: u64,
     current_program_source: Option<String>,
     current_program_entrypoint: Option<String>,
+    /// The file of the code running now, for error locations.
+    code_origin: Option<Arc<SourceFile>>,
+    /// Where the error now unwinding came from.
+    error_trace: ErrorTrace,
     context: ContextState,
     stdout: String,
     /// The program's result, once `emit(value)` has run. It is the result
@@ -1053,6 +1153,8 @@ fn eval_program_with_source_options(
             next_semantic_frontier_id: 0,
             current_program_source: source.map(str::to_string),
             current_program_entrypoint: entrypoint.map(str::to_string),
+            code_origin: program.origin.0.clone(),
+            error_trace: ErrorTrace::default(),
             context: options
                 .session
                 .as_ref()
@@ -1098,6 +1200,10 @@ fn eval_program_with_source_options(
         )),
         _ => evaluator.eval_program(program),
     };
+    let error_trace = match &pipeline {
+        Err(error) => evaluator.state.error_trace.take_json(error),
+        Ok(_) => None,
+    };
     // An emitted value is the result, whatever the last statement was.
     let pipeline = pipeline.map(|output| match evaluator.state.emitted.take() {
         Some(value) => value.into_pipeline_data(),
@@ -1125,6 +1231,7 @@ fn eval_program_with_source_options(
         session.update_transition_id(evaluator.state.next_transition_id);
         session.update_host_errors(&evaluator.state.host_errors);
         session.last_stdout = evaluator.state.stdout.clone();
+        session.last_error_trace = error_trace;
     }
     // What the program printed before its budget ran out belongs to the
     // unfinished result.
@@ -1479,14 +1586,39 @@ impl Evaluator<'_> {
 
     fn eval_block(
         &mut self,
+        block: &Block,
+        record_session_bindings: bool,
+    ) -> Result<EvalFlow, EvalError> {
+        self.eval_statements(block, block.offsets(), record_session_bindings)
+    }
+
+    /// Run `statements`, whose source offsets are `offsets` (possibly
+    /// empty). An error leaving a statement records where it happened.
+    fn eval_statements(
+        &mut self,
         statements: &[Stmt],
+        offsets: &[u32],
         record_session_bindings: bool,
     ) -> Result<EvalFlow, EvalError> {
         let started = self.state.profiler.start();
         let mut output = none_value();
         let result = (|| {
-            for statement in statements {
-                let flow = self.eval_stmt(statement, record_session_bindings)?;
+            for (index, statement) in statements.iter().enumerate() {
+                let flow = match self.eval_stmt(statement, record_session_bindings) {
+                    Ok(flow) => {
+                        if !self.state.error_trace.frames.is_empty() {
+                            // An error was handled since it was recorded.
+                            self.state.error_trace.clear();
+                        }
+                        flow
+                    }
+                    Err(error) => {
+                        let offset = offsets.get(index).copied();
+                        let file = self.state.code_origin.clone();
+                        self.state.error_trace.note(&error.0, file, offset);
+                        return Err(error);
+                    }
+                };
                 match flow {
                     // Only an expression statement has a value: a program
                     // that never emits returns its final expression, and a
@@ -1509,6 +1641,28 @@ impl Evaluator<'_> {
             .profiler
             .finish(EvalProfileBucket::Block, started);
         result
+    }
+
+    /// Run a function's body in the function's own file; an error leaving
+    /// it names the function in its trace.
+    fn eval_function_body(&mut self, function: &FunctionDef) -> Result<EvalFlow, EvalError> {
+        let same_file = match (&self.state.code_origin, &function.origin.0) {
+            (Some(current), Some(origin)) => Arc::ptr_eq(current, origin),
+            (None, None) => true,
+            _ => false,
+        };
+        let flow = if same_file {
+            self.eval_block(&function.body, false)
+        } else {
+            let caller = std::mem::replace(&mut self.state.code_origin, function.origin.0.clone());
+            let flow = self.eval_block(&function.body, false);
+            self.state.code_origin = caller;
+            flow
+        };
+        if flow.is_err() {
+            self.state.error_trace.leave_function(&function.name);
+        }
+        flow
     }
 
     fn eval_stmt(
@@ -1555,9 +1709,11 @@ impl Evaluator<'_> {
             }
             Stmt::Pass => Ok(EvalFlow::Output(none_value())),
             Stmt::Module(module) => {
-                for statement in &module.body {
-                    self.eval_stmt(statement, false)?;
-                }
+                let importer =
+                    std::mem::replace(&mut self.state.code_origin, module.origin.0.clone());
+                let ran = self.eval_block(&module.body, false);
+                self.state.code_origin = importer;
+                ran?;
                 // Module values are read-only all the way down, so no
                 // importer can change what another importer sees.
                 for name in &module.constants {
@@ -1762,7 +1918,7 @@ impl Evaluator<'_> {
         &mut self,
         targets: &[String],
         iter: &Expr,
-        body: &[Stmt],
+        body: &Block,
     ) -> Result<EvalFlow, ShellError> {
         // The loop engine recognizes these builtins by name; if a variable
         // hides one, run the loop on the general path so the variable wins.
@@ -1887,7 +2043,7 @@ impl Evaluator<'_> {
     fn try_eval_outer_jsonl_file_loop(
         &mut self,
         targets: &[String],
-        body: &[Stmt],
+        body: &Block,
         values: &[RuntimeValue],
     ) -> Result<Option<EvalFlow>, ShellError> {
         if !self.state.hot_loop_enabled {
@@ -1948,7 +2104,7 @@ impl Evaluator<'_> {
         &mut self,
         targets: &[String],
         rows: JsonlRows,
-        body: &[Stmt],
+        body: &Block,
     ) -> Result<EvalFlow, ShellError> {
         let mut output = none_value();
         for line in rows.lines.iter().cloned() {
@@ -1973,11 +2129,12 @@ impl Evaluator<'_> {
         &mut self,
         targets: &[String],
         rows: JsonlRows,
-        body: &[Stmt],
+        body: &Block,
         plan: &HotLoopPlan,
     ) -> Result<EvalFlow, ShellError> {
         let mut output = none_value();
         let remaining_body = body.get(plan.body_start..).unwrap_or(&[]);
+        let remaining_offsets = body.offsets().get(plan.body_start..).unwrap_or(&[]);
         let hot_body_plan = match_hot_jsonl_aggregation_body(&plan.target, remaining_body)
             .or_else(|| match_hot_jsonl_aggregation_body(&plan.target, body));
         if let Some(body_plan) = hot_body_plan.as_ref() {
@@ -1992,7 +2149,7 @@ impl Evaluator<'_> {
             };
             self.execute_hot_loop_prefix(plan, &view)?;
             let started = self.state.profiler.start();
-            let flow = self.eval_block(remaining_body, false);
+            let flow = self.eval_statements(remaining_body, remaining_offsets, false);
             self.state
                 .profiler
                 .finish(EvalProfileBucket::ForJsonlBody, started);
@@ -2010,7 +2167,7 @@ impl Evaluator<'_> {
         &mut self,
         targets: &[String],
         values: I,
-        body: &[Stmt],
+        body: &Block,
     ) -> Result<EvalFlow, ShellError>
     where
         I: IntoIterator<Item = RuntimeValue>,
@@ -2040,7 +2197,7 @@ impl Evaluator<'_> {
         &mut self,
         targets: &[String],
         call: &Call,
-        body: &[Stmt],
+        body: &Block,
     ) -> Result<Option<EvalFlow>, ShellError> {
         if call.name != "enumerate"
             || !call.named.is_empty()
@@ -2088,7 +2245,7 @@ impl Evaluator<'_> {
         &mut self,
         targets: &[String],
         values: Vec<RuntimeValue>,
-        body: &[Stmt],
+        body: &Block,
         same_size: impl Fn() -> bool,
         what: &str,
     ) -> Result<EvalFlow, ShellError> {
@@ -2237,7 +2394,7 @@ impl Evaluator<'_> {
         is_async: bool,
         target: Option<&str>,
         context: &Expr,
-        body: &[Stmt],
+        body: &Block,
     ) -> Result<EvalFlow, ShellError> {
         if is_async && self.state.active_async_depth == 0 {
             return Err(stone_error(
@@ -2311,7 +2468,7 @@ impl Evaluator<'_> {
 
     fn eval_try_stmt(
         &mut self,
-        body: &[Stmt],
+        body: &Block,
         handlers: &[ExceptHandler],
     ) -> Result<EvalFlow, ShellError> {
         match self.eval_block(body, false).map_err(ShellError::from) {
@@ -4182,7 +4339,7 @@ impl Evaluator<'_> {
             self.state.async_functions_entered =
                 self.state.async_functions_entered.saturating_add(1);
         }
-        let flow = self.eval_block(&function.body, false);
+        let flow = self.eval_function_body(function);
         if function.is_async {
             self.state.active_async_depth = self.state.active_async_depth.saturating_sub(1);
         }
@@ -8646,7 +8803,7 @@ impl Evaluator<'_> {
             &function.params[0].name,
             RuntimeValue::Nu(event_value),
         );
-        let flow = self.eval_block(&function.body, false);
+        let flow = self.eval_function_body(function);
         let pop_result = self.state.pop_scope();
         self.state.functions = previous_functions;
         pop_result?;

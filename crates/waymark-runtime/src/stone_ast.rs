@@ -7,7 +7,161 @@ use ruff_python_ast as py;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
-    pub statements: Vec<Stmt>,
+    pub statements: Block,
+    /// The file the program came from, for error locations.
+    pub origin: Origin,
+}
+
+/// A sequence of statements with each statement's byte offset in its source
+/// file, so a runtime error can name the line it came from. Offsets are
+/// metadata: two blocks with the same statements are equal.
+#[derive(Debug, Clone, Default)]
+pub struct Block {
+    stmts: Vec<Stmt>,
+    offsets: Vec<u32>,
+}
+
+impl Block {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a statement with no source location.
+    pub fn push(&mut self, statement: Stmt) {
+        self.stmts.push(statement);
+    }
+
+    /// Add a statement found at byte `offset` of the block's source.
+    pub fn push_at(&mut self, statement: Stmt, offset: u32) {
+        if self.offsets.len() == self.stmts.len() {
+            self.offsets.push(offset);
+        }
+        self.stmts.push(statement);
+    }
+
+    /// Each statement's source offset; empty when they are unknown (a
+    /// block built in code rather than lowered from source).
+    pub fn offsets(&self) -> &[u32] {
+        if self.offsets.len() == self.stmts.len() {
+            &self.offsets
+        } else {
+            &[]
+        }
+    }
+
+    /// Put `other`'s statements (the linked modules) ahead of this
+    /// block's. Each module statement runs its own located block, so it
+    /// needs no offset of its own; it gets 0.
+    pub fn prepend(&mut self, other: Block) {
+        let known = self.offsets.len() == self.stmts.len();
+        let added = other.stmts.len();
+        let mut stmts = other.stmts;
+        stmts.append(&mut self.stmts);
+        self.stmts = stmts;
+        if known {
+            let mut offsets = vec![0; added];
+            offsets.append(&mut self.offsets);
+            self.offsets = offsets;
+        }
+    }
+
+    pub fn into_vec(self) -> Vec<Stmt> {
+        self.stmts
+    }
+
+    pub fn as_slice(&self) -> &[Stmt] {
+        &self.stmts
+    }
+}
+
+impl PartialEq for Block {
+    fn eq(&self, other: &Self) -> bool {
+        self.stmts == other.stmts
+    }
+}
+
+impl std::ops::Deref for Block {
+    type Target = [Stmt];
+    fn deref(&self) -> &[Stmt] {
+        &self.stmts
+    }
+}
+
+impl std::ops::DerefMut for Block {
+    fn deref_mut(&mut self) -> &mut [Stmt] {
+        &mut self.stmts
+    }
+}
+
+impl From<Vec<Stmt>> for Block {
+    fn from(stmts: Vec<Stmt>) -> Self {
+        Self {
+            stmts,
+            offsets: Vec::new(),
+        }
+    }
+}
+
+impl FromIterator<Stmt> for Block {
+    fn from_iter<I: IntoIterator<Item = Stmt>>(iter: I) -> Self {
+        iter.into_iter().collect::<Vec<_>>().into()
+    }
+}
+
+impl IntoIterator for Block {
+    type Item = Stmt;
+    type IntoIter = std::vec::IntoIter<Stmt>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.stmts.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Block {
+    type Item = &'a Stmt;
+    type IntoIter = std::slice::Iter<'a, Stmt>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.stmts.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut Block {
+    type Item = &'a mut Stmt;
+    type IntoIter = std::slice::IterMut<'a, Stmt>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.stmts.iter_mut()
+    }
+}
+
+/// A source file: its name as shown in errors (`<program>` for the main
+/// program, the module path for a module) and the text the parser read.
+#[derive(Debug)]
+pub struct SourceFile {
+    pub name: String,
+    pub text: Box<str>,
+}
+
+impl SourceFile {
+    /// The 1-based line number and the trimmed text of the line holding
+    /// byte `offset`.
+    pub fn line_at(&self, offset: u32) -> (usize, &str) {
+        let offset = (offset as usize).min(self.text.len());
+        let start = self.text[..offset].rfind('\n').map_or(0, |i| i + 1);
+        let end = self.text[offset..]
+            .find('\n')
+            .map_or(self.text.len(), |i| offset + i);
+        let line = self.text[..offset].matches('\n').count() + 1;
+        (line, self.text[start..end].trim())
+    }
+}
+
+/// Where a piece of code came from. Metadata: always equal.
+#[derive(Debug, Clone, Default)]
+pub struct Origin(pub Option<std::sync::Arc<SourceFile>>);
+
+impl PartialEq for Origin {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,25 +178,25 @@ pub enum Stmt {
     For {
         targets: Vec<String>,
         iter: Expr,
-        body: Vec<Stmt>,
+        body: Block,
     },
     While {
         condition: Expr,
-        body: Vec<Stmt>,
+        body: Block,
     },
     If {
         condition: Expr,
-        then_branch: Vec<Stmt>,
-        else_branch: Vec<Stmt>,
+        then_branch: Block,
+        else_branch: Block,
     },
     With {
         is_async: bool,
         target: Option<String>,
         context: Expr,
-        body: Vec<Stmt>,
+        body: Block,
     },
     Try {
-        body: Vec<Stmt>,
+        body: Block,
         handlers: Vec<ExceptHandler>,
     },
     FunctionDef(FunctionDef),
@@ -170,7 +324,8 @@ pub struct ModuleInit {
     pub name: String,
     pub path: String,
     pub sha256: String,
-    pub body: Vec<Stmt>,
+    pub body: Block,
+    pub origin: Origin,
     /// Qualified names (`lib.LIMIT`) of the module's constants, frozen after
     /// the body runs.
     pub constants: Vec<String>,
@@ -185,7 +340,9 @@ pub struct FunctionDef {
     /// A return annotation `StoneType` cannot express (a record, a union,
     /// a `Literal`); checked when the function returns.
     pub return_check: Option<TypeExpr>,
-    pub body: Vec<Stmt>,
+    pub body: Block,
+    /// The file this function was written in, for error locations.
+    pub origin: Origin,
     pub stage: Option<Box<StageDecorator>>,
     /// Set when this function is the constructor of a model-defined error
     /// class (`class ConfigError(Exception): path: str`); holds the base type.
@@ -468,7 +625,7 @@ pub struct ExceptHandler {
     /// `except:` is rejected at parse time.
     pub types: Vec<String>,
     pub name: Option<String>,
-    pub body: Vec<Stmt>,
+    pub body: Block,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -491,17 +648,51 @@ pub struct ComprehensionClause {
     pub filters: Vec<Expr>,
 }
 
+/// The name the main program goes by in error locations.
+pub const PROGRAM_FILE: &str = "<program>";
+
 pub fn lower_source(source: &str) -> Result<Program, ShellError> {
-    lower_source_as(source, true)
+    lower_source_as(source, true, PROGRAM_FILE)
 }
 
 /// Lower a module's source without resolving scopes. The linker resolves it
-/// (`stone_scope::resolve_module`) once its own imports are known.
-pub(crate) fn lower_module_source(source: &str) -> Result<Program, ShellError> {
-    lower_source_as(source, false)
+/// (`stone_scope::resolve_module`) once its own imports are known. `file` is
+/// the module's path as errors show it.
+pub(crate) fn lower_module_source(source: &str, file: &str) -> Result<Program, ShellError> {
+    lower_source_as(source, false, file)
 }
 
-fn lower_source_as(source: &str, resolve: bool) -> Result<Program, ShellError> {
+/// Record `origin` on every function defined in `statements`, at any depth.
+fn set_function_origins(statements: &mut [Stmt], origin: &Origin) {
+    for statement in statements {
+        match statement {
+            Stmt::FunctionDef(function) => {
+                function.origin = origin.clone();
+                set_function_origins(&mut function.body, origin);
+            }
+            Stmt::For { body, .. } | Stmt::While { body, .. } | Stmt::With { body, .. } => {
+                set_function_origins(body, origin);
+            }
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                set_function_origins(then_branch, origin);
+                set_function_origins(else_branch, origin);
+            }
+            Stmt::Try { body, handlers } => {
+                set_function_origins(body, origin);
+                for handler in handlers {
+                    set_function_origins(&mut handler.body, origin);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn lower_source_as(source: &str, resolve: bool, file: &str) -> Result<Program, ShellError> {
     let expanded = expand_workflow_block_syntax(source)?;
     let parsed = ruff_python_parser::parse_module(&expanded).map_err(|err| {
         let mut error = GenericError::new_internal("python parse error", err.to_string())
@@ -517,7 +708,13 @@ fn lower_source_as(source: &str, resolve: bool) -> Result<Program, ShellError> {
         ShellError::Generic(error)
     })?;
 
-    lower_module(parsed.into_syntax(), resolve)
+    // Offsets index the text the parser read (the workflow-block expansion
+    // when the program uses that syntax).
+    let origin = Origin(Some(std::sync::Arc::new(SourceFile {
+        name: file.to_string(),
+        text: expanded.as_ref().into(),
+    })));
+    lower_module(parsed.into_syntax(), resolve, origin)
 }
 
 fn expand_workflow_block_syntax(source: &str) -> Result<Cow<'_, str>, ShellError> {
@@ -893,13 +1090,14 @@ fn workflow_syntax_error(message: impl Into<String>) -> ShellError {
     )
 }
 
-fn lower_module(module: py::ModModule, resolve: bool) -> Result<Program, ShellError> {
-    let mut statements = Vec::with_capacity(module.body.len());
-    for statement in module.body {
-        statements.push(lower_stmt(statement)?);
-    }
-
-    let mut program = Program { statements };
+fn lower_module(
+    module: py::ModModule,
+    resolve: bool,
+    origin: Origin,
+) -> Result<Program, ShellError> {
+    let statements = lower_stmt_block(module.body)?;
+    let mut program = Program { statements, origin };
+    set_function_origins(&mut program.statements, &program.origin);
     if resolve {
         crate::stone_scope::resolve_program(&mut program)?;
     }
@@ -992,6 +1190,7 @@ fn lower_function_def(function: py::StmtFunctionDef) -> Result<Stmt, ShellError>
         return_type,
         return_check,
         body: lower_stmt_block(function.body)?,
+        origin: Origin::default(),
         stage: stage.map(Box::new),
         error_base: None,
         scope: Default::default(),
@@ -1549,7 +1748,8 @@ fn lower_error_class(class: py::StmtClassDef) -> Result<Stmt, ShellError> {
         params,
         return_type: StoneType::Record,
         return_check: None,
-        body: vec![Stmt::Return(Some(Expr::Record(fields)))],
+        body: vec![Stmt::Return(Some(Expr::Record(fields)))].into(),
+        origin: Origin::default(),
         stage: None,
         error_base: Some(base),
         scope: Default::default(),
@@ -2082,14 +2282,22 @@ fn lower_loop_targets(target: py::Expr) -> Result<Vec<String>, ShellError> {
 }
 
 fn lower_if(if_stmt: py::StmtIf) -> Result<Stmt, ShellError> {
-    let mut else_branch = Vec::new();
+    let mut else_branch = Block::new();
     for clause in if_stmt.elif_else_clauses.into_iter().rev() {
+        let offset = u32::from(ruff_text_size::Ranged::start(&clause));
         else_branch = match clause.test {
-            Some(test) => vec![Stmt::If {
-                condition: lower_expr(test)?,
-                then_branch: lower_stmt_block(clause.body)?,
-                else_branch,
-            }],
+            Some(test) => {
+                let mut block = Block::new();
+                block.push_at(
+                    Stmt::If {
+                        condition: lower_expr(test)?,
+                        then_branch: lower_stmt_block(clause.body)?,
+                        else_branch,
+                    },
+                    offset,
+                );
+                block
+            }
             None => {
                 if !else_branch.is_empty() {
                     return Err(unsupported_message(
@@ -2150,11 +2358,13 @@ fn lower_with(with_stmt: py::StmtWith) -> Result<Stmt, ShellError> {
     })
 }
 
-fn lower_stmt_block(statements: Vec<py::Stmt>) -> Result<Vec<Stmt>, ShellError> {
-    statements
-        .into_iter()
-        .map(lower_stmt)
-        .collect::<Result<Vec<_>, _>>()
+fn lower_stmt_block(statements: Vec<py::Stmt>) -> Result<Block, ShellError> {
+    let mut block = Block::new();
+    for statement in statements {
+        let offset = u32::from(ruff_text_size::Ranged::start(&statement));
+        block.push_at(lower_stmt(statement)?, offset);
+    }
+    Ok(block)
 }
 
 fn lower_expr(expression: py::Expr) -> Result<Expr, ShellError> {
@@ -3113,7 +3323,8 @@ mod tests {
                     name: "pwd".to_string(),
                     positional: vec![],
                     named: vec![],
-                }))],
+                }))].into(),
+                origin: Default::default(),
             }
         );
     }
@@ -3192,7 +3403,8 @@ mod tests {
             assert_eq!(
                 program,
                 Program {
-                    statements: vec![Stmt::Expr(expected)]
+                    statements: vec![Stmt::Expr(expected)].into(),
+                    origin: Default::default(),
                 },
                 "source: {source}"
             );
@@ -3285,7 +3497,8 @@ mod tests {
             assert_eq!(
                 program,
                 Program {
-                    statements: vec![Stmt::Expr(expected)]
+                    statements: vec![Stmt::Expr(expected)].into(),
+                    origin: Default::default(),
                 },
                 "source: {source}"
             );
@@ -4119,7 +4332,8 @@ else:
                         Expr::String("/work/out.json".to_string()),
                     ],
                     named: vec![("force".to_string(), Expr::Bool(true))],
-                }))]
+                }))].into(),
+                origin: Default::default(),
             }
         );
     }

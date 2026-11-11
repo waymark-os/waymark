@@ -87,6 +87,18 @@ class StoneMcpServerTests(unittest.TestCase):
         self.assertEqual(result["error"]["kind"], "generic")
         self.assertEqual(result["error"]["message"], "bad")
 
+    def test_stone_error_keeps_type_and_trace(self) -> None:
+        trace = [
+            {"file": "<program>", "line": 3, "code": "f()"},
+            {"file": "lib.stone", "line": 2, "code": "return {}[\"k\"]", "function": "lib.f"},
+        ]
+        error = {"kind": "generic", "code": "stone_script_error", "type": "KeyError", "detail": "dict has no key `k`", "trace": trace}
+
+        normalized = server.normalize_stone_error(error)
+
+        self.assertEqual(normalized["type"], "KeyError")
+        self.assertEqual(normalized["trace"], trace)
+
     def test_normalizes_warm_task_frame(self) -> None:
         frame = {
             "version": 0,

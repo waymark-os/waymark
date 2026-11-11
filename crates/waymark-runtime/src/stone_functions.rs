@@ -350,6 +350,9 @@ pub(crate) struct StoneSession {
     /// What the last evaluation printed, kept so a failed run's error
     /// response still shows its output. Taken by the response builder.
     pub(super) last_stdout: String,
+    /// Where the last program's uncaught error came from: `{file, line,
+    /// code, function}` frames, outermost first.
+    pub(super) last_error_trace: Option<serde_json::Value>,
     #[cfg(test)]
     pub(crate) test_model: Option<std::rc::Rc<std::cell::RefCell<super::stone_model::TestModel>>>,
 }
@@ -365,6 +368,10 @@ impl StoneSession {
     /// What the last evaluation printed (cleared by this call).
     pub(crate) fn take_last_stdout(&mut self) -> String {
         std::mem::take(&mut self.last_stdout)
+    }
+
+    pub(crate) fn take_last_error_trace(&mut self) -> Option<serde_json::Value> {
+        self.last_error_trace.take()
     }
 
     /// The `unfinished` record when the attempt's budget ran out.

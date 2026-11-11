@@ -9,6 +9,27 @@ operations rather than Python standard-library APIs. Its primary author is an
 agent generating or repairing task-specific code; human readability remains
 valuable for review and debugging.
 
+## Where an Error Came From
+
+An error that ends a program carries `error.trace`, a list of frames,
+outermost first. Each frame names the file (`<program>` for the program
+itself, the module's path for an imported module), the line, the code on that
+line, and the function the statement was in (no `function` at top level):
+
+```json
+"trace": [
+  {"file": "<program>", "line": 10, "code": "emit(summarize(rows))"},
+  {"file": "<program>", "line": 7, "code": "result = pick(rows, \"v\")", "function": "summarize"},
+  {"file": "lib.stone", "line": 8, "code": "total += item[key]", "function": "lib.pick"}
+]
+```
+
+The last frame is where the error happened. Locations are statements, not
+expressions: an error inside a long expression names the statement's first
+line. A program that uses `workflow` block syntax is numbered after the
+blocks are expanded. A caught error carries no trace; the error record a
+handler sees is unchanged.
+
 ## Structured Correction Suggestions
 
 Stone error responses may include an `error.correction` record when the

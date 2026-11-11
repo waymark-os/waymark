@@ -30,6 +30,7 @@ use nu_protocol::{shell_error::generic::GenericError, ShellError};
 use sha2::{Digest, Sha256};
 
 use crate::stone_ast::{
+    Block,
     import_suggestions_for_module, lower_module_source, AssignTarget, ImportKind, ModuleInit,
     Program, Stmt,
 };
@@ -70,12 +71,11 @@ pub(crate) fn link_program(program: &mut Program, cwd: &Path) -> Result<(), Shel
         exports: HashMap::new(),
         loading: Vec::new(),
         error_classes: HashMap::new(),
-        linked: Vec::new(),
+        linked: Block::new(),
     };
     linker.link_imports(&mut program.statements, None)?;
-    let mut statements = std::mem::take(&mut linker.linked);
-    statements.append(&mut program.statements);
-    program.statements = statements;
+    let linked = std::mem::take(&mut linker.linked);
+    program.statements.prepend(linked);
     Ok(())
 }
 
@@ -102,7 +102,7 @@ struct Linker {
     /// names are global.
     error_classes: HashMap<String, String>,
     /// Linked modules in dependency order.
-    linked: Vec<Stmt>,
+    linked: Block,
 }
 
 impl Linker {
@@ -206,7 +206,7 @@ impl Linker {
             )
         })?;
         let mut program =
-            lower_module_source(&source).map_err(|err| in_module(err, module, &shown))?;
+            lower_module_source(&source, &shown).map_err(|err| in_module(err, module, &shown))?;
 
         // Link the module's own imports first: which names are error classes
         // decides which names get qualified.
@@ -296,6 +296,7 @@ impl Linker {
             path: path.display().to_string(),
             sha256: format!("{:x}", Sha256::digest(source.as_bytes())),
             body: program.statements,
+            origin: program.origin,
             constants,
         })));
         Ok(())
