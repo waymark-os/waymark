@@ -1,0 +1,66 @@
+{
+  "symptom": "Listing genindex, modindex and search as toctree entries makes Sphinx warn \"toctree contains reference to nonexisting document\" for each one, because they are generated pages, not source documents, and no links to them are made.",
+  "expected_rule": "The toctree directive should accept the special generated pages genindex, modindex and search as entries (bare or with an explicit title) without warnings, and the resolved toctree should link to the generated pages (docnames genindex, py-modindex, search), titled like the standard labels (Index, Module Index, Search Page) unless a title is given. These entries must not be treated as included source documents anywhere toctree entries are walked (section/figure numbering, toctree includes, inlining for single-file builders). References to genuinely missing documents must still warn.",
+  "rule_evidence": [
+    {
+      "source": "issue",
+      "quote": "The following directive should be possible and do not rise errors:"
+    },
+    {
+      "source": "issue",
+      "quote": "WARNING: toctree contains reference to nonexisting document 'genindex'"
+    },
+    {
+      "source": "/testbed/sphinx/directives/other.py",
+      "quote": "if url_re.match(ref) or ref == 'self':"
+    },
+    {
+      "source": "/testbed/sphinx/domains/std.py",
+      "quote": "'genindex': ('genindex', '', _('Index')),"
+    },
+    {
+      "source": "/testbed/sphinx/domains/std.py",
+      "quote": "'modindex': ('py-modindex', '', _('Module Index')),"
+    },
+    {
+      "source": "/testbed/sphinx/domains/std.py",
+      "quote": "'search':   ('search', '', _('Search Page')),"
+    },
+    {
+      "source": "/testbed/sphinx/environment/adapters/toctree.py",
+      "quote": "toc = self.env.tocs[ref].deepcopy()"
+    },
+    {
+      "source": "/testbed/sphinx/environment/collectors/toctree.py",
+      "quote": "if url_re.match(subdocname) or subdocname == 'self':"
+    }
+  ],
+  "examples": [
+    "Reported: a toctree with :maxdepth: 1 and :caption: Indices and tables listing genindex, modindex, search builds with no warnings and shows three links.",
+    "Entries with explicit titles, e.g. `Index <genindex>`, link to the same pages using the given title.",
+    "A toctree with :numbered: or a project with numfig enabled: section and figure numbering skip these entries instead of looking up doctrees that do not exist.",
+    "LaTeX/singlehtml/texinfo builds, which inline toctree includefiles, do not try to inline these pages.",
+    "A toctree entry for a document that really does not exist (e.g. `foo`) still gives the nonexisting-document warning."
+  ],
+  "named_hints": [
+    "toctree directive",
+    ":ref:`genindex`, :ref:`modindex`, :ref:`search` (the usual way to link these pages)",
+    "toctree options :maxdepth: and :caption:"
+  ],
+  "related_sites": [
+    "/testbed/sphinx/directives/other.py:TocTree.parse_content \u2014 special-cases URLs and 'self' (added to entries but not includefiles); every other missing docname warns.",
+    "/testbed/sphinx/environment/adapters/toctree.py:TocTree.resolve \u2014 _entries_from_toctree builds reference nodes directly for URLs and 'self'; other refs use env.tocs[ref] and a KeyError produces the nonexisting-document warning.",
+    "/testbed/sphinx/environment/collectors/toctree.py:TocTreeCollector.assign_section_numbers \u2014 _walk_toctree skips URLs and 'self' before touching env.tocs.",
+    "/testbed/sphinx/environment/collectors/toctree.py:TocTreeCollector.assign_figure_numbers \u2014 _walk_doctree skips URLs and 'self'; otherwise _walk_doc calls env.get_doctree(docname).",
+    "/testbed/sphinx/domains/std.py:StandardDomain.initial_data \u2014 the existing map from genindex/modindex/search to their page docnames and titles used by :ref:.",
+    "/testbed/sphinx/builders/html/__init__.py:StandaloneHTMLBuilder.handle_page \u2014 hasdoc() treats 'search' and 'genindex' as existing only when the builder generates them.",
+    "/testbed/sphinx/environment/adapters/toctree.py:TocTree.note \u2014 records includefiles into toctree_includes/files_to_rebuild.",
+    "/testbed/sphinx/util/nodes.py:inline_all_toctrees \u2014 inlines includefiles for single-document builders."
+  ],
+  "open_questions": [
+    "Should the links be shown when the target page is not generated (html_use_index off, no module index, search disabled, non-HTML builders)?",
+    "How to treat these names from a document in a subdirectory, where docname_join would turn 'genindex' into 'sub/genindex'.",
+    "What happens if a project has a real source document named genindex, modindex or search.",
+    "Whether the link title should come from the std domain labels or from elsewhere."
+  ]
+}

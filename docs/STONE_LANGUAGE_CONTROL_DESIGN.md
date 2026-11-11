@@ -8,7 +8,9 @@ after an LLM pilot (11.2): effects fall into three tiers, and models declare
 only irreversible effects. Milestones M1-M5 have implemented part of P1
 (Section 14 marks each item **done**). Draft v3.2 adds the checks-as-feedback
 framing (1.1), the typed-workflow pilot on SWE-bench (11.3), and the
-plan-check proposal it motivates (L12, 5.2). Items marked **H-n** are
+plan-check proposal it motivates (L12, 5.2). Sections 11.5 and 11.6
+(2026-11-10) record the task spec experiments that followed and the design of
+the next one, with the reason for each part of its template. Items marked **H-n** are
 hypotheses to test, **L-n** are language decisions (Section 7), and **R-n**
 are review decisions (Section 3).
 
@@ -2085,7 +2087,8 @@ both arms, with 32 against 49 calls per run.
   It did not use the typed-workflow layer (`workflow`, `stage`, `ensure`,
   and the standard stage agent; 1.1). So it tested per-step checking, not
   that layer as built.
-- The harness and the workflow programs are not in this repository yet.
+- The harness and the workflow programs are archived in
+  `host/bench/swe_spec/`, with a per-run results table.
 
 **Not yet tested:**
 
@@ -2202,6 +2205,353 @@ This is the blame form of gradual-typing soundness (Wadler and Findler,
 - judgment assumptions that do not predict failure;
 - a static rule too coarse to separate legitimate uses of model output
   (choosing which file to read next) from decisions that need facts.
+
+### 11.5 Task Spec Experiments On SWE-bench (2026-11-08 to 2026-11-10)
+
+These follow 11.3 and test 11.4, then the idea they led to: write down what
+a correct fix must do before anyone fixes anything. Unless noted, every
+experiment uses 11.3's five tasks (django-11087, matplotlib-23299,
+pytest-7205, sphinx-10673, sympy-12489), Haiku 5.5 as the fixer with
+`model.limit(calls=60)`, the Gateway on the host, task images for commands,
+and the official SWE-bench harness for grading. "Wrong claim" means the
+program reported "verified" and the harness did not resolve the patch. The
+programs, harness scripts, task lists, a per-run results table, and the
+specs the models wrote are in `host/bench/swe_spec/` (11.6 says what is
+there).
+
+**Experiment 2: fact statuses and an independent cross-check (11.4, item
+2).** The typed arm of 11.3, rewritten as a `workflow` whose stages tag every
+fact as observed, verified, tested, or judgment. A second arm adds an
+independent reproduction: a script written in a separate step, without
+seeing the diagnosis, held out from the fixer, and run as an extra check.
+Haiku, three runs per task and arm.
+
+| | Statuses only | Statuses + cross-check |
+|---|---|---|
+| Resolved | 4/15 | 3/15 |
+| Claimed "verified" | 13: 9 wrong | 12: 9 wrong |
+| Extra model calls per run | | about 8 |
+
+- **The cross-check predicted nothing.** In every run that established it,
+  the second reproduction agreed with the first. It came from the same model
+  reading the same issue text, so it shared the first one's misreading. On
+  sympy-12489 both tested one construction path; the hidden test wraps the
+  whole suite in a subclass. The program reported "cross_checked: true" on 9
+  wrong runs.
+- **A check raises a fact's status only when its evidence has a different
+  origin from the claim.** Two model outputs from the same input are one
+  origin. This is an information-flow rule over origins, not a count of
+  agreeing checks.
+- **Causes of the 18 wrong claims:** 11 fixes narrower than the hidden tests
+  require (sympy, matplotlib, sphinx); 6 where the regression gate pushed
+  Haiku off the correct pytest fix; 1 where a reproduction demanded behavior
+  the correct django fix must not have.
+- **Existing tests are not automatically right about intent.** Qwen (thinking
+  off, one run per task) made a correct pytest-7205 fix that the program
+  refused, because `testing/test_setuponly.py` checks the old behavior that
+  the benchmark's own test patch changes. Haiku, from the other side,
+  narrowed its fix to keep those tests passing. A failed regression check is
+  evidence ("this changes tested behavior X") for whoever owns the goal, not
+  a gate that silently decides it.
+- **A model-written test command can be vacuous:** one baseline command ended
+  in `; echo exit=$?` and always exited 0.
+- **Step and call limits are assumptions about the model.** Qwen never
+  committed to a diagnosis within 20 steps and resolved 1/5 in every arm,
+  with no false claims in the workflow arms.
+
+**Correction (2026-11-09): the intent was in the environment.** Experiment
+2's write-up called pytest-7205 and matplotlib-23299 underspecified. The
+sources say otherwise:
+
+- pytest-7205: the issue ends "Shouldn't that be using `saferepr` or
+  something rather than (implicitly) `str()`?", which is the reference fix.
+  The ambiguity came from old tests disagreeing with the issue, and the
+  regression gate sided with the old tests.
+- matplotlib-23299: the issue gives only the symptom, but `rcdefaults`,
+  `rc_file_defaults` and `rc_file` all skip the keys in `STYLE_BLACKLIST`,
+  which includes `backend`. The reference fix makes `rc_context` follow the
+  same rule.
+- The other three were recoverable too. Django's `can_fast_delete` already
+  treats signal listeners as needing full objects; "subclassing" (sympy)
+  implies every constructor; Sphinx has more than one builder.
+
+The failures came from anchoring on the reported symptom, not from missing
+information. The intent sat in the issue's own words and in how sibling
+code handles the same case. Running code shows what the code does, not what
+is wanted. So a workflow needs a step where the model states the general
+rule a fix must satisfy, citing what each part rests on, and the program
+checks the fix against that rule beyond the reported case.
+
+**Experiment 3: does a typed task spec help, and does it matter who writes
+it?** The only change across arms is a typed `TaskSpec` (symptom, rule,
+decisions, scope) handed to the experiment 2 fixer. Arms: A, no spec; B,
+written by Haiku; C, written by Sonnet 5.5; D, written once per task by a
+fresh Opus 5.5 agent that saw only the issue and the code. Three runs per
+task and arm.
+
+| | A none | B Haiku | C Sonnet | D Opus |
+|---|---|---|---|---|
+| Resolved | 3/15 | 4/15 | 7/15 | 3/15 |
+| Wrong claims | 11 | 10 | 6 | 10 |
+
+- **Haiku follows a spec's rule literally.** Matplotlib resolved only in the
+  two runs whose spec said to leave `backend` out of `rc_context`'s
+  save/restore. D's spec said "don't restore the auto sentinel", which is
+  narrower than the real rule; Haiku built exactly that and failed 3/3.
+- **Pytest failed in all 15 runs of every arm:** the fixes kept strings
+  unquoted so the existing tests passed, even when D's spec warned that
+  those expectations must change. The existing-test gate overrode the spec.
+- C also produced 2 working django fixes that Haiku reported as "not
+  verified".
+- A spec steers the fix strongly, but nothing checks that its rule is right,
+  and false claims stay high.
+
+**Experiment 4: spec v2, with runnable cases.** Four tasks (sphinx dropped:
+every arm resolved it in experiment 3). The spec now holds a rule; decisions
+(choice, rejected options, basis: issue, code convention, or guess, with
+verbatim quotes); runnable cases (scratch files, a command, and a Stone
+`predicate()` over its result), each marked "changes" (fails now) or "keeps"
+(passes now); `changes_existing` (existing tests the rule changes); and
+scope. Before any fix, the program runs every case on the unfixed code and
+checks the quotes, sending problems back up to 3 rounds. The fixer must pass
+every case, and tests in `changes_existing` are exempt from the regression
+gate. Three runs per task and arm.
+
+| | B Haiku writes | C Sonnet writes |
+|---|---|---|
+| Resolved | 0/12 | 9/12 |
+| Wrong claims | 9 | 3 |
+| Same tasks, experiment 3 | 1/12 | 4/12 |
+
+- **Pytest went from 0/15 to 3/3** once Sonnet's spec listed the 3 existing
+  tests as `changes_existing`, together with cases requiring quoted strings.
+  Matplotlib 3/3, django 2/2 with a spec, sympy 1/3.
+- **Every Haiku spec passed the checks yet decided the key question wrong:**
+  pytest kept strings unquoted (marked "guess"), matplotlib got a
+  symptom-level rule, django the wrong column set. The checks make a spec
+  consistent with the code, not right.
+- **The "guess" label did not separate right from wrong decisions.** Sonnet
+  also marked its correct quoting decision as a guess.
+- **Sympy** is wider than any spec: its hidden test reruns the whole
+  Permutation suite on a subclass.
+- One Sonnet spec run got provider HTTP 500 three times in a row and counts
+  as no spec. The Gateway labels every provider error as an invalid request
+  that is not worth retrying.
+
+**Experiment 5: does the model need to design the spec's type?** A model
+first designs the spec's type as typed data (fields of text, choice,
+decisions, quotes, files, and so on, plus the fixed cases, existing tests,
+and scope); Stone generates a module from it, and a second program fills it
+in. Same four tasks and Haiku fixer. Arms: E, Haiku designs and fills; F,
+Sonnet designs and Haiku fills; G, Sonnet designs and fills.
+
+| | E Haiku/Haiku | F Sonnet/Haiku | G Sonnet/Sonnet |
+|---|---|---|---|
+| Resolved | 2/12 | 2/12 (2/9 with a spec) | 6/12 (6/8 with a spec) |
+| Wrong claims | 8 | 6 | 3 |
+| Runs that lost their spec | 0 | 3 | 4 |
+
+- **Every design named the deciding question,** Haiku's included. All 9
+  pytest designs asked "quoted or bare", and every matplotlib design offered
+  `rc_context` as a fix location.
+- **The filler's answer decided the outcome.** Pytest: Haiku fills chose
+  quoting 1/5, Sonnet fills 2/2. Matplotlib resolved exactly when the fill
+  said to leave `backend` out of `rc_context`'s save/restore. A Sonnet
+  design helped a Haiku filler only when a choice option spelled out the
+  right rule (matplotlib, F, 2/3).
+- **Designing the type did not beat the fixed type** (G 6/12 against
+  experiment 4's 9/12), though lost specs blur the comparison. Type design
+  was cheap: 1-2 Sonnet calls on most tasks, 8-14 on matplotlib.
+- **Lost specs came from two bugs the runtime should have handled:** under
+  the Gateway, `stat()` on a missing path raised a generic `ToolError`
+  instead of `FileNotFoundError`, so our checker's `except
+  FileNotFoundError` was skipped (3 F runs); and provider HTTP 500s were not
+  retried (4 G runs, all Sonnet).
+
+**What the five experiments say together.**
+
+1. Program checks against the world catch invented work (11.3's Luna runs),
+   but they do not catch wrong fixes. Whether a fix is right is a question
+   about the target program's spec, which a SWE task does not state
+   formally.
+2. Lacking a formal spec, the agent can only judge through the project's
+   test infrastructure: reject bad inputs and executions, preserve good
+   ones. Its own reproduction, and a second one from the same model, give
+   false confidence; existing tests can encode the behavior the issue asks
+   to change.
+3. Failures came from fixing the symptom. The intent was in the issue text
+   and in codebase conventions.
+4. A task spec steers the fix strongly, so the spec's quality decides the
+   result. A strong writer with a cheap fixer worked (9/12); a cheap writer
+   did worse than no spec.
+5. Even a cheap model names the questions a task turns on. Answering them
+   needs the strong model. The spec's type is ours to fix; only the
+   per-task questions come from the model.
+
+Caveats: four or five tasks, three runs per cell, and by experiment 5 we
+knew these tasks well. Differences such as 9 against 6 are suggestive, not
+settled.
+
+### 11.6 Experiment 6 Design: Tests As Gates (Set Up 2026-11-10, Not Run)
+
+**Framing.** A SWE-bench fix is graded by tests, so the hidden tests are the
+spec of record; the reference fix is one patch that passes them, not the
+spec. The grader uses three test sets: new tests that must start passing,
+existing tests that must keep passing, and existing tests whose expectations
+the fix revises. The task spec is the agent's guess at each set, plus the
+decisions behind them, written and checked before anyone fixes anything.
+
+**The template.** The program owns it; it is the same for every task. Only
+the decisions are per task.
+
+```python
+class Decision(BaseModel):          # the per-task part
+    id: str                         # D1, D2, ...
+    question: str
+    options: list[str]              # 2-4
+    choice: str
+    source: Literal["issue", "code_convention", "existing_test", "guess"]
+    evidence: list[Quote]           # verbatim; empty only for a guess
+
+class NewTest(BaseModel):           # ~ hidden tests that must start passing
+    name: str
+    kind: Literal["fail_to_pass", "pass_to_pass"]
+    reach: Literal["reported", "wider"]
+    checks: str                     # a decision id, or "rule"
+    files: list[ScratchFile]
+    command: list[str]
+    expect: str                     # Stone predicate over the result r
+    source: Literal["issue", "code_convention", "existing_test", "guess"]
+
+class RevisedTest(BaseModel):       # ~ existing tests whose expectation changes
+    test: str                       # /testbed/path::name
+    old_assertion: str              # copied exactly
+    replaced_by: str                # the NewTest stating the new expectation
+    reason: str
+
+class TaskSpec(BaseModel):
+    symptom: str
+    rule: str                       # general behavior, all inputs it covers
+    decisions: list[Decision]
+    new_tests: list[NewTest]
+    keep: list[str]                 # ~ existing tests that must keep passing
+    revised: list[RevisedTest]
+    scope: list[str]                # reported, not enforced
+```
+
+**Why each part is there.**
+
+| Design choice | Because |
+|---|---|
+| A spec step before any fix | Failures came from fixing the symptom (correction); a spec steers the fix strongly (experiments 3-4) |
+| The template is fixed, not designed by a model | Model-designed types did not beat the fixed one (experiment 5), and the program runs and checks most fields, so they need a stable type |
+| Per-task decisions with options | Every model, Haiku included, named the deciding question (experiment 5) |
+| Each decision cites a source, with verbatim quotes | The intent was in the issue and in codebase conventions (correction); quotes are checked, so they cannot be invented |
+| At least one `wider` fail-to-pass test | Most wrong claims were fixes narrower than the hidden tests (experiments 2-3) |
+| Each new test names the decision it checks, and every decision needs a test | Closes the gap where nothing tied the tests to the decisions (experiment 4's Haiku specs) |
+| `revised`, each naming its replacement test | Pytest: the old tests encoded the behavior the issue changes, and the gate sided with them (experiments 2-3); listing them solved it (experiment 4) |
+| `keep` commands come with a baseline run | A regression check with nothing to check passed silently (11.3); a model-written command can be vacuous (experiment 2) |
+| The fixer never writes its own success tests | Its own reproduction gave false confidence (11.3), and a second one from the same model added nothing (experiment 2) |
+| Objections go back once to the judgment's owner | Haiku follows a spec literally (experiment 3), so a wrong test is otherwise fatal; the route is explicit and logged |
+| A final verifier the fixer does not control | Leftover scratch files and untracked files could fake a pass; the `keep` list may be too narrow |
+| Specs graded against the hidden tests | The smoke run's spec rejected the reference fix on an input where the reference still raises; the reference fix is not the spec |
+
+**Gates.**
+
+- **Gate 1, the spec gate,** on the unfixed code. Every fail-to-pass test
+  fails and every pass-to-pass test passes; at least one fail-to-pass test
+  is `wider`; every `keep` command runs and at least one passes (this is the
+  baseline); every revised test exists, its old assertion is quoted exactly,
+  and its replacement is a fail-to-pass test; every decision has a test and
+  every quote is verbatim. Problems go back to the writer for up to 3
+  rounds. The spec is then frozen with a hash.
+- **Gate 2, the fix gate,** after every fix round: every new test passes;
+  every `keep` command that passed at baseline still passes, apart from
+  failures in revised tests; `git diff` is not empty and shows every file the
+  fixer lists. Failures go back to the fixer, for up to 3 rounds.
+- **The route back.** The fixer may object to a named test, decision, or the
+  rule. The first objections that come with a rejected fix go once to the
+  judgment's owner (the writer, or the strong model in the split setup),
+  who upholds the spec or revises it. A revision must pass gate 1 again: the
+  program sets the fixer's work aside, checks the revision on the unfixed
+  code, and puts the work back.
+- **The final verifier.** It returns the tree to the unfixed code, applies
+  only the graded patch (plain `git diff`), and runs gate 2 again. It also
+  runs a wider regression check: the existing test files for the changed
+  functions or modules, before and after the patch, reporting tests that
+  newly fail. Its verdict is a typed record: the spec and patch hashes, each
+  test's result, regressions, files outside the scope, the fixer's
+  objections and the owner's decision, and the assumptions (decisions with
+  source "guess"). The outcome is `verified`, `not_verified`, or
+  `spec_disputed` (the only failures are tests the fixer objected to).
+
+**Setups.** Haiku fixes in every setup. One Stone program per run calls
+both models, choosing per call with `model.ask(..., model=...)`.
+
+| Setup | Who fills the template | What it answers |
+|---|---|---|
+| none | nobody (the experiment 2 workflow) | the baseline |
+| single_strong | Sonnet, all of it | does a strong spec writer help with this template? |
+| single_default | Haiku, all of it | does the strong model matter at all? |
+| split | Haiku lists the questions, Sonnet decides them, Haiku writes the tests | is the strong model needed only for the decisions? |
+
+**Tasks.** Eight fresh SWE-bench Verified tasks, one per repository, drawn
+with a fixed seed from the "15 min - 1 hour" tier, excluding the five above:
+django-16485, sympy-23413, sphinx-11445, matplotlib-26291,
+scikit-learn-14087, astropy-12907, xarray-2905, pytest-5840. Planned: two
+runs per task and setup, 64 runs.
+
+**Grading a spec on its own.** For each task, the patches are the reference
+fix and every distinct patch the runs produce, each with its hidden-test
+verdict. Each spec is applied to each patch (its new tests and its `keep`
+commands, with revised tests exempt) and classed as:
+
+- **agrees:** accepts exactly the patches the hidden tests accept;
+- **compatible:** disagrees somewhere, but some patch passes both (for
+  example, stricter than the hidden tests);
+- **contrary:** no patch passes both. These are read by hand.
+
+The spec's `revised` list is compared with the existing tests whose old
+lines the real test patch removes or changes. Tests it only adds lines to
+count as extended, not revised. On the eight tasks: sympy has 1 revised
+test, scikit-learn 2, pytest 4, and the others none.
+
+**Smoke runs (django-16485, split setup).** Both were resolved by the
+harness and verified by the program. In the second run (the template above),
+Haiku asked 5 questions, Sonnet decided them in 5 calls (one marked a
+guess), Haiku wrote 7 tests covering every decision, and Haiku fixed it in
+one round, in 17 + 5 + 8 calls and about 20 minutes. The spec rejected the
+reference fix: two of its wider tests (zero with a positive number of
+places, and zero with a large negative exponent) fail on it, and the
+reference still raises `ValueError` there. Graded against the hidden tests,
+the spec is compatible.
+
+**Fixed before running.**
+
+- Gateway file errors are typed by OS error number and kind suffix, so a
+  missing workspace path raises `FileNotFoundError` (it arrives as
+  `workspace_path_not_found`).
+- Model calls retry temporary provider failures (HTTP 408, 409, 429, 5xx,
+  529, dropped connections) up to 3 times, after 1, 4, and 16 seconds; a
+  persistent failure or a refusal raises the host-only `ModelProviderError`
+  with `status`, `retryable`, and `attempts`. Checked live against a
+  Gateway.
+- The launcher sets the Gateway's default model (`WAYMARK_MODEL_DEFAULT`)
+  instead of forcing one (`WAYMARK_MODEL`), so a per-call `model=` takes
+  effect within one provider.
+
+**Stone gaps found while writing the programs** (not fixed yet):
+
+- no `zip` builtin;
+- unpacking into an item (`a, d["k"] = f()`) is not supported;
+- record class names are global across modules (the error says so clearly).
+
+**Limits.** Nothing checks that a test's expected output is right, only that
+it is consistent with the unfixed code; a wider test whose expected output
+was a guess can make a spec contrary. The wider regression check finds test
+files by name and by module path, which can miss the relevant tests.
+"Revised" is read from the test patch's changed lines, so a refactored line
+also counts.
 
 ## 12. Uncertainties
 

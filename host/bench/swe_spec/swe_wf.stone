@@ -1,0 +1,254 @@
+"""Experiment 2 (H-16): the typed arm written as an evidence-gated workflow,
+with every fact the outcome rests on tagged by status.
+
+Statuses:
+- observed: read from the environment;
+- verified: a model claim checked against the environment;
+- tested: a model proposal (a script, a patch) run in the environment;
+- judgment: something only a model judged, listed as an assumption unless
+  an independent check backs it (cross_checked).
+
+Stages: environment -> [independent reproduction] -> diagnose -> fix. The
+agent loop, tools, step limits and budget are the same as swe_typed."""
+from swe_loop import Read, Search, Shell, Edit, Write, user, clip, final_patch, work, shell, shell_text
+
+
+class Diagnosis(BaseModel):
+    """Your findings. Before any edit, the workflow checks them: every file must exist, the reproduction is run now and must fail, and the tests are run now; after your fix the reproduction must pass and every test that passed now must still pass."""
+    kind: Literal["done"]
+    files: list[str] = Field(min_length=1, max_length=8, description="absolute paths of the source files that need to change")
+    root_cause: str = Field(min_length=1)
+    reproduction: str = Field(min_length=1, description="a complete Python script that exits with a nonzero status while the bug is present and with status 0 once it is fixed")
+    tests: list[str] = Field(min_length=1, max_length=5, description="shell commands, run in /testbed, that run existing tests of the code you will change; at least one must pass now")
+
+
+class FixReport(BaseModel):
+    """Your fix. The workflow then checks it: the reproduction must pass, the tests that passed before must still pass, and every file you list must appear in git diff."""
+    kind: Literal["done"]
+    changed: list[str] = Field(min_length=1, description="absolute paths of the files you changed")
+    explanation: str = Field(min_length=1)
+
+
+class Repro(BaseModel):
+    """Your reproduction script."""
+    kind: Literal["done"]
+    reproduction: str = Field(min_length=1, description="a complete Python script that exits with a nonzero status while the bug is present and with status 0 once it is fixed")
+
+
+def fact(state, claim, status, check, against):
+    state["facts"].append({"claim": claim, "status": status, "check": check, "against": against})
+
+
+def write_script(path, text):
+    shell("cat > " + path, 30, text, Expect(exit=0))
+
+
+def check_diagnosis(found):
+    """Run the diagnosis's checks; return the problems and the test baseline."""
+    problems = []
+    for path in found.files:
+        try:
+            stat(path)
+        except FileNotFoundError as error:
+            problems.append("file " + path + " does not exist")
+    write_script("/tmp/repro.py", found.reproduction)
+    before = shell("python /tmp/repro.py", 300, None, None)
+    if before.exit_code == 0:
+        problems.append("the reproduction exits 0 on the unfixed code, so it does not show the bug:\n" + shell_text(before))
+    baseline = []
+    for command in found.tests:
+        result = shell(command, 600, None, None)
+        baseline.append({"command": command, "passed": result.exit_code == 0, "output": shell_text(result)})
+    if not [t for t in baseline if t["passed"]]:
+        outputs = "\n".join([t["command"] + "\n" + clip(t["output"], 1500) for t in baseline])
+        problems.append("none of your test commands passes on the unfixed code, so none can catch a regression; give at least one command that runs existing tests of this code and exits 0 now; what they did:\n" + outputs)
+    return {"problems": problems, "before": shell_text(before), "baseline": baseline}
+
+
+def check_fix(fix, reproduction, baseline):
+    """Run the fix's checks; return the failures (empty when the fix holds)."""
+    failures = []
+    changed = must_run(["git", "-C", "/testbed", "diff", "--name-only"]).stdout.splitlines()
+    if not changed:
+        failures.append("git diff is empty: no source file was changed")
+    for path in fix.changed:
+        relative = path[len("/testbed/"):] if path.startswith("/testbed/") else path
+        if relative not in changed:
+            failures.append("you listed " + path + " as changed, but git diff does not show it")
+    write_script("/tmp/repro.py", reproduction)
+    try:
+        shell("python /tmp/repro.py", 300, None, Expect(exit=0))
+    except ExpectationFailed as error:
+        failures.append("the reproduction still fails:\n" + shell_text(error.result))
+    for test in baseline:
+        if test["passed"]:
+            try:
+                shell(test["command"], 600, None, Expect(exit=0))
+            except ExpectationFailed as error:
+                failures.append("this test passed before your change and fails now: " + test["command"] + "\n" + shell_text(error.result))
+    return failures
+
+
+def solve(agent, problem, cross_check, spec=None):
+    intro = "Issue to resolve in /testbed:\n\n" + problem + "\n\n"
+    if spec is not None:
+        # Experiment 3: the same text for every spec source (B, C, D).
+        intro = intro + "A specification of this issue, written beforehand by an engineer who read the issue and the code. Use it as a guide, and check it against the code: it may be wrong or incomplete.\n" + json_dumps(spec) + "\n\n"
+    log = []
+    state = {"facts": [], "diagnosis": None, "checked": None, "problems": [], "messages": None,
+             "fix": None, "feedback": "", "fix_round": 0, "repro2": None, "repro2_status": "not_run", "repro2_tries": 0}
+
+    # Stage 1: the environment. Its assumptions are probed before anything else.
+    def env_action(step):
+        must_run(["git", "config", "--global", "--add", "safe.directory", "*"])
+        return {"ok": True}
+
+    def env_evidence(step):
+        git = run(["git", "-C", "/testbed", "status", "--porcelain", "--untracked-files=no"])
+        py = shell("python -c 'import sys; print(sys.version)'", 60, None, None)
+        log.append({"phase": "env", "kind": "probe", "git_exit": git.exit_code, "git_dirty": len(git.stdout.strip()) > 0,
+                    "python_exit": py.exit_code, "attempt": step["attempt"]})
+        if git.exit_code != 0:
+            return workflow_evidence(False, "git cannot read /testbed: " + clip(git.stderr, 300))
+        if git.stdout.strip():
+            return workflow_evidence(False, "the repository has uncommitted changes before any work")
+        if py.exit_code != 0:
+            return workflow_evidence(False, "the project's python does not run")
+        fact(state, "git can read /testbed and the tree is clean", "observed", "git status", "environment")
+        fact(state, "the project's python runs", "observed", "python -c", "environment")
+        return workflow_evidence(True, "environment ready", ["observed:git-clean", "observed:python"])
+
+    # Stage 2 (cross_check arm only): a reproduction written without seeing
+    # the diagnosis, held out from the fix step as an independent check.
+    def repro2_action(step):
+        state["repro2_tries"] = state["repro2_tries"] + 1
+        ask = intro + "Write a Python script that reproduces this issue: it must exit with a nonzero status while the bug is present and with status 0 once it is fixed. Investigate as needed. Do not edit any files under /testbed. Finish with the script."
+        if state["repro2"] is not None:
+            ask = ask + "\n\nYour previous script exited 0 on the unfixed code, so it did not show the bug:\n" + state["repro2"] + "\nWrite one that fails now."
+        state["repro2"] = None
+        r = work(agent, [user(ask)], Read | Search | Shell | Repro, 10, log, "repro2_" + str(state["repro2_tries"]))
+        if r is not None:
+            state["repro2"] = r.reproduction
+        return {"ok": r is not None}
+
+    def repro2_evidence(step):
+        # This check backs a judgment; when it cannot be established, the
+        # judgment stays unchecked and the workflow goes on. The kernel only
+        # knows satisfied/unsatisfied, so "gave up" is reported as satisfied.
+        if state["repro2"] is None:
+            if step["phase"] == "evidence_pre":
+                return workflow_evidence(False, "no independent reproduction yet")
+            if step["attempt"] >= 2:
+                state["repro2_status"] = "unavailable"
+                return workflow_evidence(True, "no independent reproduction; the judgment stays unchecked", ["judgment:unchecked"])
+            return workflow_evidence(False, "the reproduction step ended without a script")
+        write_script("/tmp/repro2.py", state["repro2"])
+        before = shell("python /tmp/repro2.py", 300, None, None)
+        log.append({"phase": "repro2", "kind": "check", "exit_before": before.exit_code})
+        if before.exit_code != 0:
+            state["repro2_status"] = "established"
+            fact(state, "an independent reproduction fails on the unfixed code", "tested", "python /tmp/repro2.py", "environment")
+            return workflow_evidence(True, "independent reproduction fails before the fix", ["tested:repro2-fails-before"])
+        if state["repro2_tries"] >= 2:
+            state["repro2_status"] = "unavailable"
+            return workflow_evidence(True, "independent reproduction did not show the bug; the judgment stays unchecked", ["judgment:unchecked"])
+        return workflow_evidence(False, "independent reproduction exits 0 on the unfixed code")
+
+    # Stage 3: diagnose, checked before any edit.
+    def diagnose_action(step):
+        if state["messages"] is None:
+            state["messages"] = [user(intro + "Step 1, explore: find the code involved and the root cause, and write a script that reproduces the issue. Do not edit source files yet. Finish with your diagnosis.")]
+            found = work(agent, state["messages"], Read | Search | Shell | Diagnosis, 20, log, "explore")
+        else:
+            if state["diagnosis"] is not None:
+                state["messages"].append({"role": "assistant", "content": json_dumps(state["diagnosis"])})
+            state["messages"].append(user("The workflow checked your diagnosis and found problems:\n" + "\n".join(state["problems"]) + "\nInvestigate and finish with a corrected diagnosis."))
+            found = work(agent, state["messages"], Read | Search | Shell | Diagnosis, 8, log, "explore_retry" + str(step["attempt"]))
+        if found is not None:
+            state["diagnosis"] = found
+        return {"ok": found is not None}
+
+    def diagnose_evidence(step):
+        found = state["diagnosis"]
+        if found is None:
+            state["problems"] = ["the explore step ended without a diagnosis"]
+            return workflow_evidence(False, "no diagnosis")
+        checked = check_diagnosis(found)
+        state["problems"] = checked["problems"]
+        log.append({"phase": "check_diagnosis", "kind": "check", "problems": [clip(p, 300) for p in checked["problems"]],
+                    "tests_passing": len([t for t in checked["baseline"] if t["passed"]]), "tests": len(checked["baseline"])})
+        if checked["problems"]:
+            return workflow_evidence(False, clip("diagnosis rejected: " + "; ".join(checked["problems"]), 900))
+        state["checked"] = checked
+        fact(state, "the files named in the diagnosis exist", "verified", "stat", "environment")
+        fact(state, "the reproduction fails on the unfixed code", "tested", "python /tmp/repro.py", "environment")
+        fact(state, str(len([t for t in checked["baseline"] if t["passed"]])) + " test command(s) pass before the change", "observed", "baseline tests", "environment")
+        return workflow_evidence(True, "diagnosis checked", ["verified:files-exist", "tested:repro-fails-before", "observed:baseline"])
+
+    # Stage 4: fix, checked against the diagnosis (and the held-out reproduction).
+    def fix_action(step):
+        state["fix_round"] = state["fix_round"] + 1
+        found = state["diagnosis"]
+        guards = [t["command"] for t in state["checked"]["baseline"] if t["passed"]]
+        contract = "The workflow will accept your fix only if: /tmp/repro.py (rewritten from the diagnosis) exits 0" + ("; these tests still pass: " + "; ".join(guards) if guards else "") + "; and every file you report as changed appears in git diff."
+        if cross_check and state["repro2_status"] == "established":
+            contract = contract + " An independent reproduction of the issue, which you have not seen, must also pass."
+        task = intro + "Diagnosis:\n" + json_dumps(found) + "\n\nThe reproduction on the unfixed code:\n" + state["checked"]["before"] + "\n\n" + state["feedback"] + "Steps 2-4: fix the source code; run /tmp/repro.py and the tests as you go. " + contract + " Finish with your fix report."
+        fix = work(agent, [user(task)], Read | Search | Shell | Edit | Write | FixReport, 25, log, "fix" + str(state["fix_round"]))
+        state["fix"] = fix
+        return {"ok": fix is not None}
+
+    def fix_evidence(step):
+        if step["phase"] == "evidence_pre":
+            return workflow_evidence(False, "no fix yet")
+        fix = state["fix"]
+        if fix is None:
+            failures = ["the fix step ended without a fix report"]
+        else:
+            failures = check_fix(fix, state["diagnosis"].reproduction, state["checked"]["baseline"])
+            if cross_check and state["repro2_status"] == "established":
+                write_script("/tmp/repro2.py", state["repro2"])
+                try:
+                    shell("python /tmp/repro2.py", 300, None, Expect(exit=0))
+                except ExpectationFailed as error:
+                    failures.append("an independent reproduction of the issue still fails:\n" + shell_text(error.result))
+        log.append({"phase": "verify" + str(state["fix_round"]), "kind": "check", "failures": [clip(f, 300) for f in failures]})
+        if failures:
+            state["feedback"] = "The workflow rejected the previous attempt:\n" + "\n".join(failures) + "\n\n"
+            return workflow_evidence(False, clip("fix rejected: " + "; ".join(failures), 900))
+        fact(state, "every file the fix report lists appears in git diff", "verified", "git diff --name-only", "environment")
+        fact(state, "the reproduction passes after the fix", "tested", "python /tmp/repro.py", "environment")
+        fact(state, "the tests that passed before still pass", "observed", "baseline tests", "environment")
+        if cross_check and state["repro2_status"] == "established":
+            fact(state, "the independent reproduction passes after the fix", "tested", "python /tmp/repro2.py", "environment")
+        return workflow_evidence(True, "fix checked", ["verified:changed-files", "tested:repro-passes", "observed:baseline-holds"])
+
+    env_stage = workflow_stage("environment", evidence=env_evidence, action=env_action, max_attempts=1)
+    diagnose_stage = workflow_stage("diagnose", evidence=diagnose_evidence, action=diagnose_action, max_attempts=3)
+    fix_stage = workflow_stage("fix", evidence=fix_evidence, action=fix_action, max_attempts=3)
+    if cross_check:
+        repro2_stage = workflow_stage("independent_repro", evidence=repro2_evidence, action=repro2_action, max_attempts=2)
+        plan = workflow("swe", env_stage, repro2_stage, diagnose_stage, fix_stage)
+    else:
+        plan = workflow("swe", env_stage, diagnose_stage, fix_stage)
+
+    outcome = "unfinished"
+    report = None
+    try:
+        report = workflow_run(plan)
+        outcome = "verified" if report.ok else "not_verified"
+    except Exception as error:
+        log.append({"phase": "stopped", "kind": error.type, "message": clip(error.message, 400)})
+        outcome = "stopped: " + error.type
+
+    backed = cross_check and state["repro2_status"] == "established"
+    assumptions = [
+        {"claim": "the reproduction captures the issue", "status": "judgment", "cross_checked": backed},
+        {"claim": "the tests chosen cover the changed code", "status": "judgment", "cross_checked": False},
+    ]
+    stages_out = []
+    if report is not None:
+        stages_out = [{"name": s.name, "status": s.status, "attempts": s.attempts, "evidence": s.evidence.summary} for s in report.stages]
+    return {"arm": "wf_check" if cross_check else "wf_status", "with_spec": spec is not None, "outcome": outcome, "patch": final_patch(),
+            "usage": agent.usage, "facts": state["facts"], "assumptions": assumptions,
+            "repro2": state["repro2_status"], "stages": stages_out, "log": log}

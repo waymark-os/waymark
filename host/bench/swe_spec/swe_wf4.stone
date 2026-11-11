@@ -1,0 +1,118 @@
+"""Experiment 6: the fixer for a frozen task spec. The fixer cannot change the
+spec and is checked only against it (gate 2), never against tests of its own.
+It may object to parts of the spec; the first objections that come with a
+rejected fix go back once to the spec's owner, who upholds the spec or
+revises it (a revision must pass gate 1 again on the unfixed code)."""
+from swe_loop import Read, Search, Shell, Edit, Write, user, clip, work, shell, shell_text
+from swe_cases import run_case
+from swe_wf2 import only_expected_failures
+from swe_plan import gate1, describe_test
+from swe_tree import set_aside, put_back
+
+
+class Objection(BaseModel):
+    """A part of the task spec you believe is wrong."""
+    target: str = Field(min_length=1, description="the name of a new test, a keep command, a revised test, a decision id, or \"rule\"")
+    reason: str = Field(min_length=1, description="why it is wrong, with the evidence (the issue line, the code)")
+
+
+class SpecFixReport(BaseModel):
+    """Your fix. The workflow then runs gate 2: every new test must pass, the keep commands must pass apart from the tests in revised, and every file you list must appear in git diff."""
+    kind: Literal["done"]
+    changed: list[str] = Field(min_length=1, description="absolute paths of the files you changed")
+    explanation: str = Field(min_length=1)
+    objections: list[Objection] = Field(max_length=3, description="parts of the task spec you believe are wrong; an empty list if none. You cannot change the spec; objections go to the engineer who wrote it.")
+
+
+def spec_text(spec):
+    return json_dumps({k: spec[k] for k in ["rule", "decisions", "new_tests", "keep", "revised", "scope"]})
+
+
+def gate2(spec, baseline):
+    """The fix gate. Returns (failures, per-test results)."""
+    failures = []
+    results = []
+    expected = [r["test"] for r in spec["revised"]]
+    for command in [k["command"] for k in baseline if k["passed"]]:
+        result = shell(command, 600, None, None)
+        ok = result.exit_code == 0 or only_expected_failures(result.stdout + "\n" + result.stderr, expected)
+        results.append({"keep": command, "passed": ok})
+        if not ok:
+            failures.append("this keep command passed before the fix and fails now: " + command + "\n" + shell_text(result))
+    for test in spec["new_tests"]:
+        outcome = run_case(test)
+        results.append({"test": test["name"], "kind": test["kind"], "passed": outcome["passed"] is True})
+        if outcome["passed"] is not True:
+            failures.append("the spec's test " + describe_test(test) + " does not pass" + (" (" + outcome["problem"] + ")" if outcome["problem"] else "") + ":\n" + clip(outcome["output"], 1500))
+    return failures, results
+
+
+def diff_failures(fix):
+    failures = []
+    changed = must_run(["git", "-C", "/testbed", "diff", "--name-only"]).stdout.splitlines()
+    if not changed:
+        failures.append("git diff is empty: no source file was changed")
+    for path in fix.changed:
+        relative = path[len("/testbed/"):] if path.startswith("/testbed/") else path
+        if relative not in changed:
+            failures.append("you listed " + path + " as changed, but git diff does not show it")
+    return failures
+
+
+def fix_with_spec(agent, problem, spec, baseline, revise, untracked, log):
+    """Fix the issue against the frozen spec. revise(spec, objections) asks the
+    spec's owner (or is None). Returns the final spec, its keep baseline, and
+    the fix record."""
+    intro = "Issue to resolve in /testbed:\n\n" + problem + "\n\n"
+    task = intro + "A task spec for this issue, written and checked beforehand by an engineer who read the issue and the code. It defines what a correct fix must do. Follow its rule and decisions. After your fix the workflow runs every new test (writing its files, running its command, and applying its expect predicate to the result) and the keep commands, and accepts the fix only if every new test passes and the keep commands pass apart from the tests in revised, which check the old behavior. You cannot change the spec; if you believe part of it is wrong, say so in objections.\n" + spec_text(spec) + "\n\nFind the code involved, fix it, and run the tests as you go. Finish with your fix report."
+    messages = [user(task)]
+    objections = []
+    revision = None
+    failures = []
+    rounds = 0
+    limit = 3
+    reported = False
+    while rounds < limit:
+        rounds += 1
+        steps = 35 if rounds == 1 else 12
+        fix = work(agent, messages, Read | Search | Shell | Edit | Write | SpecFixReport, steps, log, "fix" + str(rounds))
+        if fix is None:
+            log.append({"phase": "gate2_" + str(rounds), "kind": "check", "failures": ["no fix report"]})
+            break
+        reported = True
+        raised = [{"target": o.target, "reason": o.reason, "round": rounds} for o in fix.objections]
+        objections = objections + raised
+        failures = diff_failures(fix)
+        gate_failures, results = gate2(spec, baseline)
+        failures = failures + gate_failures
+        log.append({"phase": "gate2_" + str(rounds), "kind": "check", "failures": [clip(f, 300) for f in failures]})
+        if not failures:
+            break
+        note = ""
+        if raised and revision is None and revise is not None:
+            decision, new = revise(spec, raised)
+            revision = decision
+            if new is not None:
+                patch = set_aside(untracked)
+                problems, results1, new_baseline = gate1(new, problem)
+                put_back(patch)
+                revision["gate1_problems"] = [clip(p, 300) for p in problems]
+                if problems:
+                    revision["decision"] = "revision_failed_gate1"
+                    note = "Your objections were sent to the spec's author, who revised the spec, but the revision failed the spec checks, so the spec stays as it was."
+                else:
+                    spec = new
+                    baseline = new_baseline
+                    limit = rounds + 2
+                    failures, results = gate2(spec, baseline)
+                    failures = diff_failures(fix) + failures
+                    if not failures:
+                        break
+                    note = "Your objections were sent to the spec's author, who revised the spec (" + clip(decision["reason"], 600) + "). The revised spec:\n" + spec_text(spec) + "\n"
+            else:
+                note = "Your objections were sent to the spec's author, who kept the spec as it is: " + clip(decision["reason"], 800) + "\n"
+            log.append({"phase": "revise", "kind": "decision", "decision": revision["decision"]})
+        messages.append({"role": "assistant", "content": json_dumps(fix)})
+        messages.append(user(note + "The workflow ran the spec's gate and rejected the fix:\n" + "\n".join(failures) + "\n\nContinue fixing and finish with a new fix report."))
+    return spec, baseline, {"reported": reported, "fix_rounds": rounds, "failures": [clip(f, 600) for f in failures],
+                            "objections": objections, "revision": revision}

@@ -1,0 +1,9 @@
+from swe_loop import Read, Search, Shell, Note, user, SYSTEM
+PROBLEM = "__PROBLEM__"
+INTRO = "Issue to resolve in /testbed:\n\n" + PROBLEM + "\n\n"
+msgs = [user(INTRO + "Step 1, explore: find the code involved and the root cause. Do not edit anything yet. Finish with a report of the files involved, the root cause, how to reproduce the issue, and which existing tests cover this code.")]
+out = []
+for i in range(3):
+    a = model.ask(msgs, output=Read | Search | Shell | Note, system=SYSTEM, max_output_tokens=8000)
+    out.append(json_dumps(a))
+emit({"actions": out, "last": model.last})

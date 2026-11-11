@@ -1,0 +1,42 @@
+model  task           arm      claimed        resolved calls edits patch
+haiku  django-11087   typed    not_verified   False       55     2 1191
+haiku  django-11087   untyped  not_verified   False       53     3 535
+haiku  matplotlib-23299 typed    verified       True        29     4 663
+haiku  matplotlib-23299 untyped  verified       True        29     1 661
+haiku  pytest-7205    typed    verified       False       16     4 764
+haiku  pytest-7205    untyped  not_verified   False       45     7 1653
+haiku  sphinx-10673   typed    verified       True        31     5 2697
+haiku  sphinx-10673   untyped  not_verified   True        58     8 2530
+haiku  sympy-12489    typed    verified       False       30     5 1450
+haiku  sympy-12489    untyped  not_verified   False       58     8 2248
+luna   django-11087   typed    not_verified   False       25     0 0
+luna   django-11087   untyped  verified       False       22     1 498
+luna   matplotlib-23299 typed    not_verified   False        8     0 0
+luna   matplotlib-23299 untyped  verified       False       12     0 0
+luna   pytest-7205    typed    verified       False       17     3 764
+luna   pytest-7205    untyped  verified       False        5     0 0
+luna   sphinx-10673   typed    not_verified   False       10     0 0
+luna   sphinx-10673   untyped  verified       False        5     0 0
+luna   sympy-12489    typed    not_verified   False        8     0 0
+luna   sympy-12489    untyped  verified       False        5     0 0
+
+haiku django-11087 typed: explore@4:done [check_diagnosis: ok, tests 2/2] fix0@12:done [verify0: 1 problems] fix1@12:out_of_budget [verify1: 1 problems] fix2@0:out_of_budget [verify2: 1 problems]
+haiku django-11087 untyped: explore@2:done fix0@4:done [verify0: no] fix1@11:done [verify1: no] fix2@7:done [verify2: no]
+haiku matplotlib-23299 typed: explore@4:done [check_diagnosis: ok, tests 0/2] fix0@11:done [verify0: ok]
+haiku matplotlib-23299 untyped: explore@7:done fix0@9:done [verify0: VERIFIED]
+haiku pytest-7205 typed: explore@1:done [check_diagnosis: ok, tests 1/1] fix0@8:done [verify0: ok]
+haiku pytest-7205 untyped: explore@3:done fix0@8:done [verify0: no] fix1@8:done [verify1: no] fix2@6:done [verify2: no]
+haiku sphinx-10673 typed: explore@4:done [check_diagnosis: ok, tests 2/2] fix0@12:done [verify0: ok]
+haiku sphinx-10673 untyped: explore@4:done fix0@14:done [verify0: no] fix1@13:out_of_budget [verify1: no] fix2@0:out_of_budget [verify2: no]
+haiku sympy-12489 typed: explore@3:done [check_diagnosis: ok, tests 0/1] fix0@15:done [verify0: ok]
+haiku sympy-12489 untyped: explore@5:done fix0@16:done [verify0: no] fix1@10:out_of_budget [verify1: no] fix2@0:out_of_budget [verify2: no]
+luna django-11087 typed: explore@17:done [check_diagnosis: ok, tests 1/1] fix0@0:done [verify0: 3 problems] fix1@0:done [verify1: 3 problems] fix2@0:done [verify2: 3 problems]
+luna django-11087 untyped: explore@0:done fix0@0:done [verify0: no] fix1@10:done [verify1: no] fix2@0:done [verify2: VERIFIED]
+luna matplotlib-23299 typed: explore@0:done [check_diagnosis: ok, tests 0/1] fix0@0:done [verify0: 3 problems] fix1@0:done [verify1: 4 problems] fix2@0:done [verify2: 3 problems]
+luna matplotlib-23299 untyped: explore@0:done fix0@0:done [verify0: no] fix1@0:done [verify1: no] fix2@0:done [verify2: VERIFIED]
+luna pytest-7205 typed: explore@6:done [check_diagnosis: ok, tests 1/1] fix0@7:done [verify0: ok]
+luna pytest-7205 untyped: explore@0:done fix0@0:done [verify0: VERIFIED]
+luna sphinx-10673 typed: explore@0:done [check_diagnosis: 1 problems, tests 0/1] explore_retry0@0:done [check_diagnosis: ok, tests 0/1] fix0@0:done [verify0: 3 problems] fix1@0:done [verify1: 3 problems] fix2@0:done [verify2: 3 problems]
+luna sphinx-10673 untyped: explore@0:done fix0@0:done [verify0: VERIFIED]
+luna sympy-12489 typed: explore@0:done [check_diagnosis: ok, tests 0/1] fix0@0:done [verify0: 3 problems] fix1@0:done [verify1: 3 problems] fix2@0:done [verify2: 3 problems]
+luna sympy-12489 untyped: explore@0:done fix0@0:done [verify0: VERIFIED]

@@ -1,0 +1,2 @@
+r = run(["bash", "-lc", "cd /testbed && pwd && ls | head -5 && source /opt/miniconda3/bin/activate testbed && python -c 'import sklearn; print(sklearn.__version__)'"])
+emit(r)

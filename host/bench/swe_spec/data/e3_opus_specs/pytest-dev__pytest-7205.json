@@ -1,0 +1,62 @@
+{
+  "symptom": "With `python -bb -m pytest --setup-show` and a test parametrized with b'Hello World', the SETUP line formats the fixture parameter with \"[{}]\".format(fixturedef.cached_param), which calls str() on bytes. Under -bb that BytesWarning is an error, so the test errors at setup.",
+  "expected_rule": "When --setup-show (also turned on by --setup-only and --setup-plan) prints a fixture's parameter on the SETUP and TEARDOWN lines, it must use a safe representation (pytest's saferepr) instead of an implicit str(). Then any parameter value, including bytes, objects whose __str__/__repr__ raise, and very large values, is shown without warnings or exceptions.",
+  "rule_evidence": [
+    {
+      "source": "issue",
+      "quote": "Shouldn't that be using `saferepr` or something rather than (implicitly) `str()`?"
+    },
+    {
+      "source": "issue",
+      "quote": "BytesWarning: str() on a bytes instance"
+    },
+    {
+      "source": "/testbed/src/_pytest/setuponly.py",
+      "quote": "tw.write(\"[{}]\".format(fixturedef.cached_param))"
+    },
+    {
+      "source": "/testbed/src/_pytest/setuponly.py",
+      "quote": "fixturedef.cached_param = request.param"
+    },
+    {
+      "source": "/testbed/src/_pytest/_io/saferepr.py",
+      "quote": "def saferepr(obj: Any, maxsize: int = 240) -> str:"
+    },
+    {
+      "source": "/testbed/src/_pytest/_io/saferepr.py",
+      "quote": "care to never raise exceptions itself."
+    },
+    {
+      "source": "/testbed/src/_pytest/python.py",
+      "quote": "msg.format(func_name, saferepr(id_value), type(id_value), idx),"
+    }
+  ],
+  "examples": [
+    "Reported: @pytest.mark.parametrize('data', [b'Hello World']) run with `python3 -bb -m pytest --setup-show` passes and prints the param as a repr (e.g. [b'Hello World']) without BytesWarning.",
+    "Same bytes parameter with --setup-only and --setup-plan, which go through the same display code.",
+    "The TEARDOWN line, which prints cached_param through the same _show_fixture_action call.",
+    "A fixture with params=['foo', 'bar']: the shown value becomes the repr (['foo']), so existing output expectations like 'arg_same?foo?' need updating.",
+    "A parameter object whose __repr__ raises: output shows saferepr's placeholder instead of crashing the setup.",
+    "A fixture with ids= (list or callable): cached_param holds the id, and it is displayed through the same safe path."
+  ],
+  "named_hints": [
+    "saferepr",
+    "--setup-show",
+    "python -bb (BytesWarning as error)",
+    "implicit str() in _show_fixture_action"
+  ],
+  "related_sites": [
+    "/testbed/src/_pytest/setuponly.py:_show_fixture_action \u2014 the formatting site that calls str() implicitly via format().",
+    "/testbed/src/_pytest/setuponly.py:pytest_fixture_setup \u2014 stores cached_param from request.param or from fixturedef.ids.",
+    "/testbed/src/_pytest/_io/saferepr.py:saferepr \u2014 existing helper that never raises and limits size (maxsize).",
+    "/testbed/src/_pytest/python.py:Metafunc._validate_ids \u2014 uses saferepr to show a user-provided value in a message.",
+    "/testbed/src/_pytest/compat.py:ascii_escaped \u2014 handles bytes for test ids (used by _idval), the other existing way to show bytes.",
+    "/testbed/src/_pytest/setupplan.py:pytest_cmdline_main \u2014 --setup-plan turns on setuponly and setupshow, so it shares the path.",
+    "/testbed/testing/test_setuponly.py:test_show_fixtures_with_parameters \u2014 current expected output ('SETUP    S arg_same?foo?') depends on str() formatting."
+  ],
+  "open_questions": [
+    "saferepr (quotes strings, e.g. ['foo']) or an id-style rendering like ascii_escaped (matches test ids like test_data[Hello World])? The issue suggests saferepr.",
+    "What maxsize to use for truncating long parameter reprs.",
+    "Whether ids given via ids= (already strings) should also be shown as a repr."
+  ]
+}

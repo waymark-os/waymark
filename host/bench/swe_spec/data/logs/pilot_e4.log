@@ -1,0 +1,35 @@
+18:58:35 starting arms ['B', 'C'] reps 3 tag -e4: 24 jobs
+19:08:51 done C django__django-11087: claimed=verified resolved=True calls=15 guesses=0 scope_extra=0 spec_calls=21 spec_problems=0 check_rounds=0 616s 20261109-190316-haiku-swe_wf_spec2-django-11087-e4C1
+19:13:44 done B pytest-dev__pytest-7205: claimed=verified resolved=False calls=15 guesses=2 scope_extra=0 spec_calls=4 spec_problems=0 check_rounds=0 293s 20261109-190923-haiku-swe_wf_spec2-pytest-7205-e4B1
+19:17:50 done C pytest-dev__pytest-7205: claimed=verified resolved=True calls=14 guesses=1 scope_extra=0 spec_calls=13 spec_problems=0 check_rounds=0 246s 20261109-191608-haiku-swe_wf_spec2-pytest-7205-e4C1
+19:19:40 done B matplotlib__matplotlib-23299: claimed=not_verified resolved=False calls=56 guesses=0 scope_extra=0 spec_calls=13 spec_problems=0 check_rounds=0 1266s 20261109-190435-haiku-swe_wf_spec2-matplotlib-23299-e4B1
+19:20:48 done B django__django-11087: claimed=not_verified resolved=False calls=56 guesses=3 scope_extra=0 spec_calls=15 spec_problems=0 check_rounds=0 1333s 20261109-190222-haiku-swe_wf_spec2-django-11087-e4B1
+19:23:21 done B sympy__sympy-12489: claimed=verified resolved=False calls=13 guesses=2 scope_extra=0 spec_calls=7 spec_problems=0 check_rounds=1 330s 20261109-192006-haiku-swe_wf_spec2-sympy-12489-e4B1
+19:24:08 done C matplotlib__matplotlib-23299: claimed=verified resolved=True calls=17 guesses=1 scope_extra=0 spec_calls=29 spec_problems=0 check_rounds=0 1534s 20261109-191040-haiku-swe_wf_spec2-matplotlib-23299-e4C1
+19:28:40 done C sympy__sympy-12489: claimed=not_verified resolved=True calls=55 guesses=2 scope_extra=0 spec_calls=19 spec_problems=0 check_rounds=0 540s 20261109-192322-haiku-swe_wf_spec2-sympy-12489-e4C1
+19:31:34 done B django__django-11087: claimed=verified resolved=False calls=15 guesses=1 scope_extra=0 spec_calls=9 spec_problems=0 check_rounds=1 646s 20261109-192403-haiku-swe_wf_spec2-django-11087-e4B2
+19:33:41 done B pytest-dev__pytest-7205: claimed=verified resolved=False calls=12 guesses=3 scope_extra=0 spec_calls=4 spec_problems=0 check_rounds=0 127s 20261109-193206-haiku-swe_wf_spec2-pytest-7205-e4B2
+19:37:45 done C pytest-dev__pytest-7205: claimed=verified resolved=True calls=10 guesses=1 scope_extra=0 spec_calls=9 spec_problems=0 check_rounds=0 243s 20261109-193542-haiku-swe_wf_spec2-pytest-7205-e4C2
+19:42:17 done C django__django-11087: claimed=not_verified resolved=True calls=55 guesses=0 scope_extra=0 spec_calls=27 spec_problems=0 check_rounds=0 1136s 20261109-192922-haiku-swe_wf_spec2-django-11087-e4C2
+19:42:20 done B sympy__sympy-12489: claimed=verified resolved=False calls=17 guesses=1 scope_extra=0 spec_calls=4 spec_problems=0 check_rounds=0 275s 20261109-193902-haiku-swe_wf_spec2-sympy-12489-e4B2
+19:45:00 done B matplotlib__matplotlib-23299: claimed=verified resolved=False calls=24 guesses=2 scope_extra=0 spec_calls=3 spec_problems=0 check_rounds=1 1251s 20261109-193030-haiku-swe_wf_spec2-matplotlib-23299-e4B2
+19:45:51 NOSPEC C django__django-11087 -e4C3: the spec writer produced no spec; fixer runs without one
+19:51:57 done C sympy__sympy-12489: claimed=verified resolved=False calls=53 guesses=0 scope_extra=0 spec_calls=19 spec_problems=0 check_rounds=0 580s 20261109-194656-haiku-swe_wf_spec2-sympy-12489-e4C2
+19:54:06 done C matplotlib__matplotlib-23299: claimed=verified resolved=True calls=16 guesses=0 scope_extra=0 spec_calls=26 spec_problems=0 check_rounds=0 1525s 20261109-193928-haiku-swe_wf_spec2-matplotlib-23299-e4C2
+19:58:23 done C django__django-11087: claimed=not_verified resolved=False calls=56 guesses=0 scope_extra=0 spec_calls=None spec_problems=0 check_rounds=None spec=missing 803s 20261109-194551-haiku-swe_wf_spec2-django-11087-e4C3
+20:00:21 done B django__django-11087: claimed=not_verified resolved=False calls=55 guesses=1 scope_extra=0 spec_calls=13 spec_problems=0 check_rounds=0 1081s 20261109-194508-haiku-swe_wf_spec2-django-11087-e4B3
+20:01:28 done B pytest-dev__pytest-7205: claimed=verified resolved=False calls=11 guesses=2 scope_extra=0 spec_calls=5 spec_problems=0 check_rounds=0 185s 20261109-195910-haiku-swe_wf_spec2-pytest-7205-e4B3
+20:05:14 done C pytest-dev__pytest-7205: claimed=verified resolved=True calls=11 guesses=2 scope_extra=0 spec_calls=14 spec_problems=0 check_rounds=0 292s 20261109-200338-haiku-swe_wf_spec2-pytest-7205-e4C3
+20:07:01 done B sympy__sympy-12489: claimed=verified resolved=False calls=33 guesses=1 scope_extra=0 spec_calls=5 spec_problems=0 check_rounds=0 333s 20261109-200251-haiku-swe_wf_spec2-sympy-12489-e4B3
+20:13:12 done C sympy__sympy-12489: claimed=verified resolved=False calls=28 guesses=0 scope_extra=0 spec_calls=17 spec_problems=0 check_rounds=0 479s 20261109-200920-haiku-swe_wf_spec2-sympy-12489-e4C3
+20:22:14 done B matplotlib__matplotlib-23299: claimed=verified resolved=False calls=26 guesses=0 scope_extra=0 spec_calls=9 spec_problems=0 check_rounds=1 1817s 20261109-200409-haiku-swe_wf_spec2-matplotlib-23299-e4B3
+20:23:17 done C matplotlib__matplotlib-23299: claimed=verified resolved=True calls=17 guesses=1 scope_extra=0 spec_calls=24 spec_problems=0 check_rounds=0 1751s 20261109-200705-haiku-swe_wf_spec2-matplotlib-23299-e4C3
+20:23:17 all done
+20:24:27 starting arms ['B', 'C'] reps 3 tag -e4: 1 jobs
+20:25:18 NOSPEC C django__django-11087 -e4C3: the spec writer produced no spec; fixer runs without one
+20:29:03 done C django__django-11087: claimed=verified resolved=False calls=14 guesses=0 scope_extra=0 spec_calls=None spec_problems=0 check_rounds=None spec=missing 277s 20261109-202518-haiku-swe_wf_spec2-django-11087-e4C3
+20:29:03 all done
+20:29:29 starting arms ['B', 'C'] reps 3 tag -e4: 1 jobs
+20:30:32 NOSPEC C django__django-11087 -e4C3: the spec writer produced no spec; fixer runs without one
+20:37:34 done C django__django-11087: claimed=verified resolved=False calls=30 guesses=0 scope_extra=0 spec_calls=None spec_problems=0 check_rounds=None spec=missing 485s 20261109-203032-haiku-swe_wf_spec2-django-11087-e4C3
+20:37:34 all done

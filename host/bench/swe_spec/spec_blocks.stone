@@ -1,0 +1,38 @@
+"""Checkable building blocks a specification type may use, shared by the
+fixed spec v2 and model-designed spec types (experiment 5)."""
+from swe_loop import clip, shell
+
+
+class Evidence(BaseModel):
+    """A verbatim quote."""
+    source: str = Field(min_length=1, description="\"issue\", or the absolute path of a file under /testbed")
+    quote: str = Field(min_length=1, description="text copied exactly from that source (one or a few lines)")
+
+
+class Decision(BaseModel):
+    """A question the issue leaves open, and your answer to it."""
+    question: str = Field(min_length=1)
+    choice: str = Field(min_length=1)
+    rejected: list[str] = Field(max_length=4, description="the alternatives you considered and rejected")
+    basis: Literal["issue", "code_convention", "guess"]
+    evidence: list[Evidence] = Field(max_length=2, description="verbatim quotes that support the choice; empty for a guess")
+
+
+def squash(text):
+    return " ".join(text.split())
+
+
+def check_quote(item, problem):
+    """item is a dict with source and quote. Returns a problem or None."""
+    if item["source"] == "issue":
+        if squash(item["quote"]) not in squash(problem):
+            return "this quote is not in the issue text: " + clip(item["quote"], 200)
+        return None
+    if not item["source"].startswith("/testbed/"):
+        return "source must be \"issue\" or an absolute path under /testbed: " + item["source"]
+    result = shell("cat " + item["source"], 60, None, None)
+    if result.exit_code != 0:
+        return "cannot read " + item["source"]
+    if squash(item["quote"]) not in squash(result.stdout):
+        return "this quote is not in " + item["source"] + ": " + clip(item["quote"], 200)
+    return None

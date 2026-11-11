@@ -1,0 +1,6 @@
+"""Experiment 5: the wf_status workflow given a model-designed spec (cases as acceptance checks)."""
+from swe_wf3 import solve
+
+PROBLEM = "__PROBLEM__"
+SPEC = "__SPEC__"
+emit(solve(model.limit(calls=60), PROBLEM, False, SPEC))

@@ -1,0 +1,138 @@
+"""Experiment 4: spec v2. The spec writer turns the issue into a rule, decided
+questions, and runnable cases (scratch files + a command + a Stone predicate
+on its result). The workflow checks the spec against the code before anyone
+fixes anything: every "changes" case must fail now, every "keeps" case must
+pass now, every listed existing test and scope file must exist, and every
+quote must appear verbatim. It still cannot check that the rule is right."""
+from swe_loop import Read, Search, Shell, user, clip, work, shell
+from swe_cases import Case, ScratchFile, case_dict, run_case, describe_case
+
+SPEC_PROBLEM = "__PROBLEM__"
+
+
+class Evidence(BaseModel):
+    """A verbatim quote."""
+    source: str = Field(min_length=1, description="\"issue\", or the absolute path of a file under /testbed")
+    quote: str = Field(min_length=1, description="text copied exactly from that source (one or a few lines)")
+
+
+class Decision(BaseModel):
+    """A question the issue leaves open, and your answer to it."""
+    question: str = Field(min_length=1)
+    choice: str = Field(min_length=1)
+    rejected: list[str] = Field(max_length=4, description="the alternatives you considered and rejected")
+    basis: Literal["issue", "code_convention", "guess"]
+    evidence: list[Evidence] = Field(max_length=2, description="verbatim quotes that support the choice; empty for a guess")
+
+
+class TaskSpec(BaseModel):
+    """Your specification of what a correct fix must do. The workflow runs every case on the current code and checks the rest against the repository."""
+    kind: Literal["done"]
+    symptom: str = Field(min_length=1, description="what the issue reports going wrong, in the reported case")
+    rule: str = Field(min_length=1, max_length=700, description="the general behavior a correct fix must have, in one to three sentences, stated for all the inputs it covers")
+    cases: list[Case] = Field(min_length=2, max_length=6)
+    decisions: list[Decision] = Field(max_length=6)
+    changes_existing: list[str] = Field(max_length=10, description="existing tests whose expectations the rule changes, so they fail after a correct fix, as /testbed/path/test_file.py::test_name")
+    scope: list[str] = Field(min_length=1, max_length=6, description="absolute paths of the source files a fix should change")
+
+
+INSTRUCTIONS = """Do not fix anything and do not edit files under /testbed. Read the issue and the code, then write a specification that another engineer can carry out without making judgment calls of their own.
+
+- rule: the general behavior a correct fix must have, for all the inputs it covers, not only the reported example.
+- decisions: answer every question the issue leaves open; do not leave any open. Include whether to use each function, API, or fix the issue names, and how existing code that handles the same concern (sibling functions, similar call sites, helpers) behaves. basis is "issue" when the issue settles it, "code_convention" when existing code does it that way (quote it), and "guess" when neither does.
+- cases: concrete, runnable checks of the rule. A case may write small files under /tmp/spec/, runs a command in /testbed with the project's Python environment, and judges the result with expect, a Stone expression over r (r.exit_code, r.stdout, r.stderr), e.g. r.exit_code == 0 and "[1]" in r.stdout. Stone expressions look like Python expressions but may use only r, literals, comparisons, and/or/not, `in`, arithmetic, indexing, len, any, all, sorted, str, int, and string methods such as .splitlines(), .strip(), .startswith(), .count(). Include the reported case and at least one case beyond it that the rule covers; add a "keeps" case where a fix could break behavior that must stay. A "changes" case must fail on the current code; a "keeps" case must pass now. Try each command with the shell action before you finish.
+- changes_existing: existing tests that check the behavior the rule changes, so they will fail after a correct fix.
+- scope: the source files a fix should change.
+
+Finish with your specification."""
+
+
+def squash(text):
+    return " ".join(text.split())
+
+
+def check_quote(item, problem):
+    if item.source == "issue":
+        if squash(item.quote) not in squash(problem):
+            return "this quote is not in the issue text: " + clip(item.quote, 200)
+        return None
+    if not item.source.startswith("/testbed/"):
+        return "source must be \"issue\" or an absolute path under /testbed: " + item.source
+    result = shell("cat " + item.source, 60, None, None)
+    if result.exit_code != 0:
+        return "cannot read " + item.source
+    if squash(item.quote) not in squash(result.stdout):
+        return "this quote is not in " + item.source + ": " + clip(item.quote, 200)
+    return None
+
+
+def check_spec(spec, problem):
+    """Check the spec against the repository; return (problems, case results)."""
+    problems = []
+    results = []
+    cases = [case_dict(c) for c in spec.cases]
+    if not [c for c in cases if c["kind"] == "changes"]:
+        problems.append("no case has kind \"changes\": at least one case must show the behavior the fix changes")
+    for case in cases:
+        outcome = run_case(case)
+        results.append({"name": case["name"], "kind": case["kind"], "passed": outcome["passed"]})
+        if outcome["problem"] is not None:
+            problems.append("case " + describe_case(case) + " is broken: " + outcome["problem"] + ("\n" + clip(outcome["output"], 1200) if outcome["output"] else ""))
+        elif case["kind"] == "changes" and outcome["passed"]:
+            problems.append("case " + describe_case(case) + " already passes on the current code, so it does not show the change; its output:\n" + clip(outcome["output"], 1200))
+        elif case["kind"] == "keeps" and not outcome["passed"]:
+            problems.append("case " + describe_case(case) + " fails on the current code, so it is not behavior to keep; its output:\n" + clip(outcome["output"], 1200))
+    for test in spec.changes_existing:
+        parts = test.split("::")
+        if len(parts) < 2 or not parts[0].startswith("/testbed/"):
+            problems.append("changes_existing entry " + test + " must look like /testbed/path/test_file.py::test_name")
+            continue
+        name = parts[-1].split("[")[0]
+        found = shell("grep -n " + json_dumps(name) + " " + parts[0], 60, None, None)
+        if found.exit_code != 0:
+            problems.append("changes_existing entry " + test + ": " + name + " is not in " + parts[0])
+    for path in spec.scope:
+        try:
+            stat(path)
+        except FileNotFoundError as error:
+            problems.append("scope file " + path + " does not exist")
+    for decision in spec.decisions:
+        for item in decision.evidence:
+            issue = check_quote(item, problem)
+            if issue is not None:
+                problems.append(issue)
+    return problems, results
+
+
+def write_spec(agent, problem):
+    must_run(["git", "config", "--global", "--add", "safe.directory", "*"])
+    log = []
+    messages = [user("Issue in the repository at /testbed:\n\n" + problem + "\n\n" + INSTRUCTIONS)]
+    spec = work(agent, messages, Read | Search | Shell | TaskSpec, 25, log, "spec")
+    problems = []
+    results = []
+    rounds = 0
+    if spec is not None:
+        problems, results = check_spec(spec, problem)
+        log.append({"phase": "check_spec", "kind": "check", "problems": [clip(p, 400) for p in problems]})
+    while spec is not None and problems and rounds < 3:
+        rounds += 1
+        messages.append({"role": "assistant", "content": json_dumps(spec)})
+        messages.append(user("The workflow checked your specification against the repository and found problems:\n\n" + "\n\n".join(problems) + "\n\nInvestigate as needed, fix them, and finish with the corrected specification."))
+        retry = work(agent, messages, Read | Search | Shell | TaskSpec, 8, log, "spec_retry" + str(rounds))
+        if retry is not None:
+            spec = retry
+            problems, results = check_spec(spec, problem)
+            log.append({"phase": "check_spec", "kind": "check", "problems": [clip(p, 400) for p in problems]})
+    out = None
+    if spec is not None:
+        out = {"symptom": spec.symptom, "rule": spec.rule,
+               "cases": [case_dict(c) for c in spec.cases],
+               "decisions": [{"question": d.question, "choice": d.choice, "rejected": d.rejected, "basis": d.basis,
+                              "evidence": [{"source": e.source, "quote": e.quote} for e in d.evidence]} for d in spec.decisions],
+               "changes_existing": spec.changes_existing, "scope": spec.scope}
+    return {"arm": "spec2", "spec": out, "spec_problems": problems, "case_results": results,
+            "check_rounds": rounds, "usage": agent.usage, "log": log}
+
+
+emit(write_spec(model.limit(calls=45), SPEC_PROBLEM))

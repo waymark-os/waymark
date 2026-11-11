@@ -1,0 +1,5 @@
+"""Experiment 2 (H-16), arm wf_status: see swe_wf.stone."""
+from swe_wf import solve
+
+PROBLEM = "__PROBLEM__"
+emit(solve(model.limit(calls=60), PROBLEM, False))

@@ -1,0 +1,69 @@
+"""Spec v2 cases: one concrete behavior, as scratch files, a command, and a
+Stone predicate on the command's result. Shared by the spec writer (which
+runs every case on the unfixed code) and the fixer workflow (which runs
+every case after the fix)."""
+from swe_loop import ACTIVATE, clip, shell, shell_text
+
+CASE_DIR = "/tmp/spec/"
+# Characters a scratch-file path may not contain (it is used in a shell command).
+UNSAFE_PATH_CHARS = [" ", "'", "\"", "$", "`", ";", "&", "|", "(", ")", "<", ">", "*", "?", "\\", "\n", "\t"]
+
+
+class ScratchFile(BaseModel):
+    """A small file a case needs, written before its command runs."""
+    path: str = Field(min_length=1, description="absolute path under /tmp/spec/")
+    content: str
+
+
+class Case(BaseModel):
+    """One concrete behavior a correct fix must have. kind "changes": the fix must change this behavior, so the check fails on the current code and passes after the fix. kind "keeps": behavior that must not change, so the check passes now and after the fix."""
+    kind: Literal["changes", "keeps"]
+    name: str = Field(min_length=1, description="a short name, e.g. \"bytes param under -bb\"")
+    files: list[ScratchFile] = Field(max_length=3, description="small files the command needs (test modules, scripts), all under /tmp/spec/")
+    command: list[str] = Field(min_length=1, description="the command as an argument list, run in /testbed with the project's Python environment, e.g. [\"python\", \"/tmp/spec/case1.py\"] or [\"python\", \"-m\", \"pytest\", \"-q\", \"/tmp/spec/test_case.py\"]")
+    expect: str = Field(min_length=1, description="a Stone expression over the command's result r (r.exit_code, r.stdout, r.stderr) that is True exactly when the behavior is right, e.g. r.exit_code == 0 and \"['foo']\" in r.stdout")
+    basis: Literal["issue", "code_convention", "guess"]
+
+
+def case_dict(case):
+    return {"kind": case.kind, "name": case.name,
+            "files": [{"path": f.path, "content": f.content} for f in case.files],
+            "command": case.command, "expect": case.expect, "basis": case.basis}
+
+
+def run_case(case):
+    """Run one case (a dict). passed is True/False, or None with a problem
+    when the case itself is broken."""
+    for f in case["files"]:
+        if not f["path"].startswith(CASE_DIR):
+            return {"passed": None, "problem": "file " + f["path"] + " is not under " + CASE_DIR, "output": ""}
+        if any([ch in f["path"] for ch in UNSAFE_PATH_CHARS]):
+            return {"passed": None, "problem": "file path " + f["path"] + " may use only letters, digits, and . _ - /", "output": ""}
+    text = case["expect"].strip()
+    if not text.startswith("lambda"):
+        text = "lambda r: " + text
+    try:
+        check = predicate(text)
+    except ValueError as error:
+        return {"passed": None, "problem": "expect is not a valid Stone predicate: " + clip(str(error), 600), "output": ""}
+    try:
+        for f in case["files"]:
+            # The Gateway writes files only inside /testbed; scratch files go
+            # through the shell, as the reproduction script does.
+            shell("mkdir -p \"$(dirname " + f["path"] + ")\" && cat > " + f["path"], 30, f["content"], Expect(exit=0))
+        result = run_complete(["bash", "-lc", ACTIVATE + "exec \"$@\"", "case"] + case["command"],
+                              timeout_ms=300000, max_stdout_bytes=200000, max_stderr_bytes=100000)
+    except Exception as error:
+        return {"passed": None, "problem": "the case could not run: " + error.type + ": " + clip(str(error), 300), "output": ""}
+    output = shell_text(result)
+    try:
+        passed = check(result)
+    except Exception as error:
+        return {"passed": None, "problem": "expect raised " + error.type + ": " + clip(str(error), 300), "output": output}
+    if not isinstance(passed, bool):
+        return {"passed": None, "problem": "expect must return True or False, not " + str(type(passed)), "output": output}
+    return {"passed": passed, "problem": None, "output": output}
+
+
+def describe_case(case):
+    return case["name"] + " (" + case["kind"] + "): command " + json_dumps(case["command"]) + ", expect " + case["expect"]

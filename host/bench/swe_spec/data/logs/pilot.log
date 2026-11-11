@@ -1,0 +1,116 @@
+18:08:12 repos ready; starting haiku,luna tag -p1
+18:13:16 done luna untyped django__django-11087: claimed=verified resolved=False calls=22 304s 20261108-180812-luna-swe_untyped-django-11087-p1
+18:13:22 done luna typed django__django-11087: claimed=not_verified resolved=False calls=25 310s 20261108-180812-luna-swe_typed-django-11087-p1
+18:16:19 done haiku untyped django__django-11087: claimed=not_verified resolved=False calls=53 487s 20261108-180812-haiku-swe_untyped-django-11087-p1
+18:18:39 done haiku untyped matplotlib__matplotlib-23299: claimed=verified resolved=True calls=29 317s 20261108-181322-haiku-swe_untyped-matplotlib-23299-p1
+18:21:06 done haiku typed matplotlib__matplotlib-23299: claimed=verified resolved=True calls=29 470s 20261108-181316-haiku-swe_typed-matplotlib-23299-p1
+18:23:55 done luna untyped matplotlib__matplotlib-23299: claimed=verified resolved=False calls=12 316s 20261108-181839-luna-swe_untyped-matplotlib-23299-p1
+18:24:39 done haiku typed django__django-11087: claimed=None resolved=False calls=None 987s 20261108-180812-haiku-swe_typed-django-11087-p1
+18:24:55 done luna typed matplotlib__matplotlib-23299: claimed=not_verified resolved=False calls=8 516s 20261108-181619-luna-swe_typed-matplotlib-23299-p1
+18:25:07 done haiku typed pytest-dev__pytest-7205: claimed=verified resolved=False calls=16 241s 20261108-182106-haiku-swe_typed-pytest-7205-p1
+18:25:08 done haiku typed sphinx-doc__sphinx-10673: claimed=None resolved=False calls=None 0s 20261108-182507-haiku-swe_typed-sphinx-10673-p1
+18:25:08 done haiku untyped sphinx-doc__sphinx-10673: claimed=None resolved=None calls=None 1s 20261108-182508-haiku-swe_untyped-sphinx-10673-p1
+18:25:09 done luna typed sphinx-doc__sphinx-10673: claimed=None resolved=False calls=None 0s 20261108-182508-luna-swe_typed-sphinx-10673-p1
+18:25:09 done luna untyped sphinx-doc__sphinx-10673: claimed=None resolved=None calls=None 1s 20261108-182509-luna-swe_untyped-sphinx-10673-p1
+18:25:10 done haiku typed sympy__sympy-12489: claimed=None resolved=False calls=None 0s 20261108-182509-haiku-swe_typed-sympy-12489-p1
+18:25:10 done haiku untyped sympy__sympy-12489: claimed=None resolved=None calls=None 0s 20261108-182510-haiku-swe_untyped-sympy-12489-p1
+18:25:36 done luna untyped pytest-dev__pytest-7205: claimed=verified resolved=False calls=5 41s 20261108-182456-luna-swe_untyped-pytest-7205-p1
+18:26:19 done luna typed pytest-dev__pytest-7205: claimed=verified resolved=False calls=17 100s 20261108-182439-luna-swe_typed-pytest-7205-p1
+18:26:39 done luna untyped sympy__sympy-12489: claimed=verified resolved=False calls=5 63s 20261108-182536-luna-swe_untyped-sympy-12489-p1
+18:28:10 done luna typed sympy__sympy-12489: claimed=not_verified resolved=False calls=8 180s 20261108-182510-luna-swe_typed-sympy-12489-p1
+18:32:01 done haiku untyped pytest-dev__pytest-7205: claimed=not_verified resolved=False calls=45 487s 20261108-182355-haiku-swe_untyped-pytest-7205-p1
+18:32:01 all done
+18:32:12 repos ready; starting haiku,luna tag -p1
+18:32:12 7 jobs to run
+18:35:59 done haiku typed sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=31 228s 20261108-183212-haiku-swe_typed-sphinx-10673-p1
+18:36:09 done luna typed sphinx-doc__sphinx-10673: claimed=not_verified resolved=False calls=10 237s 20261108-183212-luna-swe_typed-sphinx-10673-p1
+18:37:38 done luna untyped sphinx-doc__sphinx-10673: claimed=verified resolved=False calls=5 98s 20261108-183600-luna-swe_untyped-sphinx-10673-p1
+18:38:26 done haiku typed sympy__sympy-12489: claimed=verified resolved=False calls=30 137s 20261108-183609-haiku-swe_typed-sympy-12489-p1
+18:40:30 done haiku untyped sphinx-doc__sphinx-10673: claimed=not_verified resolved=True calls=58 498s 20261108-183212-haiku-swe_untyped-sphinx-10673-p1
+18:43:20 done haiku untyped sympy__sympy-12489: claimed=not_verified resolved=False calls=58 343s 20261108-183738-haiku-swe_untyped-sympy-12489-p1
+18:45:55 done haiku typed django__django-11087: claimed=not_verified resolved=False calls=55 823s 20261108-183212-haiku-swe_typed-django-11087-p1
+18:45:55 all done
+19:00:41 repos ready; starting haiku tag -r reps 3
+19:00:41 30 jobs to run
+19:02:17 done haiku typed pytest-dev__pytest-7205: claimed=verified resolved=False calls=17 96s 20261108-190041-haiku-swe_typed-pytest-7205-r1
+19:09:19 done haiku untyped django__django-11087: claimed=not_verified resolved=False calls=37 518s 20261108-190041-haiku-swe_untyped-django-11087-r1
+19:09:39 done haiku typed matplotlib__matplotlib-23299: claimed=verified resolved=False calls=19 538s 20261108-190041-haiku-swe_typed-matplotlib-23299-r1
+19:10:28 done haiku untyped pytest-dev__pytest-7205: claimed=verified resolved=False calls=31 491s 20261108-190217-haiku-swe_untyped-pytest-7205-r1
+19:12:31 done haiku typed sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=22 192s 20261108-190919-haiku-swe_typed-sphinx-10673-r1
+19:15:34 done haiku untyped matplotlib__matplotlib-23299: claimed=not_verified resolved=True calls=56 893s 20261108-190041-haiku-swe_untyped-matplotlib-23299-r1
+19:15:47 done haiku typed sympy__sympy-12489: claimed=not_verified resolved=False calls=55 319s 20261108-191028-haiku-swe_typed-sympy-12489-r1
+19:15:54 done haiku typed django__django-11087: claimed=not_verified resolved=False calls=48 913s 20261108-190041-haiku-swe_typed-django-11087-r1
+19:17:54 done haiku untyped sympy__sympy-12489: claimed=not_verified resolved=False calls=56 323s 20261108-191231-haiku-swe_untyped-sympy-12489-r1
+19:19:26 done haiku typed django__django-11087: claimed=verified resolved=False calls=12 232s 20261108-191534-haiku-swe_typed-django-11087-r2
+19:21:00 done haiku typed pytest-dev__pytest-7205: claimed=verified resolved=False calls=22 94s 20261108-191926-haiku-swe_typed-pytest-7205-r2
+19:22:12 done haiku untyped django__django-11087: claimed=not_verified resolved=False calls=47 384s 20261108-191547-haiku-swe_untyped-django-11087-r2
+19:22:37 done haiku untyped sphinx-doc__sphinx-10673: claimed=not_verified resolved=True calls=57 778s 20261108-190939-haiku-swe_untyped-sphinx-10673-r1
+19:24:39 done haiku typed sphinx-doc__sphinx-10673: claimed=verified resolved=False calls=20 147s 20261108-192212-haiku-swe_typed-sphinx-10673-r2
+19:24:48 done haiku typed matplotlib__matplotlib-23299: claimed=verified resolved=False calls=25 534s 20261108-191554-haiku-swe_typed-matplotlib-23299-r2
+19:26:48 done haiku untyped pytest-dev__pytest-7205: claimed=not_verified resolved=False calls=35 348s 20261108-192100-haiku-swe_untyped-pytest-7205-r2
+19:26:58 done haiku typed sympy__sympy-12489: claimed=verified resolved=False calls=18 139s 20261108-192439-haiku-swe_typed-sympy-12489-r2
+19:29:08 done haiku untyped matplotlib__matplotlib-23299: claimed=not_verified resolved=True calls=50 674s 20261108-191754-haiku-swe_untyped-matplotlib-23299-r2
+19:30:25 done haiku typed django__django-11087: claimed=verified resolved=False calls=14 217s 20261108-192648-haiku-swe_typed-django-11087-r3
+19:33:06 done haiku untyped sphinx-doc__sphinx-10673: claimed=not_verified resolved=True calls=51 629s 20261108-192237-haiku-swe_untyped-sphinx-10673-r2
+19:34:23 done haiku typed pytest-dev__pytest-7205: claimed=verified resolved=False calls=14 77s 20261108-193306-haiku-swe_typed-pytest-7205-r3
+19:35:44 done haiku untyped django__django-11087: claimed=not_verified resolved=False calls=46 526s 20261108-192658-haiku-swe_untyped-django-11087-r3
+19:37:36 done haiku typed matplotlib__matplotlib-23299: claimed=verified resolved=False calls=22 508s 20261108-192908-haiku-swe_typed-matplotlib-23299-r3
+19:37:41 done haiku untyped sympy__sympy-12489: claimed=not_verified resolved=False calls=57 773s 20261108-192448-haiku-swe_untyped-sympy-12489-r2
+19:40:48 done haiku typed sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=26 304s 20261108-193544-haiku-swe_typed-sphinx-10673-r3
+19:42:45 done haiku typed sympy__sympy-12489: claimed=verified resolved=False calls=41 304s 20261108-193742-haiku-swe_typed-sympy-12489-r3
+19:43:46 done haiku untyped matplotlib__matplotlib-23299: claimed=not_verified resolved=False calls=43 801s 20261108-193025-haiku-swe_untyped-matplotlib-23299-r3
+19:46:24 done haiku untyped pytest-dev__pytest-7205: claimed=verified resolved=False calls=43 722s 20261108-193423-haiku-swe_untyped-pytest-7205-r3
+19:48:14 done haiku untyped sphinx-doc__sphinx-10673: claimed=not_verified resolved=True calls=57 638s 20261108-193736-haiku-swe_untyped-sphinx-10673-r3
+19:49:04 done haiku untyped sympy__sympy-12489: claimed=not_verified resolved=False calls=57 496s 20261108-194048-haiku-swe_untyped-sympy-12489-r3
+19:49:04 all done
+20:59:19 repos ready; starting haiku arms wf_status,wf_check tag -e2r reps 3
+20:59:19 30 jobs to run
+21:03:44 done haiku wf_status pytest-dev__pytest-7205: claimed=verified resolved=False calls=19 265s 20261108-205919-haiku-swe_wf_status-pytest-7205-e2r1
+21:05:51 done haiku wf_check pytest-dev__pytest-7205: claimed=verified resolved=False calls=17 127s 20261108-210344-haiku-swe_wf_check-pytest-7205-e2r1
+21:09:18 done haiku wf_status sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=24 207s 20261108-210551-haiku-swe_wf_status-sphinx-10673-e2r1
+21:09:37 repos ready; starting qwen arms wf_status,wf_check,untyped tag -e2q reps 1
+21:09:37 15 jobs to run
+21:11:23 done haiku wf_status matplotlib__matplotlib-23299: claimed=verified resolved=True calls=26 724s 20261108-205919-haiku-swe_wf_status-matplotlib-23299-e2r1
+21:11:32 done qwen wf_status django__django-11087: claimed=not_verified resolved=False calls=36 116s 20261108-210937-qwen-swe_wf_status-django-11087-e2q1
+21:13:04 done haiku wf_status django__django-11087: claimed=not_verified resolved=False calls=55 825s 20261108-205919-haiku-swe_wf_status-django-11087-e2r1
+21:14:33 done haiku wf_check django__django-11087: claimed=not_verified resolved=False calls=55 914s 20261108-205919-haiku-swe_wf_check-django-11087-e2r1
+21:15:27 done haiku wf_check sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=33 369s 20261108-210918-haiku-swe_wf_check-sphinx-10673-e2r1
+21:15:47 done haiku wf_check matplotlib__matplotlib-23299: claimed=verified resolved=False calls=37 988s 20261108-205919-haiku-swe_wf_check-matplotlib-23299-e2r1
+21:17:31 done haiku wf_status sympy__sympy-12489: claimed=verified resolved=False calls=34 368s 20261108-211123-haiku-swe_wf_status-sympy-12489-e2r1
+21:19:44 done qwen wf_check django__django-11087: claimed=not_verified resolved=False calls=55 492s 20261108-211133-qwen-swe_wf_check-django-11087-e2q1
+21:22:59 done haiku wf_check sympy__sympy-12489: claimed=verified resolved=False calls=46 595s 20261108-211304-haiku-swe_wf_check-sympy-12489-e2r1
+21:25:11 done qwen untyped django__django-11087: claimed=not_verified resolved=False calls=57 326s 20261108-211945-qwen-swe_untyped-django-11087-e2q1
+21:27:06 done haiku wf_status pytest-dev__pytest-7205: claimed=verified resolved=False calls=15 247s 20261108-212259-haiku-swe_wf_status-pytest-7205-e2r2
+21:28:21 done haiku wf_status matplotlib__matplotlib-23299: claimed=verified resolved=True calls=30 754s 20261108-211547-haiku-swe_wf_status-matplotlib-23299-e2r2
+21:28:57 done haiku wf_status django__django-11087: claimed=not_verified resolved=False calls=55 864s 20261108-211433-haiku-swe_wf_status-django-11087-e2r2
+21:29:04 done haiku wf_check django__django-11087: claimed=not_verified resolved=False calls=55 817s 20261108-211527-haiku-swe_wf_check-django-11087-e2r2
+21:32:02 done haiku wf_check pytest-dev__pytest-7205: claimed=verified resolved=False calls=27 296s 20261108-212706-haiku-swe_wf_check-pytest-7205-e2r2
+21:32:58 done haiku wf_status sympy__sympy-12489: claimed=verified resolved=False calls=26 234s 20261108-212904-haiku-swe_wf_status-sympy-12489-e2r2
+21:33:00 done haiku wf_status sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=26 279s 20261108-212821-haiku-swe_wf_status-sphinx-10673-e2r2
+21:35:21 done haiku wf_check sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=35 384s 20261108-212857-haiku-swe_wf_check-sphinx-10673-e2r2
+21:35:44 done haiku wf_check sympy__sympy-12489: claimed=verified resolved=False calls=33 221s 20261108-213202-haiku-swe_wf_check-sympy-12489-e2r2
+21:36:26 done haiku wf_check matplotlib__matplotlib-23299: claimed=verified resolved=False calls=43 1135s 20261108-211731-haiku-swe_wf_check-matplotlib-23299-e2r2
+21:36:54 done qwen wf_status matplotlib__matplotlib-23299: claimed=not_verified resolved=False calls=36 703s 20261108-212511-qwen-swe_wf_status-matplotlib-23299-e2q1
+21:37:47 done haiku wf_status pytest-dev__pytest-7205: claimed=verified resolved=False calls=11 81s 20261108-213626-haiku-swe_wf_status-pytest-7205-e2r3
+21:38:34 done haiku wf_status django__django-11087: claimed=verified resolved=False calls=18 337s 20261108-213258-haiku-swe_wf_status-django-11087-e2r3
+21:39:31 done haiku wf_check pytest-dev__pytest-7205: claimed=verified resolved=False calls=14 105s 20261108-213747-haiku-swe_wf_check-pytest-7205-e2r3
+21:42:34 done haiku wf_status sphinx-doc__sphinx-10673: claimed=verified resolved=False calls=28 239s 20261108-213834-haiku-swe_wf_status-sphinx-10673-e2r3
+21:42:35 done qwen wf_check matplotlib__matplotlib-23299: claimed=not_verified resolved=False calls=55 341s 20261108-213654-qwen-swe_wf_check-matplotlib-23299-e2q1
+21:42:58 done haiku wf_check sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=26 206s 20261108-213931-haiku-swe_wf_check-sphinx-10673-e2r3
+21:45:36 done haiku wf_status sympy__sympy-12489: claimed=verified resolved=False calls=30 182s 20261108-214234-haiku-swe_wf_status-sympy-12489-e2r3
+21:46:30 done haiku wf_check django__django-11087: claimed=not_verified resolved=False calls=55 811s 20261108-213300-haiku-swe_wf_check-django-11087-e2r3
+21:46:44 done haiku wf_check sympy__sympy-12489: claimed=verified resolved=False calls=34 226s 20261108-214258-haiku-swe_wf_check-sympy-12489-e2r3
+21:47:33 done haiku wf_status matplotlib__matplotlib-23299: claimed=verified resolved=False calls=26 732s 20261108-213521-haiku-swe_wf_status-matplotlib-23299-e2r3
+21:49:10 done qwen untyped matplotlib__matplotlib-23299: claimed=not_verified resolved=False calls=57 395s 20261108-214235-qwen-swe_untyped-matplotlib-23299-e2q1
+21:50:01 done haiku wf_check matplotlib__matplotlib-23299: claimed=verified resolved=False calls=31 857s 20261108-213544-haiku-swe_wf_check-matplotlib-23299-e2r3
+21:50:01 all done
+21:52:24 done qwen wf_status pytest-dev__pytest-7205: claimed=not_verified resolved=True calls=55 194s 20261108-214910-qwen-swe_wf_status-pytest-7205-e2q1
+21:55:14 done qwen wf_check pytest-dev__pytest-7205: claimed=not_verified resolved=True calls=55 170s 20261108-215224-qwen-swe_wf_check-pytest-7205-e2q1
+21:58:07 done qwen untyped pytest-dev__pytest-7205: claimed=verified resolved=True calls=56 173s 20261108-215514-qwen-swe_untyped-pytest-7205-e2q1
+22:01:28 done qwen wf_status sphinx-doc__sphinx-10673: claimed=not_verified resolved=False calls=55 202s 20261108-215807-qwen-swe_wf_status-sphinx-10673-e2q1
+22:04:37 done qwen wf_check sphinx-doc__sphinx-10673: claimed=not_verified resolved=False calls=55 188s 20261108-220129-qwen-swe_wf_check-sphinx-10673-e2q1
+22:06:31 done qwen untyped sphinx-doc__sphinx-10673: claimed=not_verified resolved=False calls=57 115s 20261108-220437-qwen-swe_untyped-sphinx-10673-e2q1
+22:11:04 done qwen wf_status sympy__sympy-12489: claimed=not_verified resolved=False calls=55 273s 20261108-220631-qwen-swe_wf_status-sympy-12489-e2q1
+22:15:04 done qwen wf_check sympy__sympy-12489: claimed=not_verified resolved=False calls=55 240s 20261108-221104-qwen-swe_wf_check-sympy-12489-e2q1
+22:17:30 done qwen untyped sympy__sympy-12489: claimed=verified resolved=False calls=46 146s 20261108-221504-qwen-swe_untyped-sympy-12489-e2q1
+22:17:30 all done

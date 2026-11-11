@@ -1,0 +1,62 @@
+model  task           arm      claimed        resolved calls edits patch
+haiku  django-11087   typed    not_verified   False       48     4 498
+haiku  django-11087   typed    verified       False       12     1 1173
+haiku  django-11087   typed    verified       False       14     2 535
+haiku  django-11087   untyped  not_verified   False       37     1 935
+haiku  django-11087   untyped  not_verified   False       46     3 1312
+haiku  django-11087   untyped  not_verified   False       47     3 1140
+haiku  matplotlib-23299 typed    verified       False       19     2 945
+haiku  matplotlib-23299 typed    verified       False       22     1 902
+haiku  matplotlib-23299 typed    verified       False       25     1 930
+haiku  matplotlib-23299 untyped  not_verified   False       43     3 774
+haiku  matplotlib-23299 untyped  not_verified   True        50     2 655
+haiku  matplotlib-23299 untyped  not_verified   True        56     5 2042
+haiku  pytest-7205    typed    verified       False       14     4 685
+haiku  pytest-7205    typed    verified       False       17     4 787
+haiku  pytest-7205    typed    verified       False       22     5 677
+haiku  pytest-7205    untyped  not_verified   False       35     2 1706
+haiku  pytest-7205    untyped  verified       False       31     3 685
+haiku  pytest-7205    untyped  verified       False       43     4 1808
+haiku  sphinx-10673   typed    verified       False       20     2 2157
+haiku  sphinx-10673   typed    verified       True        22     3 2260
+haiku  sphinx-10673   typed    verified       True        26     3 2289
+haiku  sphinx-10673   untyped  not_verified   True        51     3 2373
+haiku  sphinx-10673   untyped  not_verified   True        57     3 2417
+haiku  sphinx-10673   untyped  not_verified   True        57     5 2184
+haiku  sympy-12489    typed    not_verified   False       55     7 1801
+haiku  sympy-12489    typed    verified       False       18     4 1519
+haiku  sympy-12489    typed    verified       False       41     7 1894
+haiku  sympy-12489    untyped  not_verified   False       56    11 2886
+haiku  sympy-12489    untyped  not_verified   False       57     8 2833
+haiku  sympy-12489    untyped  not_verified   False       57    12 3851
+
+haiku django-11087 typed: explore@3:done [check_diagnosis: ok, tests 2/2] fix0@8:done [verify0: 1 problems] fix1@4:done [verify1: 1 problems] fix2@8:done [verify2: 1 problems]
+haiku django-11087 typed: explore@2:done [check_diagnosis: ok, tests 2/2] fix0@4:done [verify0: ok]
+haiku django-11087 typed: explore@2:done [check_diagnosis: ok, tests 2/2] fix0@6:done [verify0: ok]
+haiku django-11087 untyped: explore@3:done fix0@3:done [verify0: no] fix1@6:done [verify1: no] fix2@6:done [verify2: no]
+haiku django-11087 untyped: explore@3:done fix0@3:done [verify0: no] fix1@9:done [verify1: no] fix2@7:done [verify2: no]
+haiku django-11087 untyped: explore@3:done fix0@4:done [verify0: no] fix1@9:done [verify1: no] fix2@8:done [verify2: no]
+haiku matplotlib-23299 typed: explore@4:done [check_diagnosis: 1 problems, tests 1/2] explore_retry0@0:done [check_diagnosis: ok, tests 1/2] fix0@7:done [verify0: ok]
+haiku matplotlib-23299 typed: explore@6:done [check_diagnosis: 1 problems, tests 0/2] explore_retry0@1:done [check_diagnosis: ok, tests 1/1] fix0@6:done [verify0: ok]
+haiku matplotlib-23299 typed: explore@0:invalid explore@9:done [check_diagnosis: 1 problems, tests 0/2] explore_retry0@0:done [check_diagnosis: ok, tests 2/2] fix0@5:done [verify0: ok]
+haiku matplotlib-23299 untyped: explore@7:done fix0@6:done [verify0: no] fix1@5:done [verify1: no] fix2@6:done [verify2: no]
+haiku matplotlib-23299 untyped: explore@8:done fix0@6:done [verify0: no] fix1@5:done [verify1: no] fix2@7:done [verify2: no]
+haiku matplotlib-23299 untyped: explore@8:done fix0@7:done [verify0: no] fix1@14:done [verify1: no] fix2@3:out_of_budget [verify2: no]
+haiku pytest-7205 typed: explore@1:done [check_diagnosis: ok, tests 1/1] fix0@6:done [verify0: ok]
+haiku pytest-7205 typed: explore@1:done [check_diagnosis: ok, tests 1/1] fix0@8:done [verify0: ok]
+haiku pytest-7205 typed: explore@2:done [check_diagnosis: ok, tests 1/1] fix0@11:done [verify0: ok]
+haiku pytest-7205 untyped: explore@3:done fix0@4:done [verify0: no] fix1@7:done [verify1: no] fix2@5:done [verify2: no]
+haiku pytest-7205 untyped: explore@3:done fix0@8:done [verify0: no] fix1@6:done [verify1: VERIFIED]
+haiku pytest-7205 untyped: explore@2:done fix0@8:done [verify0: no] fix1@10:done [verify1: no] fix2@3:done [verify2: VERIFIED]
+haiku sphinx-10673 typed: explore@4:done [check_diagnosis: ok, tests 3/3] fix0@7:done [verify0: ok]
+haiku sphinx-10673 typed: explore@4:done [check_diagnosis: ok, tests 3/3] fix0@8:done [verify0: ok]
+haiku sphinx-10673 typed: explore@3:done [check_diagnosis: ok, tests 2/2] fix0@8:done [verify0: ok]
+haiku sphinx-10673 untyped: explore@3:done fix0@9:done [verify0: no] fix1@7:done [verify1: no] fix2@5:done [verify2: no]
+haiku sphinx-10673 untyped: explore@4:done fix0@13:done [verify0: no] fix1@8:done [verify1: no] fix2@5:out_of_budget [verify2: no]
+haiku sphinx-10673 untyped: explore@2:done fix0@12:done [verify0: no] fix1@12:done [verify1: no] fix2@4:out_of_budget [verify2: no]
+haiku sympy-12489 typed: explore@3:done [check_diagnosis: 1 problems, tests 0/2] explore_retry0@1:done [check_diagnosis: ok, tests 1/1] fix0@10:done [verify0: 1 problems] fix1@13:done [verify1: 1 problems] fix2@2:out_of_budget [verify2: 1 problems]
+haiku sympy-12489 typed: explore@2:done [check_diagnosis: 1 problems, tests 0/2] explore_retry0@1:done [check_diagnosis: ok, tests 1/1] fix0@7:done [verify0: ok]
+haiku sympy-12489 typed: explore@2:done [check_diagnosis: 1 problems, tests 0/2] explore_retry0@1:done [check_diagnosis: ok, tests 2/2] fix0@13:done [verify0: 1 problems] fix1@8:done [verify1: ok]
+haiku sympy-12489 untyped: explore@2:done fix0@16:done [verify0: no] fix1@14:done [verify1: no] fix2@0:out_of_budget [verify2: no]
+haiku sympy-12489 untyped: explore@4:done fix0@10:done [verify0: no] fix1@11:done [verify1: no] fix2@6:out_of_budget [verify2: no]
+haiku sympy-12489 untyped: explore@4:done fix0@24:done [verify0: no] fix1@3:out_of_budget [verify1: no] fix2@0:out_of_budget [verify2: no]

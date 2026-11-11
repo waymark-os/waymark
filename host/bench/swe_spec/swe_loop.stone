@@ -1,0 +1,153 @@
+"""Shared pieces of the SWE-bench workflows. Both arms explore and edit through
+the same tool loop; they differ only at the step boundaries."""
+
+ACTIVATE = "source /opt/miniconda3/bin/activate testbed >/dev/null 2>&1; cd /testbed; "
+MAX_OBSERVATION = 6000
+MAX_REPLY_TOKENS = 8000
+BUDGET_FLOOR = 6
+
+SYSTEM = "You are a careful software engineer fixing an issue in the Python repository at /testbed. You act one step at a time by choosing exactly one action; you then see its result. Change only non-test source files. Keep scratch scripts under /tmp, never inside /testbed."
+
+
+class Read(BaseModel):
+    """Read numbered lines of a file."""
+    kind: Literal["read"]
+    path: str = Field(min_length=1)
+    start_line: int = Field(1, ge=1)
+    end_line: int = Field(200, ge=1)
+
+
+class Search(BaseModel):
+    """Search file contents under a directory with a regular expression."""
+    kind: Literal["search"]
+    pattern: str = Field(min_length=1)
+    path: str = "/testbed"
+
+
+class Shell(BaseModel):
+    """Run a bash command in /testbed with the project's Python environment active."""
+    kind: Literal["shell"]
+    command: str = Field(min_length=1)
+    timeout_s: int = Field(120, ge=1, le=900)
+
+
+class Edit(BaseModel):
+    """Replace old with new in a file; old must match exactly once."""
+    kind: Literal["edit"]
+    path: str = Field(min_length=1)
+    old: str = Field(min_length=1)
+    new: str
+
+
+class Write(BaseModel):
+    """Write a whole file."""
+    kind: Literal["write"]
+    path: str = Field(min_length=1)
+    content: str
+
+
+class Note(BaseModel):
+    """Finish this step with a written report."""
+    kind: Literal["done"]
+    report: str = Field(min_length=1)
+
+
+def user(text):
+    return {"role": "user", "content": text}
+
+
+def clip(text, limit):
+    if len(text) <= limit:
+        return text
+    half = limit // 2
+    return text[:half] + "\n...[" + str(len(text) - limit) + " characters cut]...\n" + text[-half:]
+
+
+def shell(command, timeout_s, stdin, expect):
+    return run_complete(["bash", "-lc", ACTIVATE + command], stdin=stdin, timeout_ms=timeout_s * 1000,
+                        max_stdout_bytes=200000, max_stderr_bytes=100000, expect=expect)
+
+
+def shell_text(result):
+    text = "exit " + str(result.exit_code)
+    if result.timed_out:
+        text = text + " (timed out)"
+    if result.stdout:
+        text = text + "\nstdout:\n" + result.stdout
+    if result.stderr:
+        text = text + "\nstderr:\n" + result.stderr
+    return clip(text, MAX_OBSERVATION)
+
+
+def setup():
+    must_run(["git", "config", "--global", "--add", "safe.directory", "*"])
+
+
+def final_patch():
+    return must_run(["git", "-C", "/testbed", "diff"], max_stdout_bytes=1000000).stdout
+
+
+def perform(action):
+    """Carry out one action and describe what happened."""
+    try:
+        if isinstance(action, Read):
+            text = read_file(action.path, start_line=action.start_line, end_line=action.end_line)
+            lines = text.splitlines()
+            numbered = [str(action.start_line + i) + ": " + line for i, line in enumerate(lines)]
+            return clip("\n".join(numbered), MAX_OBSERVATION) if numbered else "(no lines in that range)"
+        if isinstance(action, Search):
+            hits = search(action.path, action.pattern, regex=True)
+            shown = [hit.path + ":" + str(hit.line) + ": " + hit.text.strip() for hit in hits[:60]]
+            more = "" if len(hits) <= 60 else "\n... " + str(len(hits) - 60) + " more matches"
+            return clip("\n".join(shown), MAX_OBSERVATION) + more if shown else "no matches"
+        if isinstance(action, Shell):
+            return shell_text(shell(action.command, action.timeout_s, None, None))
+        if isinstance(action, Edit):
+            edit(action.path, action.old, action.new)
+            return "edited " + action.path
+        if isinstance(action, Write):
+            write_file(action.path, action.content)
+            return "wrote " + action.path
+        return "unknown action"
+    except Exception as error:
+        return "error " + error.type + ": " + clip(error.message, 3000)
+
+
+def work(model, messages, actions, max_steps, log, phase, use=""):
+    """Let the model act until it finishes the step (returns its final action)
+    or runs out of steps (returns None). Every step is appended to log. use
+    names the model for this step ("" is the Gateway's default)."""
+    for step in range(max_steps):
+        left = max_steps - step
+        # Running out of budget ends the whole program (uncatchable), so stop
+        # while there is room for one more ask (up to 3 calls with retries)
+        # plus the untyped arm's reviewer.
+        if model.remaining.calls is not None and model.remaining.calls < BUDGET_FLOOR:
+            log.append({"phase": phase, "step": step, "kind": "out_of_budget"})
+            return None
+        try:
+            action = model.ask(messages, output=actions, system=SYSTEM, max_output_tokens=MAX_REPLY_TOKENS, model=use)
+        except ModelOutputError as error:
+            log.append({"phase": phase, "step": step, "kind": "invalid", "issues": clip(str(error.issues), 400)})
+            messages.append(user("Your last reply was not a valid action: " + clip(str(error.issues), 1500) + "\nReply with exactly one action."))
+            continue
+        except TimeoutError as error:
+            log.append({"phase": phase, "step": step, "kind": "model_timeout", "message": clip(error.message, 200)})
+            continue
+        except ModelProviderError as error:
+            # Already retried by the runtime; the step cannot go on.
+            log.append({"phase": phase, "step": step, "kind": "provider_error", "status": error.status,
+                        "attempts": error.attempts, "message": clip(error.message, 300)})
+            return None
+        if action.kind == "done":
+            log.append({"phase": phase, "step": step, "kind": "done", "final": json_dumps(action)})
+            return action
+        observation = perform(action)
+        log.append({"phase": phase, "step": step, "kind": action.kind, "detail": clip(json_dumps(action), 4000),
+                    "result": clip(observation, 1000)})
+        if left <= 3:
+            observation = observation + "\n\n[" + str(left - 1) + " steps left in this phase; finish soon.]"
+        messages.append({"role": "assistant", "content": json_dumps(action)})
+        messages.append(user(observation))
+    log.append({"phase": phase, "step": max_steps, "kind": "out_of_steps"})
+    return None

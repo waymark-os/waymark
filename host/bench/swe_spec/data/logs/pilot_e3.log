@@ -1,0 +1,68 @@
+13:48:55 starting arms ['A', 'B', 'C', 'D'] reps 3 tag -e3: 60 jobs
+13:57:11 done C django__django-11087: claimed=verified resolved=True calls=13 spec_calls=7 quote_problems=0 496s 20261109-135105-haiku-swe_wf_spec-django-11087-e3C1
+14:01:57 done B django__django-11087: claimed=verified resolved=False calls=24 spec_calls=4 quote_problems=0 782s 20261109-135039-haiku-swe_wf_spec-django-11087-e3B1
+14:06:47 done A django__django-11087: claimed=not_verified resolved=False calls=55 1073s 20261109-134855-haiku-swe_wf_status-django-11087-e3A1
+14:07:40 done D django__django-11087: claimed=not_verified resolved=False calls=55 1125s 20261109-134855-haiku-swe_wf_spec-django-11087-e3D1
+14:16:36 done A matplotlib__matplotlib-23299: claimed=verified resolved=False calls=20 1164s 20261109-135711-haiku-swe_wf_status-matplotlib-23299-e3A1
+14:18:58 done A pytest-dev__pytest-7205: claimed=verified resolved=False calls=19 143s 20261109-141636-haiku-swe_wf_status-pytest-7205-e3A1
+14:21:07 done B pytest-dev__pytest-7205: claimed=verified resolved=False calls=11 spec_calls=3 quote_problems=0 128s 20261109-141917-haiku-swe_wf_spec-pytest-7205-e3B1
+14:22:27 done B matplotlib__matplotlib-23299: claimed=verified resolved=False calls=23 spec_calls=7 quote_problems=0 1231s 20261109-140513-haiku-swe_wf_spec-matplotlib-23299-e3B1
+14:25:00 done C pytest-dev__pytest-7205: claimed=verified resolved=False calls=15 spec_calls=7 quote_problems=0 234s 20261109-142144-haiku-swe_wf_spec-pytest-7205-e3C1
+14:26:15 done D matplotlib__matplotlib-23299: claimed=verified resolved=False calls=16 1115s 20261109-140740-haiku-swe_wf_spec-matplotlib-23299-e3D1
+14:27:09 done D pytest-dev__pytest-7205: claimed=verified resolved=False calls=15 282s 20261109-142228-haiku-swe_wf_spec-pytest-7205-e3D1
+14:28:29 done A sphinx-doc__sphinx-10673: claimed=stopped: RuntimeError resolved=False calls=4 209s 20261109-142500-haiku-swe_wf_status-sphinx-10673-e3A1
+14:30:38 done B sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=23 spec_calls=8 quote_problems=0 263s 20261109-142709-haiku-swe_wf_spec-sphinx-10673-e3B1
+14:31:21 done C matplotlib__matplotlib-23299: claimed=verified resolved=False calls=19 spec_calls=14 quote_problems=0 1474s 20261109-141257-haiku-swe_wf_spec-matplotlib-23299-e3C1
+14:32:34 done D sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=27 244s 20261109-142829-haiku-swe_wf_spec-sphinx-10673-e3D1
+14:33:06 done C sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=19 spec_calls=15 quote_problems=0 357s 20261109-142946-haiku-swe_wf_spec-sphinx-10673-e3C1
+14:35:10 done A sympy__sympy-12489: claimed=verified resolved=False calls=26 272s 20261109-143038-haiku-swe_wf_status-sympy-12489-e3A1
+14:36:41 done B sympy__sympy-12489: claimed=verified resolved=False calls=20 spec_calls=5 quote_problems=0 320s 20261109-143200-haiku-swe_wf_spec-sympy-12489-e3B1
+14:38:30 done C sympy__sympy-12489: claimed=verified resolved=False calls=30 spec_calls=11 quote_problems=0 356s 20261109-143351-haiku-swe_wf_spec-sympy-12489-e3C1
+14:39:44 done D sympy__sympy-12489: claimed=verified resolved=False calls=43 398s 20261109-143306-haiku-swe_wf_spec-sympy-12489-e3D1
+14:43:03 done A django__django-11087: claimed=verified resolved=False calls=20 473s 20261109-143510-haiku-swe_wf_status-django-11087-e3A2
+14:46:19 done B django__django-11087: claimed=verified resolved=False calls=16 spec_calls=5 quote_problems=0 578s 20261109-143749-haiku-swe_wf_spec-django-11087-e3B2
+16:12:25 starting arms ['A', 'B', 'C', 'D'] reps 3 tag -e3: 38 jobs
+16:18:24 done D django__django-11087: claimed=verified resolved=False calls=24 359s 20261109-161225-haiku-swe_wf_spec-django-11087-e3D2
+16:25:09 done A matplotlib__matplotlib-23299: claimed=verified resolved=False calls=24 764s 20261109-161225-haiku-swe_wf_status-matplotlib-23299-e3A2
+16:27:00 done C django__django-11087: claimed=not_verified resolved=True calls=56 spec_calls=7 quote_problems=0 874s 20261109-161345-haiku-swe_wf_spec-django-11087-e3C2
+16:27:26 done B matplotlib__matplotlib-23299: claimed=verified resolved=True calls=29 spec_calls=3 quote_problems=0 901s 20261109-161524-haiku-swe_wf_spec-matplotlib-23299-e3B2
+16:28:37 done A pytest-dev__pytest-7205: claimed=verified resolved=False calls=18 98s 20261109-162700-haiku-swe_wf_status-pytest-7205-e3A2
+16:29:12 done B pytest-dev__pytest-7205: claimed=verified resolved=False calls=13 spec_calls=3 quote_problems=0 106s 20261109-162743-haiku-swe_wf_spec-pytest-7205-e3B2
+16:30:30 done C matplotlib__matplotlib-23299: claimed=verified resolved=True calls=20 spec_calls=13 quote_problems=0 726s 20261109-162145-haiku-swe_wf_spec-matplotlib-23299-e3C2
+16:30:33 done C pytest-dev__pytest-7205: claimed=verified resolved=False calls=13 spec_calls=10 quote_problems=0 115s 20261109-162909-haiku-swe_wf_spec-pytest-7205-e3C2
+16:30:46 done D pytest-dev__pytest-7205: claimed=verified resolved=False calls=14 94s 20261109-162912-haiku-swe_wf_spec-pytest-7205-e3D2
+16:31:50 NOSPEC C sphinx-doc__sphinx-10673 -e3C2: the spec writer produced no spec; fixer runs without one
+16:34:20 done B sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=16 spec_calls=11 quote_problems=0 227s 20261109-163131-haiku-swe_wf_spec-sphinx-10673-e3B2
+16:35:20 done A sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=21 290s 20261109-163030-haiku-swe_wf_status-sphinx-10673-e3A2
+16:36:44 done D matplotlib__matplotlib-23299: claimed=verified resolved=False calls=20 695s 20261109-162509-haiku-swe_wf_spec-matplotlib-23299-e3D2
+16:36:53 done D sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=19 153s 20261109-163420-haiku-swe_wf_spec-sphinx-10673-e3D2
+16:37:40 done C sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=29 spec_calls=None quote_problems=0 spec=missing 415s 20261109-163150-haiku-swe_wf_spec-sphinx-10673-e3C2
+16:38:29 done A sympy__sympy-12489: claimed=verified resolved=False calls=19 188s 20261109-163521-haiku-swe_wf_status-sympy-12489-e3A2
+16:40:35 done B sympy__sympy-12489: claimed=verified resolved=False calls=27 spec_calls=5 quote_problems=0 231s 20261109-163713-haiku-swe_wf_spec-sympy-12489-e3B2
+16:42:49 done A django__django-11087: claimed=verified resolved=False calls=16 261s 20261109-163829-haiku-swe_wf_status-django-11087-e3A3
+16:43:22 done C sympy__sympy-12489: claimed=not_verified resolved=False calls=55 spec_calls=13 quote_problems=0 389s 20261109-163759-haiku-swe_wf_spec-sympy-12489-e3C2
+16:46:15 done D sympy__sympy-12489: claimed=verified resolved=False calls=30 515s 20261109-163740-haiku-swe_wf_spec-sympy-12489-e3D2
+16:56:30 done A matplotlib__matplotlib-23299: claimed=verified resolved=False calls=20 615s 20261109-164615-haiku-swe_wf_status-matplotlib-23299-e3A3
+16:56:54 done C django__django-11087: claimed=not_verified resolved=True calls=43 spec_calls=7 quote_problems=0 845s 20261109-164408-haiku-swe_wf_spec-django-11087-e3C3
+16:57:55 done B django__django-11087: claimed=not_verified resolved=False calls=51 spec_calls=4 quote_problems=0 1040s 20261109-164123-haiku-swe_wf_spec-django-11087-e3B3
+17:03:50 done D django__django-11087: claimed=not_verified resolved=False calls=55 1228s 20261109-164322-haiku-swe_wf_spec-django-11087-e3D3
+17:05:22 done A pytest-dev__pytest-7205: claimed=verified resolved=False calls=18 92s 20261109-170350-haiku-swe_wf_status-pytest-7205-e3A3
+17:08:52 done D matplotlib__matplotlib-23299: claimed=verified resolved=False calls=20 656s 20261109-165755-haiku-swe_wf_spec-matplotlib-23299-e3D3
+17:09:58 done B pytest-dev__pytest-7205: claimed=verified resolved=False calls=18 spec_calls=5 quote_problems=0 276s 20261109-170546-haiku-swe_wf_spec-pytest-7205-e3B3
+17:10:07 done B matplotlib__matplotlib-23299: claimed=verified resolved=False calls=21 spec_calls=6 quote_problems=0 817s 20261109-165859-haiku-swe_wf_spec-matplotlib-23299-e3B3
+17:10:38 done C matplotlib__matplotlib-23299: claimed=verified resolved=False calls=13 spec_calls=14 quote_problems=0 824s 20261109-170016-haiku-swe_wf_spec-matplotlib-23299-e3C3
+17:11:07 done C pytest-dev__pytest-7205: claimed=verified resolved=False calls=16 spec_calls=11 quote_problems=0 136s 20261109-170926-haiku-swe_wf_spec-pytest-7205-e3C3
+17:11:36 done D pytest-dev__pytest-7205: claimed=verified resolved=False calls=16 98s 20261109-170958-haiku-swe_wf_spec-pytest-7205-e3D3
+17:14:24 done D sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=19 168s 20261109-171136-haiku-swe_wf_spec-sphinx-10673-e3D3
+17:16:09 done B sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=24 spec_calls=7 quote_problems=0 331s 20261109-171143-haiku-swe_wf_spec-sphinx-10673-e3B3
+17:16:37 done A sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=32 390s 20261109-171007-haiku-swe_wf_status-sphinx-10673-e3A3
+17:17:33 done A sympy__sympy-12489: claimed=verified resolved=False calls=27 189s 20261109-171424-haiku-swe_wf_status-sympy-12489-e3A3
+17:18:48 done C sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=34 spec_calls=14 quote_problems=0 461s 20261109-171306-haiku-swe_wf_spec-sphinx-10673-e3C3
+17:19:19 done B sympy__sympy-12489: claimed=verified resolved=False calls=19 spec_calls=5 quote_problems=0 190s 20261109-171641-haiku-swe_wf_spec-sympy-12489-e3B3
+17:20:56 done D sympy__sympy-12489: claimed=verified resolved=False calls=30 203s 20261109-171733-haiku-swe_wf_spec-sympy-12489-e3D3
+17:29:40 done C sympy__sympy-12489: claimed=not_verified resolved=False calls=55 spec_calls=12 quote_problems=0 783s 20261109-171816-haiku-swe_wf_spec-sympy-12489-e3C3
+17:29:40 all done
+17:30:12 starting arms ['A', 'C'] reps 3 tag -e3: 2 jobs
+17:32:50 done A sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=23 158s 20261109-173012-haiku-swe_wf_status-sphinx-10673-e3A1
+17:35:00 done C sphinx-doc__sphinx-10673: claimed=verified resolved=True calls=16 spec_calls=19 quote_problems=0 288s 20261109-173241-haiku-swe_wf_spec-sphinx-10673-e3C2
+17:35:00 all done

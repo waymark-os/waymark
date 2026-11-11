@@ -1,0 +1,69 @@
+{
+  "symptom": "With no backend chosen yet (rcParams['backend'] is the auto sentinel), the first figure is created inside rc_context(), which resolves the backend. On exit rc_context restores the old rcParams, putting the auto sentinel back; the next get_backend() sees the sentinel, calls plt.switch_backend(), which closes all figures, so Gcf.figs becomes empty and plt.close(fig2) no longer works.",
+  "expected_rule": "Reading the backend (get_backend() or rcParams['backend']) must never drop existing figures from Gcf. In particular, leaving rc_context (and the other code that snapshots and restores rcParams the same way) must not undo the resolution of the 'auto' backend that happened inside it: if the backend was resolved while inside, it stays resolved afterwards, while all other rcParams are restored as before and no premature backend resolution is triggered.",
+  "rule_evidence": [
+    {
+      "source": "issue",
+      "quote": "calling `matplotlib.get_backend()` removes all figures from `Gcf` if the *first* figure in `Gcf.figs` was created in an `rc_context`."
+    },
+    {
+      "source": "issue",
+      "quote": "The figure should not be missing from `Gcf`.  Consequences of this are, e.g, `plt.close(fig2)` doesn't work because `Gcf.destroy_fig()` can't find it."
+    },
+    {
+      "source": "/testbed/lib/matplotlib/__init__.py",
+      "quote": "dict.update(rcParams, orig)  # Revert to the original rcs."
+    },
+    {
+      "source": "/testbed/lib/matplotlib/__init__.py",
+      "quote": "if val is rcsetup._auto_backend_sentinel:\n                    if 'backend' in self:\n                        return"
+    },
+    {
+      "source": "/testbed/lib/matplotlib/__init__.py",
+      "quote": "plt.switch_backend(rcsetup._auto_backend_sentinel)"
+    },
+    {
+      "source": "/testbed/lib/matplotlib/pyplot.py",
+      "quote": "Close all open figures and set the Matplotlib backend."
+    },
+    {
+      "source": "/testbed/lib/matplotlib/pyplot.py",
+      "quote": "rcParamsOrig['backend'] = candidate"
+    },
+    {
+      "source": "/testbed/lib/matplotlib/pyplot.py",
+      "quote": "dict.update(rcParams, self._orig)"
+    }
+  ],
+  "examples": [
+    "Reported: `with rc_context(): fig2 = plt.figure()` then `get_backend()`; Gcf.figs must still contain fig2 and plt.close(fig2) must work.",
+    "Same pattern through plt.rc_context(), matplotlib.style.context() (built on rc_context) and the plt.xkcd() context manager, which restores rcParams with the same dict.update.",
+    "After the context exits, get_backend() returns the backend resolved inside it (e.g. 'QtAgg' or 'agg') without switching backends again.",
+    "An rc_context in which no figure is created and the backend is never read: the backend stays unresolved afterwards (no premature resolution).",
+    "Already-working cases keep working: a figure created before the rc_context, or plt.ion() called first."
+  ],
+  "named_hints": [
+    "matplotlib.get_backend()",
+    "matplotlib.rc_context()",
+    "plt._pylab_helpers.Gcf.figs",
+    "Gcf.destroy_fig() / plt.close(fig2)",
+    "plt.ion() (workaround)",
+    "plt.figure() created before the context (workaround)"
+  ],
+  "related_sites": [
+    "/testbed/lib/matplotlib/__init__.py:rc_context \u2014 snapshots with rcParams.copy() and restores with dict.update, bypassing RcParams.__setitem__, so the auto sentinel overwrites a resolved backend.",
+    "/testbed/lib/matplotlib/__init__.py:RcParams.__setitem__ \u2014 existing convention: setting 'backend' to the auto sentinel is ignored once a backend is set.",
+    "/testbed/lib/matplotlib/__init__.py:RcParams.__getitem__ \u2014 reading 'backend' on the global rcParams resolves the sentinel via plt.switch_backend.",
+    "/testbed/lib/matplotlib/__init__.py:RcParams._get_backend_or_none \u2014 reads the backend without triggering resolution (used by use() and qt_compat).",
+    "/testbed/lib/matplotlib/__init__.py:get_backend \u2014 returns rcParams['backend'], so it triggers resolution when the sentinel is present.",
+    "/testbed/lib/matplotlib/pyplot.py:switch_backend \u2014 calls close('all') first, then resolves the sentinel and records the result in rcParams, rcParamsDefault and rcParamsOrig.",
+    "/testbed/lib/matplotlib/pyplot.py:_xkcd.__exit__ \u2014 restores a rcParams.copy() snapshot with dict.update, same pattern as rc_context.",
+    "/testbed/lib/matplotlib/style/core.py:context \u2014 wraps rc_context; STYLE_BLACKLIST there already excludes 'backend' from styles.",
+    "/testbed/lib/matplotlib/__init__.py:use \u2014 avoids resolving the 'auto' backend prematurely."
+  ],
+  "open_questions": [
+    "Where the fix belongs: in rc_context's restore, in get_backend, or in switch_backend not closing figures when resolving the sentinel; any of these removes the reported symptom.",
+    "If the user explicitly sets 'backend' inside rc_context (e.g. rc_context({'backend': 'agg'})), should it still be reverted on exit?",
+    "Whether plt.xkcd()'s __exit__ needs the same treatment as rc_context."
+  ]
+}

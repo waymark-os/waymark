@@ -1,0 +1,362 @@
+"""Experiment 6: the task spec, written before any fix, with tests as gates.
+
+SWE-bench grades a fix with three test sets: new tests that must start
+passing, existing tests that must keep passing, and existing tests whose
+expectations the fix revises. The spec is the agent's guess at each, plus
+the decisions behind them:
+
+- decisions: the questions this task turns on (the only per-task part of
+  the template), each with options, a choice, a source and quotes;
+- new_tests: fail_to_pass and pass_to_pass checks, each marked reported or
+  wider and naming the decision (or the rule) it checks;
+- keep: commands running existing tests that must keep passing;
+- revised: existing tests whose expectation changes, each quoting its old
+  assertion and naming the new test that states the new expectation;
+- scope: files a fix should touch (reported, not enforced).
+
+Gate 1 checks the spec against the unfixed code, then the spec is frozen.
+
+Setups: "single" (one model writes the spec) and "split" (the default model
+lists the questions, a strong model answers them, the default model writes
+the tests). Objections from the fixer go back once to the model that owns
+the judgment: the writer for "single", the strong model for "split"."""
+from swe_loop import Read, Search, Shell, user, clip, work, shell
+from swe_cases import ScratchFile, run_case
+
+
+class Quote(BaseModel):
+    """A verbatim quote."""
+    source: str = Field(min_length=1, description="\"issue\", or the absolute path of a file under /testbed")
+    quote: str = Field(min_length=1, description="text copied exactly from that source (one or a few lines)")
+
+
+class Question(BaseModel):
+    """A choice a correct fix must make that the reported example alone does not settle."""
+    question: str = Field(min_length=1)
+    options: list[str] = Field(min_length=2, max_length=4)
+
+
+class Decision(BaseModel):
+    """A question the fix turns on, and its answer."""
+    id: str = Field(min_length=1, max_length=8, description="a short id such as D1, used by the tests that check this decision")
+    question: str = Field(min_length=1)
+    options: list[str] = Field(min_length=2, max_length=4)
+    choice: str = Field(min_length=1, description="one of the options, or a better answer")
+    source: Literal["issue", "code_convention", "existing_test", "guess"]
+    evidence: list[Quote] = Field(max_length=2, description="verbatim quotes that support the choice; empty for a guess")
+
+
+class NewTest(BaseModel):
+    """One test of the fix. kind "fail_to_pass": fails on the current code and must pass after a correct fix. kind "pass_to_pass": passes now and must still pass. reach "reported": the issue's own example; "wider": an input, entry point, or sibling function the rule covers beyond it."""
+    name: str = Field(min_length=1, description="a short unique name")
+    kind: Literal["fail_to_pass", "pass_to_pass"]
+    reach: Literal["reported", "wider"]
+    checks: str = Field(min_length=1, description="the id of the decision this test checks, or \"rule\"")
+    files: list[ScratchFile] = Field(max_length=3, description="small files the command needs (test modules, scripts), all under /tmp/spec/")
+    command: list[str] = Field(min_length=1, description="the command as an argument list, run in /testbed with the project's Python environment, e.g. [\"python\", \"/tmp/spec/t1.py\"] or [\"python\", \"-m\", \"pytest\", \"-q\", \"/tmp/spec/test_t1.py\"]")
+    expect: str = Field(min_length=1, description="a Stone expression over the command's result r (r.exit_code, r.stdout, r.stderr) that is True exactly when the behavior is right, e.g. r.exit_code == 0 and \"['foo']\" in r.stdout")
+    source: Literal["issue", "code_convention", "existing_test", "guess"]
+
+
+class RevisedTest(BaseModel):
+    """An existing test whose expectation a correct fix changes, so it fails after the fix."""
+    test: str = Field(min_length=1, description="/testbed/path/test_file.py::test_name")
+    old_assertion: str = Field(min_length=1, description="the assertion in that file that encodes the old behavior, copied exactly")
+    replaced_by: str = Field(min_length=1, description="the name of the fail_to_pass new test that states the new expectation")
+    reason: str = Field(min_length=1)
+
+
+class TaskSpec(BaseModel):
+    """Your task spec: what a correct fix must do and must not do. The workflow checks it against the current code, then freezes it."""
+    kind: Literal["done"]
+    symptom: str = Field(min_length=1, description="what the issue reports going wrong, in the reported case")
+    rule: str = Field(min_length=1, max_length=700, description="the general behavior a correct fix must have, in one to three sentences, for all the inputs it covers")
+    decisions: list[Decision] = Field(max_length=6)
+    new_tests: list[NewTest] = Field(min_length=2, max_length=8)
+    keep: list[str] = Field(min_length=1, max_length=5, description="shell commands, run in /testbed, that run the existing tests of the code a fix will change; at least one must pass now")
+    revised: list[RevisedTest] = Field(max_length=8)
+    scope: list[str] = Field(min_length=1, max_length=6, description="absolute paths of the source files a fix should change")
+
+
+class SpecTests(BaseModel):
+    """The tests for a rule and decisions that are already settled. The workflow checks them against the current code, then freezes them."""
+    kind: Literal["done"]
+    symptom: str = Field(min_length=1, description="what the issue reports going wrong, in the reported case")
+    new_tests: list[NewTest] = Field(min_length=2, max_length=8)
+    keep: list[str] = Field(min_length=1, max_length=5, description="shell commands, run in /testbed, that run the existing tests of the code a fix will change; at least one must pass now")
+    revised: list[RevisedTest] = Field(max_length=8)
+    scope: list[str] = Field(min_length=1, max_length=6, description="absolute paths of the source files a fix should change")
+
+
+class Questions(BaseModel):
+    """The questions a correct fix must decide."""
+    kind: Literal["done"]
+    questions: list[Question] = Field(min_length=1, max_length=5)
+
+
+class Answers(BaseModel):
+    """Your decisions and the rule that follows from them."""
+    kind: Literal["done"]
+    rule: str = Field(min_length=1, max_length=700, description="the general behavior a correct fix must have, in one to three sentences, for all the inputs it covers")
+    decisions: list[Decision] = Field(min_length=1, max_length=6)
+
+
+class Upheld(BaseModel):
+    """Keep the spec as it is."""
+    kind: Literal["upheld"]
+    reason: str = Field(min_length=1)
+
+
+class Revised(BaseModel):
+    """The spec with your changes. Change only what the objections show to be wrong."""
+    kind: Literal["revised"]
+    reason: str = Field(min_length=1)
+    rule: str = Field(min_length=1, max_length=700)
+    decisions: list[Decision] = Field(max_length=6)
+    new_tests: list[NewTest] = Field(min_length=2, max_length=8)
+    keep: list[str] = Field(min_length=1, max_length=5)
+    revised: list[RevisedTest] = Field(max_length=8)
+
+
+NO_EDITS = "Do not fix anything and do not edit files under /testbed; scratch files go under /tmp/spec/."
+
+QUESTION_HINTS = "Questions worth asking: does the rule cover only the reported input or every input of that kind; does the issue suggest a function, API, or fix to use; how does existing code that handles the same concern (sibling functions, similar call sites, helpers) behave; which existing tests check the current behavior and should change."
+
+SOURCE_RULES = "source is \"issue\" when the issue settles it, \"code_convention\" when existing code does it that way, \"existing_test\" when a test settles it (quote it), and \"guess\" when none does."
+
+TEST_RULES = """- new_tests: concrete, runnable tests. A test may write small files under /tmp/spec/, runs a command in /testbed with the project's Python environment, and judges the result with expect, a Stone expression over r (r.exit_code, r.stdout, r.stderr), e.g. r.exit_code == 0 and "[1]" in r.stdout. Stone expressions look like Python expressions but may use only r, literals, comparisons, and/or/not, `in`, arithmetic, indexing, len, any, all, sorted, str, int, and string methods such as .splitlines(), .strip(), .startswith(), .count(). Include the reported example and at least one "wider" fail_to_pass test: another input, entry point, or sibling function the rule covers. Add a pass_to_pass test where a fix could break behavior that must stay. checks names the decision id the test checks, or "rule"; every decision needs at least one test. A fail_to_pass test must fail on the current code; a pass_to_pass test must pass now. Try each command with the shell action before you finish.
+- keep: shell commands that run the existing tests of the code a fix will change. At least one must pass now. After the fix they must still pass, apart from the tests in revised.
+- revised: existing tests whose assertions check the behavior the rule changes, so they will fail after a correct fix. Copy the old assertion exactly, and name the fail_to_pass new test that states the new expectation. When the issue and an existing test disagree, say so here instead of quietly following the test.
+- scope: the source files a fix should change."""
+
+SINGLE_INSTRUCTIONS = NO_EDITS + """ Read the issue and the code, then write a task spec that defines what a correct fix must do and must not do, so another engineer can fix the issue without making judgment calls of their own.
+
+- rule: the general behavior a correct fix must have, for all the inputs it covers, not only the reported example.
+- decisions: the questions the fix turns on, each with its options and your choice. """ + QUESTION_HINTS + " " + SOURCE_RULES + """
+""" + TEST_RULES + """
+
+Finish with your task spec."""
+
+QUESTIONS_INSTRUCTIONS = NO_EDITS + " Read the issue and the code, then list the questions a correct fix must decide that the reported example alone does not settle, each with two to four concrete options. " + QUESTION_HINTS + " Do not answer them; another engineer will. Finish with your questions."
+
+ANSWERS_INSTRUCTIONS = NO_EDITS + " Another engineer read this issue and listed the questions below that a correct fix must decide. Investigate the issue and the code, and decide each: give it an id (D1, D2, ...), keep its options, and choose one or write a better answer. " + SOURCE_RULES + " Add any deciding question they missed. Then state the rule: the general behavior a correct fix must have, for all the inputs it covers, not only the reported example. Finish with your decisions."
+
+TESTS_INSTRUCTIONS = NO_EDITS + """ The rule and the decisions below are settled; do not revisit them. Write the tests that check them, so another engineer can fix the issue without making judgment calls of their own.
+
+""" + TEST_RULES + """
+
+Finish with your tests."""
+
+REVISE_INSTRUCTIONS = """The engineer fixing this issue objects to parts of the task spec below. Investigate as needed (do not edit files under /testbed). If the objections are wrong, uphold the spec and say why. If they show part of the spec is wrong, finish with the revised spec, changed only where the objections are right. The revised spec is checked against the unfixed code again."""
+
+
+def squash(text):
+    return " ".join(text.split())
+
+
+def check_quote(source, quote, problem):
+    if source == "issue":
+        if squash(quote) not in squash(problem):
+            return "this quote is not in the issue text: " + clip(quote, 200)
+        return None
+    if not source.startswith("/testbed/"):
+        return "source must be \"issue\" or an absolute path under /testbed: " + source
+    result = shell("cat " + source, 60, None, None)
+    if result.exit_code != 0:
+        return "cannot read " + source
+    if squash(quote) not in squash(result.stdout):
+        return "this quote is not in " + source + ": " + clip(quote, 200)
+    return None
+
+
+def decision_dicts(decisions):
+    return [{"id": d.id, "question": d.question, "options": d.options, "choice": d.choice, "source": d.source,
+             "evidence": [{"source": e.source, "quote": e.quote} for e in d.evidence]} for d in decisions]
+
+
+def test_dicts(tests):
+    return [{"name": t.name, "kind": t.kind, "reach": t.reach, "checks": t.checks,
+             "files": [{"path": f.path, "content": f.content} for f in t.files],
+             "command": t.command, "expect": t.expect, "source": t.source} for t in tests]
+
+
+def revised_dicts(revised):
+    return [{"test": r.test, "old_assertion": r.old_assertion, "replaced_by": r.replaced_by, "reason": r.reason} for r in revised]
+
+
+def describe_test(test):
+    return test["name"] + " (" + test["kind"] + ", " + test["reach"] + "): command " + json_dumps(test["command"]) + ", expect " + test["expect"]
+
+
+def check_decisions(decisions, problem):
+    problems = []
+    for d in decisions:
+        for item in d["evidence"]:
+            issue = check_quote(item["source"], item["quote"], problem)
+            if issue is not None:
+                problems.append("decision " + d["id"] + ": " + issue)
+    return problems
+
+
+def gate1(spec, problem):
+    """The spec gate, run on the unfixed code. Returns the problems, each
+    test's result, and the keep baseline."""
+    problems = []
+    tests = spec["new_tests"]
+    names = [t["name"] for t in tests]
+    ids = [d["id"] for d in spec["decisions"]]
+    f2p = [t for t in tests if t["kind"] == "fail_to_pass"]
+    if not f2p:
+        problems.append("no new test is fail_to_pass: at least one must show the behavior the fix changes")
+    if not [t for t in f2p if t["reach"] == "wider"]:
+        problems.append("no fail_to_pass test has reach \"wider\": add one for an input, entry point, or sibling function the rule covers beyond the reported example")
+    if len(set(names)) != len(names):
+        problems.append("new test names must be unique")
+    for t in tests:
+        if t["checks"] != "rule" and t["checks"] not in ids:
+            problems.append("test " + t["name"] + " checks \"" + t["checks"] + "\", which is neither a decision id (" + ", ".join(ids) + ") nor \"rule\"")
+    for d in spec["decisions"]:
+        if not [t for t in tests if t["checks"] == d["id"]]:
+            problems.append("decision " + d["id"] + " (" + clip(d["question"], 100) + ") has no test that checks it")
+    if len(set(ids)) != len(ids):
+        problems.append("decision ids must be unique")
+    results = []
+    for t in tests:
+        outcome = run_case(t)
+        results.append({"name": t["name"], "kind": t["kind"], "reach": t["reach"], "passed": outcome["passed"]})
+        if outcome["problem"] is not None:
+            problems.append("test " + describe_test(t) + " is broken: " + outcome["problem"] + ("\n" + clip(outcome["output"], 1200) if outcome["output"] else ""))
+        elif t["kind"] == "fail_to_pass" and outcome["passed"]:
+            problems.append("test " + describe_test(t) + " already passes on the current code, so it does not show the change; its output:\n" + clip(outcome["output"], 1200))
+        elif t["kind"] == "pass_to_pass" and not outcome["passed"]:
+            problems.append("test " + describe_test(t) + " fails on the current code, so it is not behavior to keep; its output:\n" + clip(outcome["output"], 1200))
+    baseline = []
+    for command in spec["keep"]:
+        result = shell(command, 600, None, None)
+        baseline.append({"command": command, "passed": result.exit_code == 0})
+    if not [k for k in baseline if k["passed"]]:
+        problems.append("none of the keep commands passes on the current code, so none can catch a regression; give at least one command that runs existing tests of this code and exits 0 now")
+    for r in spec["revised"]:
+        parts = r["test"].split("::")
+        if len(parts) < 2 or not parts[0].startswith("/testbed/"):
+            problems.append("revised entry " + r["test"] + " must look like /testbed/path/test_file.py::test_name")
+            continue
+        name = parts[-1].split("[")[0]
+        found = shell("grep -n " + json_dumps(name) + " " + parts[0], 60, None, None)
+        if found.exit_code != 0:
+            problems.append("revised entry " + r["test"] + ": " + name + " is not in " + parts[0])
+        issue = check_quote(parts[0], r["old_assertion"], problem)
+        if issue is not None:
+            problems.append("revised entry " + r["test"] + ": old_assertion: " + issue)
+        if r["replaced_by"] not in [t["name"] for t in f2p]:
+            problems.append("revised entry " + r["test"] + ": replaced_by \"" + r["replaced_by"] + "\" is not the name of a fail_to_pass new test")
+    for path in spec["scope"]:
+        try:
+            stat(path)
+        except FileNotFoundError as error:
+            problems.append("scope file " + path + " does not exist")
+    problems = problems + check_decisions(spec["decisions"], problem)
+    return problems, results, baseline
+
+
+def checked_loop(agent, messages, output, steps, log, phase, use, check):
+    """Ask for output, check it, and send the problems back up to 3 times.
+    check(value) returns a list of problems. Returns (value, problems, rounds)."""
+    value = work(agent, messages, Read | Search | Shell | output, steps, log, phase, use)
+    problems = []
+    rounds = 0
+    if value is not None:
+        problems = check(value)
+        log.append({"phase": "check_" + phase, "kind": "check", "problems": [clip(p, 400) for p in problems]})
+    while value is not None and problems and rounds < 3:
+        rounds += 1
+        messages.append({"role": "assistant", "content": json_dumps(value)})
+        messages.append(user("The workflow checked this against the repository and found problems:\n\n" + "\n\n".join(problems) + "\n\nInvestigate as needed, fix them, and finish with the corrected version."))
+        retry = work(agent, messages, Read | Search | Shell | output, 8, log, phase + "_retry" + str(rounds), use)
+        if retry is not None:
+            value = retry
+            problems = check(value)
+            log.append({"phase": "check_" + phase, "kind": "check", "problems": [clip(p, 400) for p in problems]})
+    return value, problems, rounds
+
+
+def frozen(spec):
+    spec["hash"] = sha256(json_dumps({k: spec[k] for k in ["rule", "decisions", "new_tests", "keep", "revised"]}))[:12]
+    return spec
+
+
+def spec_single(agent, problem, use, log):
+    """One model writes the whole spec."""
+    state = {"results": [], "baseline": []}
+
+    def to_spec(value):
+        return {"symptom": value.symptom, "rule": value.rule, "decisions": decision_dicts(value.decisions),
+                "new_tests": test_dicts(value.new_tests), "keep": value.keep,
+                "revised": revised_dicts(value.revised), "scope": value.scope, "questions": None}
+
+    def check(value):
+        problems, results, baseline = gate1(to_spec(value), problem)
+        state["results"] = results
+        state["baseline"] = baseline
+        return problems
+
+    messages = [user("Issue in the repository at /testbed:\n\n" + problem + "\n\n" + SINGLE_INSTRUCTIONS)]
+    value, problems, rounds = checked_loop(agent, messages, TaskSpec, 30, log, "spec", use, check)
+    if value is None:
+        return None, {"problems": ["the spec step ended without a spec"], "rounds": rounds}
+    return frozen(to_spec(value)), {"problems": problems, "rounds": rounds, "results": state["results"], "baseline": state["baseline"]}
+
+
+def spec_split(agent, strong, problem, strong_model, log):
+    """The default model lists the questions, the strong model decides them,
+    the default model writes the tests for the settled decisions."""
+    intro = "Issue in the repository at /testbed:\n\n" + problem + "\n\n"
+    asked = work(agent, [user(intro + QUESTIONS_INSTRUCTIONS)], Read | Search | Shell | Questions, 15, log, "questions")
+    if asked is None:
+        return None, {"problems": ["the question step ended without questions"], "rounds": 0}
+    questions = [{"question": q.question, "options": q.options} for q in asked.questions]
+
+    def check_answers(value):
+        return check_decisions(decision_dicts(value.decisions), problem)
+
+    messages = [user(intro + ANSWERS_INSTRUCTIONS + "\n\nQuestions:\n" + json_dumps(questions))]
+    answered, answer_problems, answer_rounds = checked_loop(strong, messages, Answers, 15, log, "answers", strong_model, check_answers)
+    if answered is None:
+        return None, {"problems": ["the answer step ended without decisions"], "rounds": answer_rounds, "questions": questions}
+    settled = {"rule": answered.rule, "decisions": decision_dicts(answered.decisions)}
+    state = {"results": [], "baseline": []}
+
+    def to_spec(value):
+        return {"symptom": value.symptom, "rule": settled["rule"], "decisions": settled["decisions"],
+                "new_tests": test_dicts(value.new_tests), "keep": value.keep,
+                "revised": revised_dicts(value.revised), "scope": value.scope, "questions": questions}
+
+    def check(value):
+        problems, results, baseline = gate1(to_spec(value), problem)
+        state["results"] = results
+        state["baseline"] = baseline
+        return problems
+
+    messages = [user(intro + TESTS_INSTRUCTIONS + "\n\nSettled rule and decisions:\n" + json_dumps(settled))]
+    value, problems, rounds = checked_loop(agent, messages, SpecTests, 25, log, "tests", "", check)
+    if value is None:
+        return None, {"problems": ["the test-writing step ended without tests"], "rounds": rounds, "questions": questions}
+    return frozen(to_spec(value)), {"problems": problems + answer_problems, "rounds": rounds + answer_rounds,
+                                    "results": state["results"], "baseline": state["baseline"]}
+
+
+def revise_spec(agent, problem, spec, objections, use, log):
+    """Send the fixer's objections to the spec's owner once. Returns
+    (decision, revised spec or None). The caller re-runs gate 1 on the
+    unfixed code."""
+    shown = {k: spec[k] for k in ["rule", "decisions", "new_tests", "keep", "revised"]}
+    messages = [user("Issue in the repository at /testbed:\n\n" + problem + "\n\n" + REVISE_INSTRUCTIONS + "\n\nTask spec:\n" + json_dumps(shown) + "\n\nObjections:\n" + json_dumps(objections))]
+    answer = work(agent, messages, Read | Search | Shell | Upheld | Revised, 12, log, "revise", use)
+    if answer is None:
+        return {"decision": "no_answer", "reason": ""}, None
+    if answer.kind == "upheld":
+        return {"decision": "upheld", "reason": answer.reason}, None
+    new = {"symptom": spec["symptom"], "rule": answer.rule, "decisions": decision_dicts(answer.decisions),
+           "new_tests": test_dicts(answer.new_tests), "keep": answer.keep, "revised": revised_dicts(answer.revised),
+           "scope": spec["scope"], "questions": spec["questions"]}
+    return {"decision": "revised", "reason": answer.reason}, frozen(new)

@@ -1,0 +1,103 @@
+"""Experiment 5: a model designs the type of a task specification, built from
+checkable blocks, and the workflow turns the design into Stone source for a
+second program to import. The design is typed data, not Stone text, so the
+generated class always loads; the model's freedom is in which fields exist,
+what they ask for, and what a choice field's options are."""
+
+FIELD_KINDS = ["text", "text_list", "choice", "decisions", "quotes", "files", "yes_no", "number"]
+# Fields every specification has: the workflow checks them and the fixer uses them.
+CORE_FIELDS = ["kind", "cases", "changes_existing", "scope"]
+RESERVED = ["and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif", "else",
+            "except", "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "nonlocal", "not",
+            "or", "pass", "raise", "return", "try", "while", "with", "yield", "true", "false", "none", "null",
+            "self", "model", "type", "field", "literal"]
+NAME_CHARS = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t",
+              "u", "v", "w", "x", "y", "z", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "_"]
+LETTERS = NAME_CHARS[:26]
+
+
+class FieldDesign(BaseModel):
+    """One field of the specification type, beyond the fields every specification has."""
+    name: str = Field(min_length=1, max_length=40, description="a lowercase identifier: letters, digits, underscores, starting with a letter, e.g. str_param_display")
+    type: Literal["text", "text_list", "choice", "decisions", "quotes", "files", "yes_no", "number"] = Field(description="text: one string. text_list: a list of strings. choice: exactly one of the options you list. decisions: a list of decided questions (question, choice, rejected alternatives, basis issue/code_convention/guess, verbatim evidence), with quotes checked. quotes: a list of verbatim quotes from the issue or a file under /testbed, each checked. files: absolute paths under /testbed, each checked to exist. yes_no: true or false. number: an integer.")
+    options: list[str] = Field(max_length=8, description="for a choice field: the possible answers, at least two, without saying which is right; empty for every other type")
+    description: str = Field(min_length=1, max_length=600, description="what the field must contain. The engineer who fills it in sees the issue, the field name, and this description")
+
+
+class SpecDesign(BaseModel):
+    """The type of the specification: what it must pin down so the fixer has no judgment calls left."""
+    kind: Literal["done"]
+    purpose: str = Field(min_length=1, max_length=600, description="one or two sentences: what a filled-in specification of this type settles, for the engineer who fills it in")
+    cases_description: str = Field(min_length=1, max_length=600, description="what the runnable cases must cover for this issue: the reported case, the other inputs the general rule reaches, and the behavior that must not change")
+    fields: list[FieldDesign] = Field(min_length=1, max_length=12)
+
+
+def plain_name(name):
+    rest = name
+    for ch in NAME_CHARS:
+        rest = rest.replace(ch, "")
+    return rest == "" and name[:1] in LETTERS
+
+
+def design_problems(design):
+    problems = []
+    seen = []
+    for field in design.fields:
+        if not plain_name(field.name):
+            problems.append("field name " + json_dumps(field.name) + " must use only lowercase letters, digits, and underscores, starting with a letter")
+        elif field.name in RESERVED or field.name in CORE_FIELDS:
+            problems.append("field name " + field.name + " is reserved; choose another")
+        elif field.name in seen:
+            problems.append("field name " + field.name + " is used twice")
+        seen.append(field.name)
+        if field.type == "choice":
+            options = [o.strip() for o in field.options]
+            if len(options) < 2 or "" in options or len(unique(options)) != len(options):
+                problems.append("choice field " + field.name + " needs at least two distinct, non-empty options")
+        elif field.options:
+            problems.append("field " + field.name + " is not a choice field, so its options must be empty")
+    return problems
+
+
+def annotation(field):
+    if field.type == "text":
+        return "str = Field(min_length=1, description=" + json_dumps(field.description) + ")"
+    if field.type == "text_list":
+        return "list[str] = Field(max_length=10, description=" + json_dumps(field.description) + ")"
+    if field.type == "choice":
+        return "Literal[" + ", ".join([json_dumps(o.strip()) for o in field.options]) + "] = Field(description=" + json_dumps(field.description) + ")"
+    if field.type == "decisions":
+        return "list[Decision] = Field(max_length=8, description=" + json_dumps(field.description) + ")"
+    if field.type == "quotes":
+        return "list[Evidence] = Field(max_length=8, description=" + json_dumps(field.description) + ")"
+    if field.type == "files":
+        return "list[str] = Field(max_length=8, description=" + json_dumps(field.description + " (absolute paths under /testbed)") + ")"
+    if field.type == "yes_no":
+        return "bool = Field(description=" + json_dumps(field.description) + ")"
+    return "int = Field(description=" + json_dumps(field.description) + ")"
+
+
+def type_source(design):
+    """Stone source of a module defining TaskSpec from the design."""
+    lines = ["\"\"\"Generated from a model-designed specification type.\"\"\"",
+             "from swe_cases import Case",
+             "from spec_blocks import Decision, Evidence",
+             "",
+             "",
+             "class TaskSpec(BaseModel):",
+             "    " + json_dumps(design.purpose),
+             "    kind: Literal[\"done\"]"]
+    for field in design.fields:
+        lines.append("    " + field.name + ": " + annotation(field))
+    lines.append("    cases: list[Case] = Field(min_length=2, max_length=6, description=" + json_dumps(
+        "runnable checks; each \"changes\" case fails on the current code, each \"keeps\" case passes now, and the fix must make all pass. They must cover: " + design.cases_description) + ")")
+    lines.append("    changes_existing: list[str] = Field(max_length=10, description=" + json_dumps(
+        "existing tests whose expectations the specified behavior changes, so they fail after a correct fix, as /testbed/path/test_file.py::test_name") + ")")
+    lines.append("    scope: list[str] = Field(min_length=1, max_length=6, description=" + json_dumps(
+        "absolute paths of the source files a fix should change") + ")")
+    return "\n".join(lines) + "\n"
+
+
+def design_dict(design):
+    return {"purpose": design.purpose, "cases_description": design.cases_description,
+            "fields": [{"name": f.name, "type": f.type, "options": f.options, "description": f.description} for f in design.fields]}

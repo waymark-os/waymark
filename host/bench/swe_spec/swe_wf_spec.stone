@@ -1,0 +1,6 @@
+"""Experiment 3, arms B/C/D: the wf_status workflow given a task spec."""
+from swe_wf import solve
+
+PROBLEM = "__PROBLEM__"
+SPEC = "__SPEC__"
+emit(solve(model.limit(calls=60), PROBLEM, False, SPEC))

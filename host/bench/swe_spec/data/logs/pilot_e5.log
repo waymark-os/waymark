@@ -1,0 +1,55 @@
+21:22:56 starting arms ['F'] reps 1 tag -e5smoke: 1 jobs
+21:26:00 done F pytest-dev__pytest-7205: claimed=verified resolved=False calls=12 guesses=2 scope_extra=0 design_calls=1 design_rounds=0 fields=8 fill_calls=10 spec_problems=0 check_rounds=0 184s 20261109-212418-haiku-swe_wf_spec3-pytest-7205-e5smokeF1
+21:26:00 all done
+21:26:16 starting arms ['E', 'F', 'G'] reps 3 tag -e5: 36 jobs
+21:27:44 RETRY sonnet swe_fill.stone django__django-11087 -e5G1: model transport failure in 20261109-212652-sonnet-swe_fill-django-11087-e5G1
+21:34:29 NOSPEC G django__django-11087 -e5G1: fixer runs without a spec
+21:45:20 done E django__django-11087: claimed=not_verified resolved=True calls=45 guesses=0 scope_extra=0 design_calls=3 design_rounds=0 fields=6 fill_calls=4 spec_problems=0 check_rounds=0 1144s 20261109-212950-haiku-swe_wf_spec3-django-11087-e5E1
+21:48:28 done G django__django-11087: claimed=not_verified resolved=False calls=46 guesses=0 scope_extra=0 design_calls=2 design_rounds=0 fields=9 fill_calls=None spec_problems=0 check_rounds=None spec=missing 1332s 20261109-213429-haiku-swe_wf_spec3-django-11087-e5G1
+21:49:21 done F django__django-11087: claimed=not_verified resolved=False calls=43 guesses=5 scope_extra=0 design_calls=2 design_rounds=0 fields=9 fill_calls=14 spec_problems=0 check_rounds=1 1385s 20261109-213324-haiku-swe_wf_spec3-django-11087-e5F1
+21:52:25 done E matplotlib__matplotlib-23299: claimed=verified resolved=False calls=23 guesses=0 scope_extra=0 design_calls=1 design_rounds=0 fields=6 fill_calls=7 spec_problems=0 check_rounds=0 1569s 20261109-213444-haiku-swe_wf_spec3-matplotlib-23299-e5E1
+21:55:50 done E pytest-dev__pytest-7205: claimed=not_verified resolved=False calls=27 guesses=4 scope_extra=0 design_calls=1 design_rounds=0 fields=9 fill_calls=6 spec_problems=0 check_rounds=0 388s 20261109-215115-haiku-swe_wf_spec3-pytest-7205-e5E1
+21:57:30 done F pytest-dev__pytest-7205: claimed=verified resolved=False calls=15 guesses=1 scope_extra=0 design_calls=1 design_rounds=0 fields=9 fill_calls=10 spec_problems=0 check_rounds=1 305s 20261109-215510-haiku-swe_wf_spec3-pytest-7205-e5F1
+22:08:47 done E sympy__sympy-12489: claimed=verified resolved=False calls=33 guesses=0 scope_extra=0 design_calls=2 design_rounds=0 fields=9 fill_calls=13 spec_problems=0 check_rounds=1 677s 20261109-220212-haiku-swe_wf_spec3-sympy-12489-e5E1
+22:11:14 done G pytest-dev__pytest-7205: claimed=not_verified resolved=True calls=40 guesses=0 scope_extra=0 design_calls=2 design_rounds=0 fields=8 fill_calls=22 spec_problems=0 check_rounds=0 924s 20261109-220100-haiku-swe_wf_spec3-pytest-7205-e5G1
+22:11:35 NOSPEC F sympy__sympy-12489 -e5F1: fixer runs without a spec
+22:16:01 done F sympy__sympy-12489: claimed=verified resolved=False calls=27 guesses=0 scope_extra=0 design_calls=8 design_rounds=0 fields=9 fill_calls=None spec_problems=0 check_rounds=None spec=missing 434s 20261109-221136-haiku-swe_wf_spec3-sympy-12489-e5F1
+22:23:20 done G matplotlib__matplotlib-23299: claimed=verified resolved=True calls=16 guesses=1 scope_extra=0 design_calls=10 design_rounds=0 fields=9 fill_calls=24 spec_problems=0 check_rounds=0 2093s 20261109-220531-haiku-swe_wf_spec3-matplotlib-23299-e5G1
+22:24:50 done F matplotlib__matplotlib-23299: claimed=verified resolved=True calls=14 guesses=1 scope_extra=0 design_calls=14 design_rounds=0 fields=8 fill_calls=9 spec_problems=0 check_rounds=1 2370s 20261109-220829-haiku-swe_wf_spec3-matplotlib-23299-e5F1
+22:26:15 RETRY sonnet swe_fill.stone django__django-11087 -e5G2: model transport failure in 20261109-222524-sonnet-swe_fill-django-11087-e5G2
+22:29:56 done E django__django-11087: claimed=verified resolved=False calls=24 guesses=0 scope_extra=0 design_calls=2 design_rounds=0 fields=7 fill_calls=6 spec_problems=0 check_rounds=0 835s 20261109-221903-haiku-swe_wf_spec3-django-11087-e5E2
+22:30:53 NOSPEC G django__django-11087 -e5G2: fixer runs without a spec
+22:31:35 done G sympy__sympy-12489: claimed=not_verified resolved=False calls=55 guesses=1 scope_extra=0 design_calls=2 design_rounds=0 fields=7 fill_calls=33 spec_problems=0 check_rounds=0 1222s 20261109-222017-haiku-swe_wf_spec3-sympy-12489-e5G1
+22:35:11 done G django__django-11087: claimed=verified resolved=False calls=18 guesses=0 scope_extra=0 design_calls=2 design_rounds=0 fields=8 fill_calls=None spec_problems=0 check_rounds=None spec=missing 621s 20261109-223053-haiku-swe_wf_spec3-django-11087-e5G2
+22:38:50 RETRY sonnet swe_fill.stone matplotlib__matplotlib-23299 -e5G2: model transport failure in 20261109-223700-sonnet-swe_fill-matplotlib-23299-e5G2
+22:40:12 NOSPEC G matplotlib__matplotlib-23299 -e5G2: fixer runs without a spec
+22:50:41 done F django__django-11087: claimed=not_verified resolved=False calls=55 guesses=1 scope_extra=0 design_calls=2 design_rounds=0 fields=8 fill_calls=10 spec_problems=0 check_rounds=2 1641s 20261109-223519-haiku-swe_wf_spec3-django-11087-e5F2
+22:53:24 done E pytest-dev__pytest-7205: claimed=verified resolved=False calls=11 guesses=1 scope_extra=0 design_calls=1 design_rounds=0 fields=6 fill_calls=2 spec_problems=0 check_rounds=0 163s 20261109-225138-haiku-swe_wf_spec3-pytest-7205-e5E2
+22:57:06 done G matplotlib__matplotlib-23299: claimed=verified resolved=False calls=32 guesses=0 scope_extra=0 design_calls=11 design_rounds=0 fields=9 fill_calls=None spec_problems=0 check_rounds=None spec=missing 1315s 20261109-224012-haiku-swe_wf_spec3-matplotlib-23299-e5G2
+23:00:16 done F pytest-dev__pytest-7205: claimed=verified resolved=False calls=19 guesses=1 scope_extra=0 design_calls=2 design_rounds=0 fields=9 fill_calls=7 spec_problems=0 check_rounds=0 413s 20261109-225444-haiku-swe_wf_spec3-pytest-7205-e5F2
+23:03:31 done E matplotlib__matplotlib-23299: claimed=verified resolved=False calls=23 guesses=0 scope_extra=0 design_calls=1 design_rounds=0 fields=9 fill_calls=9 spec_problems=0 check_rounds=1 2015s 20261109-224850-haiku-swe_wf_spec3-matplotlib-23299-e5E2
+23:05:52 done G pytest-dev__pytest-7205: claimed=verified resolved=True calls=32 guesses=0 scope_extra=0 design_calls=2 design_rounds=0 fields=7 fill_calls=13 spec_problems=0 check_rounds=1 526s 20261109-230105-haiku-swe_wf_spec3-pytest-7205-e5G2
+23:06:00 NOSPEC F sympy__sympy-12489 -e5F2: fixer runs without a spec
+23:07:02 done F matplotlib__matplotlib-23299: claimed=verified resolved=False calls=16 guesses=2 scope_extra=0 design_calls=13 design_rounds=0 fields=8 fill_calls=9 spec_problems=0 check_rounds=1 2126s 20261109-225001-haiku-swe_wf_spec3-matplotlib-23299-e5F2
+23:08:57 done F sympy__sympy-12489: claimed=verified resolved=False calls=20 guesses=0 scope_extra=0 design_calls=2 design_rounds=0 fields=7 fill_calls=None spec_problems=0 check_rounds=None spec=missing 326s 20261109-230600-haiku-swe_wf_spec3-sympy-12489-e5F2
+23:12:00 done E sympy__sympy-12489: claimed=verified resolved=False calls=30 guesses=1 scope_extra=0 design_calls=3 design_rounds=0 fields=6 fill_calls=6 spec_problems=0 check_rounds=1 703s 20261109-230409-haiku-swe_wf_spec3-sympy-12489-e5E2
+23:13:36 RETRY sonnet swe_fill.stone django__django-11087 -e5G3: model transport failure in 20261109-231232-sonnet-swe_fill-django-11087-e5G3
+23:20:20 done G sympy__sympy-12489: claimed=verified resolved=True calls=46 guesses=0 scope_extra=0 design_calls=2 design_rounds=0 fields=8 fill_calls=34 spec_problems=0 check_rounds=0 868s 20261109-231434-haiku-swe_wf_spec3-sympy-12489-e5G2
+23:24:47 done E django__django-11087: claimed=not_verified resolved=False calls=49 guesses=0 scope_extra=0 design_calls=1 design_rounds=0 fields=4 fill_calls=5 spec_problems=0 check_rounds=0 1065s 20261109-230924-haiku-swe_wf_spec3-django-11087-e5E3
+23:34:53 done G django__django-11087: claimed=not_verified resolved=True calls=55 guesses=0 scope_extra=0 design_calls=2 design_rounds=0 fields=9 fill_calls=25 spec_problems=0 check_rounds=0 1373s 20261109-232125-haiku-swe_wf_spec3-django-11087-e5G3
+23:36:09 RETRY sonnet swe_design.stone matplotlib__matplotlib-23299 -e5G3: model transport failure in 20261109-233453-sonnet-swe_design-matplotlib-23299-e5G3
+23:37:37 done F django__django-11087: claimed=not_verified resolved=False calls=55 guesses=4 scope_extra=0 design_calls=2 design_rounds=0 fields=8 fill_calls=13 spec_problems=0 check_rounds=2 1720s 20261109-232109-haiku-swe_wf_spec3-django-11087-e5F3
+23:40:44 done E pytest-dev__pytest-7205: claimed=verified resolved=True calls=14 guesses=0 scope_extra=0 design_calls=3 design_rounds=0 fields=7 fill_calls=3 spec_problems=0 check_rounds=0 187s 20261109-233851-haiku-swe_wf_spec3-pytest-7205-e5E3
+23:42:36 NOSPEC F pytest-dev__pytest-7205 -e5F3: fixer runs without a spec
+23:44:34 done F pytest-dev__pytest-7205: claimed=verified resolved=False calls=19 guesses=0 scope_extra=0 design_calls=2 design_rounds=0 fields=8 fill_calls=None spec_problems=0 check_rounds=None spec=missing 230s 20261109-234236-haiku-swe_wf_spec3-pytest-7205-e5F3
+23:47:26 RETRY sonnet swe_fill.stone pytest-dev__pytest-7205 -e5G3: model transport failure in 20261109-234510-sonnet-swe_fill-pytest-7205-e5G3
+23:50:16 done E matplotlib__matplotlib-23299: claimed=verified resolved=False calls=14 guesses=1 scope_extra=0 design_calls=2 design_rounds=0 fields=6 fill_calls=9 spec_problems=0 check_rounds=1 1796s 20261109-233337-haiku-swe_wf_spec3-matplotlib-23299-e5E3
+23:51:29 NOSPEC G pytest-dev__pytest-7205 -e5G3: fixer runs without a spec
+23:52:53 done G pytest-dev__pytest-7205: claimed=verified resolved=False calls=9 guesses=0 scope_extra=0 design_calls=8 design_rounds=0 fields=9 fill_calls=None spec_problems=0 check_rounds=None spec=missing 499s 20261109-235130-haiku-swe_wf_spec3-pytest-7205-e5G3
+23:53:59 done F matplotlib__matplotlib-23299: claimed=verified resolved=True calls=19 guesses=1 scope_extra=0 design_calls=11 design_rounds=0 fields=8 fill_calls=8 spec_problems=0 check_rounds=0 1753s 20261109-233524-haiku-swe_wf_spec3-matplotlib-23299-e5F3
+23:56:15 RETRY sonnet swe_fill.stone sympy__sympy-12489 -e5G3: model transport failure in 20261109-235442-sonnet-swe_fill-sympy-12489-e5G3
+00:04:11 done F sympy__sympy-12489: claimed=not_verified resolved=False calls=56 guesses=4 scope_extra=0 design_calls=2 design_rounds=0 fields=8 fill_calls=9 spec_problems=0 check_rounds=1 678s 20261109-235738-haiku-swe_wf_spec3-sympy-12489-e5F3
+00:05:37 done E sympy__sympy-12489: claimed=verified resolved=False calls=36 guesses=0 scope_extra=0 design_calls=2 design_rounds=0 fields=4 fill_calls=7 spec_problems=0 check_rounds=1 921s 20261109-235331-haiku-swe_wf_spec3-sympy-12489-e5E3
+00:09:58 done G sympy__sympy-12489: claimed=not_verified resolved=False calls=56 guesses=3 scope_extra=0 design_calls=8 design_rounds=0 fields=9 fill_calls=17 spec_problems=0 check_rounds=0 959s 20261110-000340-haiku-swe_wf_spec3-sympy-12489-e5G3
+00:20:18 done G matplotlib__matplotlib-23299: claimed=verified resolved=True calls=10 guesses=0 scope_extra=0 design_calls=2 design_rounds=0 fields=8 fill_calls=22 spec_problems=0 check_rounds=1 2725s 20261110-000636-haiku-swe_wf_spec3-matplotlib-23299-e5G3
+00:20:18 all done

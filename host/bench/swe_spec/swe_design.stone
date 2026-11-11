@@ -1,0 +1,59 @@
+"""Experiment 5, stage 1: the model designs the type of the specification for
+this issue. The workflow checks the design and turns it into Stone source
+(spec_design.type_source); a second program imports that type and has a
+model fill it in (swe_fill.stone)."""
+from swe_loop import Read, Search, Shell, user, clip, work
+from spec_design import SpecDesign, design_problems, type_source, design_dict
+
+SPEC_PROBLEM = "__PROBLEM__"
+
+INSTRUCTIONS = """Do not fix anything and do not edit files under /testbed. Do not write the specification itself either.
+
+Your job is to design the type of a specification for this issue. Another engineer will read the issue and the code and fill in a specification of your type. A third engineer will then fix the issue by following that specification, without making judgment calls of their own. Design the fields so that, once filled in, the specification pins down everything the fixer would otherwise have to decide for this issue. Read the issue and as much of the code as you need to see what those decisions are.
+
+Do not answer the questions yourself. A field's description says what must be decided or established, not what the answer is. A choice field lists the possible answers without saying which is right.
+
+Every specification already has three fields, which the workflow checks against the repository:
+- cases: runnable checks. Each writes small files, runs a command in /testbed, and judges the result with a predicate. A "changes" case must fail on the current code and a "keeps" case must pass now. After the fix, every case must pass. You write cases_description: what the cases must cover for this issue.
+- changes_existing: existing tests whose expectations the specified behavior changes.
+- scope: the source files a fix should change.
+
+Add the other fields this issue needs: the questions to settle, the facts to establish, the evidence to quote, and anything else the fixer must not have to work out alone. Field types:
+- text: one string.
+- text_list: a list of strings.
+- choice: exactly one of the options you list.
+- decisions: a list of decided questions, each with its choice, the rejected alternatives, its basis (issue, code_convention, or guess), and verbatim evidence.
+- quotes: verbatim quotes from the issue or a file under /testbed. Each is checked.
+- files: paths under /testbed. Each is checked to exist.
+- yes_no: true or false.
+- number: an integer.
+
+Finish with your design."""
+
+
+def write_design(agent, problem):
+    must_run(["git", "config", "--global", "--add", "safe.directory", "*"])
+    log = []
+    messages = [user("Issue in the repository at /testbed:\n\n" + problem + "\n\n" + INSTRUCTIONS)]
+    design = work(agent, messages, Read | Search | Shell | SpecDesign, 18, log, "design")
+    problems = []
+    rounds = 0
+    if design is not None:
+        problems = design_problems(design)
+    while design is not None and problems and rounds < 2:
+        rounds += 1
+        log.append({"phase": "check_design", "kind": "check", "problems": problems})
+        messages.append({"role": "assistant", "content": json_dumps(design)})
+        messages.append(user("The workflow found problems in your design:\n\n" + "\n".join(problems) + "\n\nFix them and finish with the corrected design."))
+        retry = work(agent, messages, Read | Search | Shell | SpecDesign, 4, log, "design_retry" + str(rounds))
+        if retry is not None:
+            design = retry
+            problems = design_problems(design)
+    if design is None or problems:
+        return {"arm": "design", "design": None, "type_source": None, "design_problems": problems,
+                "check_rounds": rounds, "usage": agent.usage, "log": log}
+    return {"arm": "design", "design": design_dict(design), "type_source": type_source(design),
+            "design_problems": [], "check_rounds": rounds, "usage": agent.usage, "log": log}
+
+
+emit(write_design(model.limit(calls=30), SPEC_PROBLEM))

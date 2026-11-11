@@ -1,0 +1,123 @@
+"""SWE-bench workflow, typed arm: explore -> reproduce -> fix -> verify -> submit.
+Steps hand each other records, and the program (not the model) checks each
+handoff: the diagnosis must name real files and a reproduction that fails on
+the unfixed code; the fix must make that reproduction pass, keep the tests that
+passed before passing, and change the files it claims to change."""
+from swe_loop import Read, Search, Shell, Edit, Write, user, clip, setup, final_patch, work, shell, shell_text
+
+PROBLEM = "__PROBLEM__"
+CALLS = 60
+ROUNDS = 3
+DIAGNOSIS_RETRIES = 2
+
+
+class Diagnosis(BaseModel):
+    """Your findings. Before any edit, the workflow checks them: every file must exist, the reproduction is run now and must fail, and the tests are run now; after your fix the reproduction must pass and every test that passed now must still pass."""
+    kind: Literal["done"]
+    files: list[str] = Field(min_length=1, max_length=8, description="absolute paths of the source files that need to change")
+    root_cause: str = Field(min_length=1)
+    reproduction: str = Field(min_length=1, description="a complete Python script that exits with a nonzero status while the bug is present and with status 0 once it is fixed")
+    tests: list[str] = Field(min_length=1, max_length=5, description="shell commands, run in /testbed, that run existing tests of the code you will change; at least one must pass now")
+
+
+class FixReport(BaseModel):
+    """Your fix. The workflow then checks it: the reproduction must pass, the tests that passed before must still pass, and every file you list must appear in git diff."""
+    kind: Literal["done"]
+    changed: list[str] = Field(min_length=1, description="absolute paths of the files you changed")
+    explanation: str = Field(min_length=1)
+
+
+INTRO = "Issue to resolve in /testbed:\n\n" + PROBLEM + "\n\n"
+
+
+def check_diagnosis(found):
+    """Run the diagnosis's checks; return the problems and the test baseline."""
+    problems = []
+    for path in found.files:
+        try:
+            stat(path)
+        except FileNotFoundError as error:
+            problems.append("file " + path + " does not exist")
+    shell("cat > /tmp/repro.py", 30, found.reproduction, Expect(exit=0))
+    before = shell("python /tmp/repro.py", 300, None, None)
+    if before.exit_code == 0:
+        problems.append("the reproduction exits 0 on the unfixed code, so it does not show the bug:\n" + shell_text(before))
+    baseline = []
+    for command in found.tests:
+        result = shell(command, 600, None, None)
+        baseline.append({"command": command, "passed": result.exit_code == 0, "output": shell_text(result)})
+    # A regression check with no passing tests checks nothing, so ask for one that runs.
+    if not [t for t in baseline if t["passed"]]:
+        outputs = "\n".join([t["command"] + "\n" + clip(t["output"], 1500) for t in baseline])
+        problems.append("none of your test commands passes on the unfixed code, so none can catch a regression; give at least one command that runs existing tests of this code and exits 0 now" + ("; what they did:\n" + outputs if outputs else ""))
+    return {"problems": problems, "before": shell_text(before), "baseline": baseline}
+
+
+def check_fix(fix, reproduction, baseline):
+    """Run the fix's checks; return the failures (empty when the fix holds)."""
+    failures = []
+    changed = must_run(["git", "-C", "/testbed", "diff", "--name-only"]).stdout.splitlines()
+    if not changed:
+        failures.append("git diff is empty: no source file was changed")
+    for path in fix.changed:
+        relative = path[len("/testbed/"):] if path.startswith("/testbed/") else path
+        if relative not in changed:
+            failures.append("you listed " + path + " as changed, but git diff does not show it")
+    # Re-write the reproduction from the diagnosis: the program's copy is the
+    # one that counts, whatever happened to /tmp/repro.py during the fix.
+    shell("cat > /tmp/repro.py", 30, reproduction, Expect(exit=0))
+    try:
+        shell("python /tmp/repro.py", 300, None, Expect(exit=0))
+    except ExpectationFailed as error:
+        failures.append("the reproduction still fails:\n" + shell_text(error.result))
+    for test in baseline:
+        if test["passed"]:
+            try:
+                shell(test["command"], 600, None, Expect(exit=0))
+            except ExpectationFailed as error:
+                failures.append("this test passed before your change and fails now: " + test["command"] + "\n" + shell_text(error.result))
+    return failures
+
+
+setup()
+agent = model.limit(calls=CALLS)
+log = []
+outcome = "unfinished"
+try:
+    messages = [user(INTRO + "Step 1, explore: find the code involved and the root cause, and write a script that reproduces the issue. Do not edit source files yet. Finish with your diagnosis.")]
+    found = work(agent, messages, Read | Search | Shell | Diagnosis, 20, log, "explore")
+    checked = None
+    for retry in range(DIAGNOSIS_RETRIES + 1):
+        if found is None:
+            break
+        checked = check_diagnosis(found)
+        log.append({"phase": "check_diagnosis", "kind": "check", "problems": [clip(p, 300) for p in checked["problems"]],
+                    "tests_passing": len([t for t in checked["baseline"] if t["passed"]]), "tests": len(checked["baseline"])})
+        if not checked["problems"] or retry == DIAGNOSIS_RETRIES:
+            break
+        messages.append({"role": "assistant", "content": json_dumps(found)})
+        messages.append(user("The workflow checked your diagnosis and found problems:\n" + "\n".join(checked["problems"]) + "\nInvestigate and finish with a corrected diagnosis."))
+        found = work(agent, messages, Read | Search | Shell | Diagnosis, 8, log, "explore_retry" + str(retry))
+    if found is None:
+        raise RuntimeError("the explore step ended without a diagnosis")
+    guards = [t["command"] for t in checked["baseline"] if t["passed"]]
+    contract = "The workflow will accept your fix only if: /tmp/repro.py (rewritten from the diagnosis) exits 0" + ("; these tests still pass: " + "; ".join(guards) if guards else "") + "; and every file you report as changed appears in git diff."
+    feedback = ""
+    for round in range(ROUNDS):
+        task = INTRO + "Diagnosis:\n" + json_dumps(found) + "\n\nThe reproduction on the unfixed code:\n" + checked["before"] + "\n\n" + feedback + "Steps 2-4: fix the source code; run /tmp/repro.py and the tests as you go. " + contract + " Finish with your fix report."
+        fix = work(agent, [user(task)], Read | Search | Shell | Edit | Write | FixReport, 25, log, "fix" + str(round))
+        if fix is None:
+            failures = ["the fix step ended without a fix report"]
+        else:
+            failures = check_fix(fix, found.reproduction, checked["baseline"])
+        log.append({"phase": "verify" + str(round), "kind": "check", "failures": [clip(f, 300) for f in failures]})
+        if not failures:
+            outcome = "verified"
+            break
+        feedback = "The workflow rejected the previous attempt:\n" + "\n".join(failures) + "\n\n"
+        outcome = "not_verified"
+except Exception as error:
+    log.append({"phase": "stopped", "kind": error.type, "message": clip(error.message, 400)})
+    outcome = "stopped: " + error.type
+
+emit({"arm": "typed", "outcome": outcome, "patch": final_patch(), "usage": agent.usage, "log": log})

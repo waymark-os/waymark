@@ -1,0 +1,70 @@
+{
+  "symptom": "Job.objects.filter(guid__in=...).delete() cascades through TextLogStep to TextLogError, and the Collector fetches every column of each related row (e.g. text_log_error.line) just to find what to delete. Under Python 3 with mysqlclient, one of those unneeded text columns holds bytes that are not valid UTF-8, so the SELECT raises UnicodeDecodeError and the whole delete fails.",
+  "expected_rule": "When the deletion Collector queries related rows only to cascade or delete them, it should load only the fields deletion needs: the primary key plus any field another relation points at (for example a ForeignKey's to_field target, or a parent link), at every cascade level and for both QuerySet.delete() and Model.delete(). Full rows must still be loaded when user code can see the instances, for example when pre_delete/post_delete receivers are connected for that model or a custom on_delete handler needs them. Counts, ordering, SET_NULL/SET updates and Collector subclasses like the admin's NestedObjects must keep working.",
+  "rule_evidence": [
+    {
+      "source": "issue",
+      "quote": "the UnicodeDecodeError is occurring for a field (text_log_error.line) that is not actually needed for the .delete() (it's not a primary key etc), so Django shouldn't be fetching that field regardless when making the text_log_error SELECT query"
+    },
+    {
+      "source": "issue",
+      "quote": "Fixing issue (2) would presumably also improve .delete() performance."
+    },
+    {
+      "source": "/testbed/django/db/models/deletion.py",
+      "quote": "return related.related_model._base_manager.using(self.using).filter("
+    },
+    {
+      "source": "/testbed/django/db/models/deletion.py",
+      "quote": "sub_objs = self.related_objects(related, batch)"
+    },
+    {
+      "source": "/testbed/django/db/models/deletion.py",
+      "quote": "if (signals.pre_delete.has_listeners(model) or\n                signals.post_delete.has_listeners(model) or"
+    },
+    {
+      "source": "/testbed/django/db/models/deletion.py",
+      "quote": "pk_list = [obj.pk for obj in instances]"
+    },
+    {
+      "source": "/testbed/django/contrib/admin/utils.py",
+      "quote": "return qs.select_related(related.field.name)"
+    },
+    {
+      "source": "/testbed/django/db/models/query.py",
+      "quote": "Essentially, the opposite of defer(). Only the fields passed into this"
+    }
+  ],
+  "examples": [
+    "Reported: deleting Jobs cascades to TextLogStep and then TextLogError; the text_log_error SELECT should not include the `line` column (only `id` is needed), so bad bytes in `line` no longer break the delete.",
+    "A related model with a ForeignKey(to_field='guid') pointing at the collected model (failure_line.job_guid -> job.guid): the collected Job rows must still have `guid` loaded so the next cascade query can filter on it.",
+    "A related model with a pre_delete or post_delete receiver connected: its rows are still fetched with all fields, so the receiver sees a complete instance.",
+    "A single instance's Model.delete() that cascades to child rows: child rows are fetched with only the fields needed, and the returned (count, per-model counts) are unchanged.",
+    "on_delete=SET_NULL / SET(...) on a related model: the update is done by primary key and still applies.",
+    "Admin delete confirmation (NestedObjects, which select_related()s the FK and displays objects) still works without errors."
+  ],
+  "named_hints": [
+    "QuerySet.delete()",
+    "\"Optimize .delete() to use only required fields\" (issue title)",
+    "mysqlclient use_unicode (issue (1), driver-level decoding)",
+    "Django ticket 21961 (database-level cascade deletes)"
+  ],
+  "related_sites": [
+    "/testbed/django/db/models/deletion.py:Collector.related_objects \u2014 builds the cascade-target queryset with `<fk>__in` and loads all columns; the natural place to limit fields.",
+    "/testbed/django/db/models/deletion.py:Collector.collect \u2014 batches related querysets, evaluates them with `elif sub_objs:` and hands them to on_delete handlers (CASCADE, PROTECT, SET_*).",
+    "/testbed/django/db/models/deletion.py:Collector.can_fast_delete \u2014 already treats pre_delete/post_delete/m2m_changed listeners as the condition under which instances must be materialised; the same test fits deciding when full rows are needed.",
+    "/testbed/django/db/models/deletion.py:Collector.delete \u2014 only uses obj.pk for DeleteQuery/UpdateQuery, but sends instances to signals.",
+    "/testbed/django/contrib/admin/utils.py:NestedObjects.related_objects \u2014 overrides related_objects and adds select_related(related.field.name); a field restriction must not clash with this (deferring a field that is also select_related raises).",
+    "/testbed/django/contrib/contenttypes/management/commands/remove_stale_contenttypes.py:NoFastDeleteCollector \u2014 Collector subclass that shows the collected objects to the user.",
+    "/testbed/django/contrib/contenttypes/fields.py:GenericRelation.bulk_related_objects \u2014 generic-relation cascade only needs obj.pk.",
+    "/testbed/django/db/models/query.py:QuerySet.only \u2014 existing API for loading only some fields (deferred loading).",
+    "/testbed/django/db/models/fields/related.py:ForeignObject.target_field \u2014 the field on the referenced model that a relation filters against (to_field), i.e. what must stay loaded.",
+    "/testbed/django/db/models/query.py:QuerySet.delete \u2014 top-level entry that creates the Collector and calls collect(del_query)."
+  ],
+  "open_questions": [
+    "Should the top-level queryset in QuerySet.delete() also be restricted, or only the related querysets fetched during cascades?",
+    "Issue (1) (making mysqlclient decoding consistent via use_unicode) is a separate change; the title points at issue (2) only.",
+    "Exactly which fields count as required: pk, referenced to_field targets, parent links; custom on_delete callables may read arbitrary fields.",
+    "How the restriction should interact with Collector subclasses that override related_objects (admin NestedObjects)."
+  ]
+}

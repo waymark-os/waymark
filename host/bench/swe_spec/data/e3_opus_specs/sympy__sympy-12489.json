@@ -1,0 +1,68 @@
+{
+  "symptom": "Subclassing combinatorics.Permutation does not work: many construction paths go through _af_new, a static method that always calls Basic.__new__(Perm, perm), so they return plain Permutation objects instead of the subclass. Only overriding _af_new works around it.",
+  "expected_rule": "Every way of building a permutation should create an instance of the class it was called on, not a hard-coded Permutation. That covers Subclass(...) for every argument form handled by __new__ and the class-level constructors (random, unrank_lex, unrank_nonlex, unrank_trotterjohnson, from_inversion_vector, from_sequence, josephus), and it means _af_new takes the class as a parameter, like a classmethod. Behaviour for plain Permutation and existing callers of the module-level _af_new must stay the same.",
+  "rule_evidence": [
+    {
+      "source": "issue",
+      "quote": "This method eventually creates the object calling `Basic.__new__(Perm, perm)` (`Perm` is a reference to `Permutation`)."
+    },
+    {
+      "source": "issue",
+      "quote": "use the mandatory reference to the class (the first argument of a classmethod) the method is called on for instance creation."
+    },
+    {
+      "source": "/testbed/sympy/combinatorics/permutations.py",
+      "quote": "p = Basic.__new__(Perm, perm)"
+    },
+    {
+      "source": "/testbed/sympy/combinatorics/permutations.py",
+      "quote": "obj = Basic.__new__(cls, aform)"
+    },
+    {
+      "source": "/testbed/sympy/combinatorics/permutations.py",
+      "quote": "return _af_new(list(range(size or 0)))"
+    },
+    {
+      "source": "/testbed/sympy/combinatorics/permutations.py",
+      "quote": "return Perm(a.array_form, size=size)"
+    },
+    {
+      "source": "/testbed/sympy/combinatorics/permutations.py",
+      "quote": "return Perm.unrank_nonlex(self.size, r + 1)"
+    },
+    {
+      "source": "/testbed/sympy/combinatorics/permutations.py",
+      "quote": "_af_new = Perm._af_new"
+    }
+  ],
+  "examples": [
+    "Reported: with `class MyPerm(Permutation): pass`, MyPerm() and MyPerm(1, 2) currently return a Permutation; they should return MyPerm.",
+    "MyPerm(Cycle(1, 2)), MyPerm(3) (identity of size 4) and MyPerm(MyPerm([1, 0]), size=4) should return MyPerm, as MyPerm([1, 0]) already does through the array-form path.",
+    "Class-level constructors called on the subclass, e.g. MyPerm.random(3), MyPerm.unrank_lex(3, 2), MyPerm.from_inversion_vector([1, 0]), MyPerm.josephus(2, 4), return MyPerm.",
+    "Operations on a subclass instance (p*q, ~p, p**2, p.next_lex()) return the subclass if results follow type(self) (see open questions).",
+    "Permutation itself and existing callers of the module-level _af_new (tensor_can, group_constructs, tensor.py) keep getting Permutation objects."
+  ],
+  "named_hints": [
+    "Permutation.__new__",
+    "_af_new / Permutation._af_new (static method)",
+    "Basic.__new__(Perm, perm)",
+    "classmethods using the class argument (cls) for instance creation",
+    "overriding Permutation._af_new (current workaround)"
+  ],
+  "related_sites": [
+    "/testbed/sympy/combinatorics/permutations.py:Permutation.__new__ \u2014 the array/cyclic-form path already uses Basic.__new__(cls, aform); the empty, multi-arg, Cycle, int and Permutation-argument paths call _af_new or Perm(...).",
+    "/testbed/sympy/combinatorics/permutations.py:Permutation._af_new \u2014 static method that hard-codes Perm.",
+    "/testbed/sympy/combinatorics/permutations.py:Permutation.random / unrank_lex / unrank_nonlex / unrank_trotterjohnson / from_inversion_vector / from_sequence / josephus \u2014 already classmethods (first arg named self) but build results with _af_new or Perm(...).",
+    "/testbed/sympy/combinatorics/permutations.py:Permutation.__mul__ / __rmul__ / __pow__ / __xor__ / __invert__ / mul_inv / rmul_with_af / next_lex / next_nonlex / next_trotterjohnson / commutator \u2014 instance and static methods that create results via _af_new or Perm.",
+    "/testbed/sympy/combinatorics/permutations.py:module level `_af_new = Perm._af_new` \u2014 alias imported by other modules.",
+    "/testbed/sympy/combinatorics/group_constructs.py:DirectProduct \u2014 uses `_af_new = Permutation._af_new` to build generators.",
+    "/testbed/sympy/combinatorics/tensor_can.py \u2014 imports _af_new from permutations and calls it with an array only.",
+    "/testbed/sympy/tensor/tensor.py \u2014 imports _af_new from permutations inside methods."
+  ],
+  "open_questions": [
+    "Should instance-method results (products, powers, inverses, next_*) use type(self), and which class wins when a subclass and a plain Permutation are combined?",
+    "Case (g) in __new__: Subclass(p) where p is a plain Permutation of the same size currently returns p unchanged; should it be converted to the subclass?",
+    "How to keep `_af_new(perm)` callable with an array only for external callers while letting the class choose the type.",
+    "Whether other classes that make Permutations internally (e.g. PermutationGroup) should be in scope."
+  ]
+}

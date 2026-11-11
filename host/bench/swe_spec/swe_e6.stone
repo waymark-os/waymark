@@ -1,0 +1,69 @@
+"""Experiment 6: a task spec with tests as gates, written before any fix.
+The Gateway's default model (Haiku) fixes in every setup; setups differ in
+who writes the spec:
+  none           no spec: the experiment 2-4 workflow
+  single_strong  the strong model writes the whole spec
+  single_default the default model writes the whole spec
+  split          the default model lists the questions, the strong model
+                 decides them, the default model writes the tests
+Gate 1 checks the spec on the unfixed code, gate 2 checks each fix, and the
+final verifier re-runs gate 2 on a clean copy with only the graded patch,
+plus a wider regression check. A setup whose spec step ends without a spec
+falls back to "none" and says so."""
+from swe_loop import final_patch
+from swe_plan import spec_single, spec_split, revise_spec
+from swe_wf4 import fix_with_spec
+from swe_verify import verify
+from swe_tree import untracked_files
+from swe_wf2 import solve
+
+PROBLEM = "__PROBLEM__"
+CONFIG = "__SPEC__"
+STRONG = "claude-sonnet-5-5"
+
+
+def main():
+    must_run(["git", "config", "--global", "--add", "safe.directory", "*"])
+    untracked = untracked_files()
+    setup = CONFIG["setup"]
+    log = []
+    planner = model.limit(calls=45)
+    strong = model.limit(calls=30)
+    fixer = model.limit(calls=60)
+    spec = None
+    info = {}
+    owner = None
+    if setup == "single_strong":
+        spec, info = spec_single(planner, PROBLEM, STRONG, log)
+        owner = [planner, STRONG]
+    elif setup == "single_default":
+        spec, info = spec_single(planner, PROBLEM, "", log)
+        owner = [planner, ""]
+    elif setup == "split":
+        spec, info = spec_split(planner, strong, PROBLEM, STRONG, log)
+        owner = [strong, STRONG]
+    # The spec step must not touch the repository; undo it if it did.
+    dirty = must_run(["git", "-C", "/testbed", "status", "--porcelain", "--untracked-files=no"]).stdout.strip()
+    if dirty:
+        must_run(["git", "-C", "/testbed", "checkout", "--", "."])
+        log.append({"phase": "spec", "kind": "reverted_edits", "files": dirty.splitlines()})
+    if spec is None:
+        fallback = solve(fixer, PROBLEM, False, None)
+        return {"setup": setup, "spec": None, "spec_info": info, "fell_back": setup != "none",
+                "outcome": fallback["outcome"], "patch": fallback["patch"],
+                "usage": {"planner": planner.usage, "strong": strong.usage, "fixer": fixer.usage},
+                "log": log + fallback["log"]}
+
+    def revise(current, objections):
+        return revise_spec(owner[0], PROBLEM, current, objections, owner[1], log)
+
+    first_hash = spec["hash"]
+    spec, baseline, fixed = fix_with_spec(fixer, PROBLEM, spec, info["baseline"], revise, untracked, log)
+    verdict = verify(spec, baseline, untracked, fixed, log)
+    outcome = verdict["outcome"] if fixed["reported"] else "unfinished"
+    return {"setup": setup, "spec": spec, "first_spec_hash": first_hash, "spec_info": info, "fell_back": False,
+            "outcome": outcome, "fix": fixed, "verdict": verdict, "patch": final_patch(),
+            "usage": {"planner": planner.usage, "strong": strong.usage, "fixer": fixer.usage}, "log": log}
+
+
+emit(main())

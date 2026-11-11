@@ -1,0 +1,46 @@
+"""Experiment 6: grade a task spec on its own, apart from any fixer. Each
+patch (the reference fix and every distinct patch the runs produced) is
+applied to the unfixed code in turn; the spec accepts a patch when every new
+test passes and every keep command that passed on the unfixed code still
+passes, apart from failures in the spec's revised tests. The caller compares
+these verdicts with the hidden tests' verdicts. No model is called."""
+from swe_loop import shell, shell_text, clip
+from swe_cases import run_case
+from swe_wf2 import only_expected_failures
+
+PROBLEM = "__PROBLEM__"
+INPUT = "__SPEC__"
+
+
+def judge(plan, guards):
+    cases = []
+    for case in plan["new_tests"]:
+        outcome = run_case(case)
+        cases.append({"name": case["name"], "kind": case["kind"], "reach": case["reach"],
+                      "passed": outcome["passed"], "problem": outcome["problem"]})
+    expected = [t["test"] for t in plan["revised"]]
+    tests = []
+    for command in guards:
+        result = shell(command, 600, None, None)
+        ok = result.exit_code == 0 or only_expected_failures(result.stdout + "\n" + result.stderr, expected)
+        tests.append({"command": command, "passed": ok})
+    accepts = all([c["passed"] is True for c in cases]) and all([t["passed"] for t in tests])
+    return {"accepts": accepts, "cases": cases, "tests": tests}
+
+
+def main():
+    must_run(["git", "config", "--global", "--add", "safe.directory", "*"])
+    out = []
+    for item in INPUT["patches"]:
+        applied = shell("git apply -", 120, item["patch"], None)
+        if applied.exit_code != 0:
+            out.append({"name": item["name"], "error": clip(shell_text(applied), 500)})
+            continue
+        result = judge(INPUT["plan"], INPUT["guards"])
+        result["name"] = item["name"]
+        out.append(result)
+        shell("git apply -R -", 120, item["patch"], Expect(exit=0))
+    return out
+
+
+emit(main())

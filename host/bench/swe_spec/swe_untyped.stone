@@ -1,0 +1,37 @@
+"""SWE-bench workflow, untyped arm: explore -> reproduce -> fix -> verify -> submit.
+Steps hand each other free-text reports, and the model judges whether its own
+fix is verified."""
+from swe_loop import Read, Search, Shell, Edit, Write, Note, user, clip, setup, final_patch, work
+
+PROBLEM = "__PROBLEM__"
+CALLS = 60
+ROUNDS = 3
+
+INTRO = "Issue to resolve in /testbed:\n\n" + PROBLEM + "\n\n"
+
+setup()
+agent = model.limit(calls=CALLS)
+log = []
+outcome = "unfinished"
+try:
+    found = work(agent, [user(INTRO + "Step 1, explore: find the code involved and the root cause. Do not edit anything yet. Finish with a report of the files involved, the root cause, how to reproduce the issue, and which existing tests cover this code.")],
+                 Read | Search | Shell | Note, 20, log, "explore")
+    findings = found.report if found is not None else "(the explore step ended without a report)"
+    feedback = ""
+    for round in range(ROUNDS):
+        task = INTRO + "Findings so far:\n" + findings + "\n\n" + feedback + "Steps 2-4: reproduce the issue with a script under /tmp, fix the source code, then verify the fix by rerunning your script and the relevant existing tests. Finish with a report of what you changed and how you verified it."
+        fixed = work(agent, [user(task)], Read | Search | Shell | Edit | Write | Note, 25, log, "fix" + str(round))
+        report = fixed.report if fixed is not None else "(the fix step ended without a report)"
+        patch = final_patch()
+        verdict = agent.ask(INTRO + "Current change (git diff):\n" + clip(patch, 8000) + "\n\nThe engineer's report:\n" + report + "\n\nIs the issue resolved and the fix verified? Start your reply with VERIFIED or NOT VERIFIED, then give the reason.", max_output_tokens=2000)
+        log.append({"phase": "verify" + str(round), "kind": "judgment", "verdict": clip(verdict, 400)})
+        if verdict.strip().upper().startswith("VERIFIED"):
+            outcome = "verified"
+            break
+        feedback = "A reviewer did not accept the previous attempt:\n" + verdict + "\n\n"
+        outcome = "not_verified"
+except Exception as error:
+    log.append({"phase": "stopped", "kind": error.type, "message": clip(error.message, 400)})
+    outcome = "stopped: " + error.type
+
+emit({"arm": "untyped", "outcome": outcome, "patch": final_patch(), "usage": agent.usage, "log": log})

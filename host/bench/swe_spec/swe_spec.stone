@@ -1,0 +1,92 @@
+"""Experiment 3: write a typed specification of an issue before anyone fixes it.
+
+The spec writer reads the issue and the code (no edits) and fills in TaskSpec.
+The workflow checks what it can against the environment: every quoted piece
+of evidence must appear verbatim in the issue or in the file it names. It
+cannot check that the rule is right; that is what the experiment measures."""
+from swe_loop import Read, Search, Shell, user, clip, work, shell
+
+SPEC_PROBLEM = "__PROBLEM__"
+
+
+class Evidence(BaseModel):
+    """A verbatim quote that supports the rule."""
+    source: str = Field(min_length=1, description="\"issue\", or the absolute path of a file under /testbed")
+    quote: str = Field(min_length=1, description="text copied exactly from that source (one or a few lines)")
+
+
+class TaskSpec(BaseModel):
+    """Your specification of what a correct fix must do. The workflow checks that every quote appears verbatim in its source."""
+    kind: Literal["done"]
+    symptom: str = Field(min_length=1, description="what the issue reports going wrong, in the reported case")
+    expected_rule: str = Field(min_length=1, description="the general behavior a correct fix must have, stated for all the inputs it covers, not only the reported example")
+    rule_evidence: list[Evidence] = Field(min_length=1, max_length=8, description="quotes from the issue or the code that support expected_rule")
+    examples: list[str] = Field(min_length=1, max_length=6, description="concrete cases the rule covers, including the reported one")
+    named_hints: list[str] = Field(max_length=8, description="functions, APIs, options, or fixes the issue itself names or suggests")
+    related_sites: list[str] = Field(max_length=10, description="places in the code (path:function) that handle the same concern, and how they handle it")
+    open_questions: list[str] = Field(max_length=6, description="what the issue and the code leave unsettled")
+
+
+INSTRUCTIONS = """Do not fix anything and do not edit files. Read the issue and the code, then write a specification of what a correct fix must do.
+
+Separate the reported symptom (the one case the reporter hit) from the general rule a correct fix must satisfy. To find the rule:
+- note every function, API, option, or fix the issue names or suggests;
+- find code elsewhere in the repository that already handles the same concern (sibling functions, similar call sites, existing helpers), and how it handles it, since a correct fix usually follows that convention;
+- list the other inputs or code paths the same rule applies to.
+
+Every rule_evidence item must quote text verbatim from the issue (source "issue") or from a file (source = its absolute path). Finish with your specification."""
+
+
+def squash(text):
+    return " ".join(text.split())
+
+
+def check_spec(spec, problem):
+    problems = []
+    issue = squash(problem)
+    for item in spec.rule_evidence:
+        quote = squash(item.quote)
+        if item.source == "issue":
+            if quote not in issue:
+                problems.append("this quote is not in the issue text: " + clip(item.quote, 200))
+            continue
+        if not item.source.startswith("/testbed/"):
+            problems.append("source must be \"issue\" or an absolute path under /testbed: " + item.source)
+            continue
+        result = shell("cat " + item.source, 60, None, None)
+        if result.exit_code != 0:
+            problems.append("cannot read " + item.source)
+        elif quote not in squash(result.stdout):
+            problems.append("this quote is not in " + item.source + ": " + clip(item.quote, 200))
+    return problems
+
+
+def write_spec(agent, problem):
+    must_run(["git", "config", "--global", "--add", "safe.directory", "*"])
+    log = []
+    messages = [user("Issue in the repository at /testbed:\n\n" + problem + "\n\n" + INSTRUCTIONS)]
+    spec = work(agent, messages, Read | Search | Shell | TaskSpec, 20, log, "spec")
+    problems = []
+    rounds = 0
+    while spec is not None and rounds < 2:
+        problems = check_spec(spec, problem)
+        log.append({"phase": "check_spec", "kind": "check", "problems": problems})
+        if not problems:
+            break
+        rounds += 1
+        messages.append({"role": "assistant", "content": json_dumps(spec)})
+        messages.append(user("The workflow checked your quotes and found problems:\n" + "\n".join(problems) + "\nFix the quotes (copy them exactly) and finish with the corrected specification."))
+        retry = work(agent, messages, Read | Search | Shell | TaskSpec, 6, log, "spec_retry" + str(rounds))
+        if retry is not None:
+            spec = retry
+            problems = check_spec(spec, problem)
+    out = None
+    if spec is not None:
+        out = {"symptom": spec.symptom, "expected_rule": spec.expected_rule,
+               "rule_evidence": [{"source": e.source, "quote": e.quote} for e in spec.rule_evidence],
+               "examples": spec.examples, "named_hints": spec.named_hints,
+               "related_sites": spec.related_sites, "open_questions": spec.open_questions}
+    return {"arm": "spec", "spec": out, "quote_problems": problems, "usage": agent.usage, "log": log}
+
+
+emit(write_spec(model.limit(calls=30), SPEC_PROBLEM))

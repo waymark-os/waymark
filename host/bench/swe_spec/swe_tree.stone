@@ -1,0 +1,37 @@
+"""Experiment 6: move the working tree between the unfixed code and a patch,
+for checks that must run on the unfixed code mid-fix (gate 1 on a revised
+spec) and for the final verifier (a clean copy with only the patch)."""
+from swe_loop import shell
+
+
+def untracked_files():
+    """Untracked, not ignored files under /testbed."""
+    out = must_run(["git", "-C", "/testbed", "ls-files", "--others", "--exclude-standard"]).stdout
+    return [line for line in out.splitlines() if line.strip()]
+
+
+def set_aside(untracked, keep_new_files=True):
+    """Return the tree to the unfixed code and return the patch that undoes
+    it. New untracked files are part of the patch when keep_new_files is
+    True (so mid-fix work is not lost); the final verifier passes False,
+    because the graded patch is plain git diff and does not carry them."""
+    new_files = [p for p in untracked_files() if p not in untracked]
+    if keep_new_files and new_files:
+        must_run(["git", "-C", "/testbed", "add", "--intent-to-add", "--"] + new_files)
+    patch = must_run(["git", "-C", "/testbed", "diff"], max_stdout_bytes=4000000).stdout
+    if keep_new_files and new_files:
+        must_run(["git", "-C", "/testbed", "reset", "-q", "--"] + new_files)
+    for path in new_files:
+        must_run(["rm", "-rf", "/testbed/" + path])
+    must_run(["git", "-C", "/testbed", "checkout", "--", "."])
+    return patch
+
+
+def put_back(patch):
+    """Apply a patch from set_aside. Returns None, or the reason it failed."""
+    if not patch.strip():
+        return None
+    result = shell("git apply --whitespace=nowarn -", 120, patch, None)
+    if result.exit_code != 0:
+        return "git apply failed: " + result.stderr[:500]
+    return None

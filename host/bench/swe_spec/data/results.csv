@@ -1,0 +1,225 @@
+experiment,setup,model,task,tag,outcome,resolved,calls,spec_given,run,counted
+1,"typed, first round",haiku,matplotlib__matplotlib-23299,,stopped: TimeoutError,,22,,20261108-142904-haiku-swe_typed-matplotlib-23299,False
+1,"untyped, first round",haiku,matplotlib__matplotlib-23299,,,,,,20261108-142904-haiku-swe_untyped-matplotlib-23299,False
+1,"untyped, first round",haiku,matplotlib__matplotlib-23299,,stopped: TimeoutError,,26,,20261108-142941-haiku-swe_untyped-matplotlib-23299,False
+1,"typed, first round",haiku,matplotlib__matplotlib-23299,,verified,True,23,,20261108-173902-haiku-swe_typed-matplotlib-23299,True
+1,"untyped, first round",haiku,matplotlib__matplotlib-23299,,verified,False,45,,20261108-173907-haiku-swe_untyped-matplotlib-23299,True
+1,"untyped, one run",haiku,django__django-11087,-p1,not_verified,False,53,,20261108-180812-haiku-swe_untyped-django-11087-p1,True
+1,"typed, one run",luna,django__django-11087,-p1,not_verified,False,25,,20261108-180812-luna-swe_typed-django-11087-p1,True
+1,"untyped, one run",luna,django__django-11087,-p1,verified,False,22,,20261108-180812-luna-swe_untyped-django-11087-p1,True
+1,"typed, one run",haiku,matplotlib__matplotlib-23299,-p1,verified,True,29,,20261108-181316-haiku-swe_typed-matplotlib-23299-p1,True
+1,"untyped, one run",haiku,matplotlib__matplotlib-23299,-p1,verified,True,29,,20261108-181322-haiku-swe_untyped-matplotlib-23299-p1,True
+1,"typed, one run",luna,matplotlib__matplotlib-23299,-p1,not_verified,False,8,,20261108-181619-luna-swe_typed-matplotlib-23299-p1,True
+1,"untyped, one run",luna,matplotlib__matplotlib-23299,-p1,verified,False,12,,20261108-181839-luna-swe_untyped-matplotlib-23299-p1,True
+1,"typed, one run",haiku,pytest-dev__pytest-7205,-p1,verified,False,16,,20261108-182106-haiku-swe_typed-pytest-7205-p1,True
+1,"untyped, one run",haiku,pytest-dev__pytest-7205,-p1,not_verified,False,45,,20261108-182355-haiku-swe_untyped-pytest-7205-p1,True
+1,"typed, one run",luna,pytest-dev__pytest-7205,-p1,verified,False,17,,20261108-182439-luna-swe_typed-pytest-7205-p1,True
+1,"untyped, one run",luna,pytest-dev__pytest-7205,-p1,verified,False,5,,20261108-182456-luna-swe_untyped-pytest-7205-p1,True
+1,"typed, one run",luna,sympy__sympy-12489,-p1,not_verified,False,8,,20261108-182510-luna-swe_typed-sympy-12489-p1,True
+1,"untyped, one run",luna,sympy__sympy-12489,-p1,verified,False,5,,20261108-182536-luna-swe_untyped-sympy-12489-p1,True
+1,"typed, one run",haiku,django__django-11087,-p1,not_verified,False,55,,20261108-183212-haiku-swe_typed-django-11087-p1,True
+1,"typed, one run",haiku,sphinx-doc__sphinx-10673,-p1,verified,True,31,,20261108-183212-haiku-swe_typed-sphinx-10673-p1,True
+1,"untyped, one run",haiku,sphinx-doc__sphinx-10673,-p1,not_verified,True,58,,20261108-183212-haiku-swe_untyped-sphinx-10673-p1,True
+1,"typed, one run",luna,sphinx-doc__sphinx-10673,-p1,not_verified,False,10,,20261108-183212-luna-swe_typed-sphinx-10673-p1,True
+1,"untyped, one run",luna,sphinx-doc__sphinx-10673,-p1,verified,False,5,,20261108-183600-luna-swe_untyped-sphinx-10673-p1,True
+1,"typed, one run",haiku,sympy__sympy-12489,-p1,verified,False,30,,20261108-183609-haiku-swe_typed-sympy-12489-p1,True
+1,"untyped, one run",haiku,sympy__sympy-12489,-p1,not_verified,False,58,,20261108-183738-haiku-swe_untyped-sympy-12489-p1,True
+1,typed,haiku,django__django-11087,-r1,not_verified,False,48,,20261108-190041-haiku-swe_typed-django-11087-r1,True
+1,typed,haiku,matplotlib__matplotlib-23299,-r1,verified,False,19,,20261108-190041-haiku-swe_typed-matplotlib-23299-r1,True
+1,typed,haiku,pytest-dev__pytest-7205,-r1,verified,False,17,,20261108-190041-haiku-swe_typed-pytest-7205-r1,True
+1,untyped,haiku,django__django-11087,-r1,not_verified,False,37,,20261108-190041-haiku-swe_untyped-django-11087-r1,True
+1,untyped,haiku,matplotlib__matplotlib-23299,-r1,not_verified,True,56,,20261108-190041-haiku-swe_untyped-matplotlib-23299-r1,True
+1,untyped,haiku,pytest-dev__pytest-7205,-r1,verified,False,31,,20261108-190217-haiku-swe_untyped-pytest-7205-r1,True
+1,typed,haiku,sphinx-doc__sphinx-10673,-r1,verified,True,22,,20261108-190919-haiku-swe_typed-sphinx-10673-r1,True
+1,untyped,haiku,sphinx-doc__sphinx-10673,-r1,not_verified,True,57,,20261108-190939-haiku-swe_untyped-sphinx-10673-r1,True
+1,typed,haiku,sympy__sympy-12489,-r1,not_verified,False,55,,20261108-191028-haiku-swe_typed-sympy-12489-r1,True
+1,untyped,haiku,sympy__sympy-12489,-r1,not_verified,False,56,,20261108-191231-haiku-swe_untyped-sympy-12489-r1,True
+1,typed,haiku,django__django-11087,-r2,verified,False,12,,20261108-191534-haiku-swe_typed-django-11087-r2,True
+1,untyped,haiku,django__django-11087,-r2,not_verified,False,47,,20261108-191547-haiku-swe_untyped-django-11087-r2,True
+1,typed,haiku,matplotlib__matplotlib-23299,-r2,verified,False,25,,20261108-191554-haiku-swe_typed-matplotlib-23299-r2,True
+1,untyped,haiku,matplotlib__matplotlib-23299,-r2,not_verified,True,50,,20261108-191754-haiku-swe_untyped-matplotlib-23299-r2,True
+1,typed,haiku,pytest-dev__pytest-7205,-r2,verified,False,22,,20261108-191926-haiku-swe_typed-pytest-7205-r2,True
+1,untyped,haiku,pytest-dev__pytest-7205,-r2,not_verified,False,35,,20261108-192100-haiku-swe_untyped-pytest-7205-r2,True
+1,typed,haiku,sphinx-doc__sphinx-10673,-r2,verified,False,20,,20261108-192212-haiku-swe_typed-sphinx-10673-r2,True
+1,untyped,haiku,sphinx-doc__sphinx-10673,-r2,not_verified,True,51,,20261108-192237-haiku-swe_untyped-sphinx-10673-r2,True
+1,typed,haiku,sympy__sympy-12489,-r2,verified,False,18,,20261108-192439-haiku-swe_typed-sympy-12489-r2,True
+1,untyped,haiku,sympy__sympy-12489,-r2,not_verified,False,57,,20261108-192448-haiku-swe_untyped-sympy-12489-r2,True
+1,typed,haiku,django__django-11087,-r3,verified,False,14,,20261108-192648-haiku-swe_typed-django-11087-r3,True
+1,untyped,haiku,django__django-11087,-r3,not_verified,False,46,,20261108-192658-haiku-swe_untyped-django-11087-r3,True
+1,typed,haiku,matplotlib__matplotlib-23299,-r3,verified,False,22,,20261108-192908-haiku-swe_typed-matplotlib-23299-r3,True
+1,untyped,haiku,matplotlib__matplotlib-23299,-r3,not_verified,False,43,,20261108-193025-haiku-swe_untyped-matplotlib-23299-r3,True
+1,typed,haiku,pytest-dev__pytest-7205,-r3,verified,False,14,,20261108-193306-haiku-swe_typed-pytest-7205-r3,True
+1,untyped,haiku,pytest-dev__pytest-7205,-r3,verified,False,43,,20261108-193423-haiku-swe_untyped-pytest-7205-r3,True
+1,typed,haiku,sphinx-doc__sphinx-10673,-r3,verified,True,26,,20261108-193544-haiku-swe_typed-sphinx-10673-r3,True
+1,untyped,haiku,sphinx-doc__sphinx-10673,-r3,not_verified,True,57,,20261108-193736-haiku-swe_untyped-sphinx-10673-r3,True
+1,typed,haiku,sympy__sympy-12489,-r3,verified,False,41,,20261108-193742-haiku-swe_typed-sympy-12489-r3,True
+1,untyped,haiku,sympy__sympy-12489,-r3,not_verified,False,57,,20261108-194048-haiku-swe_untyped-sympy-12489-r3,True
+2,statuses + cross-check,haiku,django__django-11087,-e2r1,not_verified,False,55,,20261108-205919-haiku-swe_wf_check-django-11087-e2r1,True
+2,statuses + cross-check,haiku,matplotlib__matplotlib-23299,-e2r1,verified,False,37,,20261108-205919-haiku-swe_wf_check-matplotlib-23299-e2r1,True
+2,statuses only,haiku,django__django-11087,-e2r1,not_verified,False,55,,20261108-205919-haiku-swe_wf_status-django-11087-e2r1,True
+2,statuses only,haiku,matplotlib__matplotlib-23299,-e2r1,verified,True,26,,20261108-205919-haiku-swe_wf_status-matplotlib-23299-e2r1,True
+2,statuses only,haiku,pytest-dev__pytest-7205,-e2r1,verified,False,19,,20261108-205919-haiku-swe_wf_status-pytest-7205-e2r1,True
+2,statuses + cross-check,haiku,pytest-dev__pytest-7205,-e2r1,verified,False,17,,20261108-210344-haiku-swe_wf_check-pytest-7205-e2r1,True
+2,statuses only,haiku,sphinx-doc__sphinx-10673,-e2r1,verified,True,24,,20261108-210551-haiku-swe_wf_status-sphinx-10673-e2r1,True
+2,statuses + cross-check,haiku,sphinx-doc__sphinx-10673,-e2r1,verified,True,33,,20261108-210918-haiku-swe_wf_check-sphinx-10673-e2r1,True
+2,statuses only,qwen,django__django-11087,-e2q1,not_verified,False,36,,20261108-210937-qwen-swe_wf_status-django-11087-e2q1,True
+2,statuses only,haiku,sympy__sympy-12489,-e2r1,verified,False,34,,20261108-211123-haiku-swe_wf_status-sympy-12489-e2r1,True
+2,statuses + cross-check,qwen,django__django-11087,-e2q1,not_verified,False,55,,20261108-211133-qwen-swe_wf_check-django-11087-e2q1,True
+2,statuses + cross-check,haiku,sympy__sympy-12489,-e2r1,verified,False,46,,20261108-211304-haiku-swe_wf_check-sympy-12489-e2r1,True
+2,statuses only,haiku,django__django-11087,-e2r2,not_verified,False,55,,20261108-211433-haiku-swe_wf_status-django-11087-e2r2,True
+2,statuses + cross-check,haiku,django__django-11087,-e2r2,not_verified,False,55,,20261108-211527-haiku-swe_wf_check-django-11087-e2r2,True
+2,statuses only,haiku,matplotlib__matplotlib-23299,-e2r2,verified,True,30,,20261108-211547-haiku-swe_wf_status-matplotlib-23299-e2r2,True
+2,statuses + cross-check,haiku,matplotlib__matplotlib-23299,-e2r2,verified,False,43,,20261108-211731-haiku-swe_wf_check-matplotlib-23299-e2r2,True
+2,untyped,qwen,django__django-11087,-e2q1,not_verified,False,57,,20261108-211945-qwen-swe_untyped-django-11087-e2q1,True
+2,statuses only,haiku,pytest-dev__pytest-7205,-e2r2,verified,False,15,,20261108-212259-haiku-swe_wf_status-pytest-7205-e2r2,True
+2,statuses only,qwen,matplotlib__matplotlib-23299,-e2q1,not_verified,False,36,,20261108-212511-qwen-swe_wf_status-matplotlib-23299-e2q1,True
+2,statuses + cross-check,haiku,pytest-dev__pytest-7205,-e2r2,verified,False,27,,20261108-212706-haiku-swe_wf_check-pytest-7205-e2r2,True
+2,statuses only,haiku,sphinx-doc__sphinx-10673,-e2r2,verified,True,26,,20261108-212821-haiku-swe_wf_status-sphinx-10673-e2r2,True
+2,statuses + cross-check,haiku,sphinx-doc__sphinx-10673,-e2r2,verified,True,35,,20261108-212857-haiku-swe_wf_check-sphinx-10673-e2r2,True
+2,statuses only,haiku,sympy__sympy-12489,-e2r2,verified,False,26,,20261108-212904-haiku-swe_wf_status-sympy-12489-e2r2,True
+2,statuses + cross-check,haiku,sympy__sympy-12489,-e2r2,verified,False,33,,20261108-213202-haiku-swe_wf_check-sympy-12489-e2r2,True
+2,statuses only,haiku,django__django-11087,-e2r3,verified,False,18,,20261108-213258-haiku-swe_wf_status-django-11087-e2r3,True
+2,statuses + cross-check,haiku,django__django-11087,-e2r3,not_verified,False,55,,20261108-213300-haiku-swe_wf_check-django-11087-e2r3,True
+2,statuses only,haiku,matplotlib__matplotlib-23299,-e2r3,verified,False,26,,20261108-213521-haiku-swe_wf_status-matplotlib-23299-e2r3,True
+2,statuses + cross-check,haiku,matplotlib__matplotlib-23299,-e2r3,verified,False,31,,20261108-213544-haiku-swe_wf_check-matplotlib-23299-e2r3,True
+2,statuses only,haiku,pytest-dev__pytest-7205,-e2r3,verified,False,11,,20261108-213626-haiku-swe_wf_status-pytest-7205-e2r3,True
+2,statuses + cross-check,qwen,matplotlib__matplotlib-23299,-e2q1,not_verified,False,55,,20261108-213654-qwen-swe_wf_check-matplotlib-23299-e2q1,True
+2,statuses + cross-check,haiku,pytest-dev__pytest-7205,-e2r3,verified,False,14,,20261108-213747-haiku-swe_wf_check-pytest-7205-e2r3,True
+2,statuses only,haiku,sphinx-doc__sphinx-10673,-e2r3,verified,False,28,,20261108-213834-haiku-swe_wf_status-sphinx-10673-e2r3,True
+2,statuses + cross-check,haiku,sphinx-doc__sphinx-10673,-e2r3,verified,True,26,,20261108-213931-haiku-swe_wf_check-sphinx-10673-e2r3,True
+2,statuses only,haiku,sympy__sympy-12489,-e2r3,verified,False,30,,20261108-214234-haiku-swe_wf_status-sympy-12489-e2r3,True
+2,untyped,qwen,matplotlib__matplotlib-23299,-e2q1,not_verified,False,57,,20261108-214235-qwen-swe_untyped-matplotlib-23299-e2q1,True
+2,statuses + cross-check,haiku,sympy__sympy-12489,-e2r3,verified,False,34,,20261108-214258-haiku-swe_wf_check-sympy-12489-e2r3,True
+2,statuses only,qwen,pytest-dev__pytest-7205,-e2q1,not_verified,True,55,,20261108-214910-qwen-swe_wf_status-pytest-7205-e2q1,True
+2,statuses + cross-check,qwen,pytest-dev__pytest-7205,-e2q1,not_verified,True,55,,20261108-215224-qwen-swe_wf_check-pytest-7205-e2q1,True
+2,untyped,qwen,pytest-dev__pytest-7205,-e2q1,verified,True,56,,20261108-215514-qwen-swe_untyped-pytest-7205-e2q1,True
+2,statuses only,qwen,sphinx-doc__sphinx-10673,-e2q1,not_verified,False,55,,20261108-215807-qwen-swe_wf_status-sphinx-10673-e2q1,True
+2,statuses + cross-check,qwen,sphinx-doc__sphinx-10673,-e2q1,not_verified,False,55,,20261108-220129-qwen-swe_wf_check-sphinx-10673-e2q1,True
+2,untyped,qwen,sphinx-doc__sphinx-10673,-e2q1,not_verified,False,57,,20261108-220437-qwen-swe_untyped-sphinx-10673-e2q1,True
+2,statuses only,qwen,sympy__sympy-12489,-e2q1,not_verified,False,55,,20261108-220631-qwen-swe_wf_status-sympy-12489-e2q1,True
+2,statuses + cross-check,qwen,sympy__sympy-12489,-e2q1,not_verified,False,55,,20261108-221104-qwen-swe_wf_check-sympy-12489-e2q1,True
+2,untyped,qwen,sympy__sympy-12489,-e2q1,verified,False,46,,20261108-221504-qwen-swe_untyped-sympy-12489-e2q1,True
+3,D Opus spec,haiku,django__django-11087,-e3D1,not_verified,False,55,True,20261109-134855-haiku-swe_wf_spec-django-11087-e3D1,True
+3,A no spec,haiku,django__django-11087,-e3A1,not_verified,False,55,False,20261109-134855-haiku-swe_wf_status-django-11087-e3A1,True
+3,B Haiku spec,haiku,django__django-11087,-e3B1,verified,False,24,True,20261109-135039-haiku-swe_wf_spec-django-11087-e3B1,True
+3,C Sonnet spec,haiku,django__django-11087,-e3C1,verified,True,13,True,20261109-135105-haiku-swe_wf_spec-django-11087-e3C1,True
+3,A no spec,haiku,matplotlib__matplotlib-23299,-e3A1,verified,False,20,False,20261109-135711-haiku-swe_wf_status-matplotlib-23299-e3A1,True
+3,B Haiku spec,haiku,matplotlib__matplotlib-23299,-e3B1,verified,False,23,True,20261109-140513-haiku-swe_wf_spec-matplotlib-23299-e3B1,True
+3,D Opus spec,haiku,matplotlib__matplotlib-23299,-e3D1,verified,False,16,True,20261109-140740-haiku-swe_wf_spec-matplotlib-23299-e3D1,True
+3,C Sonnet spec,haiku,matplotlib__matplotlib-23299,-e3C1,verified,False,19,True,20261109-141257-haiku-swe_wf_spec-matplotlib-23299-e3C1,True
+3,A no spec,haiku,pytest-dev__pytest-7205,-e3A1,verified,False,19,False,20261109-141636-haiku-swe_wf_status-pytest-7205-e3A1,True
+3,B Haiku spec,haiku,pytest-dev__pytest-7205,-e3B1,verified,False,11,True,20261109-141917-haiku-swe_wf_spec-pytest-7205-e3B1,True
+3,C Sonnet spec,haiku,pytest-dev__pytest-7205,-e3C1,verified,False,15,True,20261109-142144-haiku-swe_wf_spec-pytest-7205-e3C1,True
+3,D Opus spec,haiku,pytest-dev__pytest-7205,-e3D1,verified,False,15,True,20261109-142228-haiku-swe_wf_spec-pytest-7205-e3D1,True
+3,B Haiku spec,haiku,sphinx-doc__sphinx-10673,-e3B1,verified,True,23,True,20261109-142709-haiku-swe_wf_spec-sphinx-10673-e3B1,True
+3,D Opus spec,haiku,sphinx-doc__sphinx-10673,-e3D1,verified,True,27,True,20261109-142829-haiku-swe_wf_spec-sphinx-10673-e3D1,True
+3,C Sonnet spec,haiku,sphinx-doc__sphinx-10673,-e3C1,verified,True,19,True,20261109-142946-haiku-swe_wf_spec-sphinx-10673-e3C1,True
+3,A no spec,haiku,sympy__sympy-12489,-e3A1,verified,False,26,False,20261109-143038-haiku-swe_wf_status-sympy-12489-e3A1,True
+3,B Haiku spec,haiku,sympy__sympy-12489,-e3B1,verified,False,20,True,20261109-143200-haiku-swe_wf_spec-sympy-12489-e3B1,True
+3,D Opus spec,haiku,sympy__sympy-12489,-e3D1,verified,False,43,True,20261109-143306-haiku-swe_wf_spec-sympy-12489-e3D1,True
+3,C Sonnet spec,haiku,sympy__sympy-12489,-e3C1,verified,False,30,True,20261109-143351-haiku-swe_wf_spec-sympy-12489-e3C1,True
+3,A no spec,haiku,django__django-11087,-e3A2,verified,False,20,False,20261109-143510-haiku-swe_wf_status-django-11087-e3A2,True
+3,B Haiku spec,haiku,django__django-11087,-e3B2,verified,False,16,True,20261109-143749-haiku-swe_wf_spec-django-11087-e3B2,True
+3,D Opus spec,haiku,django__django-11087,-e3D2,,,,True,20261109-143944-haiku-swe_wf_spec-django-11087-e3D2,False
+3,C Sonnet spec,haiku,django__django-11087,-e3C2,verified,,26,True,20261109-144016-haiku-swe_wf_spec-django-11087-e3C2,False
+3,A no spec,haiku,matplotlib__matplotlib-23299,-e3A2,,,,False,20261109-144303-haiku-swe_wf_status-matplotlib-23299-e3A2,False
+3,B Haiku spec,haiku,matplotlib__matplotlib-23299,-e3B2,,,,True,20261109-144936-haiku-swe_wf_spec-matplotlib-23299-e3B2,False
+3,D Opus spec,haiku,django__django-11087,-e3D2,verified,False,24,True,20261109-161225-haiku-swe_wf_spec-django-11087-e3D2,True
+3,A no spec,haiku,matplotlib__matplotlib-23299,-e3A2,verified,False,24,False,20261109-161225-haiku-swe_wf_status-matplotlib-23299-e3A2,True
+3,C Sonnet spec,haiku,django__django-11087,-e3C2,not_verified,True,56,True,20261109-161345-haiku-swe_wf_spec-django-11087-e3C2,True
+3,B Haiku spec,haiku,matplotlib__matplotlib-23299,-e3B2,verified,True,29,True,20261109-161524-haiku-swe_wf_spec-matplotlib-23299-e3B2,True
+3,C Sonnet spec,haiku,matplotlib__matplotlib-23299,-e3C2,verified,True,20,True,20261109-162145-haiku-swe_wf_spec-matplotlib-23299-e3C2,True
+3,D Opus spec,haiku,matplotlib__matplotlib-23299,-e3D2,verified,False,20,True,20261109-162509-haiku-swe_wf_spec-matplotlib-23299-e3D2,True
+3,A no spec,haiku,pytest-dev__pytest-7205,-e3A2,verified,False,18,False,20261109-162700-haiku-swe_wf_status-pytest-7205-e3A2,True
+3,B Haiku spec,haiku,pytest-dev__pytest-7205,-e3B2,verified,False,13,True,20261109-162743-haiku-swe_wf_spec-pytest-7205-e3B2,True
+3,C Sonnet spec,haiku,pytest-dev__pytest-7205,-e3C2,verified,False,13,True,20261109-162909-haiku-swe_wf_spec-pytest-7205-e3C2,True
+3,D Opus spec,haiku,pytest-dev__pytest-7205,-e3D2,verified,False,14,True,20261109-162912-haiku-swe_wf_spec-pytest-7205-e3D2,True
+3,A no spec,haiku,sphinx-doc__sphinx-10673,-e3A2,verified,True,21,False,20261109-163030-haiku-swe_wf_status-sphinx-10673-e3A2,True
+3,B Haiku spec,haiku,sphinx-doc__sphinx-10673,-e3B2,verified,True,16,True,20261109-163131-haiku-swe_wf_spec-sphinx-10673-e3B2,True
+3,D Opus spec,haiku,sphinx-doc__sphinx-10673,-e3D2,verified,True,19,True,20261109-163420-haiku-swe_wf_spec-sphinx-10673-e3D2,True
+3,A no spec,haiku,sympy__sympy-12489,-e3A2,verified,False,19,False,20261109-163521-haiku-swe_wf_status-sympy-12489-e3A2,True
+3,B Haiku spec,haiku,sympy__sympy-12489,-e3B2,verified,False,27,True,20261109-163713-haiku-swe_wf_spec-sympy-12489-e3B2,True
+3,D Opus spec,haiku,sympy__sympy-12489,-e3D2,verified,False,30,True,20261109-163740-haiku-swe_wf_spec-sympy-12489-e3D2,True
+3,C Sonnet spec,haiku,sympy__sympy-12489,-e3C2,not_verified,False,55,True,20261109-163759-haiku-swe_wf_spec-sympy-12489-e3C2,True
+3,A no spec,haiku,django__django-11087,-e3A3,verified,False,16,False,20261109-163829-haiku-swe_wf_status-django-11087-e3A3,True
+3,B Haiku spec,haiku,django__django-11087,-e3B3,not_verified,False,51,True,20261109-164123-haiku-swe_wf_spec-django-11087-e3B3,True
+3,D Opus spec,haiku,django__django-11087,-e3D3,not_verified,False,55,True,20261109-164322-haiku-swe_wf_spec-django-11087-e3D3,True
+3,C Sonnet spec,haiku,django__django-11087,-e3C3,not_verified,True,43,True,20261109-164408-haiku-swe_wf_spec-django-11087-e3C3,True
+3,A no spec,haiku,matplotlib__matplotlib-23299,-e3A3,verified,False,20,False,20261109-164615-haiku-swe_wf_status-matplotlib-23299-e3A3,True
+3,D Opus spec,haiku,matplotlib__matplotlib-23299,-e3D3,verified,False,20,True,20261109-165755-haiku-swe_wf_spec-matplotlib-23299-e3D3,True
+3,B Haiku spec,haiku,matplotlib__matplotlib-23299,-e3B3,verified,False,21,True,20261109-165859-haiku-swe_wf_spec-matplotlib-23299-e3B3,True
+3,C Sonnet spec,haiku,matplotlib__matplotlib-23299,-e3C3,verified,False,13,True,20261109-170016-haiku-swe_wf_spec-matplotlib-23299-e3C3,True
+3,A no spec,haiku,pytest-dev__pytest-7205,-e3A3,verified,False,18,False,20261109-170350-haiku-swe_wf_status-pytest-7205-e3A3,True
+3,B Haiku spec,haiku,pytest-dev__pytest-7205,-e3B3,verified,False,18,True,20261109-170546-haiku-swe_wf_spec-pytest-7205-e3B3,True
+3,C Sonnet spec,haiku,pytest-dev__pytest-7205,-e3C3,verified,False,16,True,20261109-170926-haiku-swe_wf_spec-pytest-7205-e3C3,True
+3,D Opus spec,haiku,pytest-dev__pytest-7205,-e3D3,verified,False,16,True,20261109-170958-haiku-swe_wf_spec-pytest-7205-e3D3,True
+3,A no spec,haiku,sphinx-doc__sphinx-10673,-e3A3,verified,True,32,False,20261109-171007-haiku-swe_wf_status-sphinx-10673-e3A3,True
+3,D Opus spec,haiku,sphinx-doc__sphinx-10673,-e3D3,verified,True,19,True,20261109-171136-haiku-swe_wf_spec-sphinx-10673-e3D3,True
+3,B Haiku spec,haiku,sphinx-doc__sphinx-10673,-e3B3,verified,True,24,True,20261109-171143-haiku-swe_wf_spec-sphinx-10673-e3B3,True
+3,C Sonnet spec,haiku,sphinx-doc__sphinx-10673,-e3C3,verified,True,34,True,20261109-171306-haiku-swe_wf_spec-sphinx-10673-e3C3,True
+3,A no spec,haiku,sympy__sympy-12489,-e3A3,verified,False,27,False,20261109-171424-haiku-swe_wf_status-sympy-12489-e3A3,True
+3,B Haiku spec,haiku,sympy__sympy-12489,-e3B3,verified,False,19,True,20261109-171641-haiku-swe_wf_spec-sympy-12489-e3B3,True
+3,D Opus spec,haiku,sympy__sympy-12489,-e3D3,verified,False,30,True,20261109-171733-haiku-swe_wf_spec-sympy-12489-e3D3,True
+3,C Sonnet spec,haiku,sympy__sympy-12489,-e3C3,not_verified,False,55,True,20261109-171816-haiku-swe_wf_spec-sympy-12489-e3C3,True
+3,A no spec,haiku,sphinx-doc__sphinx-10673,-e3A1,verified,True,23,False,20261109-173012-haiku-swe_wf_status-sphinx-10673-e3A1,True
+3,C Sonnet spec,haiku,sphinx-doc__sphinx-10673,-e3C2,verified,True,16,True,20261109-173241-haiku-swe_wf_spec-sphinx-10673-e3C2,True
+4,B Haiku spec,haiku,django__django-11087,-e4B1,not_verified,False,56,True,20261109-190222-haiku-swe_wf_spec2-django-11087-e4B1,True
+4,C Sonnet spec,haiku,django__django-11087,-e4C1,verified,True,15,True,20261109-190316-haiku-swe_wf_spec2-django-11087-e4C1,True
+4,B Haiku spec,haiku,matplotlib__matplotlib-23299,-e4B1,not_verified,False,56,True,20261109-190435-haiku-swe_wf_spec2-matplotlib-23299-e4B1,True
+4,B Haiku spec,haiku,pytest-dev__pytest-7205,-e4B1,verified,False,15,True,20261109-190923-haiku-swe_wf_spec2-pytest-7205-e4B1,True
+4,C Sonnet spec,haiku,matplotlib__matplotlib-23299,-e4C1,verified,True,17,True,20261109-191040-haiku-swe_wf_spec2-matplotlib-23299-e4C1,True
+4,C Sonnet spec,haiku,pytest-dev__pytest-7205,-e4C1,verified,True,14,True,20261109-191608-haiku-swe_wf_spec2-pytest-7205-e4C1,True
+4,B Haiku spec,haiku,sympy__sympy-12489,-e4B1,verified,False,13,True,20261109-192006-haiku-swe_wf_spec2-sympy-12489-e4B1,True
+4,C Sonnet spec,haiku,sympy__sympy-12489,-e4C1,not_verified,True,55,True,20261109-192322-haiku-swe_wf_spec2-sympy-12489-e4C1,True
+4,B Haiku spec,haiku,django__django-11087,-e4B2,verified,False,15,True,20261109-192403-haiku-swe_wf_spec2-django-11087-e4B2,True
+4,C Sonnet spec,haiku,django__django-11087,-e4C2,not_verified,True,55,True,20261109-192922-haiku-swe_wf_spec2-django-11087-e4C2,True
+4,B Haiku spec,haiku,matplotlib__matplotlib-23299,-e4B2,verified,False,24,True,20261109-193030-haiku-swe_wf_spec2-matplotlib-23299-e4B2,True
+4,B Haiku spec,haiku,pytest-dev__pytest-7205,-e4B2,verified,False,12,True,20261109-193206-haiku-swe_wf_spec2-pytest-7205-e4B2,True
+4,C Sonnet spec,haiku,pytest-dev__pytest-7205,-e4C2,verified,True,10,True,20261109-193542-haiku-swe_wf_spec2-pytest-7205-e4C2,True
+4,B Haiku spec,haiku,sympy__sympy-12489,-e4B2,verified,False,17,True,20261109-193902-haiku-swe_wf_spec2-sympy-12489-e4B2,True
+4,C Sonnet spec,haiku,matplotlib__matplotlib-23299,-e4C2,verified,True,16,True,20261109-193928-haiku-swe_wf_spec2-matplotlib-23299-e4C2,True
+4,B Haiku spec,haiku,django__django-11087,-e4B3,not_verified,False,55,True,20261109-194508-haiku-swe_wf_spec2-django-11087-e4B3,True
+4,C Sonnet spec,haiku,sympy__sympy-12489,-e4C2,verified,False,53,True,20261109-194656-haiku-swe_wf_spec2-sympy-12489-e4C2,True
+4,B Haiku spec,haiku,pytest-dev__pytest-7205,-e4B3,verified,False,11,True,20261109-195910-haiku-swe_wf_spec2-pytest-7205-e4B3,True
+4,B Haiku spec,haiku,sympy__sympy-12489,-e4B3,verified,False,33,True,20261109-200251-haiku-swe_wf_spec2-sympy-12489-e4B3,True
+4,C Sonnet spec,haiku,pytest-dev__pytest-7205,-e4C3,verified,True,11,True,20261109-200338-haiku-swe_wf_spec2-pytest-7205-e4C3,True
+4,B Haiku spec,haiku,matplotlib__matplotlib-23299,-e4B3,verified,False,26,True,20261109-200409-haiku-swe_wf_spec2-matplotlib-23299-e4B3,True
+4,C Sonnet spec,haiku,matplotlib__matplotlib-23299,-e4C3,verified,True,17,True,20261109-200705-haiku-swe_wf_spec2-matplotlib-23299-e4C3,True
+4,C Sonnet spec,haiku,sympy__sympy-12489,-e4C3,verified,False,28,True,20261109-200920-haiku-swe_wf_spec2-sympy-12489-e4C3,True
+4,C Sonnet spec,haiku,django__django-11087,-e4C3,verified,False,30,False,20261109-203032-haiku-swe_wf_spec2-django-11087-e4C3,True
+5,E Haiku designs+fills,haiku,django__django-11087,-e5E1,not_verified,True,45,True,20261109-212950-haiku-swe_wf_spec3-django-11087-e5E1,True
+5,"F Sonnet designs, Haiku fills",haiku,django__django-11087,-e5F1,not_verified,False,43,True,20261109-213324-haiku-swe_wf_spec3-django-11087-e5F1,True
+5,G Sonnet designs+fills,haiku,django__django-11087,-e5G1,not_verified,False,46,False,20261109-213429-haiku-swe_wf_spec3-django-11087-e5G1,True
+5,E Haiku designs+fills,haiku,matplotlib__matplotlib-23299,-e5E1,verified,False,23,True,20261109-213444-haiku-swe_wf_spec3-matplotlib-23299-e5E1,True
+5,E Haiku designs+fills,haiku,pytest-dev__pytest-7205,-e5E1,not_verified,False,27,True,20261109-215115-haiku-swe_wf_spec3-pytest-7205-e5E1,True
+5,"F Sonnet designs, Haiku fills",haiku,pytest-dev__pytest-7205,-e5F1,verified,False,15,True,20261109-215510-haiku-swe_wf_spec3-pytest-7205-e5F1,True
+5,G Sonnet designs+fills,haiku,pytest-dev__pytest-7205,-e5G1,not_verified,True,40,True,20261109-220100-haiku-swe_wf_spec3-pytest-7205-e5G1,True
+5,E Haiku designs+fills,haiku,sympy__sympy-12489,-e5E1,verified,False,33,True,20261109-220212-haiku-swe_wf_spec3-sympy-12489-e5E1,True
+5,G Sonnet designs+fills,haiku,matplotlib__matplotlib-23299,-e5G1,verified,True,16,True,20261109-220531-haiku-swe_wf_spec3-matplotlib-23299-e5G1,True
+5,"F Sonnet designs, Haiku fills",haiku,matplotlib__matplotlib-23299,-e5F1,verified,True,14,True,20261109-220829-haiku-swe_wf_spec3-matplotlib-23299-e5F1,True
+5,"F Sonnet designs, Haiku fills",haiku,sympy__sympy-12489,-e5F1,verified,False,27,False,20261109-221136-haiku-swe_wf_spec3-sympy-12489-e5F1,True
+5,E Haiku designs+fills,haiku,django__django-11087,-e5E2,verified,False,24,True,20261109-221903-haiku-swe_wf_spec3-django-11087-e5E2,True
+5,G Sonnet designs+fills,haiku,sympy__sympy-12489,-e5G1,not_verified,False,55,True,20261109-222017-haiku-swe_wf_spec3-sympy-12489-e5G1,True
+5,G Sonnet designs+fills,haiku,django__django-11087,-e5G2,verified,False,18,False,20261109-223053-haiku-swe_wf_spec3-django-11087-e5G2,True
+5,"F Sonnet designs, Haiku fills",haiku,django__django-11087,-e5F2,not_verified,False,55,True,20261109-223519-haiku-swe_wf_spec3-django-11087-e5F2,True
+5,G Sonnet designs+fills,haiku,matplotlib__matplotlib-23299,-e5G2,verified,False,32,False,20261109-224012-haiku-swe_wf_spec3-matplotlib-23299-e5G2,True
+5,E Haiku designs+fills,haiku,matplotlib__matplotlib-23299,-e5E2,verified,False,23,True,20261109-224850-haiku-swe_wf_spec3-matplotlib-23299-e5E2,True
+5,"F Sonnet designs, Haiku fills",haiku,matplotlib__matplotlib-23299,-e5F2,verified,False,16,True,20261109-225001-haiku-swe_wf_spec3-matplotlib-23299-e5F2,True
+5,E Haiku designs+fills,haiku,pytest-dev__pytest-7205,-e5E2,verified,False,11,True,20261109-225138-haiku-swe_wf_spec3-pytest-7205-e5E2,True
+5,"F Sonnet designs, Haiku fills",haiku,pytest-dev__pytest-7205,-e5F2,verified,False,19,True,20261109-225444-haiku-swe_wf_spec3-pytest-7205-e5F2,True
+5,G Sonnet designs+fills,haiku,pytest-dev__pytest-7205,-e5G2,verified,True,32,True,20261109-230105-haiku-swe_wf_spec3-pytest-7205-e5G2,True
+5,E Haiku designs+fills,haiku,sympy__sympy-12489,-e5E2,verified,False,30,True,20261109-230409-haiku-swe_wf_spec3-sympy-12489-e5E2,True
+5,"F Sonnet designs, Haiku fills",haiku,sympy__sympy-12489,-e5F2,verified,False,20,False,20261109-230600-haiku-swe_wf_spec3-sympy-12489-e5F2,True
+5,E Haiku designs+fills,haiku,django__django-11087,-e5E3,not_verified,False,49,True,20261109-230924-haiku-swe_wf_spec3-django-11087-e5E3,True
+5,G Sonnet designs+fills,haiku,sympy__sympy-12489,-e5G2,verified,True,46,True,20261109-231434-haiku-swe_wf_spec3-sympy-12489-e5G2,True
+5,"F Sonnet designs, Haiku fills",haiku,django__django-11087,-e5F3,not_verified,False,55,True,20261109-232109-haiku-swe_wf_spec3-django-11087-e5F3,True
+5,G Sonnet designs+fills,haiku,django__django-11087,-e5G3,not_verified,True,55,True,20261109-232125-haiku-swe_wf_spec3-django-11087-e5G3,True
+5,E Haiku designs+fills,haiku,matplotlib__matplotlib-23299,-e5E3,verified,False,14,True,20261109-233337-haiku-swe_wf_spec3-matplotlib-23299-e5E3,True
+5,"F Sonnet designs, Haiku fills",haiku,matplotlib__matplotlib-23299,-e5F3,verified,True,19,True,20261109-233524-haiku-swe_wf_spec3-matplotlib-23299-e5F3,True
+5,E Haiku designs+fills,haiku,pytest-dev__pytest-7205,-e5E3,verified,True,14,True,20261109-233851-haiku-swe_wf_spec3-pytest-7205-e5E3,True
+5,"F Sonnet designs, Haiku fills",haiku,pytest-dev__pytest-7205,-e5F3,verified,False,19,False,20261109-234236-haiku-swe_wf_spec3-pytest-7205-e5F3,True
+5,G Sonnet designs+fills,haiku,pytest-dev__pytest-7205,-e5G3,verified,False,9,False,20261109-235130-haiku-swe_wf_spec3-pytest-7205-e5G3,True
+5,E Haiku designs+fills,haiku,sympy__sympy-12489,-e5E3,verified,False,36,True,20261109-235331-haiku-swe_wf_spec3-sympy-12489-e5E3,True
+5,"F Sonnet designs, Haiku fills",haiku,sympy__sympy-12489,-e5F3,not_verified,False,56,True,20261109-235738-haiku-swe_wf_spec3-sympy-12489-e5F3,True
+5,G Sonnet designs+fills,haiku,sympy__sympy-12489,-e5G3,not_verified,False,56,True,20261110-000340-haiku-swe_wf_spec3-sympy-12489-e5G3,True
+5,G Sonnet designs+fills,haiku,matplotlib__matplotlib-23299,-e5G3,verified,True,10,True,20261110-000636-haiku-swe_wf_spec3-matplotlib-23299-e5G3,True

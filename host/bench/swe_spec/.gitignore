@@ -1,0 +1,8 @@
+runs/
+repos/
+venv/
+grading/
+runs_broken/
+runs_invalid/
+spec_judging/
+__pycache__/
