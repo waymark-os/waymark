@@ -1290,6 +1290,75 @@ script that is really unused, and a two-line excerpt from this document. No
 pilot workflow is flagged. The scan also found one gap, now fixed: an
 append through a subscript (`out[k].append(a.kind)`) had not counted as
 reading `a`.
+
+**Experiment 9 (2026-11-12): do these checks matter for task success?** The
+plan followed Lean4Agent: a strong model writes many workflows, the checks
+sort them, and runner models run the flagged and clean ones on the same
+tasks.
+
+- **Writing.** Opus 5.5 wrote 20 generic SWE workflows from one prompt. The
+  prompt held this language doc, the `help()` index, and a one-page task
+  description. Each draft was checked before it ran, and the writer got up
+  to 2 rounds to fix errors; it never saw the warnings.
+  - 18 drafts passed at once, and 2 needed one repair (redefining the
+    builtin `tail`, and the unsupported string method `isupper`).
+  - All 20 passed with no warnings. Every model call, 73 in all, passed its
+    evidence through `inputs=`, and only one function had a record-typed
+    parameter.
+  - Cost: about $27 (19-25k tokens out per draft, 57k in).
+  - In hindsight Opus 5.5 was the wrong writer: Lean4Agent used Opus 4.6,
+    a weaker model, and Sonnet 5.5 is closer to it in strength.
+  - So a strong writer that is taught named inputs does not make the
+    information-flow mistake these checks look for. That matches
+    Lean4Agent's own remark that modern models rarely make explicit
+    variable mismatches.
+- **Planted defect.** With nothing flagged, the paid-for workflows were
+  reused instead. Three pipelines were chosen at random (seeded). In each
+  copy, the fix step lost the list of earlier failed attempts and why they
+  failed: the most common Lean4Agent defect, a step that cannot see what an
+  earlier step found.
+  - **The checks do not flag the planted copies.** The failure history
+    still goes into logs and conditions, so it counts as read, and nothing
+    tells the checks which step needs it.
+  - **A harness fix applied to all six programs.** The task page had told
+    writers to keep scratch files in /tmp, which the Gateway's file builtins
+    cannot reach (16 of 20 workflows did this). Those paths were moved to a
+    git-ignored directory under /testbed.
+- **Runs.** The 13 pilot tasks (Section 11), one run per cell, graded by
+  the SWE-bench harness.
+
+| runner | original | planted | pairs solved by one only (orig / planted) |
+| --- | --- | --- | --- |
+| Haiku 5.5 | 21/39 | 21/39 | 3 / 3 |
+| Luna (gpt-5.6-luna) | 16/39 | 16/39 | 5 / 5 |
+| Qwen 3.8 flash (stopped at 55 of 78) | 10/28 | 10/27 | — |
+
+- **The planted copies took more fix attempts:** Haiku 2.4 to 2.5, Luna 2.3
+  to 3.2. The defect costs model calls, not solved tasks.
+- **Comparing only the runs that retried looked like an effect** (Haiku and
+  Luna together 18/40 against 13/38). It is biased: whether a run retries
+  depends on the defect. The paired comparison shows none.
+- **Per-task swings cancel out.** scikit-learn-14087 favored the original
+  (4/9 against 0/9 over all runners). pytest-7205 favored the planted copy,
+  4/6 against 0/6, perhaps because forgetting failed attempts stops the
+  model fixating on one wrong approach. With one run per cell this is
+  within run-to-run noise.
+
+**What follows.**
+- In this setting, Lean4Agent's +14.8 points does not come from missing
+  inputs to model steps. Their gain plausibly comes from weaker generated
+  workflows and broader defects (retry loops, precondition gaps), not
+  from one missing input.
+- The checks in 5.9 cost nothing to run and are kept. But neither the
+  unseen-evidence warning nor the unread-evidence warning has yet caught a
+  defect in a workflow a model wrote, and a defect they cannot see did not
+  change outcomes either.
+- Catching which step needs which evidence would need steps to declare what
+  they need (item 3, or preconditions like Lean4Agent's). That is only worth
+  building if a weaker writer shows defects that matter.
+- Materials are in the session scratchpad under e9/: the workflows, the
+  run files, run.log, and e9_analyze.py.
+
 Not built yet: items 2 and 3, the `system=` warning, cached-token counts,
 and the Gateway cache markers.
 
