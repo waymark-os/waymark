@@ -2044,13 +2044,22 @@ both arms, with 32 against 49 calls per run.
   model, before any run. It also argues for combining the two: program
   checks as a gate that catches invention, then a reviewer for whether the
   fix is adequate (untested).
-- **Lean4Agent's main effect is not reproduced yet.** Its largest gains come
-  from rewriting the workflow from formal diagnostics, and they are largest
-  for weaker models. That is the level-B loop (static and repeated dynamic
-  errors revise the plan; 1.1). This pilot reproduced per-step checking
-  only. Its headline comparison (58% versus 43%) is between workflows that
-  passed or failed its checks, so it does not separate the checks' effect
-  from workflow quality. The setup here holds the workflow fixed.
+- **Lean4Agent's main effect is not reproduced yet** (corrected 2026-11-11
+  against the full paper). Its largest gain comes from the check before the
+  run: Claude Opus wrote candidate workflows once per benchmark, an LLM
+  annotated each step's pre- and post-conditions, and Lean checked that
+  every step's preconditions follow from earlier steps, assuming each step
+  meets its own contract. On 50 hard SWE-bench tasks, workflows that passed
+  solved 58.3% against 43.5% for those that failed (14.8 points, 95% CI 10.0
+  to 19.6). The gap was larger for the small models (Gemma-4-31B 27 points).
+  Most failures were information flow: a step that needs evidence an earlier
+  step found but cannot see it. Repairing the one diagnosed defect in a
+  failing SWE workflow raised GPT-5.2 from 52% to 62%, so the check does more
+  than pick better workflows. Rewriting a workflow after a failed run is a
+  smaller add-on: 7.5 points, 5.1 without its plain-LLM rewrite mode.
+  This pilot held one hand-written workflow fixed and checked steps only
+  at run time, which corresponds to their after-the-run checks, not to the
+  check that produced the main result.
 
 **Language and runtime problems found while running it:**
 
