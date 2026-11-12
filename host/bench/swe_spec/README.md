@@ -32,13 +32,21 @@ registering copies every test file the tests use, and every run writes those
 copies first, so editing a test file cannot change a gate (a run that finds a
 repository test file edited warns, and puts the edit back afterwards).
 
-- `new_suite(root, wrap, runner)`: snapshot the unfixed code.
+- `new_suite(root, wrap, runner, env=None)`: snapshot the unfixed code. With
+  `env` (an argv such as `["python", "-m", "pip", "freeze"]`) it also records
+  the environment: `check()` warns when it changes, `verify()` fails, and a
+  verdict carries its hash. Each keep run's output is read with the runner its
+  command shows (pytest, Django `runtests.py`, SymPy `bin/test`), else
+  `runner`.
 - `register_tests(suite, tests, keep, revised)`: copy the test files (the new
   tests' files and the repository files keep runs name) and, while the tree
   is the unfixed code, run each new part there: fail-to-pass must fail,
-  pass-to-pass must pass, keep runs must finish and pass some tests. Parts
-  registered later are listed in `suite["unchecked"]`; unchanged parts are not
-  run again. `revise(suite, tests=, keep=, revised=)` re-registers with the
+  pass-to-pass must pass, keep runs must finish and pass some tests. A test
+  whose output on the unfixed code shows a module the environment lacks
+  (`No module named 'numpy'`, not part of the code) is reported as broken.
+  Parts registered later are listed in `suite["unchecked"]`, and a later keep
+  run is still run once on the current tree, so one that does not finish is
+  reported; unchanged parts are not run again. `revise(suite, tests=, keep=, revised=)` re-registers with the
   other parts as they are.
 - `check(suite)`: run the suite on the current tree (feedback for the fixer,
   with warnings for edited test files); `rejecting(report)` names the parts

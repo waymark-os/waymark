@@ -1,7 +1,7 @@
 """SWE harness test suites: the workflow registers tests, keeps a copy of
 every test file they use, and runs only that copy.
 
-    suite = new_suite("/testbed", WRAP, "pytest")       # snapshot of the unfixed code
+    suite = new_suite("/testbed", WRAP, "pytest", ENV)  # snapshot of the unfixed code
     suite, problems = register_tests(suite, tests, keep, revised)
     report = check(suite)                                # the current tree, for feedback
     verdict = verify(suite, patch)                       # the tree must be unfixed code + patch
@@ -20,6 +20,12 @@ repository test file edited puts the edit back afterwards and reports it in
 warnings. Results are sealed runtime records: RunResult/TestRun record the
 hash of every file written, and every result and Snapshot carries seq, the
 order the runtime made it in.
+
+Each keep run's output is read with its command's own runner (pytest,
+Django runtests.py, SymPy bin/test), falling back to the suite's. With env
+(an argv whose output describes the installed packages, e.g. pip freeze),
+the suite records the environment when it is created; check() warns when it
+differs, and verify() fails, since test results depend on it.
 
 There is no switching between trees. The unfixed code is run only while the
 tree is the unfixed code (registration, checked by snapshot id); a part
@@ -47,22 +53,66 @@ class Verdict(Record):
     failures: list[str]
     warnings: list[str]
     unchecked: list[str]
+    env: str
 
 
-def new_suite(root, wrap, runner):
+def new_suite(root, wrap, runner, env=None):
     """A suite for the code under root as it is now. wrap is the argv prefix
     every command runs under (e.g. ["bash", "-lc", "<activate>; exec \\"$@\\"", "t"]);
-    runner is run_tests()'s runner for keep runs."""
+    runner is run_tests()'s runner for keep runs whose command does not show
+    one. env, when given, is an argv (run under wrap) whose output describes
+    the environment, e.g. ["python", "-m", "pip", "freeze"]."""
     base = snapshot(root)
-    return {"base": base, "root": base.root, "wrap": wrap, "runner": runner, "tests": [], "keep": [], "revised": [],
-            "held": {}, "at_base": {}, "baseline": {}, "unchecked": [], "ran": []}
+    suite = {"base": base, "root": base.root, "wrap": wrap, "runner": runner, "tests": [], "keep": [], "revised": [],
+             "held": {}, "at_base": {}, "baseline": {}, "unchecked": [], "ran": [], "env": env, "env_text": None}
+    if env is not None:
+        suite["env_text"] = environment(suite)
+    return suite
+
+
+def environment(suite):
+    """The env command's output now, or None without one."""
+    if suite["env"] is None:
+        return None
+    r = run(suite["wrap"] + suite["env"], cwd=suite["root"], timeout_ms=120000, max_stdout_bytes=2000000)
+    return r.stdout if r.exit_code == 0 else "(env command failed: exit " + str(r.exit_code) + ")"
+
+
+def environment_change(suite):
+    """None when the environment is as it was when the suite was created;
+    otherwise what changed, in words."""
+    if suite["env"] is None:
+        return None
+    now = environment(suite)
+    if now == suite["env_text"]:
+        return None
+    old = set(suite["env_text"].splitlines())
+    new = set(now.splitlines())
+    added = sorted([l for l in new if l not in old])
+    removed = sorted([l for l in old if l not in new])
+    return "the environment changed since the suite was created (" + " ".join(suite["env"]) + "): added " + json_dumps(added[:10]) + ", removed " + json_dumps(removed[:10])
+
+
+def runner_for(suite, argv):
+    """run_tests()'s runner for a test command: pytest, Django runtests.py, or
+    SymPy bin/test when the command shows one, else the suite's runner."""
+    for i, arg in enumerate(argv):
+        name = arg.split("/")[-1]
+        if name in ["pytest", "py.test"] or (arg == "-m" and i + 1 < len(argv) and argv[i + 1] == "pytest"):
+            return "pytest"
+        if name == "runtests.py":
+            return "django"
+        if arg.endswith("bin/test"):
+            return "sympy"
+    return suite["runner"]
 
 
 def suite_hash(suite):
-    """Identifies what the suite checks: the base, every part, and the held
-    test-file copies."""
+    """Identifies what the suite checks: the base, every part, the held
+    test-file copies, and the environment."""
     held = [[k, sorted([[p, sha256(t)] for p, t in suite["held"][k].items()])] for k in sorted(list(suite["held"].keys()))]
-    return sha256(json_dumps([suite["base"].id, suite["wrap"], suite["runner"], suite["tests"], suite["keep"], suite["revised"], held]))[:16]
+    env = None if suite["env_text"] is None else sha256(suite["env_text"])
+    return sha256(json_dumps([suite["base"].id, suite["wrap"], suite["runner"], suite["tests"], suite["keep"], suite["revised"], held, env]))[:16]
 
 
 def test_key(test):
@@ -227,6 +277,29 @@ def new_failures(before, run, revised):
     return names, None
 
 
+def missing_modules(suite, r):
+    """Modules a run could not import that are not part of the code under
+    root (`No module named 'numpy'`): the test needs something the
+    environment does not have."""
+    text = output_of_full(r)
+    names = []
+    marker = "No module named '"
+    while marker in text:
+        text = text[text.index(marker) + len(marker):]
+        name = text.split("'")[0]
+        top = name.split(".")[0]
+        if not top or top in names:
+            continue
+        inside = run(["test", "-e", top, "-o", "-e", top + ".py"], cwd=suite["root"]).exit_code == 0
+        if not inside:
+            names.append(top)
+    return names
+
+
+def output_of_full(r):
+    return r.output if isinstance(r, TestRun) else r.stdout + "\n" + r.stderr
+
+
 # --- registering ---------------------------------------------------------
 
 def register_tests(suite, tests, keep, revised):
@@ -273,7 +346,12 @@ def register_tests(suite, tests, keep, revised):
             continue
         r = at_base[key]["result"]
         passed, problem = judge(t, r)
-        if problem is not None:
+        missing = missing_modules(suite, r)
+        if missing:
+            # A failure that is only a missing module shows nothing about
+            # the code; installing it later would turn the test green.
+            problems.append("test " + describe(t) + " is broken: it needs modules the environment does not have (" + ", ".join(missing) + "); use only what is installed\n" + output_of(r))
+        elif problem is not None:
             problems.append("test " + describe(t) + " is broken: " + problem + "\n" + output_of(r))
         elif t["kind"] == "fail_to_pass" and passed:
             problems.append("test " + describe(t) + " already passes on the unfixed code, so it does not show the change; its output:\n" + output_of(r))
@@ -284,11 +362,17 @@ def register_tests(suite, tests, keep, revised):
         if key in suite["baseline"]:
             baseline[key] = suite["baseline"][key]
         elif on_base:
-            run, warnings = run_held(suite, k["command"], held[key], suite["runner"])
+            run, warnings = run_held(suite, k["command"], held[key], runner_for(suite, k["command"]))
             baseline[key] = {"result": run, "on": before}
             ran.append(k["id"])
         else:
+            # Not the unfixed code: no baseline, but a run must at least
+            # finish, so a command whose output cannot be read is caught now.
             unchecked.append(k["id"])
+            run, warnings = run_held(suite, k["command"], held[key], runner_for(suite, k["command"]))
+            ran.append(k["id"] + " (current tree)")
+            if not run.complete:
+                problems.append("keep run " + k["id"] + " " + json_dumps(k["command"]) + " does not finish on the current tree: " + str(run.problem) + "\n" + output_of(run))
             continue
         run = baseline[key]["result"]
         if not usable(run):
@@ -325,7 +409,7 @@ def check(suite):
     keep = []
     for k in suite["keep"]:
         key = keep_key(k)
-        run, w = run_held(suite, k["command"], suite["held"][key], suite["runner"])
+        run, w = run_held(suite, k["command"], suite["held"][key], runner_for(suite, k["command"]))
         warnings = warnings + w
         before = suite["baseline"][key]["result"] if key in suite["baseline"] else None
         names, problem = new_failures(before, run, suite["revised"])
@@ -335,6 +419,9 @@ def check(suite):
             failures.append("keep run " + k["id"] + " " + json_dumps(k["command"]) + " did not finish properly: " + problem)
         elif names:
             failures.append("keep run " + k["id"] + " " + json_dumps(k["command"]) + ": these tests " + ("passed on the unfixed code and " if before is not None else "") + "fail now: " + json_dumps(names) + "\n" + output_of(run))
+    changed = environment_change(suite)
+    if changed is not None:
+        warnings.append(changed + "; the final verification fails unless it is restored")
     return {"passed": not failures, "failures": failures, "warnings": warnings, "tests": tests, "keep": keep}
 
 
@@ -348,9 +435,11 @@ def verify(suite, patch):
     """Check that the tree is exactly the unfixed code plus patch (text), then
     run the suite on it. Returns a Verdict."""
     def verdict(verified, expected, before, after, tests, keep, failures, warnings):
+        env = environment(suite)
         return Verdict(verified=verified, suite=suite_hash(suite), base=suite["base"].id, patch=patch,
                        expected=expected, before=before, after=after, tests=tests, keep=keep,
-                       failures=failures, warnings=warnings, unchecked=suite["unchecked"])
+                       failures=failures, warnings=warnings, unchecked=suite["unchecked"],
+                       env="" if env is None else sha256(env))
     if not patch.strip():
         return verdict(False, None, None, None, [], [], ["the patch is empty"], [])
     try:
@@ -365,6 +454,9 @@ def verify(suite, patch):
     report = check(suite)
     after = snapshot(suite["root"])
     failures = report["failures"]
+    changed = environment_change(suite)
+    if changed is not None:
+        failures = failures + [changed]
     if after.id != expected.id:
         failures = failures + ["the tree changed while the suite ran: " + ", ".join([f.path for f in diff(since=expected, to=after).files][:20])]
     return verdict(not failures, expected, before, after, [t["result"] for t in report["tests"]],
@@ -405,6 +497,8 @@ def accepts(suite, v):
         problems.append("the verdict is for another suite")
     if v.base != suite["base"].id:
         problems.append("the verdict is for another base")
+    if suite["env_text"] is not None and v.env != sha256(suite["env_text"]):
+        problems.append("the verdict ran in another environment")
     if not v.verified:
         problems.append("the verdict is not verified: " + "; ".join(v.failures)[:600])
     snaps = [v.expected, v.before, v.after]
