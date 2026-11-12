@@ -512,12 +512,9 @@ fn for_each_child<'a>(expr: &'a Expr, visit: &mut dyn FnMut(&'a Expr, &[String])
         Expr::Attribute { value, .. } | Expr::Not(value) | Expr::Neg(value) | Expr::Invert(value) | Expr::Await(value) => {
             visit(value, NONE)
         }
-        Expr::Slice { lower, upper } => {
-            if let Some(lower) = lower {
-                visit(lower, NONE);
-            }
-            if let Some(upper) = upper {
-                visit(upper, NONE);
+        Expr::Slice { lower, upper, step } => {
+            for part in [lower, upper, step].into_iter().flatten() {
+                visit(part, NONE);
             }
         }
         Expr::Compare { left, comparators, .. } => {

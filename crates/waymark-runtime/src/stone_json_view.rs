@@ -210,12 +210,18 @@ pub(super) fn eval_json_object_view_method(
 ) -> Result<RuntimeValue, ShellError> {
     match method {
         "get" => {
-            let [key, default] = args else {
-                return Err(stone_error("get", "record.get() requires key and default"));
+            let (key, default) = match args {
+                [key] => (key, Value::nothing(Span::unknown())),
+                [key, default] => (key, default.clone()),
+                _ => return Err(stone_error("get", "get() takes a key and an optional default")),
             };
-            let key = value_to_string(key, "get")?;
-            Ok(json_object_view_get(view, &key)?
-                .unwrap_or_else(|| RuntimeValue::Nu(default.clone())))
+            let Value::String { val: key, .. } = key else {
+                return Err(crate::stone_builtins::dict_key_error(
+                    "get",
+                    &crate::stone_builtins::value_type_name(key),
+                ));
+            };
+            Ok(json_object_view_get(view, key)?.unwrap_or(RuntimeValue::Nu(default)))
         }
         "items" | "keys" | "values" => {
             let materialized = materialize_json_object_view(view)?;

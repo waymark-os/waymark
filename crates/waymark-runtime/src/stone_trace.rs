@@ -296,8 +296,8 @@ fn expr_names<'a>(expr: &'a Expr, bound: &[&str], names: &mut Vec<&'a str>) {
         | Expr::Neg(value)
         | Expr::Invert(value)
         | Expr::Await(value) => each(value, names),
-        Expr::Slice { lower, upper } => {
-            for part in [lower, upper].into_iter().flatten() {
+        Expr::Slice { lower, upper, step } => {
+            for part in [lower, upper, step].into_iter().flatten() {
                 each(part, names);
             }
         }

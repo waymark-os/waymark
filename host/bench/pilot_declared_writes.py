@@ -65,6 +65,7 @@ DEFAULT_TASKS = (
 
 MODELS = {
     "qwen-local": {"provider": "openai-compatible", "model": None, "server": "http://127.0.0.1:8080/v1/chat/completions"},
+    "qwen-flash": {"provider": "openai-compatible", "model": "qwen3.8-flash-next-iq3_s", "server": "http://192.168.1.9:8080/v1/chat/completions"},
     "claude-haiku-5-5": {"provider": "anthropic", "model": "claude-haiku-5-5", "server": "https://api.anthropic.com/v1/messages"},
     "gpt-6-luna": {"provider": "openai", "model": "gpt-6-luna", "server": "https://api.openai.com/v1/chat/completions", "key": "OPENAI_API_KEY"},
     "gemini-3.8-flash": {

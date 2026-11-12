@@ -2201,6 +2201,14 @@ impl Evaluator<'_> {
         let key = self.state.get_local(&plan.key_name).ok_or_else(|| {
             stone_error("membership", format!("unknown name `{}`", plan.key_name))
         })?;
+        if let RuntimeValue::Nu(other) = &key {
+            if !matches!(other, Value::String { .. }) {
+                return Err(crate::stone_builtins::dict_key_error(
+                    "membership",
+                    &crate::stone_builtins::value_type_name(other),
+                ));
+            }
+        }
         let key_text = runtime_value_to_string_key(&key, "membership")?;
         let addends = plan
             .updates
@@ -3449,9 +3457,13 @@ impl Evaluator<'_> {
                         None => {
                             let value = self.eval_expr_value(value)?;
                             match index.as_ref() {
-                                Expr::Slice { lower, upper } => {
+                                Expr::Slice { lower, upper, step } => {
                                     let lower = self.eval_optional_index(lower.as_deref())?;
                                     let upper = self.eval_optional_index(upper.as_deref())?;
+                                    let step = self.eval_optional_index(step.as_deref())?;
+                                    if let Some(step) = step.filter(|step| *step != 1) {
+                                        return slice_with_step(value, lower, upper, step);
+                                    }
                                     if let RuntimeValue::List(list) = &value {
                                         // A new list holding the same elements.
                                         let picked = slice_builtin(
@@ -3578,7 +3590,7 @@ impl Evaluator<'_> {
                 }
                 Expr::Generator { .. } => Err(stone_error(
                     "generator expression",
-                    "generator expressions are only supported inside sum(...), any(...), all(...), join(...), and set(...) for now; use a list comprehension like [expr for x in items] when you need a list",
+                    "a generator expression must be passed straight to a call, as in max(x for x in xs) or list(x for x in xs); to keep the values in a variable, write a list comprehension [x for x in xs]",
                 )),
                 Expr::Lambda {
                     params,
@@ -3972,6 +3984,8 @@ impl Evaluator<'_> {
             "read_json" => self.eval_read_json_call(call),
             "read_jsonl" => self.eval_read_jsonl_call(call),
             "round" => self.eval_round_call(call),
+            "abs" => self.eval_abs_call(call),
+            "reversed" => self.eval_reversed_call(call),
             "run" => self.eval_run_call(call),
             "run_complete" => self.eval_run_complete_call(call),
             "must_run" => self.eval_must_run_call(call),
@@ -4063,14 +4077,21 @@ impl Evaluator<'_> {
             Some("function")
         } else if is_builtin_error_type(name) {
             Some("error type")
-        } else if STONE_BUILTIN_NAMES.contains(&name) {
+        } else if STONE_BUILTIN_NAMES.contains(&name)
+            || matches!(name, "keys" | "values" | "items" | "get")
+        {
             Some("builtin")
         } else {
             None
         };
+        let method_form = if matches!(name, "keys" | "values" | "items") {
+            format!(", or call the dict method: `d.{name}()`")
+        } else {
+            String::new()
+        };
         let message = match hidden {
             Some(what) => format!(
-                "`{name}` is a variable here (a {kind} value), so `{name}(...)` cannot call the {what} `{name}`: Stone, like Python, has one namespace and the variable hides the {what}. Rename the variable (for example `{name}_value = ...`)"
+                "`{name}` is a variable here (a {kind} value), so `{name}(...)` cannot call the {what} `{name}`: Stone, like Python, has one namespace and the variable hides the {what}. Rename the variable (for example `{name}_value = ...`){method_form}"
             ),
             None => format!(
                 "`{name}` is a variable here (a {kind} value), not a function, so it cannot be called"
@@ -6170,6 +6191,7 @@ impl Evaluator<'_> {
             ));
         };
         let values = self.eval_expr_value(values)?;
+        let typed_record = matches!(values, RuntimeValue::Record(_));
         // A shared list sorts its elements themselves, so the result holds
         // the same dicts (Python's sorted() returns the same objects).
         let shared = match &values {
@@ -6186,6 +6208,11 @@ impl Evaluator<'_> {
                     Value::String { val, .. } => val
                         .chars()
                         .map(|ch| Value::string(ch.to_string(), Span::unknown()))
+                        .collect(),
+                    // sorted(d) sorts a dict's keys, as in Python.
+                    Value::Record { val, .. } if !typed_record => val
+                        .columns()
+                        .map(|key| Value::string(key.clone(), Span::unknown()))
                         .collect(),
                     other => {
                         return Err(stone_error(
@@ -6349,6 +6376,66 @@ impl Evaluator<'_> {
             return Ok(list_from_values(kept));
         }
         unique_builtin(&values.into_nu_value("unique")?).map(RuntimeValue::Nu)
+    }
+
+    fn eval_abs_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let ([value], []) = (call.positional.as_slice(), call.named.as_slice()) else {
+            return Err(stone_typed_error("TypeError", "abs", "abs() takes exactly one argument"));
+        };
+        let value = self.eval_expr_value(value)?.into_nu_value("abs")?;
+        crate::stone_builtins::abs_builtin(&value).map(RuntimeValue::Nu)
+    }
+
+    /// `reversed(xs)`: a new list of the same elements in reverse order (a
+    /// dict gives its keys, a string its characters). Python returns an
+    /// iterator; a list loops, converts, and indexes the same way.
+    fn eval_reversed_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let ([value], []) = (call.positional.as_slice(), call.named.as_slice()) else {
+            return Err(stone_typed_error(
+                "TypeError",
+                "reversed",
+                "reversed() takes exactly one argument",
+            ));
+        };
+        let value = self.eval_expr_value(value)?;
+        let not_reversible = |kind: &str| {
+            stone_typed_error(
+                "TypeError",
+                "reversed",
+                format!("{kind} is not reversible; use reversed(sorted(xs)) or reversed(list(xs))"),
+            )
+        };
+        match value {
+            RuntimeValue::List(list) => {
+                let mut items = list.shared_items();
+                items.reverse();
+                Ok(list_from_values(items))
+            }
+            RuntimeValue::Tuple(items) => Ok(list_from_values(items.iter().rev().cloned().collect())),
+            RuntimeValue::Record(_) => Err(not_reversible("a record")),
+            RuntimeValue::Set(_) => Err(not_reversible("a set")),
+            other => match other.into_nu_value("reversed")? {
+                Value::List { mut vals, .. } => {
+                    vals.reverse();
+                    Ok(RuntimeValue::Nu(Value::list(vals, Span::unknown())))
+                }
+                Value::String { val, .. } => Ok(RuntimeValue::Nu(Value::list(
+                    val.chars()
+                        .rev()
+                        .map(|ch| Value::string(ch.to_string(), Span::unknown()))
+                        .collect(),
+                    Span::unknown(),
+                ))),
+                Value::Record { val, .. } => Ok(RuntimeValue::Nu(Value::list(
+                    val.columns()
+                        .rev()
+                        .map(|key| Value::string(key.clone(), Span::unknown()))
+                        .collect(),
+                    Span::unknown(),
+                ))),
+                other => Err(not_reversible(&crate::stone_builtins::value_type_name(&other))),
+            },
+        }
     }
 
     fn eval_round_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -13952,6 +14039,8 @@ impl Evaluator<'_> {
                     record_method_builtin(&receiver, method, &args).map(RuntimeValue::Nu)
                 }
                 "find" => find_method_builtin(&receiver, &args).map(RuntimeValue::Nu),
+                "rfind" => crate::stone_builtins::rfind_method_builtin(&receiver, &args)
+                    .map(RuntimeValue::Nu),
                 "index" => index_method_builtin(&receiver, &args).map(RuntimeValue::Nu),
                 other => Err(stone_error(
                     "method call",
@@ -14393,11 +14482,7 @@ impl Evaluator<'_> {
                         _ => return Err(arity("1 or 2 arguments (key, default)")),
                     };
                     let RuntimeValue::Nu(Value::String { val: key, .. }) = key else {
-                        return Err(stone_typed_error(
-                            "TypeError",
-                            method,
-                            format!("dict keys are strings, got {}", runtime_type_name(key)),
-                        ));
+                        return Err(crate::stone_builtins::dict_key_error(method, &runtime_type_name(key)));
                     };
                     if method == "setdefault" {
                         if !dict.contains_key(key) {
@@ -14491,6 +14576,7 @@ impl Evaluator<'_> {
                 [RuntimeValue::Nu(Value::String { val: key, .. }), value] => {
                     entries.push((key.clone(), value.clone()))
                 }
+                [key, _] => return Err(crate::stone_builtins::dict_key_error(context, &runtime_type_name(key))),
                 _ => {
                     return Err(stone_typed_error(
                         "TypeError",
@@ -15091,7 +15177,7 @@ fn returns_program_data(builtin: &str) -> bool {
             | "read_json" | "read_jsonl" | "read_csv" | "task_input" | "task_spec"
             | "echo" | "print" | "emit" | "Expect"
             | "Effects" | "split" | "range" | "int" | "float" | "str" | "repr" | "round"
-            | "parse_int" | "parse_float" | "format" | "join" | "type" | "isinstance"
+            | "parse_int" | "parse_float" | "format" | "join" | "type" | "isinstance" | "reversed"
             | "any" | "all" | "cat" | "read_file" | "read_text" | "open" | "predicate"
     )
 }
@@ -15299,6 +15385,8 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "read_csv",
     "read_jsonl",
     "round",
+    "abs",
+    "reversed",
     "rm",
     "run",
     "run_complete",
@@ -18363,6 +18451,56 @@ fn select_shared_matching(
 /// is not a shared container.
 /// `==` on values that may be records: records are equal when they have the
 /// same type and equal fields; a record never equals a dict.
+/// `value[lower:upper:step]` for a step other than 1: lists keep their
+/// shared elements, tuples stay tuples, and strings pick characters.
+#[inline(never)]
+fn slice_with_step(
+    value: RuntimeValue,
+    lower: Option<i64>,
+    upper: Option<i64>,
+    step: i64,
+) -> Result<RuntimeValue, ShellError> {
+    let positions = |len| crate::stone_builtins::stepped_slice_positions(lower, upper, step, len);
+    match value {
+        RuntimeValue::List(list) => {
+            let picked = positions(list.len())?
+                .into_iter()
+                .map(|index| Value::int(index as i64, Span::unknown()))
+                .collect();
+            Ok(select_shared(&list, &Value::list(picked, Span::unknown())))
+        }
+        RuntimeValue::Tuple(items) => Ok(tuple_value(
+            positions(items.len())?
+                .into_iter()
+                .map(|index| items[index].clone())
+                .collect(),
+        )),
+        other => match other.into_nu_value("subscript")? {
+            Value::List { vals, .. } => Ok(RuntimeValue::Nu(Value::list(
+                positions(vals.len())?
+                    .into_iter()
+                    .map(|index| vals[index].clone())
+                    .collect(),
+                Span::unknown(),
+            ))),
+            Value::String { val, .. } => {
+                let chars = val.chars().collect::<Vec<_>>();
+                Ok(RuntimeValue::Nu(Value::string(
+                    positions(chars.len())?
+                        .into_iter()
+                        .map(|index| chars[index])
+                        .collect::<String>(),
+                    Span::unknown(),
+                )))
+            }
+            other => Err(stone_error(
+                "slice",
+                format!("cannot slice {}", crate::stone_builtins::value_type_name(&other)),
+            )),
+        },
+    }
+}
+
 #[inline(never)]
 fn slice_tuple(
     items: &[RuntimeValue],
@@ -21630,6 +21768,120 @@ emit({
                 "zfill_sign": "-05",
             })
         );
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn dict_literals_take_computed_string_keys_and_name_the_fix_for_others(
+    ) -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("dict-keys")?;
+        let program = lower_source(
+            r#"k = "x"
+d = {k: 1, "a": 2, f"{k}2": 3}
+errors = []
+def attempt(label, action):
+    try:
+        action()
+    except TypeError as error:
+        errors.append([label, error.message])
+attempt("int literal key", lambda: {k: 1, 1 + 0: 2})
+attempt("tuple subscript", lambda: d[("a", "b")])
+attempt("int get", lambda: d.get(3))
+attempt("int membership", lambda: 3 in d)
+emit({"d": d, "errors": errors})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        let value = json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?;
+        assert_eq!(value["d"], json_value!({"x": 1, "a": 2, "x2": 3}));
+        let errors = value["errors"].as_array().expect("errors");
+        assert_eq!(errors.len(), 4, "every bad key should raise: {value}");
+        for row in errors {
+            let message = row[1].as_str().unwrap_or_default();
+            assert!(
+                message.contains("dict keys in Stone are strings"),
+                "unexpected message: {message}"
+            );
+        }
+        assert!(errors[0][1].as_str().unwrap().contains("str(key)"));
+        assert!(errors[1][1].as_str().unwrap().contains("f\"{a}|{b}\""));
+
+        let literal = lower_source(r#"d = {1: 2}"#).expect_err("int literal key is a compile error");
+        assert!(format!("{literal:?}").contains("dict keys in Stone are strings"));
+
+        cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn python_builtins_and_forms_models_reach_for_work_as_in_python() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("python-forms")?;
+        let program = lower_source(
+            r#"xs = [1, 2, 3, 4, 5]
+pairs = []
+for i, (k, v) in enumerate({"a": 1, "b": 2}.items()):
+    if k == "a":
+        continue
+    pairs.append([i, k, v])
+def total(rows):
+    t = 0
+    for a, (b, c) in rows:
+        t += a + b + c
+    return t
+def count(values):
+    return len(values)
+emit({
+    "abs": [abs(-3), abs(2.5)],
+    "reversed": [reversed(xs), reversed((1, 2)), reversed("ab"), reversed({"a": 1, "b": 2})],
+    "rfind": ["a/b/c".rfind("/"), "abc".rfind("z"), "a/b/c".rfind("/", 4)],
+    "steps": [xs[::-1], xs[::2], xs[1::2], xs[4:1:-1], xs[-1:-3:-1], "abc"[::-1], (1, 2, 3)[::-1]],
+    "sets": [{3, 1, 3}, {x % 2 for x in xs}, type({"a"})],
+    "generators": [
+        max(x for x in xs),
+        min((x for x in xs if x > 2), default=0),
+        list(x * 2 for x in [1, 2]),
+        sorted(x for x in [3, 1]),
+        dict((k, len(k)) for k in ["ab"]),
+        count(x for x in xs),
+    ],
+    "pairs": pairs,
+    "nested": total([[1, [2, 3]], [4, [5, 6]]]),
+    "comprehension": [[a, b, c] for a, (b, c) in [[1, [2, 3]]] if c > 2],
+    "sorted_dict": sorted({"b": 1, "a": 2}),
+})
+"#,
+        )?;
+        let output = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())?;
+        assert_eq!(
+            json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
+            json_value!({
+                "abs": [3, 2.5],
+                "reversed": [[5, 4, 3, 2, 1], [2, 1], ["b", "a"], ["b", "a"]],
+                "rfind": [3, -1, -1],
+                "steps": [[5, 4, 3, 2, 1], [1, 3, 5], [2, 4], [5, 4, 3], [5, 4], "cba", [3, 2, 1]],
+                "sets": [[3, 1], [1, 0], "set"],
+                "generators": [5, 3, [2, 4], [1, 3], {"ab": 2}, 5],
+                "pairs": [[1, "b", 2]],
+                "nested": 21,
+                "comprehension": [[1, 2, 3]],
+                "sorted_dict": ["a", "b"],
+            })
+        );
+
+        for (source, expected) in [
+            ("emit([1][::0])", "slice step cannot be zero"),
+            ("emit(abs(\"3\"))", "abs() takes an int or float, not str"),
+            ("emit(reversed(set([1])))", "a set is not reversible"),
+            ("g = (x for x in [1])", "a generator expression must be passed straight to a call"),
+        ] {
+            let program = lower_source(source)?;
+            let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
+                .expect_err(source);
+            let text = format!("{err:?}");
+            assert!(text.contains(expected), "{source}: unexpected error {text}");
+        }
 
         cleanup_dir(&root);
         Ok(())
@@ -27280,12 +27532,12 @@ emit({
     #[test]
     fn generator_expression_error_mentions_supported_contexts() -> Result<(), ShellError> {
         let (engine_state, mut stack, root) = test_engine("generator-error")?;
-        let program = lower_source(r#"emit(int(x) for x in ["1"])"#)?;
+        let program = lower_source(r#"values = (int(x) for x in ["1"])"#)?;
         let err = eval_program(&engine_state, &mut stack, &program, PipelineData::empty())
-            .expect_err("bare generator expression should fail");
+            .expect_err("a generator outside a call should fail");
         let text = format!("{err:?}");
 
-        assert!(text.contains("sum(...), any(...), all(...), join(...), and set(...)"));
+        assert!(text.contains("passed straight to a call"));
         assert!(text.contains("list comprehension"));
 
         cleanup_dir(&root);

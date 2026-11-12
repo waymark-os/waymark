@@ -18,12 +18,12 @@ use crate::stone_ast::{lower_source, ComprehensionClause, Expr, FormattedStringP
 /// Builtins a predicate may call: they only compute from their arguments.
 const PREDICATE_CALLS: &[&str] = &[
     "all", "any", "first", "float", "int", "isinstance", "last", "len", "list", "max", "min",
-    "repr", "round", "set", "sorted", "str", "sum", "tuple", "unique",
+    "repr", "round", "set", "sorted", "str", "sum", "tuple", "unique", "abs", "reversed",
 ];
 
 /// Methods a predicate may call: string, list, dict, and set queries.
 const PREDICATE_METHODS: &[&str] = &[
-    "count", "endswith", "find", "get", "index", "isdigit", "items", "join", "keys", "lower",
+    "count", "endswith", "find", "rfind", "get", "index", "isdigit", "items", "join", "keys", "lower",
     "lstrip", "replace", "rstrip", "split", "splitlines", "startswith", "strip", "upper",
     "values",
 ];
@@ -97,8 +97,8 @@ fn check_pure(expr: &Expr, bound: &mut Vec<String>) -> Result<(), String> {
             check_pure(index, bound)
         }
         Expr::Attribute { value, .. } => check_pure(value, bound),
-        Expr::Slice { lower, upper } => {
-            for part in [lower, upper].into_iter().flatten() {
+        Expr::Slice { lower, upper, step } => {
+            for part in [lower, upper, step].into_iter().flatten() {
                 check_pure(part, bound)?;
             }
             Ok(())

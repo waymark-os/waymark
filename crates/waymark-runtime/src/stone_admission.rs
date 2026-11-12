@@ -427,12 +427,9 @@ fn validate_expr(expr: &Expr, names: &AdmissionNames) -> Result<(), ShellError> 
         Expr::Attribute { value, .. } => {
             validate_expr(value, names)?;
         }
-        Expr::Slice { lower, upper } => {
-            if let Some(lower) = lower {
-                validate_expr(lower, names)?;
-            }
-            if let Some(upper) = upper {
-                validate_expr(upper, names)?;
+        Expr::Slice { lower, upper, step } => {
+            for part in [lower, upper, step].into_iter().flatten() {
+                validate_expr(part, names)?;
             }
         }
         Expr::Compare {
@@ -744,12 +741,9 @@ fn collect_expr_bindings(expr: &Expr, names: &mut HashSet<String>) {
         Expr::Attribute { value, .. } => {
             collect_expr_bindings(value, names);
         }
-        Expr::Slice { lower, upper } => {
-            if let Some(lower) = lower {
-                collect_expr_bindings(lower, names);
-            }
-            if let Some(upper) = upper {
-                collect_expr_bindings(upper, names);
+        Expr::Slice { lower, upper, step } => {
+            for part in [lower, upper, step].into_iter().flatten() {
+                collect_expr_bindings(part, names);
             }
         }
         Expr::Compare {

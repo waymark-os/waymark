@@ -179,6 +179,64 @@ pub(crate) fn find_method_builtin(receiver: &Value, args: &[Value]) -> Result<Va
     Ok(Value::int(index, Span::unknown()))
 }
 
+/// `text.rfind(sub, start=0)`: the last index of `sub` at or after
+/// `start`, or -1, as in Python.
+pub(crate) fn rfind_method_builtin(receiver: &Value, args: &[Value]) -> Result<Value, ShellError> {
+    let Value::String { val, .. } = receiver else {
+        return Err(stone_error(
+            "rfind",
+            format!("{} has no rfind()", crate::stone_builtins::value_type_name(receiver)),
+        ));
+    };
+    let ([needle] | [needle, _]) = args else {
+        return Err(stone_error(
+            "rfind",
+            "string rfind() requires a substring and optional start",
+        ));
+    };
+    let needle = value_to_string(needle, "rfind")?;
+    let start = match args {
+        [_, start] => normalize_string_start(value_to_i64(start, "rfind")?, val.chars().count())?,
+        _ => 0,
+    };
+    let prefix_len = val
+        .char_indices()
+        .nth(start)
+        .map(|(index, _)| index)
+        .unwrap_or_else(|| val.len());
+    let index = val[prefix_len..]
+        .rfind(&needle)
+        .map(|index| char_offset(val, prefix_len + index))
+        .unwrap_or(-1);
+    Ok(Value::int(index, Span::unknown()))
+}
+
+/// `abs(x)` for an int or float. Bools are not numbers in Stone.
+pub(crate) fn abs_builtin(value: &Value) -> Result<Value, ShellError> {
+    match value {
+        Value::Int { val, .. } => val
+            .checked_abs()
+            .map(|val| Value::int(val, Span::unknown()))
+            .ok_or_else(|| crate::stone_eval::stone_typed_error("ArithmeticError", "abs", "abs() of the smallest int overflows")),
+        Value::Float { val, .. } => Ok(Value::float(val.abs(), Span::unknown())),
+        other => Err(crate::stone_eval::stone_typed_error(
+            "TypeError",
+            "abs",
+            format!(
+                "abs() takes an int or float, not {}{}",
+                value_type_name(other),
+                if matches!(other, Value::String { .. }) {
+                    "; convert text first with int(x) or float(x)"
+                } else if matches!(other, Value::Bool { .. }) {
+                    "; convert with int(flag)"
+                } else {
+                    ""
+                }
+            ),
+        )),
+    }
+}
+
 pub(crate) fn float_builtin(value: &Value) -> Result<Value, ShellError> {
     convert_to_f64(value, "float").map(|value| Value::float(value, Span::unknown()))
 }
@@ -1164,6 +1222,25 @@ pub(crate) fn value_ordering(left: &Value, right: &Value) -> Result<Ordering, Sh
     }
 }
 
+/// The error for a dict key that is not a string. Stone dicts are JSON
+/// objects, so their keys are strings; the message says what to write.
+pub(crate) fn dict_key_error(context: &str, key_type: &str) -> ShellError {
+    let fix = match key_type {
+        "int" | "float" | "bool" => {
+            "use str(key) as the key, both when storing and when looking up, or a list when the numbers are positions"
+        }
+        "list" | "tuple" => {
+            "for a pair (a, b), join the parts into one string key such as f\"{a}|{b}\", or nest dicts: d[a][b]"
+        }
+        _ => "convert it with str(key), both when storing and when looking up",
+    };
+    crate::stone_eval::stone_typed_error(
+        "TypeError",
+        context,
+        format!("dict keys in Stone are strings, not {key_type}; {fix}"),
+    )
+}
+
 fn value_contains(container: &Value, needle: &Value) -> Result<bool, ShellError> {
     match container {
         Value::String { val, .. } => {
@@ -1179,8 +1256,10 @@ fn value_contains(container: &Value, needle: &Value) -> Result<bool, ShellError>
             Ok(false)
         }
         Value::Record { val, .. } => {
-            let needle = value_to_string(needle, "membership")?;
-            Ok(val.get(&needle).is_some())
+            let Value::String { val: needle, .. } = needle else {
+                return Err(dict_key_error("membership", &value_type_name(needle)));
+            };
+            Ok(val.get(needle).is_some())
         }
         other => Err(stone_error(
             "membership",
@@ -1209,8 +1288,10 @@ pub(crate) fn record_method_builtin(
                     "record get() requires key and optional default",
                 ));
             };
-            let key = value_to_string(key, "get")?;
-            if let Some(value) = val.get(&key) {
+            let Value::String { val: key, .. } = key else {
+                return Err(dict_key_error("get", &value_type_name(key)));
+            };
+            if let Some(value) = val.get(key) {
                 return Ok(value.clone());
             }
             match args {
@@ -1837,6 +1918,7 @@ pub(crate) fn subscript_builtin(value: &Value, index: &Value) -> Result<Value, S
             .get(key)
             .cloned()
             .ok_or_else(|| stone_error("subscript", format!("dict has no key `{key}`"))),
+        (Value::Record { .. }, index) => Err(dict_key_error("subscript", &value_type_name(index))),
         (Value::List { vals, .. }, Value::Int { val: index, .. }) => {
             let index = normalize_index(*index, vals.len())?;
             vals.get(index).cloned().ok_or_else(|| {
@@ -1877,6 +1959,50 @@ fn value_len(value: &Value) -> Result<i64, ShellError> {
         }
     };
     i64::try_from(len).map_err(|_| stone_error("len", "value is too large"))
+}
+
+/// The positions `[lower:upper:step]` picks from `len` items, with Python's
+/// rules: a negative step walks backwards, and its omitted bounds mean the
+/// last item and "past the first".
+pub(crate) fn stepped_slice_positions(
+    lower: Option<i64>,
+    upper: Option<i64>,
+    step: i64,
+    len: usize,
+) -> Result<Vec<usize>, ShellError> {
+    if step == 0 {
+        return Err(crate::stone_eval::stone_typed_error(
+            "ValueError",
+            "slice",
+            "slice step cannot be zero",
+        ));
+    }
+    let len = i64::try_from(len).map_err(|_| stone_error("slice", "collection is too large"))?;
+    let bound = |value: i64, low: i64, high: i64| {
+        let value = if value < 0 { value + len } else { value };
+        value.clamp(low, high)
+    };
+    let (start, stop) = if step > 0 {
+        (
+            lower.map_or(0, |value| bound(value, 0, len)),
+            upper.map_or(len, |value| bound(value, 0, len)),
+        )
+    } else {
+        (
+            lower.map_or(len - 1, |value| bound(value, -1, len - 1)),
+            upper.map_or(-1, |value| bound(value, -1, len - 1)),
+        )
+    };
+    let mut positions = Vec::new();
+    let mut index = start;
+    while (step > 0 && index < stop) || (step < 0 && index > stop) {
+        positions.push(index as usize);
+        index = match index.checked_add(step) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    Ok(positions)
 }
 
 pub(crate) fn normalize_slice_bounds(

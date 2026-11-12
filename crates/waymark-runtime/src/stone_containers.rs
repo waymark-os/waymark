@@ -688,6 +688,10 @@ pub(super) fn child_for_mutation(
             Some(index) => Ok(record.get(index)),
             None => Err(stone_error("attribute", record.ty.no_field_message(key))),
         },
+        (RuntimeValue::Dict(_), index) => Err(crate::stone_builtins::dict_key_error(
+            context,
+            &crate::stone_builtins::value_type_name(index),
+        )),
         (parent, index) => Err(stone_error(
             context,
             format!(
@@ -721,6 +725,10 @@ pub(super) fn assign_item(
             items[position] = Item::from_runtime(value);
             Ok(())
         }
+        (RuntimeValue::Dict(_), index) => Err(crate::stone_builtins::dict_key_error(
+            "assignment",
+            &crate::stone_builtins::value_type_name(index),
+        )),
         (container, index) => Err(stone_error(
             "assignment",
             format!(

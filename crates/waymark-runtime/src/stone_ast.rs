@@ -588,6 +588,7 @@ pub enum Expr {
     Slice {
         lower: Option<Box<Expr>>,
         upper: Option<Box<Expr>>,
+        step: Option<Box<Expr>>,
     },
     Compare {
         left: Box<Expr>,
@@ -2349,41 +2350,102 @@ fn lower_for(for_stmt: py::StmtFor) -> Result<Stmt, ShellError> {
             "for/else is not supported yet",
         ));
     }
-    let targets = lower_loop_targets(*for_stmt.target)?;
+    let offset = u32::from(ruff_text_size::Ranged::start(&for_stmt));
+    let (targets, unpacks) = lower_loop_targets(*for_stmt.target)?;
+    let body = lower_stmt_block(for_stmt.body)?;
+    let body = if unpacks.is_empty() {
+        body
+    } else {
+        // `for a, (b, c) in xs:` runs as `for a, item in xs:` with
+        // `b, c = item` first in the body.
+        let offsets = body.offsets().to_vec();
+        let mut block = Block::new();
+        for (hidden, names) in unpacks {
+            block.push_at(
+                Stmt::Assign {
+                    target: AssignTarget::Tuple(names),
+                    value: Expr::Name(hidden),
+                },
+                offset,
+            );
+        }
+        for (index, statement) in body.into_vec().into_iter().enumerate() {
+            block.push_at(statement, offsets.get(index).copied().unwrap_or(offset));
+        }
+        block
+    };
     Ok(Stmt::For {
         targets,
         iter: lower_expr(*for_stmt.iter)?,
-        body: lower_stmt_block(for_stmt.body)?,
+        body,
     })
 }
 
-fn lower_loop_targets(target: py::Expr) -> Result<Vec<String>, ShellError> {
-    match target {
-        py::Expr::Name(target) => Ok(vec![target.id.to_string()]),
-        py::Expr::Tuple(tuple) => {
-            let mut targets = Vec::with_capacity(tuple.elts.len());
-            for elt in tuple.elts {
-                let py::Expr::Name(name) = elt else {
-                    return Err(unsupported_message(
-                        "for statement",
-                        "only simple name tuple loop targets are supported yet",
-                    ));
-                };
-                targets.push(name.id.to_string());
+/// A loop target's names. A nested tuple (`for a, (b, c) in ...`) is bound
+/// to a hidden name, returned with the names to unpack from it, outer
+/// tuples first.
+fn lower_loop_targets(
+    target: py::Expr,
+) -> Result<(Vec<String>, Vec<(String, Vec<String>)>), ShellError> {
+    let mut unpacks = Vec::new();
+    let targets = match target {
+        py::Expr::Name(target) => vec![target.id.to_string()],
+        py::Expr::Tuple(_) | py::Expr::List(_) => flatten_loop_target(target, &mut unpacks)?,
+        _ => {
+            return Err(unsupported_message(
+                "for statement",
+                "a loop target is a name or a tuple of names, such as `for k, v in d.items()` or `for i, (k, v) in enumerate(pairs)`",
+            ))
+        }
+    };
+    Ok((targets, unpacks))
+}
+
+fn flatten_loop_target(
+    target: py::Expr,
+    unpacks: &mut Vec<(String, Vec<String>)>,
+) -> Result<Vec<String>, ShellError> {
+    let elements = match target {
+        py::Expr::Tuple(tuple) => tuple.elts,
+        py::Expr::List(list) => list.elts,
+        _ => unreachable!("only tuples and lists are flattened"),
+    };
+    if elements.is_empty() {
+        return Err(unsupported_message(
+            "for statement",
+            "empty tuple loop targets are not supported",
+        ));
+    }
+    let mut names = Vec::with_capacity(elements.len());
+    for element in elements {
+        match element {
+            py::Expr::Name(name) => names.push(name.id.to_string()),
+            nested @ (py::Expr::Tuple(_) | py::Expr::List(_)) => {
+                // Named after where the tuple is written, so it is unique
+                // within the source and the same on every lowering.
+                let offset = u32::from(ruff_text_size::Ranged::start(&nested));
+                let hidden = format!("__loop_item_{offset}");
+                names.push(hidden.clone());
+                let slot = unpacks.len();
+                unpacks.push((hidden, Vec::new()));
+                let inner = flatten_loop_target(nested, unpacks)?;
+                unpacks[slot].1 = inner;
             }
-            if targets.is_empty() {
+            py::Expr::Starred(_) => {
                 return Err(unsupported_message(
                     "for statement",
-                    "empty tuple loop targets are not supported",
-                ));
+                    "starred loop targets (`for a, *rest in ...`) are not supported; bind the item (`for item in ...`) and slice it (`a = item[0]`, `rest = item[1:]`)",
+                ))
             }
-            Ok(targets)
+            _ => {
+                return Err(unsupported_message(
+                    "for statement",
+                    "a loop target is a name or a tuple of names, such as `for k, v in d.items()` or `for i, (k, v) in enumerate(pairs)`",
+                ))
+            }
         }
-        _ => Err(unsupported_message(
-            "for statement",
-            "only simple name and tuple loop targets are supported yet",
-        )),
     }
+    Ok(names)
 }
 
 fn lower_if(if_stmt: py::StmtIf) -> Result<Stmt, ShellError> {
@@ -2562,6 +2624,22 @@ fn lower_expr(expression: py::Expr) -> Result<Expr, ShellError> {
         py::Expr::Await(await_expr) => Ok(Expr::Await(Box::new(lower_expr(*await_expr.value)?))),
         py::Expr::Lambda(lambda) => lower_lambda(lambda),
         py::Expr::Generator(generator) => lower_generator(generator),
+        // `{a, b}` and `{x for x in xs}` are sets, as in Python.
+        py::Expr::Set(set) => Ok(Expr::Call(Call {
+            name: "set".to_string(),
+            positional: vec![Expr::List(
+                set.elts.into_iter().map(lower_expr).collect::<Result<Vec<_>, _>>()?,
+            )],
+            named: Vec::new(),
+        })),
+        py::Expr::SetComp(set_comp) => Ok(Expr::Call(Call {
+            name: "set".to_string(),
+            positional: vec![Expr::ListComprehension {
+                elt: Box::new(lower_expr(*set_comp.elt)?),
+                clauses: lower_comprehension_clauses("set comprehension", &set_comp.generators)?,
+            }],
+            named: Vec::new(),
+        })),
         py::Expr::Subscript(subscript) => Ok(Expr::Subscript {
             value: Box::new(lower_expr(*subscript.value)?),
             index: Box::new(lower_expr(*subscript.slice)?),
@@ -2576,13 +2654,11 @@ fn lower_expr(expression: py::Expr) -> Result<Expr, ShellError> {
 }
 
 fn lower_slice(slice: py::ExprSlice) -> Result<Expr, ShellError> {
-    if slice.step.is_some() {
-        return Err(unsupported_message(
-            "slice",
-            "slice steps are not supported yet",
-        ));
-    }
     Ok(Expr::Slice {
+        step: slice
+            .step
+            .map(|value| lower_expr(*value).map(Box::new))
+            .transpose()?,
         lower: slice
             .lower
             .map(|value| lower_expr(*value).map(Box::new))
@@ -2837,27 +2913,38 @@ fn lower_comprehension_clauses(
             "at least one for clause is required",
         ));
     }
-    comprehensions
-        .iter()
-        .map(|comprehension| {
-            if comprehension.is_async {
-                return Err(unsupported_message(
-                    context,
-                    "async comprehension clauses are not supported",
-                ));
-            }
-            Ok(ComprehensionClause {
-                targets: lower_loop_targets(comprehension.target.clone())?,
-                iter: lower_expr(comprehension.iter.clone())?,
-                filters: comprehension
-                    .ifs
-                    .iter()
-                    .cloned()
-                    .map(lower_expr)
-                    .collect::<Result<Vec<_>, _>>()?,
-            })
-        })
-        .collect()
+    let mut clauses = Vec::with_capacity(comprehensions.len());
+    for comprehension in comprehensions {
+        if comprehension.is_async {
+            return Err(unsupported_message(
+                context,
+                "async comprehension clauses are not supported",
+            ));
+        }
+        let (targets, unpacks) = lower_loop_targets(comprehension.target.clone())?;
+        clauses.push(ComprehensionClause {
+            targets,
+            iter: lower_expr(comprehension.iter.clone())?,
+            filters: Vec::new(),
+        });
+        // `for a, (b, c) in xs` reads as `for a, item in xs for b, c in [item]`.
+        for (hidden, names) in unpacks {
+            clauses.push(ComprehensionClause {
+                targets: names,
+                iter: Expr::List(vec![Expr::Name(hidden)]),
+                filters: Vec::new(),
+            });
+        }
+        if let Some(last) = clauses.last_mut() {
+            last.filters = comprehension
+                .ifs
+                .iter()
+                .cloned()
+                .map(lower_expr)
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+    }
+    Ok(clauses)
 }
 
 fn lower_dict(dict: py::ExprDict) -> Result<Expr, ShellError> {
@@ -2874,7 +2961,7 @@ fn lower_dict(dict: py::ExprDict) -> Result<Expr, ShellError> {
         // keep `{1: "a"}` keyed by the int 1; turning it into "1" silently
         // breaks `d[1]` later, so a non-string key is rejected here.
         let key = match key {
-            py::Expr::StringLiteral(string) => string.value.to_string(),
+            py::Expr::StringLiteral(string) => DictKey::Text(string.value.to_string()),
             py::Expr::NumberLiteral(_) | py::Expr::BooleanLiteral(_) => {
                 let written = source_key_text(&key);
                 return Err(unsupported_message(
@@ -2884,18 +2971,46 @@ fn lower_dict(dict: py::ExprDict) -> Result<Expr, ShellError> {
                     ),
                 ));
             }
-            _ => {
-                return Err(unsupported_message(
-                    "dict key",
-                    "a dict literal's keys must be written as strings, such as {\"name\": value}; for a key held in a variable, build the dict with `d = {}` then `d[key] = value`, or use a comprehension `{key: value for ...}`",
-                ));
-            }
+            // A key held in a variable (or computed) must be a string when
+            // the literal runs; dict() checks it and says what to write.
+            other => DictKey::Computed(lower_expr(other)?),
         };
 
         items.push((key, lower_expr(item.value)?));
     }
 
-    Ok(Expr::Record(items))
+    if items.iter().all(|(key, _)| matches!(key, DictKey::Text(_))) {
+        return Ok(Expr::Record(
+            items
+                .into_iter()
+                .map(|(key, value)| match key {
+                    DictKey::Text(text) => (text, value),
+                    DictKey::Computed(_) => unreachable!("all keys are text"),
+                })
+                .collect(),
+        ));
+    }
+    // `{k: v, "a": 1}` runs as `dict([[k, v], ["a", 1]])`, in order.
+    let pairs = items
+        .into_iter()
+        .map(|(key, value)| {
+            let key = match key {
+                DictKey::Text(text) => Expr::String(text),
+                DictKey::Computed(expr) => expr,
+            };
+            Expr::List(vec![key, value])
+        })
+        .collect();
+    Ok(Expr::Call(Call {
+        name: "dict".to_string(),
+        positional: vec![Expr::List(pairs)],
+        named: Vec::new(),
+    }))
+}
+
+enum DictKey {
+    Text(String),
+    Computed(Expr),
 }
 
 /// How a literal key was written, for messages.
@@ -2914,13 +3029,29 @@ fn source_key_text(key: &py::Expr) -> String {
 }
 
 fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
+    // A generator expression passed straight to a call (`max(x for x in
+    // xs)`, `list(...)`, `f(...)`) runs as a list comprehension: the call
+    // sees the same values Python's would. sum/any/all/join/set evaluate
+    // their generator argument themselves (any and all stop early).
+    let own_generator = match call.func.as_ref() {
+        py::Expr::Name(name) => matches!(name.id.as_str(), "sum" | "any" | "all" | "join" | "set"),
+        py::Expr::Attribute(attribute) => attribute.attr.as_str() == "join",
+        _ => false,
+    };
     let positional = call
         .arguments
         .args
         .into_vec()
         .into_iter()
-        .map(lower_expr)
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|argument| {
+            Ok(match lower_expr(argument)? {
+                Expr::Generator { elt, clauses } if !own_generator => {
+                    Expr::ListComprehension { elt, clauses }
+                }
+                other => other,
+            })
+        })
+        .collect::<Result<Vec<_>, ShellError>>()?;
 
     match *call.func {
         py::Expr::Name(name) => {
@@ -2955,6 +3086,7 @@ fn lower_expr_call(call: py::ExprCall) -> Result<Expr, ShellError> {
                     | "limit"
                     | "close"
                     | "find"
+                    | "rfind"
                     | "get"
                     | "items"
                     | "index"
@@ -3207,14 +3339,6 @@ fn unsupported_statement(statement: &py::Stmt) -> ShellError {
 /// A Python expression Stone does not have, with what to write instead.
 fn unsupported_expression(expression: &py::Expr) -> ShellError {
     let (kind, message) = match expression {
-        py::Expr::Set(_) => (
-            "set literal",
-            "Stone has no `{1, 2}` set literal; write `set([1, 2])`".to_string(),
-        ),
-        py::Expr::SetComp(_) => (
-            "set comprehension",
-            "Stone has no set comprehension; write `set(x for x in xs)`".to_string(),
-        ),
         py::Expr::Starred(_) => (
             "star unpacking",
             "Stone has no `*` unpacking in calls or literals; pass the list itself, or join lists with `xs + ys`".to_string(),
@@ -3529,8 +3653,6 @@ mod tests {
             ("x **= 2", "`**=`"),
             ("emit(2 ** 3)", "no `**` power operator"),
             ("emit(b\"a\")", "no bytes literals"),
-            ("emit({1, 2})", "set([1, 2])"),
-            ("emit({x for x in xs})", "set(x for x in xs)"),
             ("emit(f(*xs))", "no `*` unpacking"),
             ("if (n := 3):\n    pass", "no `:=`"),
             ("emit(a @ b)", "no `@` operator"),
@@ -3548,9 +3670,6 @@ mod tests {
             (r#"{1: "one"}"#, r#"`{"1": ...}`"#),
             (r#"{2.5: "two"}"#, r#"`{"2.5": ...}`"#),
             (r#"{True: "yes"}"#, r#"`{"True": ...}`"#),
-            (r#"k = "a"
-{k: 1}"#, "d[key] = value"),
-            (r#"{(1, 2): 1}"#, "d[key] = value"),
         ] {
             let source = source.replace("\\n", "\n");
             let err = lower_source(&source).expect_err(&source);
@@ -4697,11 +4816,10 @@ else:
         for source in [
             "obj.method()",
             "module.command()",
-            "{name: \"demo\"}",
             "f(*args)",
             "f(**kwargs)",
             "a = b = 1",
-            "for a, (b, c) in items:\n    emit(a)",
+            "for a, *rest in items:\n    emit(a)",
             "for item in items:\n    emit(item)\nelse:\n    emit(None)",
         ] {
             assert_unsupported(source);

@@ -609,12 +609,9 @@ fn resolve_expr(expr: &mut Expr, stack: &mut Ctx, reads: &mut Names) -> Result<(
         | Expr::Neg(value)
         | Expr::Invert(value)
         | Expr::Await(value) => resolve_expr(value, stack, reads),
-        Expr::Slice { lower, upper } => {
-            if let Some(lower) = lower {
-                resolve_expr(lower, stack, reads)?;
-            }
-            if let Some(upper) = upper {
-                resolve_expr(upper, stack, reads)?;
+        Expr::Slice { lower, upper, step } => {
+            for part in [lower, upper, step].into_iter().flatten() {
+                resolve_expr(part, stack, reads)?;
             }
             Ok(())
         }

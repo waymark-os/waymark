@@ -226,8 +226,9 @@ Augmented assignment is available for names and supported item targets with the
 same typed operator semantics as the corresponding expression: `+=`, `-=`,
 `*=`, `/=`, `//=`, `%=`, `&=`, `|=`, `^=`, `<<=`, and `>>=`.
 
-List and record comprehensions support one or more `for` clauses, `if` filters,
-and simple name or tuple targets:
+List, set, and record comprehensions support one or more `for` clauses, `if`
+filters, and name or tuple targets, including nested tuples
+(`for i, (k, v) in enumerate(d.items())`, in loops too):
 
 ```python
 pairs = [name + ":" + str(count) for name, count in counts.items()]
@@ -235,9 +236,12 @@ flat = [item for row in rows for item in row["items"] if item]
 lookup = {row["name"]: row["score"] for row in rows if row["score"]}
 ```
 
-Generator expressions are intentionally narrow. They are accepted by `sum`,
-`any`, and `all`, support filters, and use Stone truthiness. `any` and `all`
-short-circuit generator evaluation.
+A generator expression can be passed straight to any call:
+`max(len(x) for x in xs)`, `list(...)`, `sorted(...)`, `dict((k, v) for ...)`,
+or a function of your own. The call receives the values as a list, so it sees
+what Python's would. `any` and `all` stop at the first deciding value, as in
+Python. A generator expression anywhere else (`g = (x for x in xs)`) is an
+error that says to write a list comprehension.
 
 Functions support positional parameters, optional type annotations, return
 annotations, and default values:
@@ -451,12 +455,14 @@ emit(counter())  # 2
 
 ### Lists And Dicts
 
-Dict keys are strings, because dicts are JSON objects. A dict literal must
-write its keys as strings: `{1: "a"}` and `{True: "a"}` are rejected before
-the program runs (Python would key them by the number or bool), and so is a
-computed key such as `{name: 1}`; build that dict with `d = {}` and
-`d[name] = 1`, or with a comprehension. An int key at run time
-(`d[1] = "x"`, `{i: x for ...}`, `d.get(1)`) is an error.
+Dict keys are strings, because dicts are JSON objects. A dict literal may
+compute a key (`{name: 1, f"{a}-{b}": 2}`) as long as it is a string when
+the program runs. `{1: "a"}` and `{True: "a"}` are rejected before the
+program runs (Python would key them by the number or bool). A non-string key
+at run time (`d[1] = "x"`, `{i: x for ...}`, `d.get(1)`, `(a, b) in d`) is a
+`TypeError` that says what to write instead: `str(key)` for a number, used
+both when storing and when looking up, and a joined string key such as
+`f"{a}|{b}"` or nested dicts `d[a][b]` for a pair.
 
 Lists and dicts are shared objects, as in Python. Assigning one to another
 name, passing it to a function, or storing it inside another list or dict
@@ -500,6 +506,9 @@ emit(rows)  # both rows now have "seen": True
   repeated elements are shared: `grid = [[]] * 2` holds one inner list twice,
   so `grid[0].append(1)` gives `[[1], [1]]`. Build independent rows with a
   comprehension: `[[] for _ in range(2)]`.
+- Slices take Python's three parts, `xs[start:stop:step]`, on lists,
+  tuples, and strings: `xs[::-1]` reverses and `xs[::2]` takes every other
+  item. A step of 0 is a `ValueError`.
 - `list(xs)`, `xs[:]`, and comprehensions make a new outer list; the elements
   are still shared. `{k: v for k, v in d.items()}` copies a dict the same way.
 - `a is b` is true only when both names refer to the same list, dict, or
@@ -1099,10 +1108,10 @@ says so with `result.effects.enforced == False`.
   function. The lambda must be pure: it may use only its own parameters (and
   names its comprehensions bind), literals, comparisons, `and`/`or`/`not`,
   arithmetic, indexing, attributes, f-strings, comprehensions, the builtins
-  `all any first float int isinstance last len list max min repr round set
-  sorted str sum tuple unique`, and the methods `count endswith find get
-  index isdigit items join keys lower lstrip replace rstrip split splitlines
-  startswith strip upper values`. It cannot run commands, call models,
+  `abs all any first float int isinstance last len list max min repr
+  reversed round set sorted str sum tuple unique`, and the methods `count
+  endswith find get index isdigit items join keys lower lstrip replace rfind
+  rstrip split splitlines startswith strip upper values`. It cannot run commands, call models,
   read files, or see the program's variables: run the command in the program
   and pass the result in. Text that does not parse, is not exactly one
   lambda, or uses anything else raises `ValueError` naming what is not
@@ -1114,6 +1123,13 @@ says so with `result.effects.enforced == False`.
   if passes(result):
       print("check passed")
   ```
+- `abs(x)`: the absolute value of an int or float, as in Python; text and
+  bools raise `TypeError`.
+- `reversed(xs)`: a new list of the same items in reverse order (a dict gives
+  its keys, a string its characters). Python returns an iterator; looping,
+  `list(...)`, and indexing behave the same. A set raises `TypeError`.
+- `sorted(xs, key=None, reverse=False)`: a sorted list, as in Python;
+  `sorted(d)` gives a dict's keys in order and `sorted(text)` its characters.
 - `any(iterable)`, `all(iterable)`, `sum(iterable)`, `join(iterable)`, and
   `set(iterable)`: aggregate lists or supported generator expressions with
   Stone truthiness, typed numeric semantics, or deterministic first-seen
@@ -1124,9 +1140,9 @@ says so with `result.effects.enforced == False`.
   `union`, `intersection`, `difference`, `symmetric_difference`, `issubset`,
   `issuperset`, `isdisjoint`, the operators `|`, `&`, `-`, `^`, and `<=`/`<`
   for subsets. Iteration follows first-insertion order. A set cannot be
-  indexed, and mixing bools with numbers in one set raises. There is no
-  `{1, 2}` literal; write `set([1, 2])`. `unique(xs)` gives a de-duplicated
-  list instead. Lists have no `.add()`.
+  indexed, and mixing bools with numbers in one set raises. `{1, 2}` and
+  `{x for x in xs}` make sets too; `{}` is an empty dict, as in Python.
+  `unique(xs)` gives a de-duplicated list instead. Lists have no `.add()`.
 - `dict()`, `dict(d)`, `dict(pairs)`, and `dict(d, k=v)`: a dict, as in
   Python; `dict(d)` is a shallow copy, `pairs` is a list of `[key, value]`
   pairs, and keyword arguments add entries (later ones win). A record is not
@@ -1145,7 +1161,7 @@ says so with `result.effects.enforced == False`.
   as `"a,b".split(",")`, `line.split(":", 1)`,
   `line.split(":", maxsplit=1)`, `line.rsplit("/", 1)`, `line.strip()`,
   `line.lstrip()`, `line.rstrip()`, `text.isdigit()`, `text.isalpha()`,
-  `text.isalnum()`,
+  `text.isalnum()`, `text.find("x")`, `text.rfind("/")`,
   `text.count("x")`, `",".join(items)`, `open(path).readlines()`,
   `items.extend(other)`, `items.count(value)`, and mutating
   `items.sort(key=..., reverse=...)` are also supported.

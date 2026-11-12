@@ -343,12 +343,16 @@ impl Analyzer<'_> {
             | Expr::Not(value)
             | Expr::Neg(value)
             | Expr::Invert(value) => self.expr(value),
-            Expr::Slice { lower, upper } => union(
-                lower
-                    .as_deref()
-                    .map_or(Some(BTreeSet::new()), |e| self.expr(e)),
-                upper
-                    .as_deref()
+            Expr::Slice { lower, upper, step } => union(
+                union(
+                    lower
+                        .as_deref()
+                        .map_or(Some(BTreeSet::new()), |e| self.expr(e)),
+                    upper
+                        .as_deref()
+                        .map_or(Some(BTreeSet::new()), |e| self.expr(e)),
+                ),
+                step.as_deref()
                     .map_or(Some(BTreeSet::new()), |e| self.expr(e)),
             ),
             Expr::Compare {
