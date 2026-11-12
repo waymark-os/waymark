@@ -23,7 +23,6 @@ use nu_protocol::{Record, ShellError, Span, Value};
 use crate::stone_eval::stone_typed_error;
 
 /// Environment variable naming the store directory (read by `SCRIPT`).
-#[cfg(test)]
 pub(crate) const STORE_ENV: &str = "WAYMARK_SNAPSHOT_STORE";
 
 /// `sh -c SCRIPT waymark-snapshot OP ROOT [BASE [SINCE TO]]` with OP `save`,

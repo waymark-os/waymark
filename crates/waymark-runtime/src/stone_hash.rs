@@ -23,6 +23,10 @@ pub(crate) fn hash_builtin(name: &str, text: &str) -> Result<Value, ShellError> 
     Ok(Value::string(digest, Span::unknown()))
 }
 
+pub(crate) fn sha256_hex(text: &str) -> String {
+    hex_digest::<Sha256>(text.as_bytes())
+}
+
 fn hex_digest<D>(bytes: &[u8]) -> String
 where
     D: Digest,

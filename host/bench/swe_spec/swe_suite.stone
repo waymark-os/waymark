@@ -499,9 +499,12 @@ def rejecting(report):
     return [t["name"] for t in report["tests"] if not t["passed"]] + [k["id"] for k in report["keep"] if not k["passed"]]
 
 
-def verify(suite, patch):
+def verify(suite, patch, previous=None):
     """Check that the tree is exactly the unfixed code plus patch (text), then
-    run the suite on it. Returns a Verdict."""
+    run the suite on it. Returns a Verdict. previous, when given, is the
+    Verdict of another suite on the same patch, made just before: its after
+    snapshot, when it is that tree, serves as this run's before snapshot, so
+    two suites verified in a row share one snapshot."""
     def verdict(verified, expected, before, after, tests, keep, failures, warnings, env_text=None):
         env = env_text if env_text is not None else environment(suite)
         return Verdict(verified=verified, suite=suite_hash(suite), base=suite["base"].id, patch=patch,
@@ -514,7 +517,11 @@ def verify(suite, patch):
         expected = apply_patch(suite["base"], patch)
     except ValueError as error:
         return verdict(False, None, None, None, [], [], ["the patch does not apply to the unfixed code: " + str(error)[:600]], [])
-    before = snapshot(suite["root"])
+    before = None
+    if isinstance(previous, Verdict) and previous.patch == patch and isinstance(previous.after, Snapshot) and previous.after.id == expected.id:
+        before = previous.after
+    if before is None:
+        before = snapshot(suite["root"])
     if before.id != expected.id:
         extra = [f.path + " (" + f.change + ")" for f in diff(since=expected, to=before).files]
         return verdict(False, expected, before, None, [], [],

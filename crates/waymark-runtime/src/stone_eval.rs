@@ -244,6 +244,10 @@ pub struct EvalState {
     /// The attempt's model and tool-call budget (design 5.3), shared with
     /// the session.
     budget: Rc<stone_budget::Budget>,
+    /// `apply_patch` results this program has made, by (store, root, base id,
+    /// patch): the result is a content id, so the same inputs give the same
+    /// snapshot, and through the Gateway each step is a round trip.
+    applied_patches: HashMap<(String, String, String, String), crate::stone_snapshots::SnapshotRef>,
     #[cfg(test)]
     test_model: Option<Rc<std::cell::RefCell<stone_model::TestModel>>>,
     profiler: EvalProfiler,
@@ -1079,6 +1083,7 @@ fn eval_program_with_source_options(
                 .map(|session| session.types.clone())
                 .unwrap_or_default(),
             budget,
+            applied_patches: HashMap::new(),
             #[cfg(test)]
             test_model: options
                 .session
@@ -5219,14 +5224,33 @@ impl Evaluator<'_> {
         let base = snapshot_ref(&snapshot, "apply_patch", "snapshot")?;
         let mut args = vec!["apply".to_string(), base.root.clone(), base.id.clone()];
         let mut stdin = None;
-        match patch_spec(&patch, "apply_patch")? {
-            PatchSpec::None => {}
-            PatchSpec::Text(text) => stdin = Some(text),
-            PatchSpec::Trees { since, to } => args.extend([since, to]),
-        }
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let stdout = self.snapshot_step("apply_patch", &args, stdin.as_deref(), &base.root)?;
-        let result = crate::stone_snapshots::parse_save(&stdout, "apply_patch")?;
+        let spec = patch_spec(&patch, "apply_patch")?;
+        let patch_key = match &spec {
+            PatchSpec::None => String::new(),
+            PatchSpec::Text(text) => format!("text:{}", crate::stone_hash::sha256_hex(text)),
+            PatchSpec::Trees { since, to } => format!("trees:{since}:{to}"),
+        };
+        let key = (
+            env::var(crate::stone_snapshots::STORE_ENV).unwrap_or_default(),
+            base.root.clone(),
+            base.id.clone(),
+            patch_key,
+        );
+        let result = match self.state.applied_patches.get(&key) {
+            Some(result) => result.clone(),
+            None => {
+                match spec {
+                    PatchSpec::None => {}
+                    PatchSpec::Text(text) => stdin = Some(text),
+                    PatchSpec::Trees { since, to } => args.extend([since, to]),
+                }
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                let stdout = self.snapshot_step("apply_patch", &args, stdin.as_deref(), &base.root)?;
+                let result = crate::stone_snapshots::parse_save(&stdout, "apply_patch")?;
+                self.state.applied_patches.insert(key, result.clone());
+                result
+            }
+        };
         Ok(RuntimeValue::Nu(Value::record(
             crate::stone_snapshots::snapshot_record(&result),
             Span::unknown(),
@@ -28076,6 +28100,7 @@ now = snapshot()
 from_diff = apply_patch(base, change)
 from_text = apply_patch(base, change.patch)
 same = apply_patch(base, None)
+again = apply_patch(base, change.patch)
 write_text("build.log", "changed")
 errors = []
 for patch in ["garbage", 3]:
@@ -28093,6 +28118,7 @@ except FileNotFoundError as e:
     errors.append("FileNotFoundError")
 emit({
     "ids": [snapshot().id == now.id, base.id != now.id, from_diff.id == now.id, from_text.id == now.id, same.id == base.id],
+    "again": [again.id == from_text.id, again.seq > from_text.seq],
     "types": [isinstance(base, Snapshot), isinstance(from_diff, Snapshot), isinstance(change, TreeDiff)],
     "files": [[f.path, f.change] for f in change.files],
     "between": len(diff(since=base, to=now).files),
@@ -28107,6 +28133,7 @@ emit({
             json::pipeline_to_json_value(output, nu_protocol::Span::unknown())?,
             json_value!({
                 "ids": [true, true, true, true, true],
+                "again": [true, true],
                 "types": [true, true, true],
                 "files": [["m.txt", "modified"], ["n.txt", "added"]],
                 "between": 2,

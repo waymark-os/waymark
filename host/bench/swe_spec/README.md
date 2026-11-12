@@ -51,9 +51,11 @@ repository test file edited warns, and puts the edit back afterwards).
 - `check(suite)`: run the suite on the current tree (feedback for the fixer,
   with warnings for edited test files); `rejecting(report)` names the parts
   that reject it.
-- `verify(suite, patch)`: prove by snapshot id that the tree is exactly the
-  unfixed code plus the patch (listing any extra or missing files), run the
-  suite, and return a `Verdict` holding the results.
+- `verify(suite, patch, previous=None)`: prove by snapshot id that the tree
+  is exactly the unfixed code plus the patch (listing any extra or missing
+  files), run the suite, and return a `Verdict` holding the results. With
+  `previous`, another suite's verdict on the same patch made just before, its
+  after snapshot serves as this run's before snapshot.
 - `accepts(suite, verdict)`: re-check a verdict without running a test:
   genuine results and snapshots, this suite and patch, every run between the
   two snapshots (by `seq`), the registered commands and test-file copies,
