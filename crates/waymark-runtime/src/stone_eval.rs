@@ -1170,14 +1170,20 @@ fn eval_program_with_source_options(
         .budget
         .attach_stdout(&evaluator.state.stdout);
     let denials = evaluator.state.denials_json();
+    // Warnings found before the run matter most when the program fails.
+    let warnings = &evaluator.state.handler_warnings;
     let pipeline = match (pipeline, cleanup) {
         (Ok(pipeline), Ok(())) => pipeline,
-        (Ok(_), Err(cleanup_error)) => return Err(attach_denials(cleanup_error, denials)),
-        (Err(program_error), Ok(())) => return Err(attach_denials(program_error, denials)),
+        (Ok(_), Err(cleanup_error)) => {
+            return Err(attach_warnings(attach_denials(cleanup_error, denials), warnings))
+        }
+        (Err(program_error), Ok(())) => {
+            return Err(attach_warnings(attach_denials(program_error, denials), warnings))
+        }
         (Err(program_error), Err(cleanup_error)) => {
-            return Err(attach_denials(
-                attach_cleanup_error(program_error, cleanup_error),
-                denials,
+            return Err(attach_warnings(
+                attach_denials(attach_cleanup_error(program_error, cleanup_error), denials),
+                warnings,
             ));
         }
     };
@@ -19618,8 +19624,33 @@ fn attach_denials(program_error: ShellError, denials: Option<JsonValue>) -> Shel
         )
         .with_code("stone_denials"),
     );
+    append_related(program_error, note)
+}
+
+/// The warnings found before the run (`diagnostics.warnings` on success),
+/// attached to a failing program's error as one related entry.
+fn attach_warnings(program_error: ShellError, warnings: &[String]) -> ShellError {
+    if warnings.is_empty() {
+        return program_error;
+    }
+    let note = ShellError::Generic(
+        GenericError::new_internal(
+            "Warnings found before the program ran",
+            json!(warnings).to_string(),
+        )
+        .with_code("stone_warnings"),
+    );
+    append_related(program_error, note)
+}
+
+/// Add `note` to an error's related entries, keeping the ones it has (its
+/// `task_failure_detail`, which also names the raised type).
+fn append_related(program_error: ShellError, note: ShellError) -> ShellError {
     match program_error {
-        ShellError::Generic(error) => ShellError::Generic(error.with_inner(vec![note])),
+        ShellError::Generic(mut error) => {
+            error.inner.push(note);
+            ShellError::Generic(error)
+        }
         other => other,
     }
 }
@@ -23199,6 +23230,36 @@ emit(inc(5))
         }
 
         cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn failing_program_keeps_its_error_detail_and_reports_warnings() -> Result<(), ShellError> {
+        let (engine_state, mut stack, _root) = test_engine("stone-warnings-on-error")?;
+        let mut session = StoneSession::default();
+        let source = "def check():\n    r = run([\"true\"])\n    return 1\nraise ValueError(\"stop\")\n";
+        let error = match crate::stone_frontend::eval_stone_source_with_output_and_session(
+            &engine_state,
+            &mut stack,
+            source,
+            PipelineData::empty(),
+            &mut session,
+        ) {
+            Ok(_) => panic!("the program raises"),
+            Err(error) => error,
+        };
+        let ShellError::Generic(error) = error else {
+            panic!("a raised error is generic: {error:?}");
+        };
+        let codes: Vec<String> = error.inner.iter().map(|inner| match inner {
+            ShellError::Generic(inner) => inner.code.to_string(),
+            other => format!("{other:?}"),
+        }).collect();
+        // The raised error keeps its own detail (which names its type), and
+        // the warnings found before the run come after it.
+        assert_eq!(codes, ["task_failure_detail", "stone_warnings"], "{codes:?}");
+        let ShellError::Generic(warnings) = &error.inner[1] else { unreachable!() };
+        assert!(warnings.msg.contains("`r` holds the result of run(...)"), "{warnings:?}");
         Ok(())
     }
 

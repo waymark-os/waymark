@@ -928,7 +928,9 @@ bodies of the functions it calls, and reports a handler that can never run in
 `diagnostics.warnings`. Examples are `except OSError:` around pure
 computation, `except ExpectationFailed:` around a call without `expect=`,
 and `except FileNotFoundError:` around `run()`, which does not catch a
-missing command. These are warnings only; no handler is ever required. When
+missing command. When the program fails, its warnings come with the error
+as a related entry with code `stone_warnings`. These are warnings only; no
+handler is ever required. When
 a block calls something the analysis cannot see through (a function passed in
 a variable, an unknown method, `await`), no warning is given.
 
