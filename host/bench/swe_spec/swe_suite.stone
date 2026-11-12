@@ -138,14 +138,6 @@ def current_text(path):
     return r.stdout if r.exit_code == 0 else None
 
 
-def put_back(path, text):
-    """Leave path as the agent had it: text, or no file when text is None."""
-    if text is None:
-        run(["rm", "-f", "--", path])
-    else:
-        run(["sh", "-c", "cat > \"$1\"", "put-back", path], stdin=text)
-
-
 def keep_paths(suite, command):
     """Repository test files a keep command names: file arguments (a pytest
     node id's file part), and Django dotted test modules or packages under
@@ -173,46 +165,77 @@ def keep_paths(suite, command):
     return paths
 
 
+# Compares each held file (path, then its registered hashes joined by commas)
+# with its registered copies, copies a file the agent edited to a fresh
+# backup directory, and names edited and missing files.
+HELD_CHECK = [
+    "B=$(mktemp -d \"${TMPDIR:-/tmp}/waymark-held.XXXXXX\") || exit 3",
+    "i=0",
+    "while [ $# -gt 0 ]; do",
+    "  p=$1; want=$2; shift 2; i=$((i + 1))",
+    "  if [ -f \"$p\" ]; then",
+    "    h=$(sha256sum < \"$p\") || exit 3; h=${h%% *}",
+    "    case \",$want,\" in *\",$h,\"*) ;; *) cp -p -- \"$p\" \"$B/$i\" || exit 3; printf 'edited %s %s\\n' \"$i\" \"$p\";; esac",
+    "  else",
+    "    printf 'missing %s %s\\n' \"$i\" \"$p\"",
+    "  fi",
+    "done",
+    "rmdir \"$B\" 2>/dev/null || printf 'dir %s\\n' \"$B\"",
+]
+# Puts the agent's versions back: E <backup name> <path> copies one back,
+# D <path> removes a file the agent had deleted; then removes the backups.
+HELD_RESTORE = [
+    "B=$1; shift",
+    "while [ $# -gt 0 ]; do",
+    "  if [ \"$1\" = E ]; then cp -p -- \"$B/$2\" \"$3\" || exit 3; shift 3; else rm -f -- \"$2\"; shift 2; fi",
+    "done",
+    "[ -z \"$B\" ] || rm -rf -- \"$B\"",
+]
+
+
 def agent_versions(suite, groups):
-    """The held files that differ from their registered copies now, found with
-    one command for all of them. groups is a list of {path: registered text}.
-    Returns ({path: the agent's text, or None when deleted}, warnings)."""
+    """The held files that differ from their registered copies now. One
+    command compares them all and keeps a copy of each one the agent edited.
+    groups is a list of {path: registered text}. Returns (held, warnings);
+    put_back_all(held) restores the agent's versions after the runs."""
     registered = {}
     for files in groups:
         for p, t in files.items():
             path = absolute(suite, p)
             registered[path] = registered.get(path, []) + [sha256(t)]
+    held = {"dir": "", "back": []}
     paths = sorted(list(registered.keys()))
     if not paths:
-        return {}, []
-    script = "for p; do if [ -f \"$p\" ]; then h=$(sha256sum < \"$p\") || exit 3; printf '%s %s\\n' \"${h%% *}\" \"$p\"; else printf -- '- %s\\n' \"$p\"; fi; done"
-    r = run(["sh", "-c", script, "held"] + paths, max_stdout_bytes=1000000)
-    now = {}
-    if r.exit_code == 0:
-        for line in r.stdout.splitlines():
-            i = line.find(" ")
-            if i > 0:
-                now[line[i + 1:]] = None if line[:i] == "-" else line[:i]
-    agent = {}
-    warnings = []
+        return held, []
+    args = []
     for path in paths:
-        if path in now:
-            state = now[path]
-        else:
-            text = current_text(path)
-            state = None if text is None else sha256(text)
-        if state is not None and state in registered[path]:
-            continue
-        if state is None and not path.startswith(suite["root"] + "/"):
-            continue
-        agent[path] = None if state is None else current_text(path)
-        warnings.append("test file " + path + " differs from the registered copy (" + ("deleted" if state is None else "edited") + "); the gate ran the registered copy and left your version in place")
-    return agent, warnings
+        args = args + [path, ",".join(registered[path])]
+    r = run(["sh", "-c", "\n".join(HELD_CHECK), "held"] + args, max_stdout_bytes=1000000)
+    if r.exit_code != 0:
+        raise OSError("could not compare the held test files with their registered copies: " + r.stderr[:400])
+    warnings = []
+    root = suite["root"] + "/"
+    for line in r.stdout.splitlines():
+        parts = line.split(" ", 2)
+        if parts[0] == "dir":
+            held["dir"] = line[4:]
+        elif parts[0] == "edited":
+            held["back"].append(["E", parts[1], parts[2]])
+            warnings.append("test file " + parts[2] + " differs from the registered copy (edited); the gate ran the registered copy and left your version in place")
+        elif parts[0] == "missing" and parts[2].startswith(root):
+            held["back"].append(["D", parts[2]])
+            warnings.append("test file " + parts[2] + " differs from the registered copy (deleted); the gate ran the registered copy and left your version in place")
+    return held, warnings
 
 
-def put_back_all(agent):
-    for path, text in agent.items():
-        put_back(path, text)
+def put_back_all(held):
+    """Leave the held files as the agent had them, with one command."""
+    if not held["back"]:
+        return
+    args = [held["dir"]]
+    for entry in held["back"]:
+        args = args + entry
+    must_run(["sh", "-c", "\n".join(HELD_RESTORE), "put-back"] + args)
 
 
 def run_held(suite, argv, files, runner=None):
