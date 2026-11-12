@@ -1103,6 +1103,173 @@ The runtime also counts mismatches per action signature, which gives
 kept in history; matched predictions are not (R26, following PreAct's finding
 that retained predictions help).
 
+### 5.9 Input: Named Inputs To Model Calls (Proposed 2026-11-11)
+
+**Why.** Lean4Agent's main result (11.3) comes from a check before the run.
+On hard SWE-bench tasks, workflows whose steps each receive what they need
+solved 14.8 points more than workflows that fail the check. The most common
+defect is information flow: a step needs evidence that an earlier step found
+but cannot see. A Stone workflow is a program, so the data flow between
+steps is already visible to the checker, with one exception: the model call.
+Programs flatten evidence into prompt text just before the call
+(`host/bench/swe_spec/swe_plan.stone`):
+
+```python
+settled = {"rule": answered.rule, "decisions": decision_dicts(answered.decisions)}
+messages = [user(intro + TESTS_INSTRUCTIONS + "\n\nSettled rule and decisions:\n" + json_dumps(settled))]
+```
+
+Up to the last line, `answered` is a checked `Answers` record from the strong
+model. After it, it is characters. That costs three things:
+
+- the checker cannot tell what a model step depends on;
+- the runtime cannot say where a step's evidence came from without tracking
+  labels through every string operation, which D-3 rules out (checks happen
+  at tool and model calls, not on every operation);
+- each program renders its own way, so the same evidence can come out as
+  different bytes from one call to the next, which defeats the provider's
+  prompt cache.
+
+**Form.** Inputs are named values attached to a message. The runtime, not
+the program, turns them into text.
+
+```python
+msg = message("Write the tests for the settled decisions.",
+              inputs={"issue": issue, "settled": answered})
+tests = model.ask([msg], output=SpecTests, system=TESTS_INSTRUCTIONS)
+
+# shorthand for a one-message prompt
+tests = model.ask("Write the tests.", output=SpecTests, inputs={"settled": answered})
+```
+
+- `message(text, inputs={...}, role="user")` returns a read-only `Message`
+  record. Plain `{"role": ..., "content": ...}` dicts keep working.
+- Input values may be strings, numbers, lists, dicts, records, and sealed
+  runtime results. Functions, models, and handles are rejected.
+- Each input is rendered as a block naming its key and type, inputs come
+  before the message text (long material first, the request last), and the
+  format is JSON. Output types read better as class definitions than as JSON
+  Schema (M5); for inputs this has not been measured, so JSON is a starting
+  point.
+- `model.last` and the trace record, for each call, the inputs it saw and
+  their sources (below).
+
+**What the check before the run gets.** Every item is a linear pass that
+matches names and types and infers nothing (D-3).
+
+1. **A step that never sees its evidence.** Suppose a function takes a record
+   parameter (`def verify(fix: FixReport, ...)`) and starts a new
+   conversation for a model call, but passes the parameter to neither the
+   model nor any check. The checker warns: "verify() receives fix: FixReport,
+   but its model call never sees it". This is Lean4Agent's most common SWE
+   defect: a context-isolated verify step that needs the fix evidence.
+2. **Where each input and each check comes from.** Within a function, the
+   checker follows each input and each check's expected value back to the
+   call that produced it:
+   - a runtime result (`run`, `run_tests`, `verify`): the world;
+   - `model.ask`: a model;
+   - a literal or module constant: the program.
+
+   A check whose expected value comes from a model reply is listed among the
+   claim's assumptions before the run. That is the 11.3 lesson, in which
+   every false "verified" claim rested on the model's own reproduction.
+3. **Verify before submit, as a type rule.** The final step requires a value
+   that only the verifier makes, such as the suite's `Verdict` built from
+   sealed results. A workflow without a verify step then fails before it
+   runs. Lean4Agent states this as a separate graph-level rule
+   (`verificationCoverage`). This is 5.2's goal check, applied to inputs.
+
+At run time the source of each input is recorded when it is rendered: a
+sealed result, a `model.ask` answer (with the model name and transition id),
+or a value the program made. Labels do not follow values through
+computation. A dict that the program builds from a model's fields counts as
+program-made, and that is the honest limit of this design. Full provenance
+labels remain a separate item (D-3, P3).
+
+**Prompt caching.** Providers reuse the processed prefix of a prompt:
+Anthropic at cache markers, OpenAI and vLLM automatically, and llama.cpp per
+slot. One changed byte invalidates everything after it. Because the runtime
+owns rendering, it can keep prompts cacheable without effort from the
+program.
+
+- **Order: stable first.**
+  - The order is the program's `system` text, then the output type's
+    description, then the messages in order. This is how `model.ask`
+    already builds a request: the type description goes in after the
+    program's system messages, and repair turns go at the end.
+  - Instructions belong in `system=` and data in inputs. The checker warns
+    when `system=` is built from runtime values (an f-string over a
+    variable). That puts per-task data at the front of the prefix, so no
+    two tasks share a cache, and it puts data in the instruction channel.
+  - In M5, the derived type text already sat in the unchanging part of the
+    prompt, so a prefix-reusing server processed 1.2 times V14's input
+    instead of 1.48 times.
+- **Deterministic rendering: the same value gives the same bytes.**
+  - Record fields render in declaration order and dict keys in insertion
+    order, and numbers render in one canonical form.
+  - Rendered sealed results carry no `seq`, timestamps, hashes, or
+    transition ids. Those stay in the trace.
+  - Long text is cut deterministically, with the cut marked (as
+    `swe_loop.stone`'s `clip` does).
+- **Render once.** A `Message` fixes its rendered text when it is built.
+  Stone dicts and lists alias, so a program that changes `settled` after
+  building the message would otherwise send different bytes when it resends
+  the history.
+- **Append, don't edit.**
+  - New evidence goes in a new message. Editing, dropping, or re-clipping an
+    earlier message changes the prefix.
+  - `model.last` reports the first message that differs from the previous
+    ask on the same model value, and the provider's cached-token count when
+    the Gateway returns one.
+  - Compaction is legitimate, so this is a report, not an error.
+- **Output type changes.** The type description sits in the prefix, so
+  switching `output=` in the middle of one conversation re-processes the
+  whole history.
+  - The SWE action loops keep one action union per stage, so they do not
+    hit this.
+  - If a later ask uses a different type, one option is to append the new
+    description at the end instead of changing the system part. That waits
+    on a measurement.
+- **Model switches.** Caches are per model, so a split setup that hands a
+  question to the strong model reads nothing from the default model's cache.
+  It should send the strong model a short, self-contained prompt.
+
+**Gateway (`waymark-gateway`, separate repository).**
+- Today the Gateway sends no cache markers. It reaches Anthropic through the
+  chat-completions payload, and it records only prompt and completion tokens.
+  So the Haiku and Sonnet runs in 11.3-11.6 paid full input price on every
+  call, and cache hits were never measured.
+- Needed:
+  - on Anthropic, a marker at the end of the system block plus automatic
+    caching of the growing tail (check whether this needs the native
+    Messages API);
+  - cached-token counts in the usage it returns.
+- llama.cpp and vLLM need only stable bytes.
+
+**Not proposed.** No proof of pre- and post-conditions, and no
+LLM-annotated predicates. The static part matches names, types, and
+sources. Whether a step delivered is checked at run time against the world
+(5.2, 5.8), which is stronger than Lean4Agent's after-the-run checks, where
+an LLM judge decides open questions such as "is the fix complete".
+
+**How to test.**
+- **Lean4Agent's comparison in Stone.** A strong model writes several SWE
+  workflows. The check runs on each before any execution. Workflows that
+  pass and workflows that fail then run with Haiku and Qwen on the same
+  tasks.
+- **Repair runs.** Fix only the defect the check flagged in each failing
+  workflow and rerun it. This is their repair experiment, and it separates
+  the check from overall workflow quality.
+- **Cache.** Cached tokens per run on the experiment 6 programs, rewritten
+  with named inputs, once the Gateway reports them.
+
+**Open.**
+- The rendering format for inputs (JSON or Python-like).
+- Whether to show the docstrings of input record types to the model. They
+  are static, so they cost little once cached.
+- Whether `message()` should accept an assistant turn with inputs. No
+  current program needs it.
+
 ## 6. Realistic Examples
 
 All syntax is proposed and illustrative.
@@ -2755,6 +2922,10 @@ so V15 keeps V14's trace-id evidence links.
 - Host obligation registry, including daemons (R19).
 - Helpers in an isolated evaluator (R7).
 - Runtime stuck signal from repeated mismatches.
+- Named inputs to model calls (5.9, proposed 2026-11-11): `message(text,
+  inputs=...)`, runtime rendering that keeps prompts cacheable, input
+  sources in the trace, and the "step never sees its evidence" check. The
+  Gateway part (cache markers, cached-token counts) goes with it.
 - Static plan check (L12 proposal, 5.2): stage findings as records, a goal
   check on the final stage in workflow admission, the claim's assumption
   report, and warnings for unchecked `run()` results and budget-blind model
