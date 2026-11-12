@@ -1256,8 +1256,26 @@ a label naming the model call that made them (the reserved container label
 slot), and sources are `runtime`, `model`, or `program`. `model.last` adds
 `inputs`, `messages`, and `reused_messages` (leading request messages
 unchanged since the previous ask through the same model value).
-Not built yet: the checks before the run (items 1-3 above), the
-`system=` warning, cached-token counts, and the Gateway cache markers.
+
+**Built (2026-11-12), item 1** (`stone_evidence.rs`). A function that makes a
+model call and takes a parameter annotated with a record type (a program's
+record class or a runtime record) gets a warning in `diagnostics.warnings`
+when nothing computed from the parameter reaches a `.ask(...)` argument. The
+pass follows assignments, string formatting, `message(...)`, comprehensions,
+and appends to a list, repeated until no new name carries the value. It
+stays quiet when the value escapes where it cannot follow: any other call
+(user functions, checks such as `run_tests`, `emit`), a condition, `return`,
+`raise`, or a lambda. It also stays quiet when a model call reads an
+unannotated, list, or dict parameter, which may be a history that already
+holds the evidence. `list[Fix]` parameters are not checked, because function
+parameters keep only `list`. Across the repository's programs and about 950
+distinct programs from earlier pilot runs, the check gives no warning, but
+only because none of them has its shape. Five functions make a model call,
+and none takes a typed record parameter: programs call `model.ask` at the
+top level, or in helpers with unannotated parameters. The check pays off
+only for workflows written as typed step functions, as Lean4Agent's are.
+Not built yet: items 2 and 3, the `system=` warning, cached-token counts,
+and the Gateway cache markers.
 
 **Not proposed.** No proof of pre- and post-conditions, and no
 LLM-annotated predicates. The static part matches names, types, and

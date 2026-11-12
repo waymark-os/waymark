@@ -1333,6 +1333,16 @@ says so with `result.effects.enforced == False`.
   Keep `system=` a fixed instruction and put task data in inputs; append to
   a history rather than editing it. Both keep the start of the prompt the
   same from call to call. See `help("message")`.
+  Before the program runs, Stone warns in `diagnostics.warnings` when a
+  function takes a record parameter (`def review(fix: Fix)`, or a runtime
+  result such as `RunResult`) and makes a model call, but nothing computed
+  from that parameter reaches any of its model calls: "review() receives
+  fix: Fix, but its model call never sees it". This is the usual defect of a
+  review step that starts a fresh prompt. The warning is not given when the
+  parameter goes anywhere the check does not follow (another function, a
+  check such as `run_tests`, a condition, `return`), or when the function's
+  model call continues a conversation the caller passed in (an unannotated,
+  list, or dict parameter).
 
   ```python
   class Verdict(Record):

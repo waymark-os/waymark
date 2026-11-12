@@ -33,6 +33,7 @@ mod stone_builtins;
 mod stone_correction;
 mod stone_effects;
 mod stone_errors;
+mod stone_evidence;
 mod stone_eval;
 mod stone_file_ops;
 mod stone_frontend;
