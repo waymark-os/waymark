@@ -1274,6 +1274,22 @@ only because none of them has its shape. Five functions make a model call,
 and none takes a typed record parameter: programs call `model.ask` at the
 top level, or in helpers with unannotated parameters. The check pays off
 only for workflows written as typed step functions, as Lean4Agent's are.
+
+**Built (2026-11-12), unread evidence.** The same defect in the shape our
+programs have. A variable bound to `run(...)` or `run_tests(...)` (without
+`expect=`) or to a model answer gets a warning when nothing reads it: no
+model call sees it, and no condition, other call, `print`, `emit`, or
+`return` uses it. A `run_tests(...)` whose result is thrown away is
+reported too. It uses the same pass as item 1, with printing counted as a
+read, since a program's output goes back to the agent that ran it. Function
+bodies are always checked. The top level is checked only when it makes a
+model call, because in a session an agent may bind `r = run(...)` and read
+`r` in its next call. Its last statement is the result and counts as read.
+On the same programs it flags two values: a model answer in a budget test
+script that is really unused, and a two-line excerpt from this document. No
+pilot workflow is flagged. The scan also found one gap, now fixed: an
+append through a subscript (`out[k].append(a.kind)`) had not counted as
+reading `a`.
 Not built yet: items 2 and 3, the `system=` warning, cached-token counts,
 and the Gateway cache markers.
 

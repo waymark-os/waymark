@@ -177,6 +177,171 @@ fn check_function(function: &FunctionDef, records: &HashSet<String>, warnings: &
     }
 }
 
+/// Builtins whose result is evidence about the world: what a command or a
+/// test run did. `must_run` is left out (it raises when the command fails),
+/// and so is any call with `expect=` (the runtime checks it).
+const EVIDENCE_CALLS: &[&str] = &["run", "run_wait", "run_complete", "run_tests"];
+
+/// Warnings for evidence a program gets and never reads: a variable bound
+/// to a command result, a test run, or a model answer that nothing reads
+/// afterwards. No model call sees it, no condition or other call uses it,
+/// and it is not printed, emitted, or returned.
+///
+/// Each function body is checked on its own. The top level is checked only
+/// when it makes a model call: in a session an agent may bind `r = run(...)`
+/// in one call and read `r` in the next, and such snippets rarely call a
+/// model, while a workflow does. The top level's last statement is the
+/// program's result, so it is read.
+pub(crate) fn unread_evidence_warnings(statements: &[Stmt]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let top_level = Flow::over(statements, HashSet::new(), true).asks > 0;
+    let (checked, result) = match statements.split_last() {
+        Some((Stmt::Expr(result), rest)) => (rest, Some(result)),
+        _ => (statements, None),
+    };
+    check_scope(statements, checked, result, top_level, &mut warnings);
+    warnings
+}
+
+/// Check the evidence bound in `checked` (`body`, or `body` without its
+/// final result expression) against every read in `body`; `result` is read.
+/// With `report` false, only the functions inside are checked.
+fn check_scope(
+    body: &[Stmt],
+    checked: &[Stmt],
+    result: Option<&Expr>,
+    report: bool,
+    warnings: &mut Vec<String>,
+) {
+    let mut bound: Vec<(String, String, bool)> = Vec::new();
+    let mut found = Vec::new();
+    collect_evidence_bindings(checked, &mut bound, &mut found, warnings);
+    if !report {
+        return;
+    }
+    warnings.extend(found);
+    let mut reported = HashSet::new();
+    for (name, call, is_answer) in bound {
+        if name.starts_with('_') || !reported.insert(name.clone()) {
+            continue;
+        }
+        let mut flow = Flow::over(body, HashSet::from([name.clone()]), true);
+        if let Some(result) = result {
+            flow.used(result);
+        }
+        if flow.seen || flow.escaped {
+            continue;
+        }
+        warnings.push(if is_answer {
+            format!(
+                "`{name}` holds the answer of {call}, but nothing reads it: no model call sees it, and no check, print, or return uses it. Use the answer (pass it on with inputs={{\"{name}\": {name}}}, or check it), or drop the call."
+            )
+        } else {
+            format!(
+                "`{name}` holds the result of {call}, but nothing reads it: no model call sees it, and no check, print, or return uses it. Show it to the step that judges it (inputs={{\"{name}\": {name}}}), or check it (`if not {name}.ok: ...`)."
+            )
+        });
+    }
+}
+
+/// Names bound to evidence in one scope (nested blocks, not nested
+/// functions, which are scopes of their own and are checked here).
+fn collect_evidence_bindings(
+    statements: &[Stmt],
+    bound: &mut Vec<(String, String, bool)>,
+    found: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    for statement in statements {
+        match statement {
+            Stmt::Assign {
+                target: AssignTarget::Name(name),
+                value,
+            } => {
+                if let Some((call, is_answer)) = evidence_call(value) {
+                    bound.push((name.clone(), call, is_answer));
+                }
+            }
+            Stmt::Expr(value) => {
+                // A test run whose result is thrown away.
+                let value = match value {
+                    Expr::Await(inner) => inner.as_ref(),
+                    other => other,
+                };
+                if let Expr::Call(call) = value {
+                    if call.name == "run_tests" && !call.named.iter().any(|(k, _)| k == "expect") {
+                        found.push("the result of run_tests(...) is thrown away, so nothing sees whether the tests passed. Keep it (`tests = run_tests(...)`) and show it to the step that judges the change, or pass expect= to fail when they do not pass.".to_string());
+                    }
+                }
+            }
+            Stmt::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_evidence_bindings(then_branch, bound, found, warnings);
+                collect_evidence_bindings(else_branch, bound, found, warnings);
+            }
+            Stmt::For { body, .. } | Stmt::While { body, .. } | Stmt::With { body, .. } => {
+                collect_evidence_bindings(body, bound, found, warnings)
+            }
+            Stmt::Try { body, handlers } => {
+                collect_evidence_bindings(body, bound, found, warnings);
+                for handler in handlers {
+                    collect_evidence_bindings(&handler.body, bound, found, warnings);
+                }
+            }
+            Stmt::FunctionDef(function) => {
+                check_scope(&function.body, &function.body, None, true, warnings)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `run_tests(...)` or `model.ask(...)`, as shown in a warning, and whether
+/// it is a model answer.
+fn evidence_call(value: &Expr) -> Option<(String, bool)> {
+    let value = match value {
+        Expr::Await(inner) => inner.as_ref(),
+        other => other,
+    };
+    match value {
+        Expr::Call(call)
+            if EVIDENCE_CALLS.contains(&call.name.as_str())
+                && !call.named.iter().any(|(key, _)| key == "expect") =>
+        {
+            Some((format!("{}(...)", call.name), false))
+        }
+        Expr::MethodCall {
+            receiver, method, ..
+        } if method == "ask" => {
+            let receiver = match receiver.as_ref() {
+                Expr::Name(name) => name.as_str(),
+                _ => "model",
+            };
+            Some((format!("{receiver}.ask(...)"), true))
+        }
+        _ => None,
+    }
+}
+
+/// The variable an object expression starts from: `d` in `d["k"].items`
+/// or `d.setdefault(k, [])`.
+fn base_name(mut expr: &Expr) -> Option<&str> {
+    loop {
+        match expr {
+            Expr::Name(name) => return Some(name),
+            Expr::Attribute { value, .. }
+            | Expr::Subscript { value, .. }
+            | Expr::MethodCall {
+                receiver: value, ..
+            } => expr = value,
+            _ => return None,
+        }
+    }
+}
+
 /// Where values computed from one parameter go, within one function body.
 struct Flow {
     /// Names whose value may carry the parameter.
@@ -187,22 +352,31 @@ struct Flow {
     escaped: bool,
     /// `.ask(...)` calls in the body.
     asks: usize,
+    /// Whether `print` and `log` count as using a carrier. They do for the
+    /// unread-evidence check, since a program's output goes back to the agent
+    /// that ran it; they do not for a model step's own evidence.
+    display_reads: bool,
 }
 
 impl Flow {
     fn run(function: &FunctionDef, carriers: HashSet<String>) -> Flow {
+        Flow::over(&function.body, carriers, false)
+    }
+
+    fn over(body: &[Stmt], carriers: HashSet<String>, display_reads: bool) -> Flow {
         let mut flow = Flow {
             carriers,
             seen: false,
             escaped: false,
             asks: 0,
+            display_reads,
         };
         // Flow-insensitive: repeat until no new name carries the value, so a
         // loop that appends to a list declared above it is covered.
         loop {
             let before = flow.carriers.len();
             flow.asks = 0;
-            flow.block(&function.body);
+            flow.block(body);
             if flow.carriers.len() == before || flow.seen || flow.escaped {
                 return flow;
             }
@@ -305,20 +479,8 @@ impl Flow {
             AssignTarget::Expr(base) => {
                 self.expr(base);
                 if carries {
-                    let mut base = base;
-                    loop {
-                        match base {
-                            Expr::Name(name) => {
-                                self.carriers.insert(name.clone());
-                                break;
-                            }
-                            Expr::Attribute { value, .. }
-                            | Expr::Subscript { value, .. }
-                            | Expr::MethodCall {
-                                receiver: value, ..
-                            } => base = value,
-                            _ => break,
-                        }
+                    if let Some(name) = base_name(base) {
+                        self.carriers.insert(name.to_string());
                     }
                 }
             }
@@ -446,9 +608,10 @@ impl Flow {
                 }
                 // `history.append(message(..., inputs={"fix": fix}))`: the
                 // list now carries the value.
+                // `out[k].append(x)` changes the object `out` holds.
                 if args {
-                    if let Expr::Name(name) = receiver.as_ref() {
-                        self.carriers.insert(name.clone());
+                    if let Some(name) = base_name(receiver) {
+                        self.carriers.insert(name.to_string());
                     }
                 }
                 receiver_carries | args
@@ -457,6 +620,9 @@ impl Flow {
                 let args = self.all(&call.positional) | self.named(&call.named);
                 let name = call.name.as_str();
                 if DISPLAY_CALLS.contains(&name) {
+                    if args && self.display_reads {
+                        self.escaped = true;
+                    }
                     false
                 } else if TRANSPARENT_CALLS.contains(&name)
                     || name.starts_with(|c: char| c.is_ascii_uppercase())
@@ -571,5 +737,63 @@ mod tests {
         ));
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].starts_with("inner() receives fix: Fix"), "{found:?}");
+    }
+
+    fn unread(source: &str) -> Vec<String> {
+        let program = lower_source(source).expect("program lowers");
+        unread_evidence_warnings(&program.statements)
+    }
+
+    #[test]
+    fn warns_when_evidence_is_never_read() {
+        // The verify step asks without the test result it just ran.
+        let found = unread(&format!(
+            "{TYPES}tests = run_tests([\"pytest\", \"-q\"])\nv = model.ask(\"Did the tests pass?\", output=Verdict)\nemit(v)\n"
+        ));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].starts_with("`tests` holds the result of run_tests(...), but nothing reads it"), "{}", found[0]);
+        assert!(found[0].contains("inputs={\"tests\": tests}"), "{}", found[0]);
+
+        // Inside a function; a model answer nobody reads.
+        let found = unread(&format!(
+            "{TYPES}def verify():\n    r = run([\"pytest\"])\n    plan = model.ask(\"Plan.\")\n    return model.ask(\"ok?\", output=Verdict)\n"
+        ));
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().any(|w| w.starts_with("`r` holds the result of run(...)")), "{found:?}");
+        assert!(found.iter().any(|w| w.starts_with("`plan` holds the answer of model.ask(...)")), "{found:?}");
+
+        // A thrown-away test run in a workflow.
+        let found = unread(&format!(
+            "{TYPES}run_tests([\"pytest\"])\nv = model.ask(\"ok?\", output=Verdict)\nemit(v)\n"
+        ));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].starts_with("the result of run_tests(...) is thrown away"), "{}", found[0]);
+    }
+
+    #[test]
+    fn quiet_when_evidence_is_read() {
+        let read = [
+            // shown to the model
+            "tests = run_tests([\"pytest\"])\nv = model.ask(\"ok?\", output=Verdict, inputs={\"tests\": tests})\nemit(v)\n",
+            "r = run([\"pytest\"])\nv = model.ask(f\"Output: {r.stdout}\", output=Verdict)\nemit(v)\n",
+            // checked, printed, emitted, or the program's result
+            "r = run([\"pytest\"])\nif not r.ok:\n    fail(\"tests\")\nemit(model.ask(\"ok?\", output=Verdict))\n",
+            "r = run([\"pytest\"])\nprint(r.stdout)\nemit(model.ask(\"ok?\", output=Verdict))\n",
+            "v = model.ask(\"ok?\", output=Verdict)\nr = run([\"pytest\"])\nemit({\"v\": v, \"r\": r})\n",
+            "v = model.ask(\"ok?\", output=Verdict)\nr = run([\"pytest\"])\n[v, r]\n",
+            "out = {\"a\": []}\nfor i in range(2):\n    a = model.ask(\"ok?\", output=Verdict)\n    out[\"a\"].append(a.ok)\nemit(out)\n",
+            // checked by the runtime, or marked unused
+            "r = run([\"pytest\"], expect={\"exit_code\": 0})\nemit(model.ask(\"ok?\", output=Verdict))\n",
+            "_r = run([\"pytest\"])\nemit(model.ask(\"ok?\", output=Verdict))\n",
+            // a session snippet with no model call: the agent may read r next
+            "r = run([\"pytest\"])\nx = 1\n",
+            "run_tests([\"pytest\"])\nx = 1\n",
+            // the final statement is the program's result
+            "v = model.ask(\"ok?\", output=Verdict)\nemit(v)\nrun_tests([\"pytest\"])\n",
+        ];
+        for body in read {
+            let source = format!("{TYPES}{body}");
+            assert!(unread(&source).is_empty(), "{source}: {:?}", unread(&source));
+        }
     }
 }

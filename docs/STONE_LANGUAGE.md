@@ -1343,6 +1343,16 @@ says so with `result.effects.enforced == False`.
   check such as `run_tests`, a condition, `return`), or when the function's
   model call continues a conversation the caller passed in (an unannotated,
   list, or dict parameter).
+  Stone also warns when evidence is never read: a variable bound to the
+  result of `run(...)` or `run_tests(...)` (without `expect=`) or to a model
+  answer, that no model call sees and nothing else uses (no condition, other
+  call, `print`, `emit`, or `return`), as in `tests = run_tests(...)`
+  followed by `model.ask("Did the tests pass?")` without `tests`. A
+  `run_tests(...)` whose result is thrown away is reported too. Function
+  bodies are always checked. The top level is checked only when the program
+  makes a model call, because in a session an agent may bind `r = run(...)`
+  and read `r` in its next call; the last statement is the program's result
+  and counts as read.
 
   ```python
   class Verdict(Record):

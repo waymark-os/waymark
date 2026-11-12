@@ -1115,6 +1115,10 @@ fn eval_program_with_source_options(
         .state
         .handler_warnings
         .extend(crate::stone_evidence::unseen_evidence_warnings(&program.statements));
+    evaluator
+        .state
+        .handler_warnings
+        .extend(crate::stone_evidence::unread_evidence_warnings(&program.statements));
     let pipeline = match entrypoint {
         Some(entrypoint) if !entrypoint.is_empty() => {
             evaluator.eval_entrypoint_program(program, input, entrypoint)
