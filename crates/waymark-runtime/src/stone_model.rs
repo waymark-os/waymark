@@ -23,6 +23,22 @@ pub(super) struct ModelValue {
     /// `model.last`: the most recent `model.ask` made through this value
     /// (shared by copies of the value, not by `model.limit(...)` children).
     pub(super) last: std::rc::Rc<std::cell::RefCell<Option<JsonValue>>>,
+    /// A hash of each message the previous `model.ask` through this value
+    /// sent, system messages included, for `model.last.reused_messages`.
+    prefix: std::rc::Rc<std::cell::RefCell<Vec<u64>>>,
+}
+
+/// What `model.last` reports about a request besides its outcome.
+pub(super) struct AskInfo {
+    /// `{message, name, type, source}` for each named input the request's
+    /// messages carried (design 5.9).
+    pub(super) inputs: Vec<JsonValue>,
+    /// Messages sent on the first attempt, system messages included.
+    pub(super) messages: usize,
+    /// How many of them, from the start, were identical to the previous
+    /// ask through the same model value: the part a provider's prompt cache
+    /// can reuse.
+    pub(super) reused_messages: usize,
 }
 
 impl ModelValue {
@@ -30,17 +46,44 @@ impl ModelValue {
         Self {
             meter,
             last: Default::default(),
+            prefix: Default::default(),
         }
     }
 
+    /// Compare a request's messages with the previous ask's and remember
+    /// them. Returns how many leading messages are unchanged.
+    pub(super) fn reuse_prefix(&self, messages: &[JsonValue]) -> usize {
+        use std::hash::{Hash, Hasher};
+        let hashes = messages
+            .iter()
+            .map(|message| {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                message.to_string().hash(&mut hasher);
+                hasher.finish()
+            })
+            .collect::<Vec<_>>();
+        let mut previous = self.prefix.borrow_mut();
+        let reused = previous
+            .iter()
+            .zip(&hashes)
+            .take_while(|(old, new)| old == new)
+            .count();
+        *previous = hashes;
+        reused
+    }
+
     /// Remember a finished `model.ask`: its transition ids (one per
-    /// attempt, repairs included) and the last reply text.
-    pub(super) fn record_last(&self, transition_ids: Vec<String>, reply: &str, ok: bool) {
+    /// attempt, repairs included), the last reply text, and the request's
+    /// inputs and reused prefix.
+    pub(super) fn record_last(&self, transition_ids: Vec<String>, reply: &str, ok: bool, info: &AskInfo) {
         *self.last.borrow_mut() = Some(json!({
             "attempts": transition_ids.len(),
             "transition_ids": transition_ids,
             "reply": reply,
             "ok": ok,
+            "inputs": info.inputs,
+            "messages": info.messages,
+            "reused_messages": info.reused_messages,
         }));
     }
 }

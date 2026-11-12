@@ -1256,7 +1256,7 @@ says so with `result.effects.enforced == False`.
   [`model_infer_repair.stone`](../examples/scripts/model_infer_repair.stone),
   and the reusable
   [`typed_react_agent.stone`](../examples/scripts/typed_react_agent.stone).
-- `model.ask(prompt, output=T, system="", retries=2, validate=None, hooks={}, ...)`: ask the
+- `model.ask(prompt, output=T, inputs=None, system="", retries=2, validate=None, hooks={}, ...)`: ask the
   Gateway model for an answer of type `T`, where `T` is a record, a union of
   records, or any annotation type (`list[str]`, `Literal["yes", "no"]`, ...).
   `prompt` is a string or a message list; `system` adds a system message, and
@@ -1298,9 +1298,54 @@ says so with `result.effects.enforced == False`.
   bound in every program; functions take it as a `model: Model` parameter.
   Every attempt, including repairs, counts against the model's budget
   ([Budgets](#budgets)). `model.last` is the most recent `model.ask` made through that model value,
-  `{attempts, transition_ids, reply, ok}`, or `None` before the first one;
-  each program starts with a fresh `model`, and a `model.limit(...)` value
-  keeps its own. See `help("model.ask")`.
+  `{attempts, transition_ids, reply, ok, inputs, messages, reused_messages}`,
+  or `None` before the first one; each program starts with a fresh `model`,
+  and a `model.limit(...)` value keeps its own. `messages` counts the
+  request's messages on the first attempt, system messages included, and
+  `reused_messages` how many of them, from the start, were identical to the
+  previous ask's: the part a provider's prompt cache can reuse. See
+  `help("model.ask")`.
+- **Named inputs.** `model.ask(text, inputs={"issue": issue, "fix": fix})`
+  and `message(text, inputs={...}, role="user")` take the data a model step
+  works from as named values, and the runtime turns them into text: one
+  `<input name="..." type="...">` block per input, in the order given, then
+  the text. A string is shown as it is; records, dicts, lists, and runtime
+  results as indented JSON, with record fields in declaration order, dict
+  keys in insertion order, and the fields of runtime results that differ
+  from run to run (`seq`, `transition_id`, `duration_ms`, `sha256`) left out.
+  So the same values always give the same bytes, and a provider that reuses
+  a prompt's processed start (a prompt cache) can reuse it across calls.
+  `message(...)` returns a read-only `Message` (`role`, `content`, `inputs`)
+  for a message list; its text is fixed when it is built, so changing a dict
+  afterwards changes nothing already built. Plain
+  `{"role": ..., "content": ...}` dicts still work beside it; a dict message
+  cannot carry `inputs`. With a message list, `inputs=` is an error: give
+  each message its own. Names are identifiers, at most 32 inputs per message,
+  and a rendered message is at most 1 MB.
+  Each input is recorded in the `Message` and in `model.last.inputs` as
+  `{name, type, source}` (plus `message`, its index in the prompt), where
+  `source` is `{"kind": "runtime", "type": ...}` for a result only the
+  runtime makes (or a list of them), `{"kind": "model", "model": ...,
+  "transition_id": ...}` for a typed `model.ask` answer or a record or
+  container inside one, and `{"kind": "program"}` otherwise. Sources do not
+  follow computation: a dict the program builds from a model answer's
+  fields is `program`, and so is a plain string or number a model returned.
+  Keep `system=` a fixed instruction and put task data in inputs; append to
+  a history rather than editing it. Both keep the start of the prompt the
+  same from call to call. See `help("message")`.
+
+  ```python
+  class Verdict(Record):
+      correct: bool
+      reason: str
+
+  tests = run_tests(["pytest", "-q", "tests/test_parse.py"])
+  verdict = model.ask("Does the fix resolve the issue?", output=Verdict,
+                      system="You review fixes.",
+                      inputs={"issue": issue, "fix": fix, "tests": tests})
+  # model.last.inputs: issue (program), fix (model, if it came from
+  # model.ask), tests (runtime, TestRun)
+  ```
 
   ```python
   class Read(Record):

@@ -37,7 +37,7 @@ use crate::stone_ast::{AssignTarget, ComprehensionClause, Expr, FormattedStringP
 pub(crate) const HOST_RECORD_TYPES: &[&str] = &[
     "RunResult", "TestRun", "FileStat", "DirEntry", "ProcessInfo", "SystemInfo", "SearchMatch",
     "Daemon", "WorkflowReport", "StageReport", "StageContext", "TransitionEvent", "Finding",
-    "FindingSpec", "Probe", "StageOutput", "Snapshot", "TreeDiff",
+    "FindingSpec", "Probe", "StageOutput", "Snapshot", "TreeDiff", "Message",
 ];
 
 fn host_record_result(builtin: &str) -> Option<&'static str> {
@@ -47,6 +47,7 @@ fn host_record_result(builtin: &str) -> Option<&'static str> {
         "snapshot" | "apply_patch" => "Snapshot",
         "start_daemon" | "daemon_status" | "stop_daemon" => "Daemon",
         "stat" => "FileStat",
+        "message" => "Message",
         "sysinfo" | "sys_info" => "SystemInfo",
         "workflow_run" | "workflow_main" => "WorkflowReport",
         _ => return None,

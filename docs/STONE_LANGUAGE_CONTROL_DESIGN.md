@@ -1246,6 +1246,19 @@ program.
   - cached-token counts in the usage it returns.
 - llama.cpp and vLLM need only stable bytes.
 
+**Built (2026-11-11), runtime part.** `message(text, inputs=..., role=)`
+and `model.ask(text, inputs=...)` render inputs as `<input name type>`
+blocks (strings as they are, everything else as indented JSON) before the
+text. A `Message` is a read-only runtime record whose text is fixed when it
+is built. Runtime results are shown without `seq`, `transition_id`,
+`duration_ms`, and `sha256`. A typed answer's records and containers carry
+a label naming the model call that made them (the reserved container label
+slot), and sources are `runtime`, `model`, or `program`. `model.last` adds
+`inputs`, `messages`, and `reused_messages` (leading request messages
+unchanged since the previous ask through the same model value).
+Not built yet: the checks before the run (items 1-3 above), the
+`system=` warning, cached-token counts, and the Gateway cache markers.
+
 **Not proposed.** No proof of pre- and post-conditions, and no
 LLM-annotated predicates. The static part matches names, types, and
 sources. Whether a step delivered is checked at run time against the world

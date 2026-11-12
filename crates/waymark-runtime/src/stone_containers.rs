@@ -45,10 +45,13 @@ use crate::stone_builtins::normalize_index;
 /// that contains itself would otherwise recurse forever.
 const MAX_MATERIALIZE_DEPTH: usize = 512;
 
-/// Information-flow label slot. `Label(0)` is "no label". Reserved for
-/// provenance tracking; nothing reads it yet.
+/// Information-flow label slot. `Label(0)` is "no label". `model.ask` sets
+/// it on the containers and records of a typed answer (an index into the
+/// session's model answers, plus one), so a named input can say it came
+/// from a model (design 5.9). Labels do not follow values through
+/// computation: a container built from a labeled one is unlabeled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct Label(#[allow(dead_code)] pub(super) u32);
+pub(super) struct Label(pub(super) u32);
 
 /// One element of a shared list or dict.
 #[derive(Clone)]
@@ -113,14 +116,12 @@ impl Item {
 
 pub(super) struct ListObj {
     items: RefCell<Vec<Item>>,
-    #[allow(dead_code)]
     label: Cell<Label>,
     frozen: Cell<bool>,
 }
 
 pub(super) struct DictObj {
     entries: RefCell<IndexMap<String, Item>>,
-    #[allow(dead_code)]
     label: Cell<Label>,
     frozen: Cell<bool>,
     /// Counts removed keys, so a loop over the keys notices `d.pop(k)`
@@ -133,7 +134,6 @@ pub(super) struct DictObj {
 pub(super) struct RecordObj {
     pub(super) ty: Rc<RecordType>,
     slots: RefCell<Vec<Item>>,
-    #[allow(dead_code)]
     label: Cell<Label>,
     frozen: Cell<bool>,
 }
@@ -609,6 +609,18 @@ impl DictObj {
 }
 
 impl RecordObj {
+    /// Visit every field in declaration order without copying plain values.
+    pub(super) fn try_for_each<E>(
+        &self,
+        mut visit: impl FnMut(usize, ItemRef<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let slots = self.slots.borrow();
+        for (index, item) in slots.iter().enumerate() {
+            visit(index, item.view())?;
+        }
+        Ok(())
+    }
+
     /// The field in slot `index`, shared with the record.
     pub(super) fn get(&self, index: usize) -> RuntimeValue {
         self.slots.borrow_mut()[index].share()
@@ -837,5 +849,58 @@ mod tests {
     #[test]
     fn elements_stay_compact() {
         assert!(std::mem::size_of::<super::Item>() <= 64);
+    }
+}
+
+/// The provenance label of a shared list, dict, or record (`Label(0)` for
+/// anything else, or when none was set).
+pub(super) fn label_of(value: &RuntimeValue) -> Label {
+    match value {
+        RuntimeValue::List(list) => list.label.get(),
+        RuntimeValue::Dict(dict) => dict.label.get(),
+        RuntimeValue::Record(record) => record.label.get(),
+        _ => Label::default(),
+    }
+}
+
+/// Set `label` on a value and on every shared list, dict, and record inside
+/// it. Plain values cannot carry a label and are left alone.
+pub(super) fn set_label_deep(value: &RuntimeValue, label: Label) {
+    set_label_at(value, label, 0);
+}
+
+fn set_label_at(value: &RuntimeValue, label: Label, depth: usize) {
+    if depth > MAX_MATERIALIZE_DEPTH {
+        return;
+    }
+    let visit = |item: ItemRef<'_>| -> Result<(), ()> {
+        if let ItemRef::Shared(child) = item {
+            set_label_at(&child, label, depth + 1);
+        }
+        Ok(())
+    };
+    match value {
+        RuntimeValue::List(list) => {
+            if list.label.get() == label {
+                return;
+            }
+            list.label.set(label);
+            let _ = list.try_for_each(|_, item| visit(item));
+        }
+        RuntimeValue::Dict(dict) => {
+            if dict.label.get() == label {
+                return;
+            }
+            dict.label.set(label);
+            let _ = dict.try_for_each(|_, item| visit(item));
+        }
+        RuntimeValue::Record(record) => {
+            if record.label.get() == label {
+                return;
+            }
+            record.label.set(label);
+            let _ = record.try_for_each(|_, item| visit(item));
+        }
+        _ => {}
     }
 }

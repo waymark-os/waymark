@@ -139,6 +139,8 @@ mod stone_context;
 mod stone_expect;
 #[path = "stone_functions.rs"]
 mod stone_functions;
+#[path = "stone_inputs.rs"]
+mod stone_inputs;
 #[path = "stone_json_view.rs"]
 mod stone_json_view;
 #[path = "stone_model.rs"]
@@ -248,6 +250,8 @@ pub struct EvalState {
     /// patch): the result is a content id, so the same inputs give the same
     /// snapshot, and through the Gateway each step is a round trip.
     applied_patches: HashMap<(String, String, String, String), crate::stone_snapshots::SnapshotRef>,
+    /// The session's typed model answers, for input sources (design 5.9).
+    model_answers: Rc<std::cell::RefCell<Vec<JsonValue>>>,
     #[cfg(test)]
     test_model: Option<Rc<std::cell::RefCell<stone_model::TestModel>>>,
     profiler: EvalProfiler,
@@ -1084,6 +1088,11 @@ fn eval_program_with_source_options(
                 .unwrap_or_default(),
             budget,
             applied_patches: HashMap::new(),
+            model_answers: options
+                .session
+                .as_ref()
+                .map(|session| session.model_answers.clone())
+                .unwrap_or_default(),
             #[cfg(test)]
             test_model: options
                 .session
@@ -3985,6 +3994,7 @@ impl Evaluator<'_> {
             "read_jsonl" => self.eval_read_jsonl_call(call),
             "round" => self.eval_round_call(call),
             "abs" => self.eval_abs_call(call),
+            "message" => self.eval_message_call(call),
             "reversed" => self.eval_reversed_call(call),
             "run" => self.eval_run_call(call),
             "run_complete" => self.eval_run_complete_call(call),
@@ -9146,8 +9156,17 @@ impl Evaluator<'_> {
                 "model.ask() cannot be called from a transition hook",
             ));
         }
+        let [prompt] = positional else {
+            return Err(model_ask_input_error(
+                "model.ask() takes one prompt: a string, or a list of messages (message(text, inputs={...}) or {\"role\": ..., \"content\": ...})",
+            ));
+        };
+        // The prompt and inputs= are read as Stone values: a Message keeps
+        // its inputs' names, types, and sources, which a plain dict cannot.
+        let prompt = self.eval_expr_value(prompt)?;
         let mut output = None;
         let mut validate = None;
+        let mut inputs = None;
         let mut rest = Vec::with_capacity(named.len());
         for (name, expr) in named {
             if name == "output" {
@@ -9157,39 +9176,19 @@ impl Evaluator<'_> {
                 output = Some(self.eval_type_argument(expr, "model.ask() output=")?);
             } else if name == "validate" {
                 validate = self.eval_validate_handler(expr)?;
+            } else if name == "inputs" {
+                inputs = Some(self.eval_expr_value(expr)?);
             } else {
                 rest.push((name.clone(), expr.clone()));
             }
         }
         let call = Call {
             name: "model.ask".to_string(),
-            positional: positional.to_vec(),
+            positional: Vec::new(),
             named: rest,
         };
-        let (positional, named, hooks) = self.eval_call_values_with_transition_hooks(&call)?;
-        let [prompt] = positional.as_slice() else {
-            return Err(model_ask_input_error(
-                "model.ask() takes one prompt: a string, or a list of {\"role\": ..., \"content\": ...} messages",
-            ));
-        };
-        let messages = match prompt {
-            Value::String { val, .. } => {
-                let mut message = nu_protocol::Record::new();
-                message.push("role", Value::string("user", Span::unknown()));
-                message.push("content", Value::string(val.clone(), Span::unknown()));
-                Value::list(
-                    vec![Value::record(message, Span::unknown())],
-                    Span::unknown(),
-                )
-            }
-            Value::List { .. } => prompt.clone(),
-            other => {
-                return Err(model_ask_input_error(format!(
-                    "model.ask() prompt must be a string or a list of messages, got {}",
-                    value_type_name(other)
-                )))
-            }
-        };
+        let (_, named, hooks) = self.eval_call_values_with_transition_hooks(&call)?;
+        let (messages, input_info) = self.model_ask_messages(prompt, inputs)?;
         let mut retries = stone_model::DEFAULT_RETRIES;
         let mut type_format = stone_model::DEFAULT_TYPE_FORMAT;
         let mut system = None;
@@ -9247,12 +9246,14 @@ impl Evaluator<'_> {
                     "model.ask() validate= checks a typed answer; give the answer's type with output=",
                 ));
             }
+            let info = model_ask_info(&model, &request, input_info);
             let response = self.execute_model_request(request, &hooks, &model.meter)?;
             let content = model_response_content(&response)?;
             model.record_last(
                 vec![model_response_transition_id(&response)],
                 &content,
                 true,
+                &info,
             );
             return Ok(RuntimeValue::Nu(Value::string(content, Span::unknown())));
         };
@@ -9285,6 +9286,13 @@ impl Evaluator<'_> {
             "response_format".to_string(),
             json!({"type": "json_object"}),
         );
+        let info = model_ask_info(&model, &request, input_info);
+        let model_name = request
+            .get("model")
+            .and_then(JsonValue::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("default")
+            .to_string();
 
         let mut issues = Vec::new();
         let mut content = String::new();
@@ -9314,7 +9322,8 @@ impl Evaluator<'_> {
                                 None => Vec::new(),
                             };
                             if problems.is_empty() {
-                                model.record_last(transition_ids, &content, true);
+                                self.label_model_answer(&value, &model_name, &transition_ids);
+                                model.record_last(transition_ids, &content, true, &info);
                                 return Ok(value);
                             }
                             rejected_by_validate = true;
@@ -9345,13 +9354,221 @@ impl Evaluator<'_> {
             };
             messages.push(json!({"role": "user", "content": repair}));
         }
-        model.record_last(transition_ids, &content, false);
+        model.record_last(transition_ids, &content, false, &info);
         Err(host_error(model_output_error(
             &ty,
             retries + 1,
             &issues,
             &content,
         )))
+    }
+
+    /// Mark a typed answer's records and containers as made by this model
+    /// call, so a later named input can say so (design 5.9).
+    fn label_model_answer(&mut self, value: &RuntimeValue, model_name: &str, transition_ids: &[String]) {
+        if !matches!(
+            value,
+            RuntimeValue::Record(_) | RuntimeValue::List(_) | RuntimeValue::Dict(_)
+        ) {
+            return;
+        }
+        let mut answers = self.state.model_answers.borrow_mut();
+        answers.push(json!({
+            "model": model_name,
+            "transition_id": transition_ids.last().cloned().unwrap_or_default(),
+        }));
+        let label = u32::try_from(answers.len()).unwrap_or(u32::MAX);
+        stone_containers::set_label_deep(value, stone_containers::Label(label));
+    }
+
+    /// The messages of a `model.ask` prompt as the plain list the request
+    /// builder takes, with the inputs they carry. A string prompt with
+    /// `inputs=` becomes one rendered user message.
+    fn model_ask_messages(
+        &mut self,
+        prompt: RuntimeValue,
+        inputs: Option<RuntimeValue>,
+    ) -> Result<(Value, Vec<JsonValue>), ShellError> {
+        let plain = |role: &str, content: String| {
+            let mut message = nu_protocol::Record::new();
+            message.push("role", Value::string(role, Span::unknown()));
+            message.push("content", Value::string(content, Span::unknown()));
+            Value::record(message, Span::unknown())
+        };
+        let inputs = match inputs {
+            None | Some(RuntimeValue::Nu(Value::Nothing { .. })) => None,
+            Some(inputs) => Some(inputs),
+        };
+        if let RuntimeValue::Nu(Value::String { val, .. }) = &prompt {
+            let Some(inputs) = inputs else {
+                return Ok((Value::list(vec![plain("user", val.clone())], Span::unknown()), Vec::new()));
+            };
+            let (content, info) = self.render_message_inputs(val, inputs, "model.ask")?;
+            let info = info
+                .into_iter()
+                .map(|mut entry| {
+                    entry["message"] = json!(0);
+                    entry
+                })
+                .collect();
+            return Ok((Value::list(vec![plain("user", content)], Span::unknown()), info));
+        }
+        let items = match &prompt {
+            RuntimeValue::List(list) => list.shared_items(),
+            RuntimeValue::Nu(Value::List { vals, .. }) => {
+                vals.iter().cloned().map(RuntimeValue::Nu).collect()
+            }
+            other => {
+                return Err(model_ask_input_error(format!(
+                    "model.ask() prompt must be a string or a list of messages, got {}",
+                    runtime_type_name(other)
+                )))
+            }
+        };
+        if inputs.is_some() {
+            return Err(model_ask_input_error(
+                "model.ask() inputs= goes with a string prompt; with a list of messages, give each message its inputs: message(text, inputs={...})",
+            ));
+        }
+        let mut messages = Vec::with_capacity(items.len());
+        let mut info = Vec::new();
+        for (index, item) in items.into_iter().enumerate() {
+            match &item {
+                RuntimeValue::Record(record) if record.ty.host && record.ty.name == "Message" => {
+                    let field = |name: &str| {
+                        record
+                            .ty
+                            .fields
+                            .iter()
+                            .position(|field| field.name == name)
+                            .map(|position| record.get(position))
+                    };
+                    let text = |value: Option<RuntimeValue>| match value {
+                        Some(RuntimeValue::Nu(Value::String { val, .. })) => val,
+                        _ => String::new(),
+                    };
+                    messages.push(plain(&text(field("role")), text(field("content"))));
+                    if let Some(carried) = field("inputs") {
+                        let carried = stone_containers::materialize(&carried, "message inputs")?;
+                        if let JsonValue::Array(entries) = crate::json::nu_to_json_value(&carried) {
+                            for mut entry in entries {
+                                entry["message"] = json!(index);
+                                info.push(entry);
+                            }
+                        }
+                    }
+                }
+                other => messages.push(stone_containers::materialize(other, "model.ask message")?),
+            }
+        }
+        Ok((Value::list(messages, Span::unknown()), info))
+    }
+
+    /// Render `text` with named `inputs` (a dict), and describe each input:
+    /// `{name, type, source}`.
+    fn render_message_inputs(
+        &mut self,
+        text: &str,
+        inputs: RuntimeValue,
+        context: &str,
+    ) -> Result<(String, Vec<JsonValue>), ShellError> {
+        let entries = match inputs {
+            RuntimeValue::Dict(dict) => dict.shared_entries(),
+            RuntimeValue::Nu(Value::Record { val, .. }) => val
+                .into_owned()
+                .into_iter()
+                .map(|(key, value)| (key, RuntimeValue::Nu(value)))
+                .collect(),
+            other => {
+                return Err(model_ask_input_error(format!(
+                    "{context}() inputs= must be a dict of named values, such as inputs={{\"issue\": issue, \"fix\": fix}}; got {}",
+                    runtime_type_name(&other)
+                )))
+            }
+        };
+        if entries.len() > stone_inputs::MAX_INPUTS {
+            return Err(model_ask_input_error(format!(
+                "{context}() takes at most {} inputs on one message, got {}; group related values in a record",
+                stone_inputs::MAX_INPUTS,
+                entries.len()
+            )));
+        }
+        for (name, _) in &entries {
+            stone_inputs::check_name(name)
+                .map_err(|message| model_ask_input_error(format!("{context}(): {message}")))?;
+        }
+        let rendered = stone_inputs::render(text, &entries)
+            .map_err(|message| model_ask_input_error(format!("{context}(): {message}")))?;
+        let answers = self.state.model_answers.borrow();
+        let info = entries
+            .iter()
+            .map(|(name, value)| {
+                json!({
+                    "name": name,
+                    "type": stone_inputs::type_name(value),
+                    "source": stone_inputs::source(value, &answers),
+                })
+            })
+            .collect();
+        Ok((rendered, info))
+    }
+
+    /// `message(text, inputs={...}, role="user")`: a message for
+    /// `model.ask` whose named inputs the runtime renders once, now, so
+    /// resending it sends the same bytes (design 5.9).
+    fn eval_message_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let [text] = call.positional.as_slice() else {
+            return Err(model_ask_input_error(
+                "message() takes the message text, then inputs= and role=: message(\"Review the fix.\", inputs={\"fix\": fix})",
+            ));
+        };
+        let text = match self.eval_expr_value(text)? {
+            RuntimeValue::Nu(Value::String { val, .. }) => val,
+            other => {
+                return Err(model_ask_input_error(format!(
+                    "message() text must be a string, got {}; pass data as inputs={{\"name\": value}}",
+                    runtime_type_name(&other)
+                )))
+            }
+        };
+        let mut role = "user".to_string();
+        let mut inputs = None;
+        for (name, expr) in &call.named {
+            match name.as_str() {
+                "inputs" => inputs = Some(self.eval_expr_value(expr)?),
+                "role" => {
+                    role = match self.eval_expr_value(expr)? {
+                        RuntimeValue::Nu(Value::String { val, .. })
+                            if matches!(val.as_str(), "user" | "assistant" | "system") =>
+                        {
+                            val
+                        }
+                        other => {
+                            return Err(model_ask_input_error(format!(
+                                "message() role must be \"user\", \"assistant\", or \"system\", got {}",
+                                runtime_type_name(&other)
+                            )))
+                        }
+                    }
+                }
+                other => {
+                    return Err(model_ask_input_error(format!(
+                        "message() takes inputs= and role=, not {other}="
+                    )))
+                }
+            }
+        }
+        let (content, info) = match inputs {
+            None | Some(RuntimeValue::Nu(Value::Nothing { .. })) => (text, Vec::new()),
+            Some(inputs) => self.render_message_inputs(&text, inputs, "message")?,
+        };
+        Ok(stone_records::host_record(
+            "Message",
+            json_to_nu_value(
+                json!({"role": role, "content": content, "inputs": info}),
+                Span::unknown(),
+            ),
+        ))
     }
 
     /// The function given as `model.ask(..., validate=f)`: a named Stone
@@ -15387,6 +15604,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "round",
     "abs",
     "reversed",
+    "message",
     "rm",
     "run",
     "run_complete",
@@ -19930,6 +20148,12 @@ fn model_message_values_for(
             ));
         };
         for key in val.columns() {
+            if key == "inputs" {
+                return Err(model_input_error(
+                    operation,
+                    "a message dict cannot carry inputs; build the message with message(text, inputs={...}) so the runtime renders them".to_string(),
+                ));
+            }
             if !matches!(key.as_str(), "role" | "content" | "name") {
                 return Err(model_input_error(
                     operation,
@@ -20041,6 +20265,25 @@ fn model_response_transition_id(response: &Value) -> String {
             _ => String::new(),
         },
         _ => String::new(),
+    }
+}
+
+/// What `model.last` reports about a request: its inputs, its size, and how
+/// much of it repeats the previous ask (the part a prompt cache can reuse).
+fn model_ask_info(
+    model: &ModelValue,
+    request: &serde_json::Map<String, JsonValue>,
+    inputs: Vec<JsonValue>,
+) -> stone_model::AskInfo {
+    let messages = request
+        .get("messages")
+        .and_then(JsonValue::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    stone_model::AskInfo {
+        inputs,
+        messages: messages.len(),
+        reused_messages: model.reuse_prefix(messages),
     }
 }
 
@@ -22948,6 +23191,126 @@ emit(inc(5))
         }
 
         cleanup_dir(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn model_ask_renders_named_inputs_and_reports_their_sources() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("stone-model-inputs")?;
+        let test_model = std::rc::Rc::new(std::cell::RefCell::new(
+            super::stone_model::TestModel::default(),
+        ));
+        let mut session = StoneSession {
+            test_model: Some(test_model.clone()),
+            ..StoneSession::default()
+        };
+        let mut run = |source: &str,
+                       replies: &[&str]|
+         -> (
+            Result<serde_json::Value, ShellError>,
+            Vec<serde_json::Value>,
+        ) {
+            {
+                let mut model = test_model.borrow_mut();
+                model.replies = replies.iter().map(|reply| reply.to_string()).collect();
+                model.requests.clear();
+            }
+            let result = crate::stone_frontend::eval_stone_source_with_output_and_session(
+                &engine_state,
+                &mut stack,
+                source,
+                PipelineData::empty(),
+                &mut session,
+            )
+            .and_then(|output| {
+                json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown())
+            });
+            let requests = std::mem::take(&mut test_model.borrow_mut().requests);
+            (result, requests)
+        };
+        let content = |request: &serde_json::Value, index: usize| {
+            request["messages"][index]["content"].as_str().unwrap_or_default().to_string()
+        };
+
+        // A typed answer, then a string prompt with inputs: the inputs are
+        // rendered before the text, the answer is named as a model's, and a
+        // runtime result as the runtime's.
+        let (value, requests) = run(
+            concat!(
+                "class Fix(Record):\n    files: list[str]\n    why: str\n",
+                "fix = model.ask(\"fix it\", output=Fix)\n",
+                "check = run([\"echo\", \"hi\"])\n",
+                "verdict = model.ask(\"Is the fix right?\", output=bool, ",
+                "inputs={\"issue\": \"Crash on empty input\", \"fix\": fix, \"check\": check, \"note\": {\"b\": 1, \"a\": 2}})\n",
+                "emit([verdict, model.last.inputs, model.last.messages])\n",
+            ),
+            &[r#"{"files": ["a.py"], "why": "off by one"}"#, r#"{"value": true}"#],
+        );
+        let value = value?;
+        assert_eq!(value[0], json_value!(true));
+        let inputs = &value[1];
+        assert_eq!(inputs[0], json_value!({"name": "issue", "type": "str", "source": {"kind": "program"}, "message": 0}));
+        assert_eq!(inputs[1]["type"], json_value!("Fix"));
+        assert_eq!(inputs[1]["source"]["kind"], json_value!("model"));
+        assert_eq!(inputs[1]["source"]["model"], json_value!("default"));
+        assert_eq!(inputs[2]["source"], json_value!({"kind": "runtime", "type": "RunResult"}));
+        assert_eq!(inputs[3]["type"], json_value!("dict"));
+        assert_eq!(value[2], json_value!(2));
+        let asked = content(&requests[1], 1);
+        assert!(
+            asked.starts_with("<input name=\"issue\" type=\"str\">\nCrash on empty input\n</input>\n\n<input name=\"fix\" type=\"Fix\">\n{\n  \"files\": [\n    \"a.py\"\n  ],\n  \"why\": \"off by one\"\n}\n</input>"),
+            "{asked}"
+        );
+        assert!(asked.ends_with("<input name=\"note\" type=\"dict\">\n{\n  \"b\": 1,\n  \"a\": 2\n}\n</input>\n\nIs the fix right?"), "{asked}");
+        // Runtime results are shown without the fields that differ run to run.
+        assert!(asked.contains("\"stdout\": \"hi\\n\""), "{asked}");
+        for volatile in ["\"seq\"", "\"transition_id\"", "\"duration_ms\""] {
+            assert!(!asked.contains(volatile), "{volatile} in {asked}");
+        }
+
+        // A message renders once: changing the dict afterwards changes
+        // nothing that is sent, so a resent history repeats every message,
+        // and model.last says how many led the previous request unchanged.
+        let (value, requests) = run(
+            concat!(
+                "notes = {\"step\": 1}\n",
+                "history = [message(\"Plan the fix.\", inputs={\"notes\": notes})]\n",
+                "notes[\"step\"] = 2\n",
+                "first = model.ask(history, system=\"You fix bugs.\")\n",
+                "history.append({\"role\": \"assistant\", \"content\": first})\n",
+                "history.append(message(\"Now write it.\"))\n",
+                "second = model.ask(history, system=\"You fix bugs.\")\n",
+                "emit([history[0].content, model.last.reused_messages, model.last.messages, model.last.inputs])\n",
+            ),
+            &["plan", "done"],
+        );
+        let value = value?;
+        assert_eq!(value[0], json_value!("<input name=\"notes\" type=\"dict\">\n{\n  \"step\": 1\n}\n</input>\n\nPlan the fix."));
+        assert_eq!(value[1], json_value!(2));
+        assert_eq!(value[2], json_value!(4));
+        assert_eq!(value[3], json_value!([{"name": "notes", "type": "dict", "source": {"kind": "program"}, "message": 0}]));
+        assert_eq!(content(&requests[0], 1), content(&requests[1], 1));
+
+        // Mistakes name the fix.
+        for (source, expected) in [
+            (
+                "model.ask([message(\"a\")], inputs={\"x\": 1})",
+                "give each message its inputs",
+            ),
+            (
+                "model.ask([{\"role\": \"user\", \"content\": \"a\", \"inputs\": {}}])",
+                "build the message with message(text, inputs={...})",
+            ),
+            ("message(\"a\", inputs={\"bad name\": 1})", "must be an identifier"),
+            ("message(\"a\", inputs={\"f\": lambda x: x})", "cannot be a model input"),
+            ("message(\"a\", inputs=[1])", "must be a dict of named values"),
+            ("message(\"a\", role=\"tool\")", "role must be"),
+        ] {
+            let (value, _) = run(source, &["x"]);
+            let error = format!("{:?}", value.expect_err(source));
+            assert!(error.contains(expected), "{source}: {error}");
+        }
+        drop(root);
         Ok(())
     }
 

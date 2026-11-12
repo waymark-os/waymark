@@ -324,7 +324,7 @@ emit(inference.value.ready)"#,
     },
     StoneHelpEntry {
         name: "model.ask",
-        signature: r#"model.ask(prompt: str | list[record], output: type = None, system: str = "", retries: int = 2, validate: callable? = None, type_format: "python" | "json_schema" = "python", model_class: str = "agent", model: str = "", temperature: float? = None, max_output_tokens: int = 0, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> output type, or str without output="#,
+        signature: r#"model.ask(prompt: str | list[Message | record], output: type = None, inputs: dict = None, system: str = "", retries: int = 2, validate: callable? = None, type_format: "python" | "json_schema" = "python", model_class: str = "agent", model: str = "", temperature: float? = None, max_output_tokens: int = 0, hooks: transition_hooks | {pre: callable?, post: callable?} = {}) -> output type, or str without output="#,
         use_when: "Gateway mode only. Ask the model for an answer of a declared type: a record class, a union of records, list[T], Literal[...], or any other annotation type. The description the model sees comes from the type, and the answer comes back as a checked value, so no schema dict or JSON probing is needed.",
         examples: &[
             r#"class Plan(Record):
@@ -351,6 +351,13 @@ except ModelOutputError as error:
 def check_plan(plan):
     return [] if plan.steps else ["give at least one step"]
 plan = model.ask("Plan the fix.", output=Plan, validate=check_plan)"#,
+            r#"class Verdict(Record):
+    correct: bool
+    reason: str
+tests = run_tests(["pytest", "-q", "tests/test_parse.py"])
+verdict = model.ask("Does the fix resolve the issue?", output=Verdict,
+                    system="You review fixes.", inputs={"issue": issue, "fix": fix, "tests": tests})
+emit(model.last.inputs)"#,
         ],
         avoid: &[
             "Do not write a JSON Schema by hand or pass response_format; output= derives the type description and the check from the type.",
@@ -359,7 +366,9 @@ plan = model.ask("Plan the fix.", output=Plan, validate=check_plan)"#,
             "A union of records is decided by a Literal field such as kind: Literal[\"read\"]; give every record in a union one.",
             "Types that are not records are wrapped for the model as {\"value\": ...}; the result is the inner value.",
             "The model is shown the answer's records as pydantic class definitions (docstrings, defaults, Field limits); type_format=\"json_schema\" sends a JSON Schema instead, about twice the size. Checking and repair are the same either way.",
-            "model.last is the most recent model.ask made through that model value: {attempts, transition_ids, reply, ok}, or None before the first one. Each program starts with a fresh model, and a model.limit(...) value keeps its own.",
+            "Pass the data a step works from as inputs={name: value} (or message(text, inputs=...) in a list of messages) instead of pasting it into the prompt with f-strings or json_dumps: the runtime renders each input the same way every time, so the provider can reuse the prompt's cached start, and model.last.inputs records each input's type and source (runtime, model, or program). See help(\"message\").",
+            "Keep system= a fixed instruction and put task data in inputs: a system text built from variables changes the start of every prompt, so nothing is reused from the provider's cache.",
+            "model.last is the most recent model.ask made through that model value: {attempts, transition_ids, reply, ok, inputs, messages, reused_messages}, or None before the first one. reused_messages counts the leading messages, system messages included, that were identical to the previous ask's: append to a history instead of editing it to keep it high. Each program starts with a fresh model, and a model.limit(...) value keeps its own.",
             "Without output= the result is the reply text. Use model_call for the full response record.",
             "`model` is a value: pass it to functions as a parameter (def solve(task: str, model: Model)); module functions cannot read the program's `model`.",
             "Every attempt, including repairs, counts against the model's budget; see help(\"model.limit\").",
@@ -719,6 +728,28 @@ first, second = pair"#],
         examples: &[r#"gap = abs(3 - 7)"#, r#"error = abs(-0.25)"#],
         avoid: &["Do not pass strings or bools; convert with int(x) or float(x) first."],
         aliases: &[],
+    },
+    StoneHelpEntry {
+        name: "message",
+        signature: r#"message(text: str, inputs: dict = None, role: "user" | "assistant" | "system" = "user") -> Message"#,
+        use_when: "A message for model.ask whose data is passed as named inputs. The runtime renders each input once, when the message is built: a string as it is, anything else (records, dicts, lists, runtime results such as RunResult) as indented JSON, each in an <input name=... type=...> block before the text. The Message records each input's name, type, and source: runtime (a result only the runtime makes), model (a typed model.ask answer), or program.",
+        examples: &[
+            r#"m = message("Explain the failure.", inputs={"command": result})
+print(m.content)
+emit(m.inputs)"#,
+            r#"history = [message("Plan the fix.", inputs={"issue": "Crash on empty input", "files": ["a.py"]})]
+history.append({"role": "assistant", "content": "Read a.py first."})
+history.append(message("Now write the fix."))
+emit(len(history))"#,
+        ],
+        avoid: &[
+            "Do not paste data into the prompt with f-strings or json_dumps; inputs keep the prompt byte-identical across calls (so the provider's prompt cache is reused) and record where each value came from.",
+            "A Message is fixed when built: changing a dict you passed in afterwards does not change the message. Build a new message for new evidence and append it; do not edit earlier messages.",
+            "Runtime results are shown without fields that differ from run to run (seq, transition_id, duration_ms, sha256).",
+            "Input names are identifiers; at most 32 inputs per message, and at most 1 MB rendered. Pass a slice or the fields a step needs, not whole logs.",
+            "A dict message cannot carry inputs; use message(...). Plain {\"role\": ..., \"content\": ...} dicts still work in the same list.",
+        ],
+        aliases: &["Message"],
     },
     StoneHelpEntry {
         name: "reversed",
