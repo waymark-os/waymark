@@ -1170,8 +1170,12 @@ says so with `result.effects.enforced == False`.
   the command, where it runs (locally or in the Gateway's container), relative
   paths against the command's cwd; the result's `files` lists each one's
   absolute `path`, `bytes`, and `sha256`, so a result records what the command
-  ran on, and the files are not reported as the command's effects. `must_run`,
-  `run_complete`, and `run_tests` take `files=` too.
+  ran on, and the files are not reported as the command's effects. Through the
+  Gateway, where every command is a round trip, files up to 100 KB each (1 MB
+  in all) are written by a step inside the command's own call; larger files
+  take a call each. A file that cannot be written raises `OSError` naming it,
+  and the command does not run. `must_run`, `run_complete`, and `run_tests`
+  take `files=` too.
   Every result has `seq`, a number that increases with each result the
   runtime makes (`Snapshot` too), so results can be put in order. See "Call Contracts" below for `expect=`,
   `effects=`, and `result.effects`. Agent loops should

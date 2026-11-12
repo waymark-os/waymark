@@ -15,9 +15,10 @@ the repository test files its command names. revised lists existing test ids
 a correct fix changes, so they may fail in a keep run.
 
 Every run writes the registered copies of its files just before the command
-(files=), so editing a test file cannot change a gate; a run that finds a
-repository test file edited puts the edit back afterwards and reports it in
-warnings. Results are sealed runtime records: RunResult/TestRun record the
+(files=), so editing a test file cannot change a gate. Before a batch of
+runs one command compares every held file with its registered copy; a file
+the agent edited (or a deleted repository test file) gets the agent's
+version back after the batch and is reported in warnings. Results are sealed runtime records: RunResult/TestRun record the
 hash of every file written, and every result and Snapshot carries seq, the
 order the runtime made it in.
 
@@ -78,12 +79,14 @@ def environment(suite):
     return r.stdout if r.exit_code == 0 else "(env command failed: exit " + str(r.exit_code) + ")"
 
 
-def environment_change(suite):
+def environment_change(suite, now=None):
     """None when the environment is as it was when the suite was created;
-    otherwise what changed, in words."""
+    otherwise what changed, in words. now is the env command's output when
+    the caller already has it."""
     if suite["env"] is None:
         return None
-    now = environment(suite)
+    if now is None:
+        now = environment(suite)
     if now == suite["env_text"]:
         return None
     old = set(suite["env_text"].splitlines())
@@ -170,33 +173,59 @@ def keep_paths(suite, command):
     return paths
 
 
-def run_held(suite, argv, files, runner=None):
-    """Run argv (under the suite's wrap) with the held copies of files written
-    first. Returns (result, warnings). A file the agent edited (or deleted)
-    gets the edit back after the run."""
-    held = {absolute(suite, p): t for p, t in files.items()}
-    warnings = []
+def agent_versions(suite, groups):
+    """The held files that differ from their registered copies now, found with
+    one command for all of them. groups is a list of {path: registered text}.
+    Returns ({path: the agent's text, or None when deleted}, warnings)."""
+    registered = {}
+    for files in groups:
+        for p, t in files.items():
+            path = absolute(suite, p)
+            registered[path] = registered.get(path, []) + [sha256(t)]
+    paths = sorted(list(registered.keys()))
+    if not paths:
+        return {}, []
+    script = "for p; do if [ -f \"$p\" ]; then h=$(sha256sum < \"$p\") || exit 3; printf '%s %s\\n' \"${h%% *}\" \"$p\"; else printf -- '- %s\\n' \"$p\"; fi; done"
+    r = run(["sh", "-c", script, "held"] + paths, max_stdout_bytes=1000000)
+    now = {}
+    if r.exit_code == 0:
+        for line in r.stdout.splitlines():
+            i = line.find(" ")
+            if i > 0:
+                now[line[i + 1:]] = None if line[:i] == "-" else line[:i]
     agent = {}
-    for path, text in held.items():
-        now = current_text(path)
-        inside = path.startswith(suite["root"] + "/")
-        if now != text and (now is not None or inside):
-            agent[path] = now
-            warnings.append("test file " + path + " differs from the registered copy (" + ("deleted" if now is None else "edited") + "); the gate ran the registered copy and left your version in place")
-    try:
-        if runner is None:
-            r = run(suite["wrap"] + argv, files=held, cwd=suite["root"], timeout_ms=300000,
-                    max_stdout_bytes=200000, max_stderr_bytes=100000)
+    warnings = []
+    for path in paths:
+        if path in now:
+            state = now[path]
         else:
-            r = run_tests(suite["wrap"] + argv, runner=runner, files=held, cwd=suite["root"], timeout_ms=600000,
-                          max_stdout_bytes=4000000, max_stderr_bytes=2000000)
-    except Exception as error:
-        for path, text in agent.items():
-            put_back(path, text)
-        raise error
+            text = current_text(path)
+            state = None if text is None else sha256(text)
+        if state is not None and state in registered[path]:
+            continue
+        if state is None and not path.startswith(suite["root"] + "/"):
+            continue
+        agent[path] = None if state is None else current_text(path)
+        warnings.append("test file " + path + " differs from the registered copy (" + ("deleted" if state is None else "edited") + "); the gate ran the registered copy and left your version in place")
+    return agent, warnings
+
+
+def put_back_all(agent):
     for path, text in agent.items():
         put_back(path, text)
-    return r, warnings
+
+
+def run_held(suite, argv, files, runner=None):
+    """Run argv (under the suite's wrap) with the held copies of files written
+    first, as part of the same call (files=), so the result records them.
+    Callers find and put back the agent's own versions around a batch of runs
+    (agent_versions, put_back_all)."""
+    held = {absolute(suite, p): t for p, t in files.items()}
+    if runner is None:
+        return run(suite["wrap"] + argv, files=held, cwd=suite["root"], timeout_ms=300000,
+                   max_stdout_bytes=200000, max_stderr_bytes=100000)
+    return run_tests(suite["wrap"] + argv, runner=runner, files=held, cwd=suite["root"], timeout_ms=600000,
+                     max_stdout_bytes=4000000, max_stderr_bytes=2000000)
 
 
 # --- judging -------------------------------------------------------------
@@ -332,51 +361,60 @@ def register_tests(suite, tests, keep, revised):
             held[key] = {p: current_text(absolute(suite, p)) for p in keep_paths(suite, k["command"])}
             if not held[key]:
                 problems.append("keep run " + k["id"] + " " + json_dumps(k["command"]) + ": no test file found in its command to hold a copy of")
-    for t in tests:
-        key = test_key(t)
-        held[key] = t["files"]
-        if key in suite["at_base"]:
-            at_base[key] = suite["at_base"][key]
-        elif on_base:
-            r, warnings = run_held(suite, t["command"], t["files"])
-            at_base[key] = {"result": r, "on": before}
-            ran.append(t["name"])
-        else:
-            unchecked.append(t["name"])
-            continue
-        r = at_base[key]["result"]
-        passed, problem = judge(t, r)
-        missing = missing_modules(suite, r)
-        if missing:
-            # A failure that is only a missing module shows nothing about
-            # the code; installing it later would turn the test green.
-            problems.append("test " + describe(t) + " is broken: it needs modules the environment does not have (" + ", ".join(missing) + "); use only what is installed\n" + output_of(r))
-        elif problem is not None:
-            problems.append("test " + describe(t) + " is broken: " + problem + "\n" + output_of(r))
-        elif t["kind"] == "fail_to_pass" and passed:
-            problems.append("test " + describe(t) + " already passes on the unfixed code, so it does not show the change; its output:\n" + output_of(r))
-        elif t["kind"] == "pass_to_pass" and not passed:
-            problems.append("test " + describe(t) + " fails on the unfixed code, so it is not behavior to keep; its output:\n" + output_of(r))
-    for k in keep:
-        key = keep_key(k)
-        if key in suite["baseline"]:
-            baseline[key] = suite["baseline"][key]
-        elif on_base:
-            run, warnings = run_held(suite, k["command"], held[key], runner_for(suite, k["command"]))
-            baseline[key] = {"result": run, "on": before}
-            ran.append(k["id"])
-        else:
-            # Not the unfixed code: no baseline, but a run must at least
-            # finish, so a command whose output cannot be read is caught now.
-            unchecked.append(k["id"])
-            run, warnings = run_held(suite, k["command"], held[key], runner_for(suite, k["command"]))
-            ran.append(k["id"] + " (current tree)")
-            if not run.complete:
-                problems.append("keep run " + k["id"] + " " + json_dumps(k["command"]) + " does not finish on the current tree: " + str(run.problem) + "\n" + output_of(run))
-            continue
-        run = baseline[key]["result"]
-        if not usable(run):
-            problems.append("keep run " + k["id"] + " " + json_dumps(k["command"]) + " does not finish and pass tests on the unfixed code: " + str(run.problem))
+    # The agent's own versions of the files about to be written go back after.
+    groups = [t["files"] for t in tests if on_base and test_key(t) not in suite["at_base"]]
+    groups = groups + [held[keep_key(k)] for k in keep if keep_key(k) not in suite["baseline"]]
+    agent, ignored = agent_versions(suite, groups)
+    try:
+        for t in tests:
+            key = test_key(t)
+            held[key] = t["files"]
+            if key in suite["at_base"]:
+                at_base[key] = suite["at_base"][key]
+            elif on_base:
+                r = run_held(suite, t["command"], t["files"])
+                at_base[key] = {"result": r, "on": before}
+                ran.append(t["name"])
+            else:
+                unchecked.append(t["name"])
+                continue
+            r = at_base[key]["result"]
+            passed, problem = judge(t, r)
+            missing = missing_modules(suite, r)
+            if missing:
+                # A failure that is only a missing module shows nothing about
+                # the code; installing it later would turn the test green.
+                problems.append("test " + describe(t) + " is broken: it needs modules the environment does not have (" + ", ".join(missing) + "); use only what is installed\n" + output_of(r))
+            elif problem is not None:
+                problems.append("test " + describe(t) + " is broken: " + problem + "\n" + output_of(r))
+            elif t["kind"] == "fail_to_pass" and passed:
+                problems.append("test " + describe(t) + " already passes on the unfixed code, so it does not show the change; its output:\n" + output_of(r))
+            elif t["kind"] == "pass_to_pass" and not passed:
+                problems.append("test " + describe(t) + " fails on the unfixed code, so it is not behavior to keep; its output:\n" + output_of(r))
+        for k in keep:
+            key = keep_key(k)
+            if key in suite["baseline"]:
+                baseline[key] = suite["baseline"][key]
+            elif on_base:
+                run = run_held(suite, k["command"], held[key], runner_for(suite, k["command"]))
+                baseline[key] = {"result": run, "on": before}
+                ran.append(k["id"])
+            else:
+                # Not the unfixed code: no baseline, but a run must at least
+                # finish, so a command whose output cannot be read is caught now.
+                unchecked.append(k["id"])
+                run = run_held(suite, k["command"], held[key], runner_for(suite, k["command"]))
+                ran.append(k["id"] + " (current tree)")
+                if not run.complete:
+                    problems.append("keep run " + k["id"] + " " + json_dumps(k["command"]) + " does not finish on the current tree: " + str(run.problem) + "\n" + output_of(run))
+                continue
+            run = baseline[key]["result"]
+            if not usable(run):
+                problems.append("keep run " + k["id"] + " " + json_dumps(k["command"]) + " does not finish and pass tests on the unfixed code: " + str(run.problem))
+    except Exception as error:
+        put_back_all(agent)
+        raise error
+    put_back_all(agent)
     new = dict(suite)
     new.update({"tests": tests, "keep": keep, "revised": revised, "held": held, "at_base": at_base,
                 "baseline": baseline, "unchecked": unchecked, "ran": ran})
@@ -395,34 +433,41 @@ def revise(suite, tests=None, keep=None, revised=None):
 def check(suite):
     """Run every test and keep run on the current tree, each with its
     registered test-file copies. Returns {"passed", "failures", "warnings",
-    "tests", "keep"}; each entry of tests and keep has its sealed result."""
+    "tests", "keep", "env_text"}; each entry of tests and keep has its sealed
+    result. A test file the agent changed gets the agent's version back after
+    all the runs."""
     failures = []
-    warnings = []
     tests = []
-    for t in suite["tests"]:
-        r, w = run_held(suite, t["command"], t["files"])
-        warnings = warnings + w
-        passed, problem = judge(t, r)
-        tests.append({"name": t["name"], "kind": t["kind"], "passed": passed is True, "problem": problem, "result": r})
-        if passed is not True:
-            failures.append("test " + describe(t) + " does not pass" + (" (" + problem + ")" if problem else "") + ":\n" + output_of(r))
     keep = []
-    for k in suite["keep"]:
-        key = keep_key(k)
-        run, w = run_held(suite, k["command"], suite["held"][key], runner_for(suite, k["command"]))
-        warnings = warnings + w
-        before = suite["baseline"][key]["result"] if key in suite["baseline"] else None
-        names, problem = new_failures(before, run, suite["revised"])
-        keep.append({"id": k["id"], "passed": not names and problem is None, "new_failures": names, "problem": problem,
-                     "failed_tests": run.failed_tests, "result": run})
-        if problem is not None:
-            failures.append("keep run " + k["id"] + " " + json_dumps(k["command"]) + " did not finish properly: " + problem)
-        elif names:
-            failures.append("keep run " + k["id"] + " " + json_dumps(k["command"]) + ": these tests " + ("passed on the unfixed code and " if before is not None else "") + "fail now: " + json_dumps(names) + "\n" + output_of(run))
-    changed = environment_change(suite)
+    agent, warnings = agent_versions(suite, [t["files"] for t in suite["tests"]] + [suite["held"][keep_key(k)] for k in suite["keep"]])
+    try:
+        for t in suite["tests"]:
+            r = run_held(suite, t["command"], t["files"])
+            passed, problem = judge(t, r)
+            tests.append({"name": t["name"], "kind": t["kind"], "passed": passed is True, "problem": problem, "result": r})
+            if passed is not True:
+                failures.append("test " + describe(t) + " does not pass" + (" (" + problem + ")" if problem else "") + ":\n" + output_of(r))
+        for k in suite["keep"]:
+            key = keep_key(k)
+            run = run_held(suite, k["command"], suite["held"][key], runner_for(suite, k["command"]))
+            before = suite["baseline"][key]["result"] if key in suite["baseline"] else None
+            names, problem = new_failures(before, run, suite["revised"])
+            keep.append({"id": k["id"], "passed": not names and problem is None, "new_failures": names, "problem": problem,
+                         "failed_tests": run.failed_tests, "result": run})
+            if problem is not None:
+                failures.append("keep run " + k["id"] + " " + json_dumps(k["command"]) + " did not finish properly: " + problem)
+            elif names:
+                failures.append("keep run " + k["id"] + " " + json_dumps(k["command"]) + ": these tests " + ("passed on the unfixed code and " if before is not None else "") + "fail now: " + json_dumps(names) + "\n" + output_of(run))
+    except Exception as error:
+        put_back_all(agent)
+        raise error
+    put_back_all(agent)
+    env_text = environment(suite)
+    changed = environment_change(suite, env_text)
     if changed is not None:
         warnings.append(changed + "; the final verification fails unless it is restored")
-    return {"passed": not failures, "failures": failures, "warnings": warnings, "tests": tests, "keep": keep}
+    return {"passed": not failures, "failures": failures, "warnings": warnings, "tests": tests, "keep": keep,
+            "env_text": env_text}
 
 
 def rejecting(report):
@@ -434,8 +479,8 @@ def rejecting(report):
 def verify(suite, patch):
     """Check that the tree is exactly the unfixed code plus patch (text), then
     run the suite on it. Returns a Verdict."""
-    def verdict(verified, expected, before, after, tests, keep, failures, warnings):
-        env = environment(suite)
+    def verdict(verified, expected, before, after, tests, keep, failures, warnings, env_text=None):
+        env = env_text if env_text is not None else environment(suite)
         return Verdict(verified=verified, suite=suite_hash(suite), base=suite["base"].id, patch=patch,
                        expected=expected, before=before, after=after, tests=tests, keep=keep,
                        failures=failures, warnings=warnings, unchecked=suite["unchecked"],
@@ -454,13 +499,13 @@ def verify(suite, patch):
     report = check(suite)
     after = snapshot(suite["root"])
     failures = report["failures"]
-    changed = environment_change(suite)
+    changed = environment_change(suite, report["env_text"])
     if changed is not None:
         failures = failures + [changed]
     if after.id != expected.id:
         failures = failures + ["the tree changed while the suite ran: " + ", ".join([f.path for f in diff(since=expected, to=after).files][:20])]
     return verdict(not failures, expected, before, after, [t["result"] for t in report["tests"]],
-                   [k["result"] for k in report["keep"]], failures, report["warnings"])
+                   [k["result"] for k in report["keep"]], failures, report["warnings"], report["env_text"])
 
 
 # --- re-checking a verdict -----------------------------------------------

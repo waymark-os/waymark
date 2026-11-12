@@ -8564,7 +8564,21 @@ impl Evaluator<'_> {
         };
         // Input files are written where the command runs (locally or in the
         // Gateway's container), just before it, as part of this one call.
-        let written = self.write_run_files(&files, named, default_cwd.clone(), context)?;
+        // Through the Gateway each command is a round trip, so small files
+        // are written by a step inside the command's own call instead.
+        let inline = !files.is_empty() && crate::gateway_runtime::enabled() && files_fit_in_argv(&files);
+        let wrapped;
+        let call_positional = if inline {
+            wrapped = with_files_step(positional, &files, context)?;
+            wrapped.as_slice()
+        } else {
+            positional
+        };
+        let written = if inline {
+            files.clone()
+        } else {
+            self.write_run_files(&files, named, default_cwd.clone(), context)?
+        };
         if !written.is_empty() && !crate::gateway_runtime::enabled() {
             // Let the input files fall outside the effect clock's margin, so
             // they are not reported as changes the command made.
@@ -8572,7 +8586,7 @@ impl Evaluator<'_> {
         }
         let clock = crate::stone_effects::effect_clock();
         let invocation =
-            run_call_values(context, positional, named, default_cwd, complete, |path| {
+            run_call_values(context, call_positional, named, default_cwd, complete, |path| {
                 self.resolve_script_path(path)
             });
         let invocation = match invocation {
@@ -8587,6 +8601,22 @@ impl Evaluator<'_> {
             }
         };
         let mut record = invocation.record;
+        let mut argv = invocation.argv;
+        if inline {
+            // The result shows the command as written, not the files step.
+            record.insert("argv", positional[0].clone());
+            argv = value_to_string_list(&positional[0], context)?;
+            if let Some(path) = files_step_failure(&record) {
+                self.state
+                    .budget
+                    .after_tool_call(command_budget_summary(positional, &record));
+                return Err(stone_typed_error(
+                    "OSError",
+                    context,
+                    format!("{context}() could not write its input file {path}"),
+                ));
+            }
+        }
         if !written.is_empty() {
             record.insert("files", run_files_value(&written, &invocation.cwd));
         }
@@ -8613,7 +8643,7 @@ impl Evaluator<'_> {
         #[cfg(not(target_os = "hermit"))]
         self.attach_run_helper_observations(
             &mut record,
-            &invocation.argv,
+            &argv,
             &invocation.cwd,
             &invocation.env_overrides,
             Span::unknown(),
@@ -20059,6 +20089,68 @@ fn take_run_files(
     Ok((files, rest))
 }
 
+/// Input files written inside the command's own call go in as arguments, so
+/// each must fit one argument (Linux allows 128 KiB) and hold no NUL byte.
+const FILES_IN_ARGV_MAX: usize = 100_000;
+const FILES_IN_ARGV_TOTAL: usize = 1_000_000;
+const FILES_STEP_EXIT: i64 = 125;
+const FILES_STEP_MARKER: &str = "waymark-files: could not write ";
+/// Writes `$1` files given as path/text argument pairs, then runs the rest of
+/// its arguments as the command.
+const FILES_STEP_SCRIPT: &str = "n=$1; shift\nwhile [ \"$n\" -gt 0 ]; do\n  mkdir -p -- \"$(dirname -- \"$1\")\" && printf %s \"$2\" > \"$1\" || { printf '%s%s\\n' 'waymark-files: could not write ' \"$1\" >&2; exit 125; }\n  shift 2; n=$((n - 1))\ndone\nexec \"$@\"";
+
+fn files_fit_in_argv(files: &[(String, String)]) -> bool {
+    let total: usize = files.iter().map(|(path, content)| path.len() + content.len()).sum();
+    total <= FILES_IN_ARGV_TOTAL
+        && files.iter().all(|(path, content)| {
+            content.len() <= FILES_IN_ARGV_MAX && !content.contains('\0') && !path.contains('\0')
+        })
+}
+
+/// `positional` with its argv replaced by the files step followed by argv.
+fn with_files_step(
+    positional: &[Value],
+    files: &[(String, String)],
+    context: &str,
+) -> Result<Vec<Value>, ShellError> {
+    let span = Span::unknown();
+    let argv = value_to_string_list(&positional[0], context)?;
+    let mut parts = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        FILES_STEP_SCRIPT.to_string(),
+        "waymark-files".to_string(),
+        files.len().to_string(),
+    ];
+    for (path, content) in files {
+        parts.push(path.clone());
+        parts.push(content.clone());
+    }
+    parts.extend(argv);
+    let mut wrapped = positional.to_vec();
+    wrapped[0] = Value::list(parts.into_iter().map(|part| Value::string(part, span)).collect(), span);
+    Ok(wrapped)
+}
+
+/// The file the files step could not write, when it stopped the command.
+fn files_step_failure(record: &Record) -> Option<String> {
+    let exit = match record.get("exit_code") {
+        Some(Value::Int { val, .. }) => *val,
+        _ => return None,
+    };
+    let Some(Value::String { val: stderr, .. }) = record.get("stderr") else {
+        return None;
+    };
+    if exit != FILES_STEP_EXIT {
+        return None;
+    }
+    // The step's own line comes last, after mkdir's or the shell's reason.
+    let last = stderr.trim_end().lines().last()?;
+    let path = last.strip_prefix(FILES_STEP_MARKER)?;
+    let reason = stderr.trim_end().strip_suffix(last).unwrap_or("").trim();
+    Some(if reason.is_empty() { path.to_string() } else { format!("{path}: {reason}") })
+}
+
 /// The `files` field of a command's result: each input file's path
 /// (absolute), size, and sha256, so the result shows what the command ran on.
 fn run_files_value(files: &[(String, String)], cwd: &Path) -> Value {
@@ -27919,6 +28011,50 @@ emit({
         );
         cleanup_dir(&root);
         Ok(())
+    }
+
+    #[test]
+    fn the_files_step_writes_exact_text_then_runs_the_command() {
+        // Through the Gateway, files= is written by a step inside the
+        // command's own call; run that step here with sh.
+        use super::{files_fit_in_argv, files_step_failure, value_to_string_list, with_files_step, FILES_IN_ARGV_MAX};
+        use nu_protocol::Record;
+        let root = std::env::temp_dir().join(format!("waymark-files-step-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let span = Span::unknown();
+        let strings = |parts: &[&str]| Value::list(parts.iter().map(|p| Value::string(*p, span)).collect(), span);
+        let odd = "-n %s $HOME `x` \"q\" 'q' \\ no newline at end";
+        let files = vec![
+            ("in/deep/a.txt".to_string(), odd.to_string()),
+            ("b.txt".to_string(), "line\n\n".to_string()),
+            ("empty.txt".to_string(), String::new()),
+        ];
+        assert!(files_fit_in_argv(&files));
+        assert!(!files_fit_in_argv(&[("big".into(), "x".repeat(FILES_IN_ARGV_MAX + 1))]));
+        assert!(!files_fit_in_argv(&[("nul".into(), "a\0b".into())]));
+        let wrapped = with_files_step(&[strings(&["sh", "-c", "cat b.txt; echo \"[$1]\"", "cmd", "an arg"])], &files, "run").unwrap();
+        let argv = value_to_string_list(&wrapped[0], "run").unwrap();
+        let out = std::process::Command::new(&argv[0]).args(&argv[1..]).current_dir(&root).output().unwrap();
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "line\n\n[an arg]\n");
+        assert_eq!(std::fs::read_to_string(root.join("in/deep/a.txt")).unwrap(), odd);
+        assert_eq!(std::fs::read_to_string(root.join("empty.txt")).unwrap(), "");
+        // A file it cannot write stops the command, and the result names it.
+        std::fs::write(root.join("blocker"), "").unwrap();
+        let bad = vec![("blocker/x.txt".to_string(), "x".to_string())];
+        let wrapped = with_files_step(&[strings(&["echo", "ran"])], &bad, "run").unwrap();
+        let argv = value_to_string_list(&wrapped[0], "run").unwrap();
+        let out = std::process::Command::new(&argv[0]).args(&argv[1..]).current_dir(&root).output().unwrap();
+        assert_eq!(out.stdout, b"");
+        let mut record = Record::new();
+        record.push("exit_code", Value::int(out.status.code().unwrap() as i64, span));
+        record.push("stderr", Value::string(String::from_utf8_lossy(&out.stderr), span));
+        let failure = files_step_failure(&record).unwrap_or_default();
+        assert!(failure.starts_with("blocker/x.txt: ") && failure.contains("blocker"), "{failure}");
+        record.insert("stderr", Value::string("ordinary failure", span));
+        assert_eq!(files_step_failure(&record), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
