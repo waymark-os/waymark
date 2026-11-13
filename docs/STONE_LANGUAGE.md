@@ -1157,6 +1157,15 @@ says so with `result.effects.enforced == False`.
 - `json_dumps(value, indent=None, separators=None)`: serialize typed Stone
   values as JSON text. The common Python-shaped calls `indent=2` and
   `separators=(",", ":")` are supported.
+- `provenance(value)`: where a value's text came from, as a list of
+  `{"kind": "model", "model": ..., "transition_id": ...}` records, one per
+  model answer. Text the program builds from a model answer keeps the
+  source through f-strings, `+`, string methods, `split`, `join`, `format`,
+  `str`, slicing, indexing, and `json_dumps`/`json_loads`, and so does a
+  file the program writes it to, when the program reads the file back.
+  Numbers and booleans carry no source, and text a command writes is not
+  tracked, so an empty list does not prove the text is not a model's.
+  Commands report the same sources as `rests_on`.
 - `split(text, separator=None, maxsplit=None)`, `join(items, separator="")`,
   `slice(value, start=None, end=None)`, `starts_with(text, prefix)`, and
   `format(template, ...)`: small text/list helpers for scripts and dynamic
@@ -1197,7 +1206,15 @@ says so with `result.effects.enforced == False`.
   and the command does not run. `must_run`, `run_complete`, and `run_tests`
   take `files=` too.
   Every result has `seq`, a number that increases with each result the
-  runtime makes (`Snapshot` too), so results can be put in order. See "Call Contracts" below for `expect=`,
+  runtime makes (`Snapshot` too), so results can be put in order.
+  Every finished result has `rests_on`: the model answers the command's
+  inputs came from, one record per answer (`{model, transition_id, via}`).
+  `via` names how the text got in: `"argv"`, `"stdin"`, `"env"`,
+  `"files=<path>"`, or `"file <path>"` for a file this program wrote with
+  that text and the command names (directly, as a pytest node id such as
+  `tests/test_x.py::test_a`, or by a directory above it). An empty
+  `rests_on` means no tracked model text, not that none was used: text a
+  command wrote is not tracked. See `provenance(x)`. See "Call Contracts" below for `expect=`,
   `effects=`, and `result.effects`. Agent loops should
   normally set much smaller output bounds (for example 16 KiB/8 KiB) so one
   noisy command cannot dominate every later model call. Set `stdout` or
@@ -1222,8 +1239,10 @@ says so with `result.effects.enforced == False`.
   such as `["bash", "-lc", ...]` or `docker exec` works. Fields: `ok`,
   `runner`, `command`, `exit_code`, `timed_out`, `complete`, `passed`,
   `failed` (failures and errors), `skipped`, `xfailed`, `passed_tests`,
-  `failed_tests`, `skipped_tests`, `problem`, and `output` (the last 4000
-  characters). Counts come from the runner's final summary; `complete` is
+  `failed_tests`, `skipped_tests`, `problem`, `output` (the last 4000
+  characters), and `rests_on` (as for `run`). A passing run whose
+  `rests_on` names a model answer is the model's own check passing (for
+  example, a reproduction the model wrote), not independent evidence. Counts come from the runner's final summary; `complete` is
   `False` when that summary is missing (a crash, a timeout, or a command that
   is not a run of that runner). `ok` is `True` only when the run is complete,
   at least one test passed, none failed, and the command exited 0; otherwise
@@ -1330,10 +1349,11 @@ says so with `result.effects.enforced == False`.
   `{name, type, source}` (plus `message`, its index in the prompt), where
   `source` is `{"kind": "runtime", "type": ...}` for a result only the
   runtime makes (or a list of them), `{"kind": "model", "model": ...,
-  "transition_id": ...}` for a typed `model.ask` answer or a record or
-  container inside one, and `{"kind": "program"}` otherwise. Sources do not
-  follow computation: a dict the program builds from a model answer's
-  fields is `program`, and so is a plain string or number a model returned.
+  "transition_id": ...}` for a `model.ask` answer or anything the program
+  built from one (see `provenance(x)`), `{"kind": "mixed", "sources": [...]}`
+  when it was built from several answers, and `{"kind": "program"}`
+  otherwise. Numbers and booleans carry no source, so a number a model
+  returned is `program`.
   Keep `system=` a fixed instruction and put task data in inputs; append to
   a history rather than editing it. Both keep the start of the prompt the
   same from call to call. See `help("message")`.

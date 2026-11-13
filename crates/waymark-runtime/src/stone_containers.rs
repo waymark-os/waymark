@@ -665,6 +665,7 @@ fn kind(value: &RuntimeValue) -> String {
         RuntimeValue::Dict(_) => "record".to_string(),
         RuntimeValue::Record(record) => record.ty.name.clone(),
         RuntimeValue::Nu(value) => crate::stone_builtins::value_type_name(&value).to_string(),
+        RuntimeValue::Str(_) => "str".to_string(),
         _ => "value".to_string(),
     }
 }
@@ -852,10 +853,26 @@ mod tests {
     }
 }
 
-/// The provenance label of a shared list, dict, or record (`Label(0)` for
-/// anything else, or when none was set).
+/// The provenance label of a labeled string, or of a shared list, dict, or
+/// record (`Label(0)` for anything else, or when none was set). This is the
+/// value's own label; [`collect_labels`] gathers the labels inside it.
+/// Whether `value` is a kind that can hold a label: a labeled string or a
+/// shared container (or a tuple of values). Plain nushell values cannot.
+#[inline]
+pub(super) fn may_carry_label(value: &RuntimeValue) -> bool {
+    matches!(
+        value,
+        RuntimeValue::Str(_)
+            | RuntimeValue::List(_)
+            | RuntimeValue::Dict(_)
+            | RuntimeValue::Record(_)
+            | RuntimeValue::Tuple(_)
+    )
+}
+
 pub(super) fn label_of(value: &RuntimeValue) -> Label {
     match value {
+        RuntimeValue::Str(text) => text.label,
         RuntimeValue::List(list) => list.label.get(),
         RuntimeValue::Dict(dict) => dict.label.get(),
         RuntimeValue::Record(record) => record.label.get(),
@@ -863,44 +880,119 @@ pub(super) fn label_of(value: &RuntimeValue) -> Label {
     }
 }
 
-/// Set `label` on a value and on every shared list, dict, and record inside
-/// it. Plain values cannot carry a label and are left alone.
-pub(super) fn set_label_deep(value: &RuntimeValue, label: Label) {
-    set_label_at(value, label, 0);
+impl Item {
+    fn into_runtime(self) -> RuntimeValue {
+        match self {
+            Item::Plain(value) => RuntimeValue::Nu(value),
+            Item::List(list) => RuntimeValue::List(list),
+            Item::Dict(dict) => RuntimeValue::Dict(dict),
+            Item::Runtime(value) => *value,
+        }
+    }
 }
 
-fn set_label_at(value: &RuntimeValue, label: Label, depth: usize) {
+/// Give `value`, and every string, list, dict, and record inside it, the
+/// label `label` (a model answer's source). Plain strings become labeled
+/// strings, and plain nested lists and dicts become shared ones so their
+/// strings can carry the label. Shared containers are labeled in place, so
+/// every alias sees it.
+pub(super) fn label_deep(value: RuntimeValue, label: Label) -> RuntimeValue {
+    label_deep_at(value, label, 0)
+}
+
+fn label_deep_at(value: RuntimeValue, label: Label, depth: usize) -> RuntimeValue {
+    if depth > MAX_MATERIALIZE_DEPTH || label.0 == 0 {
+        return value;
+    }
+    let relabel = |items: &mut dyn Iterator<Item = &mut Item>| {
+        for item in items {
+            let taken = std::mem::replace(item, Item::Plain(Value::nothing(Span::unknown())));
+            *item = Item::from_runtime(label_deep_at(taken.into_runtime(), label, depth + 1));
+        }
+    };
+    match value {
+        RuntimeValue::Nu(Value::String { val, .. }) => {
+            RuntimeValue::Str(super::stone_provenance::LabeledStr { text: val, label })
+        }
+        RuntimeValue::Str(mut text) => {
+            text.label = label;
+            RuntimeValue::Str(text)
+        }
+        RuntimeValue::Nu(value @ (Value::List { .. } | Value::Record { .. })) => {
+            label_deep_at(share_nu(value), label, depth)
+        }
+        RuntimeValue::List(list) => {
+            // Set first: a container that contains itself stops here.
+            if list.label.get() != label {
+                list.label.set(label);
+                relabel(&mut list.items.borrow_mut().iter_mut());
+            }
+            RuntimeValue::List(list)
+        }
+        RuntimeValue::Dict(dict) => {
+            if dict.label.get() != label {
+                dict.label.set(label);
+                relabel(&mut dict.entries.borrow_mut().values_mut());
+            }
+            RuntimeValue::Dict(dict)
+        }
+        RuntimeValue::Record(record) => {
+            if record.label.get() != label {
+                record.label.set(label);
+                relabel(&mut record.slots.borrow_mut().iter_mut());
+            }
+            RuntimeValue::Record(record)
+        }
+        other => other,
+    }
+}
+
+/// Every label inside `value`: its strings' labels and its containers'
+/// labels, each container visited once. A sink joins them.
+pub(super) fn collect_labels(value: &RuntimeValue, out: &mut Vec<Label>) {
+    let mut seen = Vec::new();
+    collect_labels_at(value, out, &mut seen, 0);
+}
+
+fn collect_labels_at(
+    value: &RuntimeValue,
+    out: &mut Vec<Label>,
+    seen: &mut Vec<*const ()>,
+    depth: usize,
+) {
     if depth > MAX_MATERIALIZE_DEPTH {
         return;
     }
-    let visit = |item: ItemRef<'_>| -> Result<(), ()> {
-        if let ItemRef::Shared(child) = item {
-            set_label_at(&child, label, depth + 1);
+    let label = label_of(value);
+    if label.0 != 0 && !out.contains(&label) {
+        out.push(label);
+    }
+    let pointer = match value {
+        RuntimeValue::List(list) => Rc::as_ptr(list) as *const (),
+        RuntimeValue::Dict(dict) => Rc::as_ptr(dict) as *const (),
+        RuntimeValue::Record(record) => Rc::as_ptr(record) as *const (),
+        RuntimeValue::Tuple(items) => {
+            for item in items.iter() {
+                collect_labels_at(item, out, seen, depth + 1);
+            }
+            return;
         }
-        Ok(())
+        _ => return,
+    };
+    if seen.contains(&pointer) {
+        return;
+    }
+    seen.push(pointer);
+    let mut visit = |item: &Item| {
+        if let Item::Plain(_) = item {
+            return;
+        }
+        collect_labels_at(&item.to_runtime(), out, seen, depth + 1);
     };
     match value {
-        RuntimeValue::List(list) => {
-            if list.label.get() == label {
-                return;
-            }
-            list.label.set(label);
-            let _ = list.try_for_each(|_, item| visit(item));
-        }
-        RuntimeValue::Dict(dict) => {
-            if dict.label.get() == label {
-                return;
-            }
-            dict.label.set(label);
-            let _ = dict.try_for_each(|_, item| visit(item));
-        }
-        RuntimeValue::Record(record) => {
-            if record.label.get() == label {
-                return;
-            }
-            record.label.set(label);
-            let _ = record.try_for_each(|_, item| visit(item));
-        }
+        RuntimeValue::List(list) => list.items.borrow().iter().for_each(&mut visit),
+        RuntimeValue::Dict(dict) => dict.entries.borrow().values().for_each(&mut visit),
+        RuntimeValue::Record(record) => record.slots.borrow().iter().for_each(&mut visit),
         _ => {}
     }
 }

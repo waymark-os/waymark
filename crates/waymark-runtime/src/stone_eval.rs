@@ -131,6 +131,8 @@ mod stone_budget;
 mod stone_collections;
 #[path = "stone_predicate.rs"]
 mod stone_predicate;
+#[path = "stone_provenance.rs"]
+mod stone_provenance;
 #[path = "stone_containers.rs"]
 mod stone_containers;
 #[path = "stone_context.rs"]
@@ -250,8 +252,8 @@ pub struct EvalState {
     /// patch): the result is a content id, so the same inputs give the same
     /// snapshot, and through the Gateway each step is a round trip.
     applied_patches: HashMap<(String, String, String, String), crate::stone_snapshots::SnapshotRef>,
-    /// The session's typed model answers, for input sources (design 5.9).
-    model_answers: Rc<std::cell::RefCell<Vec<JsonValue>>>,
+    /// The session's provenance sources and labels (stone_provenance).
+    provenance: Rc<std::cell::RefCell<stone_provenance::Provenance>>,
     #[cfg(test)]
     test_model: Option<Rc<std::cell::RefCell<stone_model::TestModel>>>,
     profiler: EvalProfiler,
@@ -1088,10 +1090,10 @@ fn eval_program_with_source_options(
                 .unwrap_or_default(),
             budget,
             applied_patches: HashMap::new(),
-            model_answers: options
+            provenance: options
                 .session
                 .as_ref()
-                .map(|session| session.model_answers.clone())
+                .map(|session| session.provenance.clone())
                 .unwrap_or_default(),
             #[cfg(test)]
             test_model: options
@@ -1633,17 +1635,17 @@ impl Evaluator<'_> {
                     list.extend(items);
                     return Ok(EvalFlow::Output(none_value()));
                 }
+                let right = self.eval_expr_value(value)?;
+                let label = self.input_label(&[&left, &right]);
                 let left = left.into_nu_value("augmented assignment")?;
-                let right = self
-                    .eval_expr_value(value)?
-                    .into_nu_value("augmented assignment")?;
+                let right = right.into_nu_value("augmented assignment")?;
                 let value = apply_aug_op(*op, &left, &right)?;
                 if let Place::Name(name) = &place {
                     if record_session_bindings {
                         self.state.record_session_binding(name);
                     }
                 }
-                self.write_place(place, RuntimeValue::Nu(value))?;
+                self.write_place(place, labeled_result(RuntimeValue::Nu(value), label))?;
                 Ok(EvalFlow::Output(none_value()))
             }
             Stmt::Pass => Ok(EvalFlow::Output(none_value())),
@@ -2515,7 +2517,7 @@ impl Evaluator<'_> {
                 Some(Value::String { val, .. }) => val.clone(),
                 _ => return None,
             },
-            RuntimeValue::Dict(dict) => match dict.get("type") {
+            RuntimeValue::Dict(dict) => match dict.get("type").map(RuntimeValue::unlabeled) {
                 Some(RuntimeValue::Nu(Value::String { val, .. })) => val,
                 _ => return None,
             },
@@ -2545,7 +2547,7 @@ impl Evaluator<'_> {
                 Some(Value::String { val, .. }) => val.clone(),
                 _ => String::new(),
             },
-            RuntimeValue::Dict(dict) => match dict.get("message") {
+            RuntimeValue::Dict(dict) => match dict.get("message").map(RuntimeValue::unlabeled) {
                 Some(RuntimeValue::Nu(Value::String { val, .. })) => val,
                 _ => String::new(),
             },
@@ -3340,11 +3342,13 @@ impl Evaluator<'_> {
         parts: &[FormattedStringPart],
     ) -> Result<RuntimeValue, ShellError> {
         let mut output = String::new();
+        let mut labels = Vec::new();
         for part in parts {
             match part {
                 FormattedStringPart::Literal(text) => output.push_str(text),
                 FormattedStringPart::Expr(expr) => {
                     let value = self.eval_expr_value(expr)?;
+                    stone_containers::collect_labels(&value, &mut labels);
                     if let Some(text) = self.error_value_text(&value, false) {
                         output.push_str(&text);
                         continue;
@@ -3356,6 +3360,7 @@ impl Evaluator<'_> {
                 }
                 FormattedStringPart::Formatted { expr, spec } => {
                     let value = self.eval_expr_value(expr)?;
+                    stone_containers::collect_labels(&value, &mut labels);
                     let value = match self.error_value_text(&value, false) {
                         Some(text) => Value::string(text, Span::unknown()),
                         None => value.into_nu_value("f-string")?,
@@ -3364,7 +3369,61 @@ impl Evaluator<'_> {
                 }
             }
         }
-        Ok(RuntimeValue::Nu(Value::string(output, Span::unknown())))
+        let label = self.join_labels(labels);
+        Ok(stone_provenance::text_value(output, label))
+    }
+
+    /// The label naming every source in `labels` (stone_provenance).
+    fn join_labels(&self, labels: Vec<stone_containers::Label>) -> stone_containers::Label {
+        match labels.as_slice() {
+            [] => stone_containers::Label::default(),
+            [only] => *only,
+            _ => self.state.provenance.borrow_mut().join_all(labels),
+        }
+    }
+
+    /// Record that the program wrote `label`ed text to `target` (a full
+    /// write, or `keep_old` for an append or edit).
+    fn note_file_write(&self, target: &Path, label: stone_containers::Label, keep_old: bool) {
+        let mut provenance = self.state.provenance.borrow_mut();
+        if label.0 == 0 && !provenance.has_files() {
+            return;
+        }
+        provenance.note_file(&tracked_path(target), label, keep_old);
+    }
+
+    /// The label of text this program wrote to `target`, if it did.
+    fn file_read_label(&self, target: &Path) -> stone_containers::Label {
+        let provenance = self.state.provenance.borrow();
+        if !provenance.has_files() {
+            return stone_containers::Label::default();
+        }
+        provenance.file_label(&tracked_path(target))
+    }
+
+    /// A value read from `target`, with the label of what this program
+    /// wrote there.
+    fn labeled_read(&self, target: &Path, value: Value) -> RuntimeValue {
+        let label = self.file_read_label(target);
+        if label.0 == 0 {
+            return RuntimeValue::Nu(value);
+        }
+        stone_containers::label_deep(RuntimeValue::Nu(value), label)
+    }
+
+    /// The labels of an operation's inputs, joined.
+    #[inline]
+    fn input_label(&self, inputs: &[&RuntimeValue]) -> stone_containers::Label {
+        // Numbers, booleans, and plain nushell values carry no label: the
+        // common case returns before any work.
+        if !inputs.iter().any(|input| stone_containers::may_carry_label(input)) {
+            return stone_containers::Label::default();
+        }
+        let mut labels = Vec::new();
+        for input in inputs {
+            stone_containers::collect_labels(input, &mut labels);
+        }
+        self.join_labels(labels)
     }
 
     /// The value of an expression statement, kept as a runtime value.
@@ -3499,8 +3558,10 @@ impl Evaluator<'_> {
                                     if let RuntimeValue::Tuple(items) = &value {
                                         return slice_tuple(items, lower, upper);
                                     }
+                                    let label = stone_containers::label_of(&value);
                                     let value = value.into_nu_value("subscript")?;
-                                    slice_builtin(&value, lower, upper).map(RuntimeValue::Nu)
+                                    slice_builtin(&value, lower, upper)
+                                        .map(|part| labeled_result(RuntimeValue::Nu(part), label))
                                 }
                                 index => {
                                     let index = self
@@ -3910,23 +3971,26 @@ impl Evaluator<'_> {
                 if let Some(text) = self.error_value_text(&value, name == "repr") {
                     return Ok(RuntimeValue::Nu(Value::string(text, Span::unknown())));
                 }
-                if !matches!(value, RuntimeValue::Nu(_)) {
+                let label = self.input_label(&[&value]);
+                if !matches!(value, RuntimeValue::Nu(_) | RuntimeValue::Str(_)) {
                     // Records inside are written as Python writes them.
                     let text = if name == "repr" {
                         stone_records::python_repr(&value)?
                     } else {
                         stone_records::python_str(&value)?
                     };
-                    return Ok(RuntimeValue::Nu(Value::string(text, Span::unknown())));
+                    return Ok(stone_provenance::text_value(text, label));
                 }
                 let value = value.into_nu_value(name)?;
-                if name == "repr" {
-                    repr_builtin(&value).map(RuntimeValue::Nu)
+                let text = if name == "repr" {
+                    repr_builtin(&value)?
                 } else {
-                    str_builtin(&value).map(RuntimeValue::Nu)
-                }
+                    str_builtin(&value)?
+                };
+                Ok(labeled_result(RuntimeValue::Nu(text), label))
             }
             "md5" | "sha1" | "sha256" => self.eval_hash_call(call),
+            "provenance" => self.eval_provenance_call(call),
             "type" => self.eval_type_call(call),
             "isinstance" => self.eval_isinstance_call(call),
             "Expect" => self.eval_expect_call(call),
@@ -4730,7 +4794,7 @@ impl Evaluator<'_> {
         let path = value_to_path_string(&path, "cat")?;
         let target = self.resolve_script_path(&path)?;
         let text = cat_text(&target)?;
-        Ok(RuntimeValue::Nu(Value::string(text, Span::unknown())))
+        Ok(self.labeled_read(&target, Value::string(text, Span::unknown())))
     }
 
     fn eval_read_text_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -4842,7 +4906,7 @@ impl Evaluator<'_> {
                 text
             }
         };
-        Ok(RuntimeValue::Nu(Value::string(text, Span::unknown())))
+        Ok(self.labeled_read(&target, Value::string(text, Span::unknown())))
     }
 
     fn eval_write_text_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -4873,11 +4937,12 @@ impl Evaluator<'_> {
             .into_nu_value("write_text")?;
         let path = value_to_path_string(&path, "write_text")?;
         let target = self.resolve_script_path(&path)?;
-        let value = self
-            .eval_expr_value(value)?
-            .into_nu_value("write_text")?;
-        let text = value_to_string(&value, "write_text")?;
-        Ok(RuntimeValue::Nu(stone_write_text(&target, &text, append)?))
+        let value = self.eval_expr_value(value)?;
+        let label = self.input_label(&[&value]);
+        let text = value_to_string(&value.into_nu_value("write_text")?, "write_text")?;
+        let written = stone_write_text(&target, &text, append)?;
+        self.note_file_write(&target, label, append);
+        Ok(RuntimeValue::Nu(written))
     }
 
     fn eval_stat_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5422,7 +5487,8 @@ impl Evaluator<'_> {
             .into_nu_value("read_json")?;
         let path = value_to_path_string(&path, "read_json")?;
         let target = self.resolve_script_path(&path)?;
-        Ok(RuntimeValue::Nu(read_json_file(&target)?))
+        let value = read_json_file(&target)?;
+        Ok(self.labeled_read(&target, value))
     }
 
     fn eval_read_csv_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5438,7 +5504,8 @@ impl Evaluator<'_> {
         let path = value_to_path_string(&path, "read_csv")?;
         let target = self.resolve_script_path(&path)?;
         let limit = self.eval_structured_read_limit("read_csv", call)?;
-        Ok(RuntimeValue::Nu(read_csv_file(&target, limit)?))
+        let value = read_csv_file(&target, limit)?;
+        Ok(self.labeled_read(&target, value))
     }
 
     fn eval_read_jsonl_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5537,10 +5604,11 @@ impl Evaluator<'_> {
             .into_nu_value("write_json")?;
         let path = value_to_string(&path, "write_json")?;
         let target = self.resolve_script_path(&path)?;
-        let value = self
-            .eval_expr_value(value)?
-            .into_nu_value("write_json")?;
-        Ok(RuntimeValue::Nu(write_json_file(&target, &value)?))
+        let value = self.eval_expr_value(value)?;
+        let label = self.input_label(&[&value]);
+        let written = write_json_file(&target, &value.into_nu_value("write_json")?)?;
+        self.note_file_write(&target, label, false);
+        Ok(RuntimeValue::Nu(written))
     }
 
     fn eval_write_csv_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5572,9 +5640,9 @@ impl Evaluator<'_> {
             .into_nu_value("write_csv")?;
         let path = value_to_string(&path, "write_csv")?;
         let target = self.resolve_script_path(&path)?;
-        let rows = self
-            .eval_expr_value(rows)?
-            .into_nu_value("write_csv")?;
+        let rows = self.eval_expr_value(rows)?;
+        let label = self.input_label(&[&rows]);
+        let rows = rows.into_nu_value("write_csv")?;
         let columns = match call.positional.as_slice() {
             [_, _, columns] => Some(
                 self.eval_expr_value(columns)?
@@ -5587,7 +5655,9 @@ impl Evaluator<'_> {
                 .transpose()?,
         };
         let text = csv_text_from_rows(&rows, columns.as_ref())?;
-        Ok(RuntimeValue::Nu(stone_write_text(&target, &text, false)?))
+        let written = stone_write_text(&target, &text, false)?;
+        self.note_file_write(&target, label, false);
+        Ok(RuntimeValue::Nu(written))
     }
 
     fn eval_write_jsonl_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5608,16 +5678,18 @@ impl Evaluator<'_> {
             .into_nu_value("write_jsonl")?;
         let path = value_to_string(&path, "write_jsonl")?;
         let target = self.resolve_script_path(&path)?;
-        let rows = self
-            .eval_expr_value(rows)?
-            .into_nu_value("write_jsonl")?;
+        let rows = self.eval_expr_value(rows)?;
+        let label = self.input_label(&[&rows]);
+        let rows = rows.into_nu_value("write_jsonl")?;
         let Value::List { vals, .. } = rows else {
             return Err(stone_error(
                 "write_jsonl",
                 format!("expected list, got {}", crate::stone_builtins::value_type_name(&rows)),
             ));
         };
-        Ok(RuntimeValue::Nu(write_jsonl_file(&target, vals)?))
+        let written = write_jsonl_file(&target, vals)?;
+        self.note_file_write(&target, label, false);
+        Ok(RuntimeValue::Nu(written))
     }
 
     fn eval_first_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -5747,6 +5819,7 @@ impl Evaluator<'_> {
                     continue;
                 }
                 remove_path(&target)?;
+                self.state.provenance.borrow_mut().forget_files(&tracked_path(&target));
             }
         }
         Ok(RuntimeValue::Nu(Value::nothing(Span::unknown())))
@@ -5794,15 +5867,19 @@ impl Evaluator<'_> {
         let old = self
             .eval_expr_value(old)?
             .into_nu_value("edit")?;
-        let new = self
-            .eval_expr_value(new)?
-            .into_nu_value("edit")?;
+        let new = self.eval_expr_value(new)?;
+        let label = self.input_label(&[&new]);
+        let new = new.into_nu_value("edit")?;
         let path = value_to_path_string(&path, "edit")?;
         let old = value_to_string(&old, "edit old")?;
         let new = value_to_string(&new, "edit new")?;
         let target = self.resolve_script_path(&path)?;
         match edit_text_file(&target, &old, &new, replace_all, required)? {
-            Ok(record) => Ok(RuntimeValue::Nu(record)),
+            Ok(record) => {
+                // The rest of the file is unchanged, so its label stays.
+                self.note_file_write(&target, label, true);
+                Ok(RuntimeValue::Nu(record))
+            }
             Err(mismatch) => Err(host_error(stone_expect::edit_expectation_failed(
                 &path,
                 required.unwrap_or(if replace_all { 0 } else { 1 }),
@@ -5839,17 +5916,17 @@ impl Evaluator<'_> {
                 }
             }
         }
-        let value = self
-            .eval_expr_value(value)?
-            .into_nu_value("save")?;
+        let value = self.eval_expr_value(value)?;
+        let label = self.input_label(&[&value]);
+        let value = value.into_nu_value("save")?;
         let path = self
             .eval_expr_value(path)?
             .into_nu_value("save")?;
         let path = value_to_path_string(&path, "save")?;
         let target = self.resolve_script_path(&path)?;
-        Ok(RuntimeValue::Nu(save_value_file(
-            &target, &value, append, force,
-        )?))
+        let written = save_value_file(&target, &value, append, force)?;
+        self.note_file_write(&target, label, append);
+        Ok(RuntimeValue::Nu(written))
     }
 
     fn eval_search_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -6144,13 +6221,16 @@ impl Evaluator<'_> {
                 "json_loads() keyword arguments are not supported",
             ));
         }
-        let text = self
-            .eval_expr_value(text)?
-            .into_nu_value("json_loads")?;
-        let text = value_to_string(&text, "json_loads")?;
+        let text = self.eval_expr_value(text)?;
+        let label = self.input_label(&[&text]);
+        let text = value_to_string(&text.into_nu_value("json_loads")?, "json_loads")?;
         let json = serde_json::from_str::<serde_json::Value>(&text)
             .map_err(|err| stone_error("json_loads", err.to_string()))?;
-        Ok(RuntimeValue::Nu(json_to_nu_value(json, Span::unknown())))
+        let value = RuntimeValue::Nu(json_to_nu_value(json, Span::unknown()));
+        if label.0 == 0 {
+            return Ok(value);
+        }
+        Ok(stone_containers::label_deep(value, label))
     }
 
     fn eval_json_dumps_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -6194,17 +6274,16 @@ impl Evaluator<'_> {
                 }
             }
         }
-        let value = self
-            .eval_expr_value(value)?
-            .into_nu_value("json_dumps")?;
-        let json = nu_to_json_value(&value);
+        let value = self.eval_expr_value(value)?;
+        let label = self.input_label(&[&value]);
+        let json = nu_to_json_value(&value.into_nu_value("json_dumps")?);
         let text = if indent.is_some() {
             serde_json::to_string_pretty(&json)
         } else {
             serde_json::to_string(&json)
         }
         .map_err(|err| stone_error("json_dumps", err.to_string()))?;
-        Ok(RuntimeValue::Nu(Value::string(text, Span::unknown())))
+        Ok(stone_provenance::text_value(text, label))
     }
 
     fn eval_sort_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -6570,7 +6649,7 @@ impl Evaluator<'_> {
                 && matches!(receiver, RuntimeValue::Record(_) | RuntimeValue::Dict(_))
             {
                 if let [_, key_expr, rest @ ..] = call.positional.as_slice() {
-                    let key = self.eval_expr_value(key_expr)?;
+                    let key = self.eval_expr_value(key_expr)?.unlabeled();
                     if let RuntimeValue::Nu(Value::String { val: key, .. }) = &key {
                         let found = match &receiver {
                             RuntimeValue::Record(record) => {
@@ -6627,16 +6706,65 @@ impl Evaluator<'_> {
         Ok((positional, named))
     }
 
+    /// `eval_call_values` for a command: also returns the labels of its
+    /// inputs, by where each enters the command.
+    fn eval_command_call_values(
+        &mut self,
+        call: &Call,
+    ) -> Result<(Vec<Value>, Vec<(String, Value)>, CommandInputLabels), ShellError> {
+        let mut labels = CommandInputLabels::new();
+        let mut positional = Vec::with_capacity(call.positional.len());
+        for argument in &call.positional {
+            let value = self.eval_expr_value(argument)?;
+            self.note_command_input("argv", &value, &mut labels);
+            positional.push(value.into_nu_value(&call.name)?);
+        }
+        let mut named = Vec::with_capacity(call.named.len());
+        for (name, argument) in &call.named {
+            let value = self.eval_expr_value(argument)?;
+            self.note_command_input(name, &value, &mut labels);
+            named.push((name.clone(), value.into_nu_value(&call.name)?));
+        }
+        Ok((positional, named, labels))
+    }
+
+    /// Add the labels of a command input to `labels`. Each `files=` entry
+    /// is kept apart, by its path.
+    fn note_command_input(&self, via: &str, value: &RuntimeValue, labels: &mut CommandInputLabels) {
+        if via == "files" {
+            if let RuntimeValue::Dict(dict) = value {
+                for (path, content) in dict.shared_entries() {
+                    let label = self.input_label(&[&content]);
+                    if label.0 != 0 {
+                        labels.push((format!("files={path}"), label));
+                    }
+                }
+                return;
+            }
+        }
+        let label = self.input_label(&[value]);
+        if label.0 != 0 {
+            labels.push((via.to_string(), label));
+        }
+    }
+
     fn eval_call_values_with_transition_hooks(
         &mut self,
         call: &Call,
     ) -> Result<(Vec<Value>, Vec<(String, Value)>, TransitionHooks), ShellError> {
+        self.eval_call_values_with_transition_hooks_labeled(call, &mut CommandInputLabels::new())
+    }
+
+    fn eval_call_values_with_transition_hooks_labeled(
+        &mut self,
+        call: &Call,
+        labels: &mut CommandInputLabels,
+    ) -> Result<(Vec<Value>, Vec<(String, Value)>, TransitionHooks), ShellError> {
         let mut positional = Vec::with_capacity(call.positional.len());
         for argument in &call.positional {
-            positional.push(
-                self.eval_expr_value(argument)?
-                    .into_nu_value(&call.name)?,
-            );
+            let value = self.eval_expr_value(argument)?;
+            self.note_command_input("argv", &value, labels);
+            positional.push(value.into_nu_value(&call.name)?);
         }
         let mut named = Vec::with_capacity(call.named.len());
         let mut hooks = None;
@@ -6650,11 +6778,9 @@ impl Evaluator<'_> {
                 }
                 hooks = Some(self.eval_transition_hooks(&call.name, argument)?);
             } else {
-                named.push((
-                    name.clone(),
-                    self.eval_expr_value(argument)?
-                        .into_nu_value(&call.name)?,
-                ));
+                let value = self.eval_expr_value(argument)?;
+                self.note_command_input(name, &value, labels);
+                named.push((name.clone(), value.into_nu_value(&call.name)?));
             }
         }
         Ok((positional, named, hooks.unwrap_or_default()))
@@ -7656,7 +7782,7 @@ impl Evaluator<'_> {
             self.eval_expr_value(&call.positional[1])?,
             "workflow_patch",
         )?;
-        let (target, replacement) = match selector {
+        let (target, replacement) = match selector.unlabeled() {
             RuntimeValue::Nu(Value::String { val: target, .. }) => {
                 if call.positional.len() != 3 {
                     return Err(workflow_error(
@@ -8420,7 +8546,9 @@ impl Evaluator<'_> {
             ));
         }
         self.check_tool_budget()?;
-        let (mut positional, named, hooks) = self.eval_call_values_with_transition_hooks(call)?;
+        let mut inputs = CommandInputLabels::new();
+        let (mut positional, named, hooks) =
+            self.eval_call_values_with_transition_hooks_labeled(call, &mut inputs)?;
         let (named, expect, declared) = take_run_contract(named, context)?;
         let transition_id = self.state.next_transition_id();
         self.state.record_transition_event(json!({
@@ -8482,7 +8610,7 @@ impl Evaluator<'_> {
         let effective_input = run_transition_input(&positional, &named);
         let result = match rejected_reason.as_deref() {
             Some(reason) => Ok(run_policy_rejection_record(&positional, &named, reason)),
-            None => self.eval_run_values(&positional, &named, context, complete),
+            None => self.eval_run_values(&positional, &named, context, complete, &inputs),
         }
         .map(|mut record| {
             record.push(
@@ -8545,7 +8673,7 @@ impl Evaluator<'_> {
             ));
         }
         self.check_tool_budget()?;
-        let (positional, named) = self.eval_call_values(call)?;
+        let (positional, named, inputs) = self.eval_command_call_values(call)?;
         if named.iter().any(|(name, _)| name == "background") {
             return Err(stone_typed_error(
                 "TypeError",
@@ -8562,7 +8690,7 @@ impl Evaluator<'_> {
         for (key, value) in user_checks {
             checks.push(key, value);
         }
-        let mut record = self.eval_run_values(&positional, &named, "must_run", false)?;
+        let mut record = self.eval_run_values(&positional, &named, "must_run", false, &inputs)?;
         attach_declared_effects(&mut record, declared);
         match stone_expect::check_process_expectation(
             "must_run",
@@ -8588,7 +8716,7 @@ impl Evaluator<'_> {
             ));
         }
         self.check_tool_budget()?;
-        let (positional, named) = self.eval_call_values(call)?;
+        let (positional, named, inputs) = self.eval_command_call_values(call)?;
         let mut runner = "pytest".to_string();
         let mut rest = Vec::with_capacity(named.len());
         for (name, value) in named {
@@ -8619,7 +8747,7 @@ impl Evaluator<'_> {
                 _ => rest.push((name, value)),
             }
         }
-        let run = self.eval_run_values(&positional, &rest, "run_tests", true)?;
+        let run = self.eval_run_values(&positional, &rest, "run_tests", true, &inputs)?;
         Ok(RuntimeValue::Nu(Value::record(
             test_run_record(&runner, &positional, &run),
             Span::unknown(),
@@ -8682,6 +8810,7 @@ impl Evaluator<'_> {
         named: &[(String, Value)],
         context: &str,
         complete: bool,
+        inputs: &CommandInputLabels,
     ) -> Result<Record, ShellError> {
         let default_cwd = self.current_cwd_path(context)?;
         // A command is a metered call: it counts against the attempt's
@@ -8721,7 +8850,7 @@ impl Evaluator<'_> {
         }
         let clock = crate::stone_effects::effect_clock();
         let invocation =
-            run_call_values(context, call_positional, named, default_cwd, complete, |path| {
+            run_call_values(context, call_positional, named, default_cwd.clone(), complete, |path| {
                 self.resolve_script_path(path)
             });
         let invocation = match invocation {
@@ -8755,6 +8884,10 @@ impl Evaluator<'_> {
         if !written.is_empty() {
             record.insert("files", run_files_value(&written, &invocation.cwd));
         }
+        record.insert(
+            "rests_on",
+            self.command_rests_on(&argv, &written, inputs, &invocation.cwd),
+        );
         record.insert("seq", Value::int(crate::stone_snapshots::next_seq(), Span::unknown()));
         // Tier-1 effects: what changed in the workspace while the command ran.
         let effects = if crate::gateway_runtime::enabled() {
@@ -8784,6 +8917,55 @@ impl Evaluator<'_> {
             Span::unknown(),
         );
         Ok(record)
+    }
+
+    /// Which model answers a command's inputs came from: its argv, stdin,
+    /// env, and `files=` text, and files this program wrote with labeled
+    /// text that the command names (`pytest tests/test_x.py`) or that lie
+    /// under a directory it names (`pytest tests`). The `files=` it wrote
+    /// are recorded, so a later command that names them sees them too.
+    fn command_rests_on(
+        &self,
+        argv: &[String],
+        written: &[(String, String)],
+        inputs: &CommandInputLabels,
+        cwd: &Path,
+    ) -> Value {
+        let mut parts = inputs.clone();
+        for (via, label) in inputs {
+            if let Some(path) = via.strip_prefix("files=") {
+                if written.iter().any(|(written, _)| written == path) {
+                    self.note_file_write(&cwd.join(path), *label, false);
+                }
+            }
+        }
+        // `files=` text without a label replaces whatever was there.
+        for (path, _) in written {
+            let via = format!("files={path}");
+            if !inputs.iter().any(|(entry, _)| *entry == via) {
+                self.note_file_write(&cwd.join(path), stone_containers::Label::default(), false);
+            }
+        }
+        let provenance = self.state.provenance.borrow();
+        if provenance.has_files() {
+            for arg in argv {
+                // A pytest node id names its file: `tests/test_x.py::test_a`.
+                let arg = arg.split("::").next().unwrap_or_default();
+                if arg.is_empty() || arg.starts_with('-') || arg.contains('\n') {
+                    continue;
+                }
+                for (path, label) in provenance.files_named(&cwd.join(arg)) {
+                    let shown = path.strip_prefix(cwd).unwrap_or(&path);
+                    let via = format!("file {}", shown.display());
+                    let given = format!("files={}", shown.display());
+                    if !parts.iter().any(|(entry, _)| *entry == via || *entry == given) {
+                        parts.push((via, label));
+                    }
+                }
+            }
+        }
+        let rests_on = provenance.rests_on(&parts);
+        json_to_nu_value(JsonValue::Array(rests_on), Span::unknown())
     }
 
     fn eval_run_wait_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -9261,15 +9443,13 @@ impl Evaluator<'_> {
                 ));
             }
             let info = model_ask_info(&model, &request, input_info);
+            let model_name = request_model_name(&request);
             let response = self.execute_model_request(request, &hooks, &model.meter)?;
             let content = model_response_content(&response)?;
-            model.record_last(
-                vec![model_response_transition_id(&response)],
-                &content,
-                true,
-                &info,
-            );
-            return Ok(RuntimeValue::Nu(Value::string(content, Span::unknown())));
+            let transition_id = model_response_transition_id(&response);
+            model.record_last(vec![transition_id.clone()], &content, true, &info);
+            let label = self.model_answer_label(&model_name, &[transition_id]);
+            return Ok(stone_provenance::text_value(content, label));
         };
 
         let wrapped = stone_records::is_wrapped_output(&ty);
@@ -9301,12 +9481,7 @@ impl Evaluator<'_> {
             json!({"type": "json_object"}),
         );
         let info = model_ask_info(&model, &request, input_info);
-        let model_name = request
-            .get("model")
-            .and_then(JsonValue::as_str)
-            .filter(|name| !name.is_empty())
-            .unwrap_or("default")
-            .to_string();
+        let model_name = request_model_name(&request);
 
         let mut issues = Vec::new();
         let mut content = String::new();
@@ -9336,7 +9511,8 @@ impl Evaluator<'_> {
                                 None => Vec::new(),
                             };
                             if problems.is_empty() {
-                                self.label_model_answer(&value, &model_name, &transition_ids);
+                                let label = self.model_answer_label(&model_name, &transition_ids);
+                                let value = stone_containers::label_deep(value, label);
                                 model.record_last(transition_ids, &content, true, &info);
                                 return Ok(value);
                             }
@@ -9377,22 +9553,14 @@ impl Evaluator<'_> {
         )))
     }
 
-    /// Mark a typed answer's records and containers as made by this model
-    /// call, so a later named input can say so (design 5.9).
-    fn label_model_answer(&mut self, value: &RuntimeValue, model_name: &str, transition_ids: &[String]) {
-        if !matches!(
-            value,
-            RuntimeValue::Record(_) | RuntimeValue::List(_) | RuntimeValue::Dict(_)
-        ) {
-            return;
-        }
-        let mut answers = self.state.model_answers.borrow_mut();
-        answers.push(json!({
+    /// A new provenance source for one model call's answer, and its label:
+    /// its strings and containers say this call made them (design 5.9).
+    fn model_answer_label(&mut self, model_name: &str, transition_ids: &[String]) -> stone_containers::Label {
+        self.state.provenance.borrow_mut().source(json!({
+            "kind": "model",
             "model": model_name,
             "transition_id": transition_ids.last().cloned().unwrap_or_default(),
-        }));
-        let label = u32::try_from(answers.len()).unwrap_or(u32::MAX);
-        stone_containers::set_label_deep(value, stone_containers::Label(label));
+        }))
     }
 
     /// The messages of a `model.ask` prompt as the plain list the request
@@ -9413,9 +9581,9 @@ impl Evaluator<'_> {
             None | Some(RuntimeValue::Nu(Value::Nothing { .. })) => None,
             Some(inputs) => Some(inputs),
         };
-        if let RuntimeValue::Nu(Value::String { val, .. }) = &prompt {
+        if let Some(val) = stone_provenance::as_text(&prompt) {
             let Some(inputs) = inputs else {
-                return Ok((Value::list(vec![plain("user", val.clone())], Span::unknown()), Vec::new()));
+                return Ok((Value::list(vec![plain("user", val.to_string())], Span::unknown()), Vec::new()));
             };
             let (content, info) = self.render_message_inputs(val, inputs, "model.ask")?;
             let info = info
@@ -9457,7 +9625,7 @@ impl Evaluator<'_> {
                             .position(|field| field.name == name)
                             .map(|position| record.get(position))
                     };
-                    let text = |value: Option<RuntimeValue>| match value {
+                    let text = |value: Option<RuntimeValue>| match value.map(RuntimeValue::unlabeled) {
                         Some(RuntimeValue::Nu(Value::String { val, .. })) => val,
                         _ => String::new(),
                     };
@@ -9513,14 +9681,14 @@ impl Evaluator<'_> {
         }
         let rendered = stone_inputs::render(text, &entries)
             .map_err(|message| model_ask_input_error(format!("{context}(): {message}")))?;
-        let answers = self.state.model_answers.borrow();
+        let provenance = self.state.provenance.borrow();
         let info = entries
             .iter()
             .map(|(name, value)| {
                 json!({
                     "name": name,
                     "type": stone_inputs::type_name(value),
-                    "source": stone_inputs::source(value, &answers),
+                    "source": stone_inputs::source(value, &provenance),
                 })
             })
             .collect();
@@ -9536,7 +9704,7 @@ impl Evaluator<'_> {
                 "message() takes the message text, then inputs= and role=: message(\"Review the fix.\", inputs={\"fix\": fix})",
             ));
         };
-        let text = match self.eval_expr_value(text)? {
+        let text = match self.eval_expr_value(text)?.unlabeled() {
             RuntimeValue::Nu(Value::String { val, .. }) => val,
             other => {
                 return Err(model_ask_input_error(format!(
@@ -9551,7 +9719,7 @@ impl Evaluator<'_> {
             match name.as_str() {
                 "inputs" => inputs = Some(self.eval_expr_value(expr)?),
                 "role" => {
-                    role = match self.eval_expr_value(expr)? {
+                    role = match self.eval_expr_value(expr)?.unlabeled() {
                         RuntimeValue::Nu(Value::String { val, .. })
                             if matches!(val.as_str(), "user" | "assistant" | "system") =>
                         {
@@ -13277,6 +13445,30 @@ impl Evaluator<'_> {
         }
     }
 
+    /// `provenance(x)`: the sources of the data in `x`, such as the model
+    /// answers its text came from, as a list of records.
+    fn eval_provenance_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
+        let [value] = call.positional.as_slice() else {
+            return Err(stone_error(
+                "provenance",
+                "provenance() requires exactly one value",
+            ));
+        };
+        if !call.named.is_empty() {
+            return Err(stone_error(
+                "provenance",
+                "provenance() keyword arguments are not supported",
+            ));
+        }
+        let value = self.eval_expr_value(value)?;
+        let label = self.input_label(&[&value]);
+        let sources = self.state.provenance.borrow().sources_of(label);
+        Ok(RuntimeValue::Nu(json_to_nu_value(
+            JsonValue::Array(sources),
+            Span::unknown(),
+        )))
+    }
+
     fn eval_hash_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
         let name = call.name.as_str();
         if !call.named.is_empty() {
@@ -13600,9 +13792,9 @@ impl Evaluator<'_> {
                 "split() requires text, optional separator, and optional maxsplit",
             ));
         };
-        let text = self
-            .eval_expr_value(text)?
-            .into_nu_value("split")?;
+        let text = self.eval_expr_value(text)?;
+        let label = self.input_label(&[&text]);
+        let text = text.into_nu_value("split")?;
         let separator = match call.positional.as_slice() {
             [_] => None,
             [_, separator] | [_, separator, _] => {
@@ -13624,7 +13816,8 @@ impl Evaluator<'_> {
                 .map(|value| value.into_nu_value("split"))
                 .transpose()?,
         };
-        split_builtin(&text, separator.as_ref(), maxsplit.as_ref()).map(RuntimeValue::Nu)
+        split_builtin(&text, separator.as_ref(), maxsplit.as_ref())
+            .map(|parts| labeled_result(RuntimeValue::Nu(parts), label))
     }
 
     fn eval_join_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -13640,25 +13833,35 @@ impl Evaluator<'_> {
                 "join() requires items and optional separator",
             ));
         };
+        let mut labels = Vec::new();
         let first = match items {
             Expr::Generator { .. } => {
-                Value::list(self.eval_generator_values(items)?, Span::unknown())
+                let items = self.eval_generator_runtime_values(items)?;
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    stone_containers::collect_labels(&item, &mut labels);
+                    values.push(item.into_nu_value("join")?);
+                }
+                Value::list(values, Span::unknown())
             }
-            _ => self
-                .eval_expr_value(items)?
-                .into_nu_value("join")?,
+            _ => {
+                let items = self.eval_expr_value(items)?;
+                stone_containers::collect_labels(&items, &mut labels);
+                items.into_nu_value("join")?
+            }
         };
         let second = match call.positional.as_slice() {
             [_] => None,
             [_, second] => {
-                let second = self
-                    .eval_expr_value(second)?
-                    .into_nu_value("join")?;
-                Some(second)
+                let second = self.eval_expr_value(second)?;
+                stone_containers::collect_labels(&second, &mut labels);
+                Some(second.into_nu_value("join")?)
             }
             _ => unreachable!(),
         };
-        join_builtin(&first, second.as_ref()).map(RuntimeValue::Nu)
+        let label = self.join_labels(labels);
+        join_builtin(&first, second.as_ref())
+            .map(|text| labeled_result(RuntimeValue::Nu(text), label))
     }
 
     fn eval_slice_call(&mut self, call: &Call) -> Result<RuntimeValue, ShellError> {
@@ -13694,7 +13897,9 @@ impl Evaluator<'_> {
                 crate::stone_builtins::normalize_slice_bounds(start, end, items.len())?;
             return Ok(list_from_values(items[start..end].to_vec()));
         }
-        slice_builtin(&value.into_nu_value("slice")?, start, end).map(RuntimeValue::Nu)
+        let label = self.input_label(&[&value]);
+        slice_builtin(&value.into_nu_value("slice")?, start, end)
+            .map(|part| labeled_result(RuntimeValue::Nu(part), label))
     }
 
     fn eval_optional_slice_arg(
@@ -13744,18 +13949,22 @@ impl Evaluator<'_> {
         let Some(template) = call.positional.first() else {
             return Err(stone_error("format", "format() requires a template string"));
         };
-        let template = self
-            .eval_expr_value(template)?
-            .into_nu_value("format")?;
+        let template = self.eval_expr_value(template)?;
+        let mut labels = Vec::new();
+        stone_containers::collect_labels(&template, &mut labels);
+        let template = template.into_nu_value("format")?;
         let mut args = Vec::with_capacity(call.positional.len().saturating_sub(1));
         for arg in call.positional.iter().skip(1) {
             let value = self.eval_expr_value(arg)?;
+            stone_containers::collect_labels(&value, &mut labels);
             args.push(match self.error_value_text(&value, false) {
                 Some(text) => Value::string(text, Span::unknown()),
                 None => value.into_nu_value("format")?,
             });
         }
-        format_builtin(&template, &args).map(RuntimeValue::Nu)
+        let label = self.join_labels(labels);
+        format_builtin(&template, &args)
+            .map(|text| labeled_result(RuntimeValue::Nu(text), label))
     }
 
     /// Python's print: writes str() of each value, joined by `sep` and
@@ -14237,18 +14446,27 @@ impl Evaluator<'_> {
             }
 
             let receiver = self.eval_expr_value(receiver)?;
+            let mut labels = Vec::new();
+            stone_containers::collect_labels(&receiver, &mut labels);
             let args = positional
                 .iter()
                 .map(|arg| {
                     if method == "join" && matches!(arg, Expr::Generator { .. }) {
-                        let values = self.eval_generator_values(arg)?;
-                        Ok(Value::list(values, Span::unknown()))
+                        let values = self.eval_generator_runtime_values(arg)?;
+                        let mut plain = Vec::with_capacity(values.len());
+                        for value in values {
+                            stone_containers::collect_labels(&value, &mut labels);
+                            plain.push(value.into_nu_value("method call")?);
+                        }
+                        Ok(Value::list(plain, Span::unknown()))
                     } else {
-                        self.eval_expr_value(arg)?
-                            .into_nu_value("method call")
+                        let value = self.eval_expr_value(arg)?;
+                        stone_containers::collect_labels(&value, &mut labels);
+                        value.into_nu_value("method call")
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let label = self.join_labels(labels);
 
             if let RuntimeValue::File(handle) = receiver {
                 return self.eval_file_method(handle, method, &args);
@@ -14264,9 +14482,8 @@ impl Evaluator<'_> {
             match method {
                 "strip" | "lstrip" | "rstrip" | "isdigit" | "isalpha" | "isalnum" | "split"
                 | "rsplit" | "splitlines" | "replace" | "join" | "lower" | "upper" | "zfill"
-                | "startswith" | "endswith" => {
-                    string_method_builtin(&receiver, method, &args).map(RuntimeValue::Nu)
-                }
+                | "startswith" | "endswith" => string_method_builtin(&receiver, method, &args)
+                    .map(|value| labeled_result(RuntimeValue::Nu(value), label)),
                 "count" => self.eval_count_method(receiver, &args),
                 "get" | "items" | "keys" | "values" => {
                     record_method_builtin(&receiver, method, &args).map(RuntimeValue::Nu)
@@ -14312,6 +14529,7 @@ impl Evaluator<'_> {
         if let Some(value) = collection_binop(op, &left, &right)? {
             return Ok(value);
         }
+        let label = self.input_label(&[&left, &right]);
         let left = left.into_nu_value(op)?;
         let right = right.into_nu_value(op)?;
         match op {
@@ -14322,7 +14540,7 @@ impl Evaluator<'_> {
             "bitwise or" => bitwise_int_values(&left, &right, op, |left, right| left | right),
             _ => bitwise_int_values(&left, &right, op, |left, right| left ^ right),
         }
-        .map(RuntimeValue::Nu)
+        .map(|value| labeled_result(RuntimeValue::Nu(value), label))
     }
 
     #[inline(never)]
@@ -14714,12 +14932,12 @@ impl Evaluator<'_> {
                         [key, default] => (key, Some(default.clone())),
                         _ => return Err(arity("1 or 2 arguments (key, default)")),
                     };
-                    let RuntimeValue::Nu(Value::String { val: key, .. }) = key else {
+                    let Some(key) = stone_provenance::as_text(key) else {
                         return Err(crate::stone_builtins::dict_key_error(method, &runtime_type_name(key)));
                     };
                     if method == "setdefault" {
                         if !dict.contains_key(key) {
-                            dict.insert(key.clone(), default.unwrap_or_else(none));
+                            dict.insert(key.to_string(), default.unwrap_or_else(none));
                         }
                         return Ok(dict.get(key).unwrap_or_else(none));
                     }
@@ -14730,7 +14948,7 @@ impl Evaluator<'_> {
                             "KeyError",
                             "pop",
                             crate::stone_builtins::python_repr(&Value::string(
-                                key.clone(),
+                                key,
                                 Span::unknown(),
                             ))?,
                         )),
@@ -14806,9 +15024,10 @@ impl Evaluator<'_> {
                 other => shared_sequence_items(other).unwrap_or_default(),
             };
             match items.as_slice() {
-                [RuntimeValue::Nu(Value::String { val: key, .. }), value] => {
-                    entries.push((key.clone(), value.clone()))
-                }
+                [key, value] if stone_provenance::as_text(key).is_some() => entries.push((
+                    stone_provenance::as_text(key).unwrap_or_default().to_string(),
+                    value.clone(),
+                )),
                 [key, _] => return Err(crate::stone_builtins::dict_key_error(context, &runtime_type_name(key))),
                 _ => {
                     return Err(stone_typed_error(
@@ -15003,6 +15222,19 @@ impl Evaluator<'_> {
         Ok(output)
     }
 
+    /// A generator's items as runtime values, so labels survive (`"".join(...)`).
+    fn eval_generator_runtime_values(&mut self, expression: &Expr) -> Result<Vec<RuntimeValue>, ShellError> {
+        let Expr::Generator { elt, clauses } = expression else {
+            return Err(stone_error("generator expression", "expected generator"));
+        };
+        let mut output = Vec::new();
+        self.eval_comprehension_clauses("generator expression", clauses, 0, &mut |evaluator| {
+            output.push(evaluator.eval_expr_value(elt)?);
+            Ok(false)
+        })?;
+        Ok(output)
+    }
+
     fn eval_generator_truthy(
         &mut self,
         expression: &Expr,
@@ -15115,11 +15347,8 @@ impl Evaluator<'_> {
                     identical == (*op == CompareOp::Is)
                 } else if matches!(op, CompareOp::Is | CompareOp::IsNot) {
                     identity_comparison(*op, &left_value, &right_value)?
-                } else if let (
-                    CompareOp::In | CompareOp::NotIn,
-                    RuntimeValue::Nu(Value::String { val: key, .. }),
-                    RuntimeValue::Dict(dict),
-                ) = (op, &left_value, &right_value)
+                } else if let (CompareOp::In | CompareOp::NotIn, Some(key), RuntimeValue::Dict(dict)) =
+                    (op, stone_provenance::as_text(&left_value), &right_value)
                 {
                     dict.contains_key(key) == (*op == CompareOp::In)
                 } else if let Some(result) =
@@ -15374,6 +15603,12 @@ fn repeat_sequence(left: &RuntimeValue, right: &RuntimeValue) -> Result<Option<R
             }
             Ok(Some(RuntimeValue::Nu(Value::string(val.repeat(times), Span::unknown()))))
         }
+        RuntimeValue::Str(text) => {
+            if too_large(text.text.len()) {
+                return Err(stone_error("multiplication", "repeated string is too large"));
+            }
+            Ok(Some(stone_provenance::text_value(text.text.repeat(times), text.label)))
+        }
         RuntimeValue::List(_) | RuntimeValue::Nu(Value::List { .. }) => {
             let items = match sequence {
                 RuntimeValue::List(list) => list.shared_items(),
@@ -15573,6 +15808,7 @@ const STONE_BUILTIN_NAMES: &[&str] = &[
     "map",
     "max",
     "md5",
+    "provenance",
     "min",
     "model_call",
     "model_infer",
@@ -18605,6 +18841,7 @@ fn stone_const_string(function: &StoneIrFunction, id: ConstId) -> Result<&str, S
 fn runtime_type_name(value: &RuntimeValue) -> &'static str {
     match value {
         RuntimeValue::Nu(value) => value_type_name(value),
+        RuntimeValue::Str(_) => "str",
         RuntimeValue::List(_) => "list",
         RuntimeValue::Dict(_) => "dict",
         RuntimeValue::Record(_) => "record",
@@ -18709,6 +18946,17 @@ fn slice_with_step(
                 .map(|index| items[index].clone())
                 .collect(),
         )),
+        RuntimeValue::Str(text) => {
+            let label = text.label;
+            let chars = text.text.chars().collect::<Vec<_>>();
+            Ok(stone_provenance::text_value(
+                positions(chars.len())?
+                    .into_iter()
+                    .map(|index| chars[index])
+                    .collect::<String>(),
+                label,
+            ))
+        }
         other => match other.into_nu_value("subscript")? {
             Value::List { vals, .. } => Ok(RuntimeValue::Nu(Value::list(
                 positions(vals.len())?
@@ -19042,10 +19290,7 @@ fn as_type(value: &RuntimeValue) -> Option<&TypeSpec> {
 }
 
 fn as_text(value: &RuntimeValue) -> Option<&str> {
-    match value {
-        RuntimeValue::Nu(Value::String { val, .. }) => Some(val),
-        _ => None,
-    }
+    stone_provenance::as_text(value)
 }
 
 /// Comparisons with a type on either side, or `None` for other values.
@@ -19140,9 +19385,7 @@ fn record_comparison(
         // results differ in their optional fields (a timed-out run has no
         // exit status to report, say).
         CompareOp::In | CompareOp::NotIn if right_record => {
-            let (RuntimeValue::Record(record), RuntimeValue::Nu(Value::String { val, .. })) =
-                (right, left)
-            else {
+            let (RuntimeValue::Record(record), Some(val)) = (right, as_text(left)) else {
                 return Err(stone_error(
                     "membership",
                     "a record is not a container: `\"name\" in record` asks whether it has a field; read fields as attributes, such as `value.field`",
@@ -19382,6 +19625,12 @@ fn value_to_iter_values(value: &RuntimeValue) -> Result<Vec<Value>, ShellError> 
                 .map(|ch| Value::string(ch.to_string(), Span::unknown()))
                 .collect())
         }
+        // Characters reached by iteration do not carry the label; `s[i]` does.
+        RuntimeValue::Str(text) => Ok(text
+            .text
+            .chars()
+            .map(|ch| Value::string(ch.to_string(), Span::unknown()))
+            .collect()),
         RuntimeValue::Nu(other) => Err(stone_error(
             "iteration",
             format!("cannot iterate {}", crate::stone_builtins::value_type_name(&other)),
@@ -20311,6 +20560,48 @@ fn model_response_content(response: &Value) -> Result<String, ShellError> {
         .map_err(|error| model_infer_validation_error(error.to_string()))
 }
 
+/// A path the program wrote, as the file table keys it: absolute. Through
+/// the Gateway a relative path is relative to the workspace root, which is
+/// where the command container mounts it; locally paths are already
+/// absolute (`resolve_script_path`).
+fn tracked_path(target: &Path) -> PathBuf {
+    if target.is_absolute() {
+        return target.to_path_buf();
+    }
+    match gateway_runtime::workspace_mount_path() {
+        Some(root) if gateway_runtime::enabled() => root.join(target),
+        _ => target.to_path_buf(),
+    }
+}
+
+/// The labels of a command's inputs, by where each enters it: "argv",
+/// "stdin", "env", or "files=<path>".
+type CommandInputLabels = Vec<(String, stone_containers::Label)>;
+
+/// A string (or list of strings) an operation made from labeled inputs
+/// carries their label; any other result is left as it is.
+fn labeled_result(value: RuntimeValue, label: stone_containers::Label) -> RuntimeValue {
+    if label.0 == 0 {
+        return value;
+    }
+    match value {
+        RuntimeValue::Nu(Value::String { .. } | Value::List { .. }) | RuntimeValue::Str(_) => {
+            stone_containers::label_deep(value, label)
+        }
+        other => other,
+    }
+}
+
+/// The model a request names, or "default" when the Gateway picks it.
+fn request_model_name(request: &serde_json::Map<String, JsonValue>) -> String {
+    request
+        .get("model")
+        .and_then(JsonValue::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("default")
+        .to_string()
+}
+
 fn model_response_transition_id(response: &Value) -> String {
     match response {
         Value::Record { val, .. } => match val.get("transition_id") {
@@ -20496,7 +20787,7 @@ fn test_run_record(runner: &str, argv: &[Value], run: &Record) -> Record {
         .nth(TEST_OUTPUT_TAIL_CHARS)
         .map_or(0, |(index, _)| index);
     record.push("output", Value::string(&output[tail_start..], span));
-    for field in ["files", "seq"] {
+    for field in ["files", "rests_on", "seq"] {
         if let Some(value) = run.get(field) {
             record.push(field, value.clone());
         }
@@ -21624,7 +21915,7 @@ fn isinstance_type_error(spec: &str) -> ShellError {
 /// shape. `None` means `name` is not one of them.
 fn builtin_isinstance(name: &str, value: &RuntimeValue) -> Result<Option<bool>, ShellError> {
     let matches = match name {
-        "str" => matches!(value, RuntimeValue::Nu(Value::String { .. })),
+        "str" => as_text(value).is_some(),
         // As in Python, bool is a subclass of int.
         "int" => matches!(
             value,
@@ -23393,6 +23684,189 @@ emit(inc(5))
             let error = format!("{:?}", value.expect_err(source));
             assert!(error.contains(expected), "{source}: {error}");
         }
+        drop(root);
+        Ok(())
+    }
+
+    /// Every operation that makes text or a list of text from labeled text
+    /// keeps the label. Operations that give a number or a bool drop it by
+    /// design (numbers and bools carry no label); they are listed here so a
+    /// new operation has to be put on one side or the other.
+    #[test]
+    fn provenance_audit_of_text_operations() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("stone-provenance-audit")?;
+        let test_model = std::rc::Rc::new(std::cell::RefCell::new(
+            super::stone_model::TestModel::default(),
+        ));
+        test_model.borrow_mut().replies = vec![
+            " Fix: a,b\nline2 ".to_string(),
+            r#"{"value": ["b.py", "a.py", "b.py"]}"#.to_string(),
+        ]
+        .into();
+        let mut session = StoneSession {
+            test_model: Some(test_model.clone()),
+            ..StoneSession::default()
+        };
+        let keeps: &[&str] = &[
+            "s.strip()", "s.lstrip()", "s.rstrip()", "s.split(',')[0]", "s.rsplit(',')[1]",
+            "s.splitlines()[1]", "s.replace('a', 'x')", "s.lower()", "s.upper()", "s.zfill(20)",
+            "'-'.join(xs)", "s.join(['1', '2'])", "'-'.join(x for x in xs)",
+            "split(s, ',')[0]", "join(xs, ',')", "slice(s, 1, 3)", "slice(xs, 0, 1)[0]",
+            "format('{}', s)", "format(s)", "str(s)", "repr(s)", "str(xs)",
+            "json_dumps(xs)", "json_loads(json_dumps(xs))[0]",
+            "s[0]", "s[1:3]", "s[::2]", "xs[0]", "xs[-1]", "xs[0:2][1]", "xs[::-1][0]",
+            "f'{s}'", "s + '!'", "'!' + s", "s * 2", "xs + ['c']", "[x for x in xs][0]",
+            "sorted(xs)[0]", "unique(xs)[0]", "reversed(xs)[0]", "list(xs)[0]",
+            "first(xs)", "last(xs)", "min(xs)", "max(xs)", "tuple(xs)[0]",
+            "{'k': s}['k']", "{'k': s}.get('k')", "[s][0]", "(s, 1)[0]",
+            "enumerate(xs)[0][1]", "zip(xs, xs)[0][0]",
+        ];
+        let drops: &[&str] = &[
+            "len(s)", "s.count('a')", "s.find('a')", "s.rfind('a')", "s.index('a')",
+            "s.isdigit()", "s.isalpha()", "s.isalnum()", "s.startswith('a')",
+            "s.endswith('a')", "starts_with(s, 'a')", "'a' in s", "s == s",
+            "md5(s)", "sha1(s)", "sha256(s)",
+        ];
+        let mut source = String::from(
+            "s = model.ask(\"text\")\nxs = model.ask(\"files\", output=list[str])\nout = {}\n",
+        );
+        for expression in keeps.iter().chain(drops) {
+            source.push_str(&format!(
+                "out[{expression:?}] = len(provenance({expression}))\n"
+            ));
+        }
+        source.push_str("emit(out)\n");
+        let value = crate::stone_frontend::eval_stone_source_with_output_and_session(
+            &engine_state,
+            &mut stack,
+            &source,
+            PipelineData::empty(),
+            &mut session,
+        )
+        .and_then(|output| json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown()))?;
+        let lost: Vec<_> = keeps
+            .iter()
+            .filter(|expression| value[**expression] != json_value!(1))
+            .collect();
+        assert!(lost.is_empty(), "these lost the label: {lost:?}");
+        let kept: Vec<_> = drops
+            .iter()
+            .filter(|expression| value[**expression] != json_value!(0))
+            .collect();
+        assert!(kept.is_empty(), "these were expected to drop it: {kept:?}");
+        drop(root);
+        Ok(())
+    }
+
+    #[test]
+    fn provenance_follows_model_text_into_files_and_commands() -> Result<(), ShellError> {
+        let (engine_state, mut stack, root) = test_engine("stone-provenance")?;
+        let test_model = std::rc::Rc::new(std::cell::RefCell::new(
+            super::stone_model::TestModel::default(),
+        ));
+        test_model.borrow_mut().replies =
+            vec!["print('repro ok')".to_string(), r#"{"value": ["x.py", "y.py"]}"#.to_string()].into();
+        let mut session = StoneSession {
+            test_model: Some(test_model.clone()),
+            ..StoneSession::default()
+        };
+        let source = concat!(
+            "code = model.ask(\"write a repro\")\n",
+            "files = model.ask(\"which files?\", output=list[str])\n",
+            "t = model.last.transition_ids[-1]\n",
+            "def n(x):\n    return len(provenance(x))\n",
+            "derived = {\n",
+            "    \"fstring\": n(f\"# repro\\n{code}\\n\"),\n",
+            "    \"plus\": n(\"a\" + code),\n",
+            "    \"method\": n(code.upper()),\n",
+            "    \"split\": n(code.split(\"'\")[1]),\n",
+            "    \"join\": n(\",\".join(files)),\n",
+            "    \"join_gen\": n(\"\".join(x for x in [code])),\n",
+            "    \"format\": n(format(\"{}!\", code)),\n",
+            "    \"index\": n(code[0]),\n",
+            "    \"slice\": n(code[1:4]),\n",
+            "    \"str\": n(str(code)),\n",
+            "    \"json\": n(json_loads(json_dumps({\"c\": code}))[\"c\"]),\n",
+            "    \"element\": n(files[1]),\n",
+            "    \"both\": n(code + files[0]),\n",
+            "    \"plain\": n(\"plain\"),\n",
+            "    \"length\": n(len(code)),\n",
+            "}\n",
+            "acc = \"\"\n",
+            "for i in range(50):\n    acc = acc + code[i % 3]\n",
+            "derived[\"loop_concat\"] = n(acc)\n",
+            "kept = []\n",
+            "for i in range(50):\n    kept.append(files[i % 2])\n",
+            "derived[\"loop_append\"] = n(kept[49])\n",
+            "total = 0\n",
+            "for i in range(2000):\n    total = total + len(kept[i % 50])\n    kept[i % 50] = kept[i % 50]\n",
+            "derived[\"hot_loop\"] = n(kept[3])\n",
+            "words = [w + \"!\" for w in files]\n",
+            "derived[\"comprehension\"] = n(words[0])\n",
+            "box = {\"c\": code}\n",
+            "for i in range(50):\n    box[\"c\"] = box[\"c\"]\n",
+            "derived[\"dict_loop\"] = n(box[\"c\"])\n",
+            "def wrap(x):\n    return \"<\" + x + \">\"\n",
+            "derived[\"function\"] = n(wrap(code))\n",
+            "write_text(\"repro.py\", f\"# repro\\n{code}\\n\")\n",
+            "write_text(\"mine.py\", \"print('mine')\\n\")\n",
+            "read_back = n(read_text(\"repro.py\"))\n",
+            "a = run([\"cat\", \"repro.py\"])\n",
+            "b = run([\"cat\", \"mine.py\"])\n",
+            "c = run([\"cat\", \"./\"])\n",
+            "d = run([\"cat\"], stdin=code)\n",
+            "e = run([\"cat\", \"t/check.txt\"], files={\"t/check.txt\": code})\n",
+            "f = run([\"cat\", \"t/check.txt\"])\n",
+            "g = run_tests([\"cat\", \"repro.py::test_a\"])\n",
+            "edit(\"mine.py\", \"mine\", files[0])\n",
+            "h = run([\"cat\", \"mine.py\"])\n",
+            "write_text(\"repro.py\", \"print('rewritten')\\n\")\n",
+            "rm(\"mine.py\")\n",
+            "i = run([\"cat\", \".\"])\n",
+            "emit({\"derived\": derived, \"read_back\": read_back, \"t\": t, \"code_source\": provenance(code),\n",
+            "      \"a\": a.rests_on, \"b\": b.rests_on, \"c\": c.rests_on, \"d\": d.rests_on, \"e\": e.rests_on,\n",
+            "      \"f\": f.rests_on, \"g\": g.rests_on, \"h\": h.rests_on, \"i\": i.rests_on})\n",
+        );
+        let value = crate::stone_frontend::eval_stone_source_with_output_and_session(
+            &engine_state,
+            &mut stack,
+            source,
+            PipelineData::empty(),
+            &mut session,
+        )
+        .and_then(|output| json::pipeline_to_json_value(output.pipeline, nu_protocol::Span::unknown()))?;
+        let derived = value["derived"].as_object().expect("derived");
+        for (name, count) in derived {
+            let expected = match name.as_str() {
+                "both" => 2,
+                "plain" | "length" => 0,
+                _ => 1,
+            };
+            assert_eq!(count, &json_value!(expected), "{name}");
+        }
+        assert_eq!(value["read_back"], json_value!(1));
+        let code_source = &value["code_source"][0];
+        assert_eq!(code_source["kind"], json_value!("model"));
+        assert_eq!(code_source["model"], json_value!("default"));
+        let code_transition = code_source["transition_id"].clone();
+        let list_transition = value["t"].clone();
+        assert_ne!(code_transition, list_transition);
+        let rests = |key: &str| value[key].clone();
+        let entry = |transition: &serde_json::Value, via: serde_json::Value| {
+            json_value!([{"model": "default", "transition_id": transition, "via": via}])
+        };
+        assert_eq!(rests("a"), entry(&code_transition, json_value!(["file repro.py"])), "a");
+        assert_eq!(rests("b"), json_value!([]), "b");
+        assert_eq!(rests("c"), entry(&code_transition, json_value!(["file repro.py"])), "c");
+        assert_eq!(rests("d"), entry(&code_transition, json_value!(["stdin"])), "d");
+        assert_eq!(rests("e"), entry(&code_transition, json_value!(["files=t/check.txt"])), "e");
+        let check_path = "t/check.txt";
+        assert_eq!(rests("f"), entry(&code_transition, json_value!([format!("file {check_path}")])), "f");
+        assert_eq!(rests("g"), entry(&code_transition, json_value!(["file repro.py"])), "g");
+        assert_eq!(rests("h"), entry(&list_transition, json_value!(["file mine.py"])), "h");
+        // repro.py was rewritten with plain text and mine.py removed; the
+        // command files= wrote is still tracked.
+        assert_eq!(rests("i"), entry(&code_transition, json_value!([format!("file {check_path}")])), "i");
         drop(root);
         Ok(())
     }

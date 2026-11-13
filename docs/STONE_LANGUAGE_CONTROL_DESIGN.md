@@ -176,8 +176,10 @@ So the open work is to connect the two tracks, not to invent a third:
   - Exists: `expect=` and `must_run` (5.8); record validation of model
     output, with `Field` limits (5.6); budgets at metered calls (5.3);
     typed errors (5.5); stage evidence and `ensure` (typed workflows).
-  - Missing: provenance labels that mark data the model made (D-3); a
-    loud signal when output is cut at `max_stdout_bytes`.
+  - Exists since 2026-11-12: provenance labels that mark text a model made,
+    followed through string operations and files the program writes, and
+    reported on commands as `rests_on` (5.10).
+  - Missing: a loud signal when output is cut at `max_stdout_bytes`.
 - **Errors.**
   - Exist: prescriptive admission errors; `ModelOutputError` issues, which
     feed the repair turn; `ExpectationFailed` with `.diff` (R12); the
@@ -1124,8 +1126,8 @@ model. After it, it is characters. That costs three things:
 
 - the checker cannot tell what a model step depends on;
 - the runtime cannot say where a step's evidence came from without tracking
-  labels through every string operation, which D-3 rules out (checks happen
-  at tool and model calls, not on every operation);
+  labels through every string operation (D-3 ruled this out at first; 5.10
+  later adopted it);
 - each program renders its own way, so the same evidence can come out as
   different bytes from one call to the next, which defeats the provider's
   prompt cache.
@@ -1181,10 +1183,10 @@ matches names and types and infers nothing (D-3).
 
 At run time the source of each input is recorded when it is rendered: a
 sealed result, a `model.ask` answer (with the model name and transition id),
-or a value the program made. Labels do not follow values through
-computation. A dict that the program builds from a model's fields counts as
-program-made, and that is the honest limit of this design. Full provenance
-labels remain a separate item (D-3, P3).
+or a value the program made. Since 5.10, an input's source also comes from
+its provenance label, so a string or dict the program builds from a model's
+answer is reported as that model's (several models give `{"kind": "mixed",
+"sources": [...]}`).
 
 **Prompt caching.** Providers reuse the processed prefix of a prompt:
 Anthropic at cache markers, OpenAI and vLLM automatically, and llama.cpp per
@@ -1385,6 +1387,71 @@ an LLM judge decides open questions such as "is the fix complete".
   are static, so they cost little once cached.
 - Whether `message()` should accept an assistant turn with inputs. No
   current program needs it.
+
+### 5.10 Provenance: Labels On Values (Built 2026-11-12)
+
+**Why.** In the SWE pilot (11.3 and Q2), false "verified" claims came from
+checks that ran tests the model itself wrote. 5.9 records where a model
+call's inputs came from, but it could not follow a model's text once the
+program turned it into a file and ran a command on it. That is exactly the
+path a model-written reproduction takes.
+
+**Decision.** Labels are carried by the interpreter, as in TaintDroid. A log
+of model text matched at sinks was considered and rejected: it misses text
+that was transformed, and it costs a search at every sink. Strings were
+nushell `Value::String`, which has no room for a label, so this is the first
+piece of Stone's own object model: a Stone-owned string with a label slot
+(`LabeledStr`). Unlabeled strings stay nushell strings, so programs that
+never touch model text run as before. Later steps move all strings, and
+then numbers, to Stone's own forms, which the interpreter and JIT work
+needs anyway (see `STONE_IR_INTERPRETER_JIT_ROADMAP.md`).
+
+**Mechanism.**
+
+- A label is a 32-bit index into a per-session table of source sets. Label
+  0 means "no source". Joining two labels interns the union of their sets,
+  so a join after the first is a hash lookup.
+- Sources: each `model.ask` answer. A text answer is a labeled string; a
+  typed answer has every string, list, dict, and record inside it labeled.
+- Strings carry a label; lists, dicts, and records carry one in their
+  existing container slot. Numbers and booleans carry none, so the numeric
+  path is untouched, and decisions made on labeled data (implicit flows)
+  are not tracked.
+- Every operation that makes text from labeled text gives the result the
+  join of its inputs' labels: f-strings, `+`, `*`, string methods, `split`,
+  `join`, `format`, `str`/`repr`, slicing and indexing, `json_dumps` and
+  `json_loads`. A test lists each text operation as keeping the label, or
+  as giving a number or bool, so a new operation must be put on one side.
+- Files: a write (`write_text`, `write_json`, `write_csv`, `write_jsonl`,
+  `save`, and `files=` on a command) records the path's label; an append or
+  `edit` adds to it; a full write of unlabeled text and `rm` clear it. A
+  read (`read_text`, `cat`, `read_json`, `read_csv`) of a recorded path
+  returns labeled values.
+- Sinks: `run`, `must_run`, `run_complete`, and `run_tests` report
+  `rests_on`, one entry per model answer, with `via` naming how its text got
+  in: `argv`, `stdin`, `env`, `files=<path>`, or `file <path>` for a
+  recorded file the command names, directly, as a pytest node id, or by a
+  directory above it.
+- `provenance(x)` returns the sources of `x`.
+
+**Safe failure.** An operation that does not know labels sees a plain
+string, and its result is unlabeled. A lost label means a missing
+`rests_on` entry, never an error. So an empty `rests_on` is not proof that
+no model text was used.
+
+**Known gaps.**
+
+- Text that a command writes (a shell `echo` into a file, a patch applied
+  by `git apply`) is not tracked; only files the program writes are.
+- Characters reached by iterating a string, dict keys, and the
+  `read_jsonl` row view drop the label.
+- Paths are compared as written, after `.` and `..` are applied (through
+  the Gateway, a relative path is taken from the workspace root). Symlinks
+  and other names for the same file are not followed.
+
+**What it is for.** A `TestRun` whose `rests_on` names a model answer is the
+model's own check passing, not independent evidence. A program, a stage's
+`ensure`, or a reviewer can now tell the two apart from the result.
 
 ## 6. Realistic Examples
 

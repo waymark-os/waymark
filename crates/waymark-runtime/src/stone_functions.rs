@@ -353,10 +353,9 @@ pub(crate) struct StoneSession {
     /// Where the last program's uncaught error came from: `{file, line,
     /// code, function}` frames, outermost first.
     pub(super) last_error_trace: Option<serde_json::Value>,
-    /// `{model, transition_id}` of each typed `model.ask` answer, so a named
-    /// input can say which call made it (design 5.9). A labeled value keeps
-    /// its index across the session's programs.
-    pub(super) model_answers: std::rc::Rc<std::cell::RefCell<Vec<serde_json::Value>>>,
+    /// The session's provenance sources and labels (stone_provenance), so a
+    /// labeled value keeps its meaning across the session's programs.
+    pub(super) provenance: std::rc::Rc<std::cell::RefCell<super::stone_provenance::Provenance>>,
     #[cfg(test)]
     pub(crate) test_model: Option<std::rc::Rc<std::cell::RefCell<super::stone_model::TestModel>>>,
 }

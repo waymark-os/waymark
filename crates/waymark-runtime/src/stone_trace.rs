@@ -186,6 +186,7 @@ impl Evaluator<'_> {
             }
             let large = match &value {
                 RuntimeValue::Nu(Value::String { val, .. }) => val.len() > VALUE_CHARS,
+                RuntimeValue::Str(text) => text.text.len() > VALUE_CHARS,
                 RuntimeValue::Nu(Value::List { .. } | Value::Record { .. }) => true,
                 _ => false,
             };

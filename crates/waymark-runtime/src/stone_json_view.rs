@@ -165,6 +165,15 @@ pub(super) fn eval_runtime_subscript(
             }
             Err(stone_error("subscript", "tuple index out of range"))
         }
+        // A character of a labeled string keeps the string's label.
+        RuntimeValue::Str(text) => {
+            let label = text.label;
+            let value = RuntimeValue::Str(text).into_nu_value("subscript")?;
+            match subscript_builtin(&value, index)? {
+                Value::String { val, .. } => Ok(super::stone_provenance::text_value(val, label)),
+                other => Ok(RuntimeValue::Nu(other)),
+            }
+        }
         RuntimeValue::Set(_) => Err(stone_error(
             "set",
             "a set has no positions, so it cannot be indexed (in Python either); use sorted(s)[i] or list(s)[i], or test membership with `x in s`",

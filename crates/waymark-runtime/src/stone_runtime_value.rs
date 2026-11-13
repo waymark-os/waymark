@@ -29,6 +29,9 @@ use crate::stone_attempt_value::{
 /// so rare, large values (workflows, attempt results, closures) are boxed.
 pub(super) enum RuntimeValue {
     Nu(Value),
+    /// A string that carries a provenance label (stone_provenance). Plain
+    /// strings stay `Nu`.
+    Str(super::stone_provenance::LabeledStr),
     /// A shared list (Python reference semantics; see stone_containers).
     List(ListRef),
     /// A shared dict.
@@ -68,6 +71,7 @@ pub(super) enum RuntimeValue {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RuntimeValueTag {
     Nu,
+    Str,
     List,
     Dict,
     Record,
@@ -127,6 +131,7 @@ impl RuntimeValueTag {
             RuntimeValueTag::Model => 25,
             RuntimeValueTag::Tuple => 26,
             RuntimeValueTag::Set => 27,
+            RuntimeValueTag::Str => 28,
         }
     }
 }
@@ -147,6 +152,7 @@ impl RuntimeValue {
     pub(super) fn is_session_persistable(&self) -> bool {
         match self {
             RuntimeValue::Nu(_) => true,
+            RuntimeValue::Str(_) => true,
             RuntimeValue::List(_) | RuntimeValue::Dict(_) | RuntimeValue::Record(_) => {
                 containers_are_persistable(self)
             }
@@ -180,6 +186,7 @@ impl RuntimeValue {
     pub(super) fn type_tag(&self) -> RuntimeValueTag {
         match self {
             RuntimeValue::Nu(_) => RuntimeValueTag::Nu,
+            RuntimeValue::Str(_) => RuntimeValueTag::Str,
             RuntimeValue::List(_) => RuntimeValueTag::List,
             RuntimeValue::Dict(_) => RuntimeValueTag::Dict,
             RuntimeValue::Record(_) => RuntimeValueTag::Record,
@@ -235,9 +242,20 @@ impl RuntimeValue {
         })
     }
 
+    /// The value with any string label dropped: a labeled string becomes a
+    /// plain one. For code that reads a string's text, not its provenance.
+    pub(super) fn unlabeled(self) -> RuntimeValue {
+        match self {
+            RuntimeValue::Str(text) => RuntimeValue::Nu(Value::string(text.text, Span::unknown())),
+            other => other,
+        }
+    }
+
     pub(super) fn into_nu_value(self, context: &str) -> Result<Value, ShellError> {
         match self {
             RuntimeValue::Nu(value) => Ok(value),
+            // Crossing into nushell drops the label.
+            RuntimeValue::Str(text) => Ok(Value::string(text.text, Span::unknown())),
             value @ (RuntimeValue::List(_) | RuntimeValue::Dict(_)) => {
                 materialize_owned(value, context)
             }

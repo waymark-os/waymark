@@ -60,6 +60,7 @@ fn hash_key(value: &RuntimeValue) -> Result<(String, KeyKind), ShellError> {
         RuntimeValue::Nu(Value::String { val, .. }) => {
             (format!("S{val}"), KeyKind::Other)
         }
+        RuntimeValue::Str(text) => (format!("S{}", text.text), KeyKind::Other),
         RuntimeValue::Tuple(items) => {
             let mut key = String::from("T");
             for item in items.iter() {

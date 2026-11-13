@@ -161,6 +161,7 @@ pub(crate) const PURE_BUILTINS: &[&str] = &[
     "parse_int",
     "predicate",
     "print",
+    "provenance",
     "pwd",
     "range",
     "repr",

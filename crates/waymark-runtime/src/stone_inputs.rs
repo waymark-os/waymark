@@ -21,6 +21,7 @@ use nu_protocol::Value;
 use serde_json::{json, Map, Value as JsonValue};
 
 use super::stone_containers::{label_of, ItemRef};
+use super::stone_provenance::Provenance;
 use super::stone_runtime_value::RuntimeValue;
 
 /// Fields of runtime results that differ between two runs of the same
@@ -48,6 +49,7 @@ pub(super) fn render(text: &str, inputs: &[(String, RuntimeValue)]) -> Result<St
     for (name, value) in inputs {
         let body = match value {
             RuntimeValue::Nu(Value::String { val, .. }) => val.clone(),
+            RuntimeValue::Str(text) => text.text.clone(),
             other => serde_json::to_string_pretty(&to_json(other, 0)?)
                 .map_err(|error| format!("input `{name}` could not be shown as JSON: {error}"))?,
         };
@@ -89,6 +91,7 @@ pub(super) fn check_name(name: &str) -> Result<(), String> {
 pub(super) fn type_name(value: &RuntimeValue) -> String {
     match value {
         RuntimeValue::Record(record) => record.ty.name.clone(),
+        RuntimeValue::Str(_) => "str".to_string(),
         RuntimeValue::List(_) => "list".to_string(),
         RuntimeValue::Dict(_) => "dict".to_string(),
         RuntimeValue::Tuple(_) => "tuple".to_string(),
@@ -111,24 +114,23 @@ pub(super) fn type_name(value: &RuntimeValue) -> String {
 /// Where an input came from:
 /// - `{"kind": "runtime", "type": ...}` for a result only the runtime makes
 ///   (`run`, `run_tests`, `snapshot`, ...), or a list of them;
-/// - `{"kind": "model", "model": ..., "transition_id": ...}` for a typed
-///   `model.ask` answer, or a record or container inside one;
-/// - `{"kind": "program"}` for anything else, including values the program
-///   computed from a model's answer (labels do not follow computation).
-pub(super) fn source(value: &RuntimeValue, model_answers: &[JsonValue]) -> JsonValue {
+/// - `{"kind": "model", "model": ..., "transition_id": ...}` for a value
+///   that carries one model call's label: an answer, a record, container, or
+///   string inside one, or a string built from it (stone_provenance);
+/// - `{"kind": "mixed", "sources": [...]}` for a value built from several;
+/// - `{"kind": "program"}` for anything else, such as a container the
+///   program built (a container's own label is what counts here).
+pub(super) fn source(value: &RuntimeValue, provenance: &Provenance) -> JsonValue {
     if let RuntimeValue::Record(record) = value {
         if record.ty.host {
             return json!({"kind": "runtime", "type": record.ty.name});
         }
     }
-    let label = label_of(value).0 as usize;
-    if label > 0 {
-        if let Some(JsonValue::Object(answer)) = model_answers.get(label - 1) {
-            let mut source = Map::new();
-            source.insert("kind".to_string(), json!("model"));
-            source.extend(answer.clone());
-            return JsonValue::Object(source);
-        }
+    let mut sources = provenance.sources_of(label_of(value));
+    match sources.len() {
+        0 => {}
+        1 => return sources.remove(0),
+        _ => return json!({"kind": "mixed", "sources": sources}),
     }
     if let RuntimeValue::List(list) = value {
         let mut host_type = None;
@@ -165,6 +167,7 @@ fn to_json(value: &RuntimeValue, depth: usize) -> Result<JsonValue, String> {
     };
     match value {
         RuntimeValue::Nu(value) => Ok(crate::json::nu_to_json_value(value)),
+        RuntimeValue::Str(text) => Ok(JsonValue::String(text.text.clone())),
         RuntimeValue::Record(record) => {
             let mut object = Map::new();
             record.try_for_each(|index, value| {

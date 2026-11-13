@@ -478,7 +478,8 @@ pub(super) fn check(
 fn is_plain_view(value: &RuntimeValue) -> bool {
     matches!(
         value,
-        RuntimeValue::TextLines(_)
+        RuntimeValue::Str(_)
+            | RuntimeValue::TextLines(_)
             | RuntimeValue::JsonlRows(_)
             | RuntimeValue::JsonObjectView(_)
             | RuntimeValue::JsonArrayView(_)
@@ -619,6 +620,7 @@ fn plain_preview(value: &Value) -> String {
 pub(super) fn runtime_kind(value: &RuntimeValue) -> String {
     match value {
         RuntimeValue::Nu(value) => value_type_name(value).to_string(),
+        RuntimeValue::Str(_) => "str".to_string(),
         RuntimeValue::List(_) | RuntimeValue::TextLines(_) | RuntimeValue::JsonlRows(_) => {
             "list".to_string()
         }
@@ -776,6 +778,7 @@ pub(super) fn check_limits(value: &RuntimeValue, limits: &FieldLimits) -> Result
     if limits.has_length_bounds() {
         let measured = match value {
             RuntimeValue::Nu(Value::String { val, .. }) => Some((val.chars().count(), "character")),
+            RuntimeValue::Str(text) => Some((text.text.chars().count(), "character")),
             RuntimeValue::Nu(Value::List { vals, .. }) => Some((vals.len(), "item")),
             RuntimeValue::Nu(Value::Record { val, .. }) => Some((val.len(), "key")),
             RuntimeValue::List(list) => Some((list.len(), "item")),
@@ -923,7 +926,10 @@ pub(super) fn isinstance(value: &RuntimeValue, ty: &TypeSpec) -> Result<bool, St
             false
         }
         TypeSpec::None => matches!(value, RuntimeValue::Nu(Value::Nothing { .. })),
-        TypeSpec::Str => matches!(value, RuntimeValue::Nu(Value::String { .. })),
+        TypeSpec::Str => matches!(
+            value,
+            RuntimeValue::Nu(Value::String { .. }) | RuntimeValue::Str(_)
+        ),
         TypeSpec::Int => matches!(value, RuntimeValue::Nu(Value::Int { .. } | Value::Bool { .. })),
         TypeSpec::Float => matches!(value, RuntimeValue::Nu(Value::Float { .. })),
         TypeSpec::Bool => matches!(value, RuntimeValue::Nu(Value::Bool { .. })),
@@ -1576,6 +1582,7 @@ fn record_schema(
 pub(super) fn python_str(value: &RuntimeValue) -> Result<String, ShellError> {
     match value {
         RuntimeValue::Nu(Value::String { val, .. }) => Ok(val.clone()),
+        RuntimeValue::Str(text) => Ok(text.text.clone()),
         other => python_repr(other),
     }
 }
