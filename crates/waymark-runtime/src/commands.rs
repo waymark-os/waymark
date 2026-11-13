@@ -1055,10 +1055,10 @@ change = diff(since=base)
         signature: "edit(path: str, old: str, new: str, all: bool = False, expect: Expect? = None) -> record",
         use_when: "Use for exact text replacement in a UTF-8 file. The old text must match exactly once; all=True replaces every match (at least one), and expect=Expect(occurrences=N) requires exactly N matches and replaces them all. Otherwise the file is unchanged and ExpectationFailed reports the match count and lines. Raises: FileNotFoundError, PermissionError, IsADirectoryError, NotADirectoryError, ExpectationFailed.",
         examples: &[
-            r#"write_text("/tmp/edit_example.txt", "debug=false\n")
-edit("/tmp/edit_example.txt", "debug=false", "debug=true")"#,
-            r#"write_text("/tmp/edit_example.txt", "x = 1\ny = 1\n")
-edit("/tmp/edit_example.txt", " = 1", " = 2", expect=Expect(occurrences=2))"#,
+            r#"write_text("/app/edit_example.txt", "debug=false\n")
+edit("/app/edit_example.txt", "debug=false", "debug=true")"#,
+            r#"write_text("/app/edit_example.txt", "x = 1\ny = 1\n")
+edit("/app/edit_example.txt", " = 1", " = 2", expect=Expect(occurrences=2))"#,
         ],
         avoid: &[
             "Do not pass empty old text; read a sample first if the replacement is risky.",
