@@ -377,7 +377,7 @@ emit(model.last.inputs)"#,
     },
     StoneHelpEntry {
         name: "model.limit",
-        signature: r#"model.limit(calls: int = None, input_tokens: int = None, output_tokens: int = None) -> Model; model.usage -> {calls, input_tokens, output_tokens}; model.remaining -> {calls, input_tokens, output_tokens, tool_calls, seconds}"#,
+        signature: r#"model.limit(calls: int = None, input_tokens: int = None, output_tokens: int = None) -> Model; model.usage -> {calls, input_tokens, cached_input_tokens, output_tokens}; model.remaining -> {calls, input_tokens, output_tokens, tool_calls, seconds}"#,
         use_when: "Give a function or loop a smaller share of the model budget, or read what is spent and left before deciding whether to continue. Budgets are checked only when a model is called or a command starts.",
         examples: &[
             r#"small = model.limit(calls=3, output_tokens=2000)
@@ -392,7 +392,7 @@ emit(calls_to_spend(model.limit(calls=5)))"#,
         avoid: &[
             "model.limit(...) returns a new Model; its calls are charged to it and to every budget above it, so it can never spend more than its parent has left. model.remaining is the smallest amount left along that chain, and None where nothing limits it.",
             "Running out of any budget ends the run: the call does not happen, try/except cannot catch it, nothing after it runs, and later evaluations in the same session do not run either. The result has status \"unfinished\" with the limit, the usage, recent model calls and commands, and printed output. To stop on your own terms, check model.remaining in the loop and return a partial result.",
-            "output_tokens also caps each call's max_output_tokens to what is left, so the model cannot overrun it. Token counts are those the provider reports.",
+            "output_tokens also caps each call's max_output_tokens to what is left, so the model cannot overrun it. Token counts are those the provider reports. cached_input_tokens is the part of input_tokens the provider served from its prompt cache, and 0 when the provider does not say.",
             "The host sets the attempt's budget: waymark eval --budget model_calls=40,output_tokens=60000,tool_calls=200,wall_time_ms=600000, or the Gateway attempt's resource limits. tool_calls counts commands started with run, run_complete, or must_run; wall_time_ms also bounds each command's timeout_ms.",
             "model.usage and model.remaining are fresh snapshots each time they are read.",
             "The host can also give the whole attempt a budget (model_calls, input_tokens, output_tokens, tool_calls, wall_time_ms); the program cannot raise it, and model.remaining already counts it.",

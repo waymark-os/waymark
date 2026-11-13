@@ -220,7 +220,7 @@ impl TestModel {
                 "content": reply,
                 "provider": "test",
                 "messages": [],
-                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                "usage": {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 5, "total_tokens": 15},
             }),
             nu_protocol::Span::unknown(),
         )

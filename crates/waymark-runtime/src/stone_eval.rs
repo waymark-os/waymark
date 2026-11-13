@@ -9789,11 +9789,13 @@ impl Evaluator<'_> {
             attach_transition_id(&mut response, &transition_id, "model_call")?;
             Ok(response)
         });
-        let (input_tokens, output_tokens) =
-            result.as_ref().map(model_response_tokens).unwrap_or((0, 0));
+        let tokens = result
+            .as_ref()
+            .map(model_response_tokens)
+            .unwrap_or_default();
         self.state
             .budget
-            .after_model_call(meter, input_tokens, output_tokens, result.is_ok());
+            .after_model_call(meter, tokens, result.is_ok());
         self.state.record_transition_event(json!({
             "id": transition_id,
             "kind": "model_call",
@@ -19543,8 +19545,8 @@ fn gateway_attempt_limits() -> Option<Result<stone_budget::AttemptLimits, String
     )
 }
 
-/// Input and output tokens a model response reports.
-fn model_response_tokens(response: &Value) -> (u64, u64) {
+/// The tokens a model response reports.
+fn model_response_tokens(response: &Value) -> stone_budget::ModelCallTokens {
     let response = nu_to_json_value(response);
     let tokens = |name: &str| {
         response
@@ -19553,7 +19555,11 @@ fn model_response_tokens(response: &Value) -> (u64, u64) {
             .and_then(JsonValue::as_u64)
             .unwrap_or(0)
     };
-    (tokens("input_tokens"), tokens("output_tokens"))
+    stone_budget::ModelCallTokens {
+        input_tokens: tokens("input_tokens"),
+        cached_input_tokens: tokens("cached_input_tokens"),
+        output_tokens: tokens("output_tokens"),
+    }
 }
 
 /// A command may not run past the attempt's wall-clock budget.
@@ -20244,6 +20250,7 @@ fn model_message_values_for(
 #[derive(Default)]
 struct ModelUsage {
     input_tokens: u64,
+    cached_input_tokens: u64,
     output_tokens: u64,
     total_tokens: u64,
 }
@@ -20257,6 +20264,12 @@ impl ModelUsage {
         self.input_tokens = self.input_tokens.saturating_add(
             usage
                 .get("input_tokens")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(0),
+        );
+        self.cached_input_tokens = self.cached_input_tokens.saturating_add(
+            usage
+                .get("cached_input_tokens")
                 .and_then(JsonValue::as_u64)
                 .unwrap_or(0),
         );
@@ -20277,6 +20290,7 @@ impl ModelUsage {
     fn to_json(&self) -> JsonValue {
         json!({
             "input_tokens": self.input_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
         })
@@ -23627,7 +23641,7 @@ emit(inc(5))
             value?,
             json_value!([
                 {"calls": 4, "input_tokens": null, "output_tokens": 100, "tool_calls": null, "seconds": null},
-                {"calls": 0, "input_tokens": 0, "output_tokens": 0}
+                {"calls": 0, "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
             ])
         );
 
@@ -23641,9 +23655,9 @@ emit(inc(5))
             value?,
             json_value!([
                 "x", "y", "z",
-                {"calls": 1, "input_tokens": 10, "output_tokens": 5},
+                {"calls": 1, "input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 5},
                 {"calls": 1, "input_tokens": null, "output_tokens": 3, "tool_calls": null, "seconds": null},
-                {"calls": 3, "input_tokens": 30, "output_tokens": 15},
+                {"calls": 3, "input_tokens": 30, "cached_input_tokens": 12, "output_tokens": 15},
                 1, 85
             ])
         );

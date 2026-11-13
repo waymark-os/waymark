@@ -685,7 +685,9 @@ emit({"plan": calls_to_spend(helper), "spent": model.usage})
   never spend more than its parent has left. Pass it to a function as a
   `model: Model` parameter.
 - `model.usage` is what that model value has spent (`calls`,
-  `input_tokens`, `output_tokens`). `model.remaining` is the smallest amount
+  `input_tokens`, `cached_input_tokens`, `output_tokens`).
+  `cached_input_tokens` is the part of `input_tokens` the provider served
+  from its prompt cache, and 0 when the provider does not say. `model.remaining` is the smallest amount
   left along its chain of budgets, plus the attempt's `tool_calls` (commands
   left) and `seconds` of wall-clock time; a value is `None` when nothing
   limits it. Both are fresh snapshots.

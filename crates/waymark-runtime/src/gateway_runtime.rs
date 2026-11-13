@@ -730,6 +730,8 @@ fn model_call_response_json(response: ModelCallResponse) -> JsonValue {
         "latency_ms": response.latency_ms,
         "usage": response.usage.map(|usage| json!({
             "input_tokens": usage.input_tokens,
+            "cached_input_tokens": usage.cached_input_tokens,
+            "cache_write_input_tokens": usage.cache_write_input_tokens,
             "output_tokens": usage.output_tokens,
             "total_tokens": usage.total_tokens,
         })).unwrap_or(JsonValue::Null),
@@ -3239,6 +3241,8 @@ mod tests {
                 input_tokens: 4,
                 output_tokens: 1,
                 total_tokens: 5,
+                cached_input_tokens: 3,
+                cache_write_input_tokens: 1,
             }),
             finish_reason: "stop".to_string(),
             latency_ms: 7,
@@ -3252,6 +3256,8 @@ mod tests {
         assert_eq!(response["messages"][0]["role"], json!("assistant"));
         assert_eq!(response["messages"][0]["metadata"]["kind"], json!("answer"));
         assert_eq!(response["usage"]["total_tokens"], json!(5));
+        assert_eq!(response["usage"]["cached_input_tokens"], json!(3));
+        assert_eq!(response["usage"]["cache_write_input_tokens"], json!(1));
         assert_eq!(response["metadata"]["model_class"], json!("agent"));
     }
 

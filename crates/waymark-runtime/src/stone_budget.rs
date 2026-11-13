@@ -158,10 +158,21 @@ pub(crate) struct ModelLimits {
     pub(crate) output_tokens: Option<u64>,
 }
 
+/// Tokens one model call reports. `cached_input_tokens` is the part of
+/// `input_tokens` the provider served from its prompt cache.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct ModelCallTokens {
+    pub(crate) input_tokens: u64,
+    pub(crate) cached_input_tokens: u64,
+    pub(crate) output_tokens: u64,
+}
+
 #[derive(Clone, Copy, Default, Debug)]
 struct ModelUsed {
     calls: u64,
     input_tokens: u64,
+    /// The part of `input_tokens` the provider served from its prompt cache.
+    cached_input_tokens: u64,
     output_tokens: u64,
 }
 
@@ -206,6 +217,7 @@ impl Meter {
         json!({
             "calls": used.calls,
             "input_tokens": used.input_tokens,
+            "cached_input_tokens": used.cached_input_tokens,
             "output_tokens": used.output_tokens,
         })
     }
@@ -440,14 +452,19 @@ impl Budget {
     pub(crate) fn after_model_call(
         &self,
         meter: &Rc<Meter>,
-        input_tokens: u64,
-        output_tokens: u64,
+        tokens: ModelCallTokens,
         ok: bool,
     ) {
+        let ModelCallTokens {
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+        } = tokens;
         for node in meter.chain() {
             let mut used = node.used.get();
             used.calls = used.calls.saturating_add(1);
             used.input_tokens = used.input_tokens.saturating_add(input_tokens);
+            used.cached_input_tokens = used.cached_input_tokens.saturating_add(cached_input_tokens);
             used.output_tokens = used.output_tokens.saturating_add(output_tokens);
             node.used.set(used);
         }
@@ -456,6 +473,7 @@ impl Budget {
             "ok": ok,
             "limited": !meter.is_root(),
             "input_tokens": input_tokens,
+            "cached_input_tokens": cached_input_tokens,
             "output_tokens": output_tokens,
         }));
     }
@@ -607,7 +625,15 @@ impl Budget {
 
 #[cfg(test)]
 mod tests {
-    use super::{Budget, HostLimits, ModelLimits};
+    use super::{Budget, HostLimits, ModelCallTokens, ModelLimits};
+
+    fn tokens(input_tokens: u64, output_tokens: u64) -> ModelCallTokens {
+        ModelCallTokens {
+            input_tokens,
+            cached_input_tokens: input_tokens / 2,
+            output_tokens,
+        }
+    }
 
     #[test]
     fn budgets_parse_and_reject_unknown_names() {
@@ -634,11 +660,12 @@ mod tests {
             output_tokens: Some(30),
         });
         assert_eq!(budget.before_model_call(&child).unwrap(), Some(30));
-        budget.after_model_call(&child, 10, 20, true);
+        budget.after_model_call(&child, tokens(10, 20), true);
         assert_eq!(budget.before_model_call(&child).unwrap(), Some(10));
         assert_eq!(budget.root().usage_json()["calls"], 1);
+        assert_eq!(child.usage_json()["cached_input_tokens"], 5);
         assert_eq!(budget.remaining_json(&budget.root())["output_tokens"], 80);
-        budget.after_model_call(&child, 10, 5, true);
+        budget.after_model_call(&child, tokens(10, 5), true);
         let message = budget.before_model_call(&child).unwrap_err();
         assert!(message.contains("model.limit(calls=2)"), "{message}");
         let stopped = budget.stopped().unwrap();
